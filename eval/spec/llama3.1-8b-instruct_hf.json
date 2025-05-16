@@ -1,8 +1,9 @@
 [
     {
-        "model_dir": "/mnt/REDACTED/eval_models/llama3.1-8b-instruct/hf",
-        "load_fn": "transformers",
+        "model_dir": "/mnt/REDACTED/models/llama3.1-8b-instruct/hf",
+        "load_fn": "transformers_auto",
         "fwd_fn": "transformers",
-        "label": "HF FP16"
+        "label": "HF FP16",
+        "out_logits": "/mnt/REDACTED/models/llama3.1-8b-instruct/ref_logits"
     }
 ]
