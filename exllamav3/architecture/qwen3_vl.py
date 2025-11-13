@@ -122,7 +122,6 @@ def read_qwen3_vl_pp_config(config_dict: dict):
             ("image_mean", list),
             ("image_std", list),
             ("image_processor_type", str),
-            ("size", dict),
         ]
     })
     pp.resample = 3
@@ -441,7 +440,6 @@ class Qwen3VLVisionModel(Model):
 
 
     def default_load_shape_dtype(self, chunk_size):
-        # TODO: Sane load shape (?)
         return (
             (
                 1,
@@ -478,10 +476,11 @@ class Qwen3VLVisionModel(Model):
             image_tensor = image_tensor.unsqueeze(0)
             return_batch = False
 
+        inv_freq = position_embedding_grid_2d(grid_thw, v.head_dim, v.spatial_merge_size, v.rope_theta)
         params = {
             "causal": False,
             "grid_thw": torch.tensor([grid_thw], dtype = torch.int),
-            "inv_freq": position_embedding_grid_2d(grid_thw, v.head_dim, v.spatial_merge_size, v.rope_theta)
+            "inv_freq": inv_freq
         }
 
         embedding_tensor = self.forward(
