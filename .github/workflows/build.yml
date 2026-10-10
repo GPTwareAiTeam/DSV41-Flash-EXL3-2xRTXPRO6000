@@ -165,15 +165,18 @@ jobs:
         with:
           python-version: ${{ matrix.pyver }}
 
-      # Compiler cache for the Linux builds: ccache in front of nvcc / hipcc and the host compiler
-      # (torch's BuildExtension does this itself for CUDA when ccache is on PATH; the HIP compiler is
-      # named through PYTORCH_NVCC below), with the cache directory carried between runs through the
-      # Actions cache. Keys end in the commit so every run saves its own state; the restore prefixes
-      # fall back to the latest cache for the same backend/torch and, failing that, any Python version
-      # of it. The kernel translation units include no Python headers, so their compiles are identical
-      # across Python versions once the torch include path is too: the venv's site-packages (whose
-      # path carries the Python version) is reached through a fixed symlink on PYTHONPATH (next step),
-      # and that is the path ccache sees in the preprocessed source
+      # Compiler cache: on Linux ccache in front of nvcc / hipcc and the host compiler (torch's
+      # BuildExtension does this itself for CUDA when ccache is on PATH; the HIP compiler is named
+      # through PYTORCH_NVCC below), on Windows sccache in front of nvcc (torch never wraps the
+      # compilers there by itself, but takes the nvcc command verbatim from PYTORCH_NVCC; the host
+      # compiler stays uncached since older torch versions name cl directly in the ninja rule, and
+      # the .cpp units are a small share of the build). The cache directory is carried between runs
+      # through the Actions cache. Keys end in the commit so every run saves its own state; the
+      # restore prefixes fall back to the latest cache for the same OS/backend/torch and, failing
+      # that, any Python version of it. The kernel translation units include no Python headers, so
+      # their compiles are identical across Python versions once the torch include path is too: the
+      # site-packages (whose path carries the Python version) is reached through a fixed link on
+      # PYTHONPATH (next step), and that is the path the cache sees in the preprocessed source
       - name: Set up ccache
         if: runner.os == 'Linux'
         run: |
@@ -186,16 +189,33 @@ jobs:
           Write-Output "CCACHE_COMPRESS=1" >> "$env:GITHUB_ENV"
           Write-Output "CCACHE_MAXSIZE=3G" >> "$env:GITHUB_ENV"
 
+      - name: Set up sccache
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "v0.18.0"
+          $name = "sccache-$ver-x86_64-pc-windows-msvc"
+          curl.exe -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$name.zip" "https://github.com/mozilla/sccache/releases/download/$ver/$name.zip"
+          if ($LASTEXITCODE -ne 0) { throw "sccache download failed with exit code $LASTEXITCODE" }
+          $dest = Join-Path $env:RUNNER_TEMP 'sccache'
+          Expand-Archive -Path "$name.zip" -DestinationPath $dest -Force
+          $bin = Join-Path $dest $name
+          & (Join-Path $bin 'sccache.exe') --version
+          Write-Output $bin >> "$env:GITHUB_PATH"
+          $dir = Join-Path $env:RUNNER_TEMP 'ccache'
+          Write-Output "SCCACHE_DIR=$dir" >> "$env:GITHUB_ENV"
+          Write-Output "SCCACHE_CACHE_SIZE=3G" >> "$env:GITHUB_ENV"
+
       - name: Stable site-packages path for the compiler cache
-        if: runner.os == 'Linux'
         run: |
           $site = python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
           $link = Join-Path $env:RUNNER_TEMP 'site'
-          New-Item -ItemType SymbolicLink -Path $link -Target $site | Out-Null
+          # A junction needs no privilege on Windows and is transparent to the file APIs
+          $kind = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+          New-Item -ItemType $kind -Path $link -Target $site | Out-Null
           Write-Output "PYTHONPATH=$link" >> "$env:GITHUB_ENV"
 
       - name: Restore compiler cache
-        if: runner.os == 'Linux'
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ccache
@@ -487,6 +507,9 @@ jobs:
             Import-Module 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
             Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64'
             $env:DISTUTILS_USE_SDK=1
+            # torch takes this command verbatim for the ninja nvcc rule (nvcc is on PATH from the
+            # CUDA install step; the host compiler from the VS shell)
+            $env:PYTORCH_NVCC = "sccache nvcc"
           }
 
           # --- Build wheel
@@ -516,13 +539,20 @@ jobs:
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
 
       - name: Compiler cache statistics
-        if: runner.os == 'Linux' && always()
+        if: (matrix.cuda != '' || matrix.rocm != '') && always()
         run: |
           python -c "import sys; print('python prefix:', sys.prefix)"
-          ccache -s
+          if ($IsWindows) {
+            sccache --show-stats
+            # flush the server's pending writes before the cache directory is saved
+            sccache --stop-server
+            $global:LASTEXITCODE = 0
+          } else {
+            ccache -s
+          }
 
       - name: Save compiler cache
-        if: runner.os == 'Linux' && (matrix.cuda != '' || matrix.rocm != '')
+        if: matrix.cuda != '' || matrix.rocm != ''
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ccache
