@@ -226,11 +226,18 @@ jobs:
                 $size = (Get-Item $OutFile).Length
                 if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
 
+                # The CDN sometimes answers 200 with a truncated or non-zip body, which curl
+                # cannot tell from a good download; unzip skips such a file with a warning later
+                # and the step only fails at the final nvcc check. Validate here so it retries
+                unzip -tq $OutFile | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Downloaded file is not a valid zip archive: $OutFile" }
+
                 Write-Host "Downloaded $OutFile ($size bytes)"
                 return
               }
               catch {
                 Write-Warning "Download failed for $Url : $_"
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                 if ($attempt -eq $MaxAttempts) { throw }
                 Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
               }
@@ -255,6 +262,7 @@ jobs:
           Download-WithRetry "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.3.3.41-archive.zip" "libcufft.zip"
 
           unzip '*.zip' -d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          if ($LASTEXITCODE -ne 0) { throw "unzip failed with exit code $LASTEXITCODE" }
 
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_cudart-windows-x86_64-12.8.57-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
           xcopy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\cuda_nvcc-windows-x86_64-12.8.61-archive\*" "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" /E /I /H /Y
@@ -307,11 +315,18 @@ jobs:
                 $size = (Get-Item $OutFile).Length
                 if ($size -le 0) { throw "Downloaded file is empty: $OutFile" }
 
+                # The CDN sometimes answers 200 with a truncated or non-zip body, which curl
+                # cannot tell from a good download; unzip skips such a file with a warning later
+                # and the step only fails at the final nvcc check. Validate here so it retries
+                unzip -tq $OutFile | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Downloaded file is not a valid zip archive: $OutFile" }
+
                 Write-Host "Downloaded $OutFile ($size bytes)"
                 return
               }
               catch {
                 Write-Warning "Download failed for $Url : $_"
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
                 if ($attempt -eq $MaxAttempts) { throw }
                 Start-Sleep -Seconds ([Math]::Min(60, 5 * $attempt))
               }
@@ -347,6 +362,7 @@ jobs:
           }
 
           unzip '*.zip' -d $cudaRoot
+          if ($LASTEXITCODE -ne 0) { throw "unzip failed with exit code $LASTEXITCODE" }
 
           foreach ($archiveDir in Get-ChildItem $cudaRoot -Directory -Filter '*-archive') {
             xcopy "$($archiveDir.FullName)\*" "$cudaRoot" /E /I /H /Y
