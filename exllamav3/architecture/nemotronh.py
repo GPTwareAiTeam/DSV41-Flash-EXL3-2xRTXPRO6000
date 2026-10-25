@@ -9,7 +9,7 @@ from ..model.config import Config, no_default
 from ..model.model import Model
 from ..util.file import read_dict
 from ..tokenizer import MMEmbedding, Tokenizer
-from ..modules.arch_specific.nemotronh_omni import NemotronHOmniPatchEmbedder, NemotronHOmniPixelShuffle
+from ..modules.arch_specific.nemotronh_omni import NemotronHOmniPatchEmbedder
 from .mm_processing.nemotronh_omni import (
     nemotronh_omni_image_grid,
     nemotronh_omni_video_grid,
@@ -21,6 +21,7 @@ from .mm_processing.nemotronh_omni import (
 from ..modules import (
     RMSNorm,
     LayerNorm,
+    PixelUnshuffle,
     Embedding,
     TransformerBlock,
     Attention,
@@ -33,6 +34,16 @@ from ..modules import (
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from .nemotronh_mtp import NemotronHMTPModel
+
+_layer_types = {"mamba": "M", "attention": "*", "mlp": "-", "moe": "E"}
+
+
+def _layer_pattern(block_types: list) -> str:
+    try:
+        return "".join(_layer_types[t] for t in block_types)
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Unsupported NemotronH block type in {block_types!r}") from exc
+
 
 class NemotronHConfig(Config):
     arch_string = "NemotronHForCausalLM"
@@ -51,23 +62,20 @@ class NemotronHConfig(Config):
             **kwargs
         )
 
-        # Layer pattern: M = Mamba2, * = attention, - = MLP, E = MoE
+        # Layer pattern: M = Mamba2, * = attention, - = MLP, E = MoE. Older configs spell it out as
+        # hybrid_override_pattern, newer ones list layers_block_type; Puzzle checkpoints (Bolt) add
+        # block_configs with per-layer MoE sizes
         block_configs = self.read_cfg(list, "block_configs", None)
-        if block_configs is not None:
-            block_types = self.read_cfg(list, "layers_block_type", None)
-            if block_types is None:
-                block_types = [layer.get("block_type") for layer in block_configs]
-            layer_types = {"mamba": "M", "attention": "*", "mlp": "-", "moe": "E"}
-            try:
-                self.hybrid_override_pattern = "".join(layer_types[t] for t in block_types)
-            except (KeyError, TypeError) as exc:
-                raise ValueError(f"Unsupported NemotronH block type in {block_types!r}") from exc
-            if len(block_types) != len(block_configs):
+        block_types = self.read_cfg(list, "layers_block_type", None)
+        if block_types is None and block_configs is not None:
+            block_types = [layer.get("block_type") for layer in block_configs]
+        if block_types is not None:
+            self.hybrid_override_pattern = _layer_pattern(block_types)
+            if block_configs is not None and len(block_types) != len(block_configs):
                 raise ValueError("NemotronH block_configs and layers_block_type lengths differ")
-            self.layer_moe_configs = block_configs
         else:
             self.hybrid_override_pattern = self.read_cfg(str, "hybrid_override_pattern", no_default)
-            self.layer_moe_configs = None
+        self.layer_moe_configs = block_configs
 
         # Attention params (NoPE: the reference model applies no positional embeddings)
         self.head_dim = self.read_cfg(int, "head_dim", None)
@@ -124,8 +132,12 @@ class NemotronHConfig(Config):
         # before MTP support gets them from util/convert_mtp.py)
         self.num_mtp_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
         self.mtp_hybrid_override_pattern = self.read_cfg(str, "mtp_hybrid_override_pattern", "")
+        if not self.mtp_hybrid_override_pattern:
+            mtp_types = self.read_cfg(list, "mtp_layers_block_type", None)
+            if mtp_types:
+                self.mtp_hybrid_override_pattern = _layer_pattern(mtp_types)
         if self.num_mtp_layers == 0 or not any(
-            self.stc.has_tensor(f"mtp.layers.0.eh_proj.{t}") for t in ("weight", "trellis")
+            self.stc.has_tensor(f"{self.tensor_prefix}mtp.layers.0.eh_proj.{t}") for t in ("weight", "trellis")
         ):
             del self.model_classes["mtp"]
 
@@ -367,7 +379,6 @@ class NemotronHOmniConfig(NemotronHConfig):
 
         self.vision = read_nemotronh_omni_vision_config(self.read_cfg(dict, "vision_config", no_default))
         self.vision.video_temporal_patch_size = self.read_cfg(int, "video_temporal_patch_size", 2)
-        self.assert_cfg(bool, "vision_final_layernorm", False, True)
 
         prep_path = os.path.join(directory, "processor_config.json")
         if not os.path.exists(prep_path):
@@ -439,8 +450,9 @@ class NemotronHOmniVisionModel(Model):
     @override
     def get_additional_compiled_tensors(config: NemotronHOmniConfig) -> dict:
         return (
-            config.stc.list_tensors(prefix = "vision_model.") |
-            config.stc.list_tensors(prefix = "mlp1.")
+            config.stc.list_tensors(prefix = "vision_model") |
+            config.stc.list_tensors(prefix = "vision_projector") |
+            config.stc.list_tensors(prefix = "mlp1")
         )
 
     def __init__(
@@ -520,13 +532,26 @@ class NemotronHOmniVisionModel(Model):
                 )
             ]
 
+        # Checkpoints whose language model carries an MTP head were trained with a LayerNorm on the
+        # tower output (Megatron places one with the last layer of every block built from the shared
+        # config); it sits before the prefix tokens are dropped, so it applies to every token
+        if config.stc.has_tensor("vision_projector.vision_final_layernorm.weight"):
+            self.modules += [
+                LayerNorm(
+                    config = config,
+                    key = "vision_projector.vision_final_layernorm",
+                    layernorm_eps = v.layer_norm_eps,
+                    out_dtype = torch.float,
+                )
+            ]
+
         self.modules += [
-            NemotronHOmniPixelShuffle(
+            PixelUnshuffle(
                 config = config,
                 key = f"{key_prefix}.pixel_shuffle",
+                factor = self.merge_size,
                 num_prefix_tokens = v.num_prefix_tokens,
-                merge_size = self.merge_size,
-                ps_version = config.ps_version,
+                legacy_order = config.ps_version == "v1",
             ),
             RMSNorm(
                 config = config,
