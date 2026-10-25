@@ -434,6 +434,9 @@ class BlockSparseMLP_CPU:
         # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
         # is its construction-time default)
         split_k = int(getattr(ip, "moe_cpu_split", 0))
+        remote_hot = getattr(ip, "moe_remote_hot", None)
+        if remote_hot is not None and self.key in remote_hot:
+            split_k = self.num_experts - len(remote_hot[self.key])
         if split_k:
             assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
@@ -787,7 +790,22 @@ class BlockSparseMLP_CPU:
         """
         stc = self.config.stc
         cpu = torch.device("cpu")
-        first = self.num_experts - split_k
+        ip = self.config.infer_params
+        remote_hot = getattr(ip, "moe_remote_hot", None)
+        remote = remote_hot is not None and self.key in remote_hot
+        perm = None
+        if remote:
+            hot = list(remote_hot[self.key])
+            cold = [e for e in range(self.num_experts) if e not in set(hot)]
+            perm = hot + cold
+            self._split_perm = perm
+            self._split_seeded = True
+            self.gates = [self.gates[e] for e in perm] if self.gated else []
+            self.ups = [self.ups[e] for e in perm]
+            self.downs = [self.downs[e] for e in perm]
+            first = len(hot)
+        else:
+            first = self.num_experts - split_k
 
         # Same eligibility probes as the whole-layer path, on the tail experts
         probe = ([self.gates[first]] if self.gated else []) + [self.ups[first], self.downs[first]]
@@ -818,8 +836,9 @@ class BlockSparseMLP_CPU:
         # indices, GPU pointer tables and the worker's key list all live in the same permuted
         # space. Measured on lfm2.5: the coldest 12/32 experts draw ~8% of selections vs
         # 37.5% uniform, cutting the CPU share per layer ~4.5x
-        self._split_perm = None
-        self._split_seeded = False
+        if not remote:
+            self._split_perm = None
+            self._split_seeded = False
         self._split_saved_lists = (self.gates, self.ups, self.downs)
         # Dynamic placement (default; EXL3_MOE_CPU_SWAP=0 disables): both the GPU's E - k
         # slots and the worker's k slots hold a CHANGING set of experts; a per-layer
@@ -827,7 +846,7 @@ class BlockSparseMLP_CPU:
         # both experts from the checkpoint: the promoted one into the GPU slot tensors in
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
-        self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
+        self._split_dynamic = (not remote) and os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
             and not self.tid2eid_key
         # Promote-on-miss (EXL3_MOE_CPU_PROMOTE = spare slots per layer, default 4, 0 off): with
         # the pinned arena the parent moves experts between the GPU slots and the worker's arena
@@ -868,9 +887,13 @@ class BlockSparseMLP_CPU:
 
         self.device = torch.device(device)
 
-        from ..model.moe_cpu_host import MoeCpuHost
+        if getattr(ip, "remote_expert_host", None) is not None:
+            from qmesh.remote_host import RemoteExpertHost
+            host = RemoteExpertHost.for_config(ip)
+        else:
+            from ..model.moe_cpu_host import MoeCpuHost
+            host = MoeCpuHost.for_config(self.config)
         comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
-        host = MoeCpuHost.for_config(self.config)
         self.cpu_host = host
         self.cpu_component = comp
 
