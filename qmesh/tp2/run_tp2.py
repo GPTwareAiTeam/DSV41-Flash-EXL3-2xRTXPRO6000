@@ -262,16 +262,29 @@ def main():
 
     if PROFILE:
         from torch.profiler import profile, ProfilerActivity
-        # both ranks must run the same collective sequence; only rank 0 prints the table
-        with profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            job = Job(input_ids = last_ids, max_new_tokens = 16, min_new_tokens = 16,
-                      sampler = GreedySampler(), stop_conditions = [])
-            generator.enqueue(job)
-            while generator.num_remaining_jobs():
-                for _ in generator.iterate():
-                    pass
+        # both ranks must run the same collective sequence; only rank 0 prints the table.
+        # Profiling starts after the first emitted token, so prefill is excluded: decode steps only.
+        prof = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        job = Job(input_ids = last_ids, max_new_tokens = 16, min_new_tokens = 16,
+                  sampler = GreedySampler(), stop_conditions = [])
+        generator.enqueue(job)
+        started, steps, t_dec, wall_ms = False, 0, None, float("nan")
+        while generator.num_remaining_jobs():
+            for result in generator.iterate():
+                if "token_ids" in result and not started:
+                    torch.cuda.synchronize()
+                    prof.start()
+                    started, t_dec = True, time.time()
+                elif "token_ids" in result:
+                    steps += 1
+        torch.cuda.synchronize()
+        if started:
+            wall_ms = (time.time() - t_dec) * 1e3 / max(steps, 1)
+            prof.stop()
         if RANK == 0:
-            print(prof.key_averages().table(sort_by = "cuda_time_total", row_limit = 25), flush = True)
+            log(f"PROFILE decode_steps={steps} wall_ms_per_step={wall_ms:.2f}")
+            prof.export_chrome_trace(os.environ.get("PROFILE_TRACE", "/artifacts/tp2logs/profile_trace.json"))
+            print(prof.key_averages().table(sort_by = "cuda_time_total", row_limit = 40), flush = True)
 
     dist.barrier()
     dist.destroy_process_group()

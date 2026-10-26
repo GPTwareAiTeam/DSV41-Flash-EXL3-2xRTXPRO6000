@@ -48,3 +48,22 @@ Includes prefill. Self CUDA 454 ms, Self CPU 340 ms (16 steps; ~28 ms/step with 
 1. Verify the skew hypothesis: time the all-reduce with both ranks pre-synchronized, then with rank-skew injected.
 2. Capture the attention core in graphs (or cut its CPU launch overhead), then re-profile.
 3. Target >= 150 tok/s (<= 6.67 ms/tok); current best 20.8 ms/tok (P2P + graph, prompt 2).
+
+## Decode-only profile, P2P + EXL3_WHOLE_GRAPH=1 (prompt 2, rank 0, 15 decode steps, PROFILE=1)
+Profiler starts after the first token (prefill excluded). Under profiler: wall 34.2 ms/step (overhead inflated).
+Unprofiled reference wall for the same config: 21.4 to 22.4 ms/tok (s0_base run, 128 tok, 3 prompts).
+GPU busy 209.3 ms / 15 steps = 13.95 ms/step. Launches: 1255 kernels/step; cudaLaunch-class runtime calls 1071/step.
+
+| category | ms/step (profiled) | share of GPU busy | main kernels |
+|---|---|---|---|
+| collective (P2P all-reduce + gather) | 4.79 | 34% | `p2p_oneshot_kernel<0>` 81 calls/step, avg 58 us (spin-wait on peer, see below) |
+| GEMV/GEMM (dense int8/EXL3) | 4.23 | 30% | `exl3_gemv_int8_sq<6,1,false>` 1.70, `<6,1,true>` 0.69, `exl3_mgemm` 0.94, `exl3_gemm<8>` 0.23, `gemvx` 0.40, aten::mm 0.42 |
+| MoE | 2.70 | 19% | `exl3_moe_coop_a_mixed_k` 1.65, `_b_mixed_k` 1.06 (40 calls each) |
+| HC (mHC mix/apply/finalize) | 0.76 | 5% | `hc_mix_finalize` 0.33, `hc_mix_partials` 0.28, `hc_apply` 0.15 |
+| attn core + misc (dsa_attn, rope, router) | 0.72 | 5% | `_dsa_attn_split` 0.31, `routing_gemv` 0.25, `_dsa_attn_combine` 0.19, rope ~0.1 |
+| copy / elementwise / index | 0.26 | 2% | DtoD memcpy, aten::copy_ |
+| other (norms, topk, misc) | 0.49 | 3% | `rms_norm` 0.32, `routing_ds3_topk` 0.13 |
+| idle / host-bound (wall - GPU busy, unprofiled) | ~7.5 to 8.5 | n/a | eager attention core + per-step host bookkeeping |
+
+Per-step kernel counts: `p2p_oneshot` 81 (all-reduce 80 + gather 1), `exl3_gemv_int8` 161, MoE 80, HC 240, rms_norm 122, dsa_attn 40+40.
+[INFERENCE] Under the profiler the GPU is busy ~14 ms of a ~22 ms step, so the GPU is idle about 35% of the wall: the step is host-launch-bound, and the all-reduce time is mostly peer skew absorbed while the faster rank waits.
