@@ -89,6 +89,13 @@ void BC_BlockSparseMLP::fold_prepare(int rows, at::Device dev)
     );
     fold_coop_p.min_expert = -1;
     fold_coop_p.max_expert = -1;
+    // Mixed-K: the per-expert half-bit rate tables (fold_tables[16..18]) must be re-attached on every rebuild
+    if (fold_tables.size() > 16)
+    {
+        fold_coop_p.k2_g = fold_tables[16].data_ptr<uint8_t>();
+        fold_coop_p.k2_u = fold_tables[17].data_ptr<uint8_t>();
+        fold_coop_p.k2_d = fold_tables[18].data_ptr<uint8_t>();
+    }
 }
 
 
@@ -136,6 +143,9 @@ void BC_BlockSparseMLP::run_bszN
         exl3_moe_coop_run(fold_coop_p, fold_K_gu, fold_K_d, fold_cb, y,
                           fold_sel.slice(0, 0, num_tokens).slice(1, 0, top_k + 1),
                           fold_rw.slice(0, 0, num_tokens).slice(1, 0, top_k + 1), c10::nullopt);
+        // The fold launch writes its (Ho-wide) routed sum into fold_out; the Python caller reads
+        // out_bszn (MAX_BSZN, H), so copy the H-wide trim into it
+        out_bszn.slice(0, 0, num_tokens).copy_(fold_out.view({-1, fold_out.size(-1)}).slice(0, 0, num_tokens).slice(1, 0, out_bszn.size(-1)));
         return;
     }
 
