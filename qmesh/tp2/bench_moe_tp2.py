@@ -215,6 +215,16 @@ def main():
             def routed():
                 run_routed(x, sel, rw, tb, sc, mixed, Kvec, sc["out"][:bsz], k2)
 
+            # Folded variant: shared expert as slot topk (expert index E, weight 1) in the one routed launch
+            fsel = torch.cat([sel, torch.full((bsz, 1), E, dtype = torch.long, device = DEV)], 1).contiguous()
+            frw = torch.cat([rw, torch.ones((bsz, 1), dtype = torch.half, device = DEV)], 1).contiguous()
+            fsc = scratch(256)
+            fk2 = {p: k2_of(Kvec[p]) for p in ("g", "u", "d")} if mixed else None
+            ftb = tb  # same tables: index E is the shared expert
+
+            def folded():
+                run_routed(x, fsel, frw, ftb, fsc, mixed, Kvec, fsc["out"][:bsz], fk2)
+
             def shared():
                 run_routed(x, sh_sel, sh_rw, {p: sh_tb[p] for p in sh_tb}, sh_sc, False, sh_K, sh_out[:bsz])
 
@@ -229,14 +239,21 @@ def main():
                 shared_ref[b] = exl3_shared(x[b:b + 1], ex, Kvec)
             routed_ref = ref - shared_ref
             err = (got - routed_ref).abs().max().item() / (routed_ref.abs().max().item() + 1e-9)
-            emit({"kind": "correct", "layer": layer, "bsz": bsz, "mixed": mixed, "routed_rel_err": err})
+            folded()
+            torch.cuda.synchronize()
+            fgot = fsc["out"][:bsz].clone()
+            ferr = (fgot - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
+            emit({"kind": "correct", "layer": layer, "bsz": bsz, "mixed": mixed, "routed_rel_err": err,
+                  "folded_rel_err": ferr})
 
             for mode in ("eager",) if args.no_graph else ("eager", "graph"):
                 g_mode = mode == "graph"
                 t_r = timed(routed, g_mode)
                 t_s = timed(shared, g_mode)
+                t_f = timed(folded, g_mode)
                 emit({"kind": "time", "layer": layer, "bsz": bsz, "mode": mode, "mixed": mixed,
-                      "routed_us": round(t_r, 2), "shared_us": round(t_s, 2), "total_us": round(t_r + t_s, 2)})
+                      "routed_us": round(t_r, 2), "shared_us": round(t_s, 2), "total_us": round(t_r + t_s, 2),
+                      "folded_us": round(t_f, 2)})
     if dump:
         dump.close()
 
