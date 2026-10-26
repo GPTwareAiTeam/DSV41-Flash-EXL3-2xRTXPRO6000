@@ -38,6 +38,7 @@ MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
+COMM = os.environ.get("COMM", "nccl")  # nccl | p2p (P2PComm one-shot collectives; needs P2P_RDV = fresh dir)
 PROFILE = os.environ.get("PROFILE", "0") == "1"
 TOKENS_OUT = os.environ.get("TOKENS_OUT")
 PROMPT_IDS = [int(i) for i in os.environ.get("PROMPT_IDS", "0,1,2").split(",")]
@@ -76,7 +77,58 @@ class TPBackendNCCL:
 
     def end_cpu_reduce_jobs(self):
         pass
+P2P_CHUNK = 256 * 1024 // 4  # fp32 elements per P2P arena payload (ARENA_MAXB = 256 KiB, multiple of 4 floats)
 
+
+class TPBackendP2P:
+    """Collective backend on P2PComm (one-shot cudaIpc / pinned-host one-shot all-reduce, fp32 only).
+    Same hook surface as TPBackendNCCL. Non-fp32 tensors go through an fp32 staging buffer; the payload must
+    fit the P2P arena (<= 256 KiB fp32), and every rank must issue the same sequence of collectives."""
+
+    def __init__(self, comm):
+        self.comm = comm
+        self._stage = {}
+
+    def _buf(self, t: torch.Tensor) -> torch.Tensor:
+        key = (t.numel(), t.device)
+        if key not in self._stage:
+            self._stage[key] = torch.empty(t.numel(), dtype = torch.float32, device = t.device)
+        return self._stage[key]
+
+    def fwd_barrier(self):
+        self.comm.barrier()
+
+    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if not contribution:
+            tensor.zero_()
+        direct = tensor.dtype == torch.float32 and tensor.is_contiguous()
+        s = tensor.view(-1) if direct else self._buf(tensor)
+        if not direct:
+            s.copy_(tensor.reshape(-1))
+        assert s.numel() % 4 == 0, f"P2P all_reduce payload {s.numel()} fp32 not 16-byte divisible"
+        # chunk to the arena size; sizes depend only on numel, so both ranks issue the same sequence
+        for off in range(0, s.numel(), P2P_CHUNK):
+            self.comm.all_reduce_(s[off:off + P2P_CHUNK])
+        if not direct:
+            tensor.copy_(s.view(tensor.shape))
+
+    def broadcast(self, tensor: torch.Tensor, src_device: int):
+        raise NotImplementedError("tp_owner broadcast not supported by P2PComm backend; TP2 splits every module")
+
+    def all_gather(self, t: torch.Tensor, world: int) -> torch.Tensor:
+        """Concatenate the per-rank t along the last dim, in rank order, on both ranks (== cat(parts, -1))."""
+        assert world == 2
+        t = t.contiguous()
+        flat = torch.empty(2 * t.numel(), dtype = torch.float32, device = t.device)
+        self.comm.all_gather(t.float().reshape(-1), flat)
+        shards = flat.view(2, *t.shape)
+        return torch.cat([shards[0], shards[1]], dim = -1).to(t.dtype)
+
+    def run_cpu_reduce_jobs(self):
+        pass
+
+    def end_cpu_reduce_jobs(self):
+        pass
 
 def set_tp_reduce(model: Model, backend: TPBackendNCCL) -> int:
     """Enable the attention/MoE partial-sum collectives on every TP-local block, and hand the backend to
@@ -125,10 +177,11 @@ def wrap_vocab_split(model: Model, rank: int, world: int, backend: TPBackendNCCL
 
     def head_fwd(x, params, out_dtype = None):
         y = orig_head(x, params, out_dtype)
+        if isinstance(backend, TPBackendP2P):
+            return backend.all_gather(y.contiguous(), world)
         parts = [torch.empty_like(y) for _ in range(world)]
         dist.all_gather(parts, y.contiguous())
-        full = torch.cat(parts, dim = -1)
-        return full
+        return torch.cat(parts, dim = -1)
 
     emb.forward = embed_fwd
     head.forward = head_fwd
@@ -150,7 +203,12 @@ def main():
     cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = 5)
     model.load(device = device, max_chunk_size = MAX_CHUNK, max_output_size = MAX_NEW,
                max_batch_size = 1, progressbar = False)
-    backend = TPBackendNCCL()
+    if COMM == "p2p":
+        from exllamav3.tp2.p2p import P2PComm
+        rdv = os.environ["P2P_RDV"]
+        backend = TPBackendP2P(P2PComm(RANK, world = WORLD, rendezvous_path = rdv, device = RANK))
+    else:
+        backend = TPBackendNCCL()
     n_blocks = set_tp_reduce(model, backend)
     local_v, full_v = wrap_vocab_split(model, RANK, WORLD, backend)
     load_s = time.time() - t0
