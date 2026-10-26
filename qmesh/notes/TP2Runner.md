@@ -21,7 +21,13 @@
 - `import exllamav3` JIT-builds `exllamav3_ext`. Always `export TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions` (private per container).
 - Do not run two launches at once on the same GPUs: concurrent runs OOM.
 
-## Next steps (M2)
-1. Swap NCCL for `P2PComm` (`tp2/p2p-allreduce`): `all_reduce_` for attn/MoE/embed, `all_gather` for head. Compare tokens against NCCL.
-2. `EXL3_WHOLE_GRAPH=1` piecewise CUDA graphs.
-3. Profile one decode step; attack the largest item.
+## M2 results (COMM=p2p; NCCL token output is the reference)
+- P2P collectives (`TPBackendP2P`, `P2PComm` from `exllamav3/tp2/p2p.py`): prompt 0 8 tok identical to NCCL; prompts 1 and 2 16 tok identical across ranks (prompt 2 matches the NCCL prefix; full NCCL list for prompt 2 not yet captured).
+- Decode ms/tok, eager: P2P 30.07/30.61 (prompt 0), 30.45/30.48 (prompt 1), 28.62/28.61 (prompt 2). NCCL eager 42.77/43.91 (prompt 0).
+- P2P + `EXL3_WHOLE_GRAPH=1`: token-identical to eager P2P on all 3 prompts. Decode ms/tok: prompt 1 24.05/24.04, prompt 2 20.81/20.81, prompt 0 32.26/32.27 (8-token run).
+- Long-prefill fix: arena limit is 256 KiB, so `all_reduce` chunks to 65536 fp32 per call (sizes depend only on numel, identical on both ranks).
+- Head all_gather under P2P: flat gather + last-dim concat, token-identical on all prompts.
+
+## Next steps (M2 step 3, then M3)
+1. Profile one decode step (torch profiler, per-category CUDA event timing; ncu is blocked). Attack the largest item.
+2. Target >= 150 tok/s (<= 6.67 ms/tok).
