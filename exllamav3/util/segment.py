@@ -84,8 +84,13 @@ class Segment:
         s.wait_stream(torch.cuda.current_stream())
         g = torch.cuda.CUDAGraph()
         with torch.cuda.stream(s):
-            with torch.cuda.graph(g, pool = _pool(), stream = s, capture_error_mode = "thread_local"):
+            # capture_begin/end directly: the torch.cuda.graph context manager device-syncs and
+            # flushes the allocator on enter, once per segment, inside the decode window
+            g.capture_begin(pool = _pool(), capture_error_mode = "thread_local")
+            try:
                 out = self.fn(*self._interleave(self.static_in))
+            finally:
+                g.capture_end()
         torch.cuda.current_stream().wait_stream(s)
         self.graph = g
         self.static_out = tuple(out) if isinstance(out, (tuple, list)) else (out,)
