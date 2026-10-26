@@ -2,7 +2,7 @@
 # Mixed-K decode A/B kernels: the GEMV tile is dispatched per block on the expert's half-bit rate k2
 # (2*bits + half). Only the rates in CASES are instantiated; the host validates the tables against them.
 import sys
-SRC = '/home/treadall/qmesh-exl3-runtime/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh'
+SRC = '/home/treadall/recipe-2xrtx-tp2-moe/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh'
 OUT = sys.argv[1] if len(sys.argv) > 1 else '/tmp/mk/mixed_kernel.cuh'
 src = open(SRC).read().split('\n')
 
@@ -18,8 +18,8 @@ def strip_head(lines, name):
 A = strip_head(body(676, 805), 'exl3_moe_coop_a_kernel')
 B = strip_head(body(812, 959), 'exl3_moe_coop_b_kernel')
 
-# (k2, bits, half). k2 = 2*bits + half, mul1 rates 2, 2.5, 3, 3.5, 4
-CASES = [(4, 2, False), (5, 2, True), (6, 3, False), (7, 3, True), (8, 4, False)]
+# (k2, bits, half). k2 = 2*bits + half. mul1 rates 2, 2.5, 3, 3.5, 4 (routed) and 6 (shared expert, staged path)
+CASES = [(4, 2, False), (5, 2, True), (6, 3, False), (7, 3, True), (8, 4, False), (12, 6, False)]
 
 def gemv_lines(lines, macro, k2_expr):
     out = []
