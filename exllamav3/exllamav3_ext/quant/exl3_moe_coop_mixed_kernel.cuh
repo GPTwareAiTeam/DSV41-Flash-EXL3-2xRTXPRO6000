@@ -39,7 +39,7 @@ constexpr int mixed_smem_b() { return smem_red_bytes() + WK * STAGE_WORDS * 4 + 
     }
 
 template <int cb, bool WIDE>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
@@ -170,7 +170,7 @@ void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
 }
 
 template <int cb, bool WIDE>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_b_mixed_kernel(const MoeCoopParams p)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
