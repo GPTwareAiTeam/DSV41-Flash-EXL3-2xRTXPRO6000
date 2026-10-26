@@ -14,7 +14,7 @@
 #define MOE_COOP_ACT_RELU2 2
 #define MOE_COOP_ACT_SILU_OAI 3
 
-#define MOE_COOP_THREADS 512
+#define MOE_COOP_THREADS 256
 #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp (32-column groups per block)
 #define MOE_COOP_COLS (MOE_COOP_WNT * 16)
 
