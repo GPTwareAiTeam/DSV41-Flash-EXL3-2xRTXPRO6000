@@ -47,7 +47,10 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const c10::optional<at::Tensor>& k2_gate,   // per-expert half-bit rates (uint8), mixed-K layers only
+    const c10::optional<at::Tensor>& k2_up,
+    const c10::optional<at::Tensor>& k2_down
 );
 
 void exl3_moe_gather

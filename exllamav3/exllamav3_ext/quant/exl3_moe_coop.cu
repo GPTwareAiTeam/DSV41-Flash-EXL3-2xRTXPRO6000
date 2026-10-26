@@ -149,10 +149,17 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     const int nproj = p.gated ? 2 : 1;
     p.a_global = p.bsz > 1;
 
-    const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
-    const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
-    MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
-    MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
+    // Measured per stage (qmesh/notes/CoopPerf.md): gate/up (A) at bsz 1 is fastest on the narrow tile,
+    // down (B) at bsz > 1 on the wide tile. Other cases keep the k-length rule; EXL3_MOE_COOP_WIDE overrides all
+    const bool forced = moe_coop_wide_mode() >= 0;
+    const bool wide_a = forced ? moe_coop_pick_wide(p.Hi / 16, slots, device) : (p.bsz > 1 && moe_coop_pick_wide(p.Hi / 16, slots, device));
+    const bool wide_b = forced ? moe_coop_pick_wide(p.I / 16, slots, device) : (p.bsz > 1 || moe_coop_pick_wide(p.I / 16, slots, device));
+    // Mixed-K (any per-expert rate table set): the *_mixed kernels dispatch each block's tile on its expert's
+    // rate, so the uniform K / half flags are not used for the projections that carry a table
+    const bool mixed = p.k2_g || p.k2_u || p.k2_d;
+    TORCH_CHECK(!mixed || cb == 2, "exl3_moe_coop: mixed per-expert bitrates require the mul1 codebook");
+    MoeCoopKernel ka = mixed ? exl3_moe_coop_kernel_a_mixed(p.Hi, wide_a) : moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
+    MoeCoopKernel kb = mixed ? exl3_moe_coop_kernel_b_mixed(wide_b) : moe_coop_kernel_b(K_d, cb, wide_b);
     moe_coop_smem_optin(ka.kernel, ka.smem);
     moe_coop_smem_optin(kb.kernel, kb.smem);
 
@@ -358,7 +365,10 @@ void exl3_moe_coop
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_out,
-    const c10::optional<at::Tensor>& sh_gate_w
+    const c10::optional<at::Tensor>& sh_gate_w,
+    const c10::optional<at::Tensor>& k2_g,     // per local expert half-bit rates (uint8, nullable): mixed-K layer
+    const c10::optional<at::Tensor>& k2_u,
+    const c10::optional<at::Tensor>& k2_d
 )
 {
     TORCH_CHECK_DTYPE(x, kHalf);
@@ -373,10 +383,29 @@ void exl3_moe_coop
                     "exl3_moe_coop: shared expert output shape");
     }
     float K_gu, K_d; int cb;
+    // Mixed layers: per-expert rates come from the tables (k2_*), and the scalar K is ignored by the kernels. Pass the
+    // gate rate for up too so the uniform gate/up guard in prepare holds; the per-expert pairing is checked below.
+    const bool mixed = k2_g.has_value() || k2_u.has_value() || k2_d.has_value();
+    const float Ku_eff = mixed ? Kg : Ku;
     MoeCoopParams p = exl3_moe_coop_prepare(Hi, g_trellis, g_suh, g_svh, u_trellis, u_suh, u_svh, d_trellis, d_suh, d_svh,
-                                            g_bias, u_bias, d_bias, Kg, Ku, Kd, mcg, mul1, act, act_limit, gated,
+                                            g_bias, u_bias, d_bias, Kg, Ku_eff, Kd, mcg, mul1, act, act_limit, gated,
                                             had_g, had_u, gu_g, gu_u, act_out, d_out, ctr, out, sh_gate_w, K_gu, K_d, cb);
     p.min_expert = min_expert;
     p.max_expert = max_expert;
+    if (mixed)
+    {
+        TORCH_CHECK(k2_g && k2_u && k2_d, "exl3_moe_coop: mixed-K needs all three rate tables");
+        for (const at::Tensor* t : { &k2_g.value(), &k2_u.value(), &k2_d.value() })
+        {
+            TORCH_CHECK(t->scalar_type() == at::kByte && t->is_contiguous() && t->is_cuda(),
+                        "exl3_moe_coop: rate tables must be contiguous uint8 CUDA tensors");
+        }
+        // gate and up of one expert must share a width. Checked by the table builder (host, once at load), NOT here:
+        // a device comparison in the launch path would synchronize and break CUDA-graph capture.
+        TORCH_CHECK(k2_g->numel() >= 1 && k2_u->numel() == k2_g->numel(), "exl3_moe_coop: gate/up rate table length");
+        p.k2_g = k2_g->data_ptr<uint8_t>();
+        p.k2_u = k2_u->data_ptr<uint8_t>();
+        p.k2_d = k2_d->data_ptr<uint8_t>();
+    }
     exl3_moe_coop_run(p, K_gu, K_d, cb, x, sel, rw, sh_out);
 }

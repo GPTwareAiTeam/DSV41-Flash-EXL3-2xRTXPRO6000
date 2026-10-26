@@ -51,9 +51,9 @@ MOE_BATCH_RECON = _env("EXL3_MOE_BATCH_RECON", 1, 0) != "0"
 MOE_MTILE = _env("EXL3_MOE_MTILE", 1, 0) != "0"
 
 # mHC launch-count folds at decode row counts (hc_mix_fused, hc_fuse.cuh): apply_ deferred into the next
-# site's mix, the following RMSNorm run inside its finalize. Bit-identical to the unfused launches; on by
-# default where the per-launch cost dominates these small kernels (RDNA)
-HC_FOLD = _env("EXL3_HC_FOLD", 0, 1) != "0"
+# site's mix, the following RMSNorm run inside its finalize. Bit-identical to the unfused launches (DSV4.1
+# logits: max abs diff 0, qmesh/notes/DenseFuse.md); on by default on both backends
+HC_FOLD = _env("EXL3_HC_FOLD", 1, 1) != "0"
 
 # Split-decode attention (triton_paged.py, bc_attn.py): AMD's Triton backend runs the split kernel at
 # 8 warps / 1 stage without spilling to scratch, where 4 / 2 does. gfx1100 is measured separately: at

@@ -89,3 +89,7 @@ EXL3_MOE_COOP_INST_DECL_H(3)
             default: return { (void*) exl3_moe_coop_b_kernel<K, 2, false>, smem }; \
         } \
     }
+
+// Per-expert mixed-K decode kernels (mul1, exl3_moe_coop_mixed_inst.cu)
+MoeCoopKernel exl3_moe_coop_kernel_a_mixed(int Hi, bool wide);
+MoeCoopKernel exl3_moe_coop_kernel_b_mixed(bool wide);

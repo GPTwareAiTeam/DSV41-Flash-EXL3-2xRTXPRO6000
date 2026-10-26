@@ -84,6 +84,8 @@ struct BC_BlockSparseMLP
     // Validated static parameter block of the fused decode kernels (built in the constructor)
     MoeCoopParams coop_p;
     float coop_K_gu, coop_K_d; int coop_cb;
+    // Per-expert half-bit rates (uint8, one per local expert) for mixed-K routed layers; empty = uniform
+    c10::optional<at::Tensor> gate_k2, up_k2, down_k2;
 
     // Shared expert as its own one-expert fused launch (at its own bit width) instead of the
     // three latency-bound GEMV launches of the BC_GatedMLP graph; the routed launch merges its
@@ -168,7 +170,10 @@ struct BC_BlockSparseMLP
         c10::optional<at::Tensor> _up_bias_ptrs,
         c10::optional<at::Tensor> _down_bias_ptrs,
         bool _act_relu2 = false,
-        bool _sh_coop = false
+        bool _sh_coop = false,
+        c10::optional<at::Tensor> _gate_k2 = c10::nullopt,
+        c10::optional<at::Tensor> _up_k2 = c10::nullopt,
+        c10::optional<at::Tensor> _down_k2 = c10::nullopt
     );
 
     void run_bszN

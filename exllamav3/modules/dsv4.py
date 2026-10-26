@@ -1003,7 +1003,10 @@ class DSV4Attention(Module):
         widest). Mirrors the BC_DSV4Attention fan. A second fan pairs q_b with idx_wq_b
         (both consume q_res) for the top-k regime."""
         self.x_fan_ready = True
-        if not self.q_head_norm or os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0":
+        # No-q-head-norm models (DSV4.1): the fused fan is argmax-stable but not bit-identical (max abs
+        # logit diff 0.5-0.8, fp16 reduction order; qmesh/notes/DenseFuse.md), so it is opt-in there
+        if os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0" or \
+                (not self.q_head_norm and os.environ.get("EXL3_DSV41_XFAN", "0") == "0"):
             return
         device = torch.device(self.device)
 
@@ -1028,13 +1031,18 @@ class DSV4Attention(Module):
             )
 
         lins = [self.q_a, self.wkv]
-        if self.compressor is not None:
-            self.compressor._build_fused() if not self.compressor.fused_ready else None
-            lins += [self.compressor.wkv, self.compressor.wgate]
-        if self.indexer is not None:
-            self.indexer._build_fused() if not self.indexer.fused_ready else None
-            lins += [self.indexer.wkv, self.indexer.wgate]
-        self.x_fan = mk_fan(lins)
+        # Compressor with no gate projection (compress_rate == 1, non-overlapping): the fan's
+        # compressor outputs need both kv and gate, so such layers keep the per-projection path
+        if self.compressor is not None and self.compressor.wgate is None:
+            self.x_fan = None
+        else:
+            if self.compressor is not None:
+                self.compressor._build_fused() if not self.compressor.fused_ready else None
+                lins += [self.compressor.wkv, self.compressor.wgate]
+            if self.indexer is not None:
+                self.indexer._build_fused() if not self.indexer.fused_ready else None
+                lins += [self.indexer.wkv, self.indexer.wgate]
+            self.x_fan = mk_fan(lins)
         self.q_fan = mk_fan([self.q_b, self.idx_wq_b]) if self.indexer is not None else None
         self._fan_scratch = {}
 
@@ -1830,13 +1838,24 @@ class DSV4Attention(Module):
             else:
                 q = self.q_b.forward(q_res, params).view(1, seq, self.num_q_heads, self.head_dim)
 
-            ext.rope(
-                q, q, kv, kv,
-                self._rope_type(), pos0, None, None,
-                int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-                self.rms_norm_eps, 0.0, 0.0, 0, 1,
-                self.head_dim - self.rope_head_dim,
-            )
+            if self.q_head_norm:
+                ext.rope(
+                    q, q, kv, kv,
+                    self._rope_type(), pos0, None, None,
+                    int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
+                    self.rms_norm_eps, 0.0, 0.0, 0, 1,
+                    self.head_dim - self.rope_head_dim,
+                )
+            else:
+                # Same split as _project_qkv's no-head-norm branch: rope the trailing q slice, kv via the norm rope
+                rd = self.rope_head_dim
+                _ext_rope(q[..., -rd:], self._rope_type(), pos0)
+                ext.rope(
+                    kv, kv, None, None,
+                    self._rope_type(), pos0, None, None,
+                    int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
+                    self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
+                )
             kv = kv.view(1, seq, self.head_dim)
         else:
             q_res, q, kv = self._project_qkv(x, params, pos0)

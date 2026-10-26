@@ -19,6 +19,9 @@ from ..util import log_tp
 GLOBALS_SIZE = 128*1024
 SHBUF_SIZE = 16 * 1024 ** 2
 _nccl_fp32 = os.environ.get("EXL3_TP_NCCL_FP32", "0") != "0"
+# Native all-reduce path: the on-device P2P ring (ext.pg_all_reduce, fp32, graph-capturable) by default;
+# EXL3_TP_GPU_REDUCE=0 falls back to the CPU-reduce helper (pg_all_reduce_cpu, not capturable)
+_gpu_reduce = os.environ.get("EXL3_TP_GPU_REDUCE", "1") != "0"
 # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
 SHBUF_SIZE_R = 17 * 8 * 256 * 1024
 SHBUF_SIZE_S = 16 * 1024
@@ -456,7 +459,23 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
-        # if tensor.numel() * 2 < MAX_CPU_REDUCE:
+        if _gpu_reduce and tensor.dtype == torch.float32 and tensor.is_contiguous() and tensor.numel() % 4 == 0:
+            # The GPU ring sums every rank's buffer, so a non-contributor must add zeros
+            if not contribution:
+                tensor.zero_()
+            ext.pg_all_reduce(
+                self.ptr_g,
+                self.dev_g,
+                self.active_devices,
+                self.device,
+                self.active_devices[0],
+                tensor,
+                self.dev_b,
+                self.shbuf_size,
+                self.abort_flag
+            )
+            return
+        # CPU-reduce helper path (fp16/bf16 payloads, or EXL3_TP_GPU_REDUCE=0)
         ext.pg_all_reduce_cpu(
             self.ptr_g,
             self.dev_g,

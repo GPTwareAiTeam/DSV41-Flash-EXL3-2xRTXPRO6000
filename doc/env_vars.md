@@ -17,7 +17,6 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
 | `EXL3_MOE_FUSED_ROWS` | `128` | `512` | the RDNA fused MoE kernel tiles the rows itself |
 | `EXL3_MOE_BATCH_RECON` | `1` | `0` | same |
 | `EXL3_MOE_MTILE` | `1` | `0` | same (no 32 / 64-row instances of the RDNA kernel) |
-| `EXL3_HC_FOLD` | `0` | `1` | the per-launch cost dominates the mHC decode kernels on RDNA |
 
 ## Attention
 
@@ -84,14 +83,13 @@ shared experts with 128-aligned widths and no post-norm. Under tensor parallelis
 expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
 rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
 
-### `EXL3_HC_FOLD` (default: `0` on CUDA, `1` on ROCm)
+### `EXL3_HC_FOLD` (default: `1`)
 
 Launch-count folds for the mHC hyper-connection sites (DeepSeek V4, GLM 5.3) at decode row counts
 (up to 32 rows): a site's residual update (`hc_apply`) is deferred and run inside the next site's
 mix kernel, and the RMSNorm that follows a mix runs inside the mix's finalize kernel, two launches
 fewer per site. The folded kernels repeat the unfused kernels' arithmetic in the same order, so
-the outputs are bit-identical either way (`tests/test_hc_fold.py`). On by default on ROCm, where
-the per-launch cost is a large part of these small kernels; `1` enables it on CUDA as well.
+the outputs are bit-identical either way (`tests/test_hc_fold.py`). `0` restores the unfused launches.
 
 ### `EXL3_GR_MIX_TILED` (default: `1`)
 
@@ -168,6 +166,9 @@ per-matrix-N batched MGEMM, and q_b pairs with the indexer query projection over
 way in the top-k regime: six to eight GEMV launches collapse into two. A/B switch for the
 eager path only; the graphed path (`EXL3_BC_DSA`) builds its own fan and is not affected.
 Layers whose projections mix quantization formats or bitrates decline the fan by themselves.
+DeepSeek V4.1 (no q head-norm) builds the x-side fan only with `EXL3_DSV41_XFAN=1`: its fused
+reduction order moves logits by up to ~0.8 (argmax unchanged), so the bit-exact per-projection
+path stays the default there.
 
 ### `EXL3_QC_STAGING` (default: `1`)
 

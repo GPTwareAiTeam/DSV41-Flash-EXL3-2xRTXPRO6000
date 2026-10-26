@@ -18,6 +18,9 @@ from ..util.memory import (
     gc_paused,
 )
 from ..util.progress import ProgressBar
+
+# Piecewise decode graphs (EXL3_WHOLE_GRAPH) run each block with its residual final at exit (see transformer._PIECEWISE)
+_PIECEWISE = os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0"
 from ..util.tensor import g_tensor_cache
 from .config import Config
 from abc import ABC, abstractmethod
@@ -501,7 +504,7 @@ class Model_LSMixin(ABC):
             x = module.prepare_for_device(x, params)
             # A block may leave its final residual add to the next block's input norm (same device)
             nxt = mods[i + 1][0] if i + 1 < len(mods) else None
-            params["resid_defer"] = (
+            params["resid_defer"] = not _PIECEWISE and (
                 type(module) is TransformerBlock and type(nxt) is TransformerBlock and nxt.device == module.device
             )
             x = module.forward(x, params)

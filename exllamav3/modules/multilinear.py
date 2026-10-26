@@ -8,6 +8,7 @@ class MultiLinear:
         device: torch.Device,
         linears: list[Linear],
         allow_bias: bool = False,
+        mixed_k: bool = False,
     ):
         self.device = device
         self.linears = linears
@@ -22,8 +23,19 @@ class MultiLinear:
 
         self.in_features = linears[0].in_features
         self.out_features = linears[0].out_features
-        self.K = linears[0].inner.K
-        assert all(l.inner.K == self.K for l in linears)
+        # Mixed-K: each linear (one expert) may carry its own EXL3 rate. Rates then travel as the per-expert k2 table
+        # (half-bit units 2*K, uint8) and self.K is None. Uniform layers keep the scalar K.
+        Ks = [l.inner.K for l in linears]
+        self.mixed_k = mixed_k or any(K != Ks[0] for K in Ks)
+        if self.mixed_k:
+            assert all(float(K * 2).is_integer() and 4 <= K * 2 <= 8 for K in Ks), \
+                f"MultiLinear: mixed-K rates must be in {{2,2.5,3,3.5,4}}, got {Ks}"
+            # Placeholder scalar: mixed-K kernels read the per-expert table, never this value
+            self.K = float(Ks[0])
+            self.k2 = torch.tensor([int(round(2 * K)) for K in Ks], dtype = torch.uint8, device = device)
+        else:
+            self.K = Ks[0]
+            self.k2 = None
         assert all(l.in_features == self.in_features for l in linears)
         assert all(l.out_features == self.out_features for l in linears)
 

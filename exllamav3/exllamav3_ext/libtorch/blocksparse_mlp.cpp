@@ -219,7 +219,10 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     c10::optional<at::Tensor> _up_bias_ptrs,
     c10::optional<at::Tensor> _down_bias_ptrs,
     bool _act_relu2,
-    bool _sh_coop
+    bool _sh_coop,
+    c10::optional<at::Tensor> _gate_k2,
+    c10::optional<at::Tensor> _up_k2,
+    c10::optional<at::Tensor> _down_k2
 ) :
         yh2                 (std::move(_yh2)),
         yh                  (std::move(_yh)),
@@ -271,7 +274,10 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         gate_bias_ptrs      (std::move(_gate_bias_ptrs)),
         up_bias_ptrs        (std::move(_up_bias_ptrs)),
         down_bias_ptrs      (std::move(_down_bias_ptrs)),
-        out_bszn            (std::move(_out_bszn))
+        out_bszn            (std::move(_out_bszn)),
+        gate_k2             (std::move(_gate_k2)),
+        up_k2               (std::move(_up_k2)),
+        down_k2             (std::move(_down_k2))
 {
     // Non-gated experts (NemotronH): python passes an empty gates vector (the gate pointer
     // tables are unused placeholders) and act_relu2; the gate GEMMs are skipped throughout
@@ -281,7 +287,10 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     TORCH_CHECK(gate_mcg == up_mcg && up_mcg == down_mcg && gate_mul1 == up_mul1 && up_mul1 == down_mul1,
                 "BC_BlockSparseMLP: gate/up/down must share a codebook");
     TORCH_CHECK(!shared_gate || shared_experts, "BC_BlockSparseMLP: shared gate without shared experts");
-    TORCH_CHECK(!gated || gate_K == up_K, "BC_BlockSparseMLP: gate and up must share a bit width");
+    // Mixed-K layers carry per-expert rates in the tables (gate/up pairing is enforced by the Python table builder at load)
+    TORCH_CHECK(!gated || gate_k2.has_value() || gate_K == up_K, "BC_BlockSparseMLP: gate and up must share a bit width");
+    TORCH_CHECK(!gate_k2.has_value() || (up_k2.has_value() && down_k2.has_value() && gated),
+                "BC_BlockSparseMLP: mixed-K needs gate/up/down k2 tables (and a gated expert)");
     TORCH_CHECK(coop_ctr.scalar_type() == at::kInt && coop_ctr.numel() >=
                 exl3_moe_coop_ctr_len(interm_u.size(0), out_bszn.size(0), interm_u.size(-1), out_d.size(-1)),
                 "BC_BlockSparseMLP: counter scratch too small");
@@ -313,7 +322,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
             up_ptrs_trellis, up_ptrs_suh, up_ptrs_svh,
             down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
             gate_bias_ptrs, up_bias_ptrs, down_bias_ptrs,
-            gate_K, up_K, down_K,
+            gate_k2.has_value() ? up_K : gate_K, up_K, down_K,
             up_mcg, up_mul1,
             act, act_limit, gated,
             yh, had_u, interm_g, interm_u, interm_a, out_d, coop_ctr, out_bszn,
@@ -321,6 +330,13 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         );
         coop_p.min_expert = min_expert;
         coop_p.max_expert = max_expert;
+        // Mixed-K: per-expert rates for the routed launch (the scalar K above is then only a placeholder)
+        if (gate_k2.has_value())
+        {
+            coop_p.k2_g = gate_k2->data_ptr<uint8_t>();
+            coop_p.k2_u = up_k2->data_ptr<uint8_t>();
+            coop_p.k2_d = down_k2->data_ptr<uint8_t>();
+        }
     }
 
 #if defined(USE_ROCM)
