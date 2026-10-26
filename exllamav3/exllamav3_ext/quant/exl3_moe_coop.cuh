@@ -67,6 +67,11 @@ struct MoeCoopParams
     int rows_max;               // token rows the output scratch holds
     int n_local;                // entries in the pointer tables
     int sh_gate_n;              // shared gate weight length (checked against H per call)
+    // Mixed-K (nullable; null: every expert of the projection uses the launch's uniform rate).
+    // Per local expert, half-bit rate k2 = 2 * bits + half (see bits_k.cuh). Read by the *_mixed kernels only.
+    const uint8_t* k2_g;
+    const uint8_t* k2_u;
+    const uint8_t* k2_d;
 
     // Output
     float* out;                 // (bsz, H_out), row stride out_stride
@@ -148,7 +153,10 @@ void exl3_moe_coop
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_out,
-    const c10::optional<at::Tensor>& sh_gate_w
+    const c10::optional<at::Tensor>& sh_gate_w,
+    const c10::optional<at::Tensor>& k2_g,     // per local expert half-bit rates (uint8): mixed-K layer, nullable
+    const c10::optional<at::Tensor>& k2_u,
+    const c10::optional<at::Tensor>& k2_d
 );
 
 // Length of the int32 scratch for a module: completion counters + run table (slots_max =

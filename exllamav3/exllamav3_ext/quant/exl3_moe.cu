@@ -299,7 +299,10 @@ void exl3_moe
     const c10::optional<at::Tensor>& fused_base,
     const int count_lo,
     const int count_hi,
-    const int m_tile
+    const int m_tile,
+    const c10::optional<at::Tensor>& k2_gate,
+    const c10::optional<at::Tensor>& k2_up,
+    const c10::optional<at::Tensor>& k2_down
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -368,9 +371,24 @@ void exl3_moe
     const int K2_gate = k2_from_K(K_gate), K2_up = k2_from_K(K_up), K2_down = k2_from_K(K_down);
     TORCH_CHECK(gate_mul1 || (K2_gate % 2 == 0 && K2_up % 2 == 0 && K2_down % 2 == 0),
                 "exl3_moe: half-integer bitrates require the mul1 codebook");
+    // Per-expert tables (mixed-K): the runtime-K instance (K = 0) reads each expert's rate; the scalars are unused
+    const bool mixed = k2_gate.has_value() || k2_up.has_value() || k2_down.has_value();
+#if defined(USE_ROCM)
+    TORCH_CHECK(!mixed, "exl3_moe: mixed-K per-expert rates are not supported on ROCm");
+#endif
+    TORCH_CHECK(!mixed || (k2_gate.has_value() && k2_up.has_value() && k2_down.has_value()),
+                "exl3_moe: mixed-K needs all of gate/up/down k2 tables");
+    if (mixed)
+    {
+        TORCH_CHECK(gate_mul1, "exl3_moe: mixed-K requires the mul1 codebook");
+        for (const at::Tensor* t : {&k2_gate.value(), &k2_up.value(), &k2_down.value()})
+        {
+            TORCH_CHECK(t->scalar_type() == at::kByte && t->is_cuda() && t->is_contiguous(), "exl3_moe: k2 tables must be contiguous uint8 on CUDA");
+        }
+    }
     int K = 0;
     bool half_k = false;
-    if (K2_gate == K2_up && K2_up == K2_down)
+    if (!mixed && K2_gate == K2_up && K2_up == K2_down)
     {
         K = K2_gate / 2;
         half_k = (K2_gate % 2) != 0;
@@ -512,6 +530,9 @@ void exl3_moe
     void* _temp_intermediate_g = temp_intermediate_g.data_ptr();
     void* _temp_intermediate_u = temp_intermediate_u.data_ptr();
     void* _output_state = output_state.data_ptr();
+    void* _k2_gate = mixed ? k2_gate.value().data_ptr() : nullptr;
+    void* _k2_up = mixed ? k2_up.value().data_ptr() : nullptr;
+    void* _k2_down = mixed ? k2_down.value().data_ptr() : nullptr;
 
     void* _gate_ptrs_trellis = gate_ptrs_trellis.data_ptr();
     void* _gate_ptrs_suh = gate_ptrs_suh.data_ptr();
@@ -562,7 +583,10 @@ void exl3_moe
         &_output_scratch,
         &_fused_base,
         (void*) &count_lo,
-        (void*) &count_hi
+        (void*) &count_hi,
+        &_k2_gate,
+        &_k2_up,
+        &_k2_down
     };
 
     cudaLaunchKernel

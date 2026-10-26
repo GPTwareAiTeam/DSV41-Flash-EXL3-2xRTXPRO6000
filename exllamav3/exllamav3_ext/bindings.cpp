@@ -316,7 +316,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
-    m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
+    m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop",
+          py::arg("x"), py::arg("sel"), py::arg("rw"), py::arg("min_expert"), py::arg("max_expert"), py::arg("Hi"),
+          py::arg("g_trellis"), py::arg("g_suh"), py::arg("g_svh"),
+          py::arg("u_trellis"), py::arg("u_suh"), py::arg("u_svh"),
+          py::arg("d_trellis"), py::arg("d_suh"), py::arg("d_svh"),
+          py::arg("g_bias"), py::arg("u_bias"), py::arg("d_bias"),
+          py::arg("Kg"), py::arg("Ku"), py::arg("Kd"),
+          py::arg("mcg"), py::arg("mul1"), py::arg("act"), py::arg("act_limit"), py::arg("gated"),
+          py::arg("had_g"), py::arg("had_u"), py::arg("gu_g"), py::arg("gu_u"), py::arg("act_out"),
+          py::arg("d_out"), py::arg("ctr"), py::arg("out"),
+          py::arg("sh_out") = py::none(), py::arg("sh_gate_w") = py::none(),
+          py::arg("k2_g") = py::none(), py::arg("k2_u") = py::none(), py::arg("k2_d") = py::none());
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");

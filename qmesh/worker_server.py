@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import socket
 import struct
@@ -59,8 +60,11 @@ def load_worker(model_dir, placement_path, device):
     config.infer_params.no_reconstruct = True
     model = Model.from_config(config)
     layers = {}
+    drop = int(os.environ.get("WORKER_DROP_PER_LAYER", "0"))
     for layer in range(40):
         cold = placement["layers"][str(layer)]["warm"]
+        if drop:
+            cold = cold[:-drop]
         block = next(m for m in model.modules if m.key == f"layers.{layer}")
         ffn = block.mlp
         ffn.gates = [ffn.gates[e] for e in cold]
@@ -76,6 +80,15 @@ def load_worker(model_dir, placement_path, device):
         ffn._split_perm = None
         ffn.load(device)
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        # Drop the 2.9 GiB of file-backed page cache just read for this layer.
+        # On GB10's unified memory that cache otherwise competes with the arena.
+        path = os.path.join(model_dir, f"cold-L{layer:02d}.safetensors")
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
         layers[layer] = ffn
         print(f"worker layer {layer}: {len(cold)} cold experts, "
               f"{torch.cuda.memory_allocated(0) / 2**30:.1f} GiB", flush=True)
@@ -109,7 +122,22 @@ def main():
                 if msg is None:
                     break
                 cmd = msg["cmd"]
-                if cmd == "ping":
+                if cmd == "stats":
+                    fields = open("/proc/self/stat").read().split(") ", 1)[1].split()
+                    mem = {}
+                    for line in open("/proc/meminfo"):
+                        k, v = line.split(":", 1)
+                        mem[k] = int(v.split()[0])
+                    send_msg(conn, {"ok": True,
+                                    "minflt": int(fields[7]),
+                                    "majflt": int(fields[9]),
+                                    "vsize": int(fields[20]),
+                                    "rss_pages": int(fields[21]),
+                                    "allocated": torch.cuda.memory_allocated(0),
+                                    "reserved": torch.cuda.memory_reserved(0),
+                                    "mem_available_kb": mem["MemAvailable"],
+                                    "mem_free_kb": mem["MemFree"]})
+                elif cmd == "ping":
                     send_msg(conn, {"ok": True})
                 elif cmd == "forward":
                     layer = int(msg["layer"])

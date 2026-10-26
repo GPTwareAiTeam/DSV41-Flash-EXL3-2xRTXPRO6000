@@ -207,6 +207,11 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         const half* exp_down_suh = down_suh[expert_idx];
         const half* exp_down_svh = down_svh[expert_idx];
 
+        // Per-expert half-bit rates (mixed-K layers, runtime-K instance); uniform layers use the scalars
+        const int exp_K_gate = k2_gate ? (int) k2_gate[expert_idx] : K_gate;
+        const int exp_K_up   = k2_up   ? (int) k2_up[expert_idx]   : K_up;
+        const int exp_K_down = k2_down ? (int) k2_down[expert_idx] : K_down;
+
         // Gather + input hadamard for g, u. Non-gated mode skips the g staging (and the g GEMM
         // below); the activation synthesizes the gate lane from u
         const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
@@ -331,11 +336,11 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, exp_K_gate);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, exp_K_up);
         group_barrier(group_idx, group_size, barrier_counters_sense);
         had_guad();
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, exp_K_down);
 #endif
         group_barrier(group_idx, group_size, barrier_counters_sense);
 

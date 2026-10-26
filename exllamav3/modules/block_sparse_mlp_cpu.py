@@ -888,7 +888,10 @@ class BlockSparseMLP_CPU:
         self.device = torch.device(device)
 
         if getattr(ip, "remote_expert_host", None) is not None:
-            from qmesh.remote_host import RemoteExpertHost
+            if os.environ.get("REMOTE_TRANSPORT", "tcp") == "seam":
+                from qmesh.remote_seam_host import RemoteSeamHost as RemoteExpertHost
+            else:
+                from qmesh.remote_host import RemoteExpertHost
             host = RemoteExpertHost.for_config(ip)
         else:
             from ..model.moe_cpu_host import MoeCpuHost

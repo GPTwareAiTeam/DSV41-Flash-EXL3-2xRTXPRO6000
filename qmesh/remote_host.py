@@ -63,7 +63,7 @@ class RemoteExpertHost:
         return idx
 
     def _forward(self, layer_idx, y, selected, weights):
-        y = y.detach().float().cpu()
+        y = y.detach().half().cpu()
         selected = selected.detach().long().cpu()
         weights = weights.detach().float().cpu()
         send_msg(self.sock, {

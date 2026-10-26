@@ -1401,6 +1401,14 @@ def main(args, job_state):
     )
     replica_models = [Model.from_config(config) for _ in devices[1:]] if parallel_calib else []
 
+    copy_mode = os.environ.get("EXL3_COPY_QTENSORS") == "1"
+    target_keys = set()
+    if copy_mode:
+        target_file = os.environ.get("EXL3_TARGET_KEYS")
+        if not target_file or not os.path.isfile(target_file):
+            raise RuntimeError("EXL3_COPY_QTENSORS needs EXL3_TARGET_KEYS")
+        target_keys = set(json.load(open(target_file)))
+
     # Iterate over modules
     for idx, module in enumerate(model.modules):
 
@@ -1421,6 +1429,13 @@ def main(args, job_state):
 
         # Collect output tensors
         q_tensors = {}
+        old_q = None
+        if copy_mode:
+            from safetensors.torch import load_file
+            old_path = os.path.join(args["work_dir"], f"qtensors/{module.key}.safetensors")
+            if os.path.isfile(old_path):
+                old_q = load_file(old_path, device="cpu")
+                q_tensors = dict(old_q)
         capture_H = None
         capture_sens = None
         ref_states = {}
@@ -1541,6 +1556,8 @@ def main(args, job_state):
 
             # Get submodules to quantize
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
+            if copy_mode and old_q is not None:
+                linears = [m for m in linears if m.key in target_keys]
             for linear in linears:
                 assert linear.key in strategy, \
                     f" ## Logic error, no quantization strategy for module {linear.key}"
@@ -1560,24 +1577,31 @@ def main(args, job_state):
             # Quantize: one linear per device in parallel when the layer has enough
             # tensors to occupy every device, else tile-split each tensor across devices
             # (single large tensors, e.g. lm_head)
-            if (
-                len(linears) >= len(devices) and
-                all(strategy[l.key] <= 8 for l in linears)
-            ):
-                quantize_linears_parallel(
-                    args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state, out_sens)
-            else:
-                quantize_linears_single(
-                    args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H, state, out_sens)
-
-            # Collect converted module tensors
-            for m in module:
-                if m is module and isinstance(m, Embedding) and m.allow_table and args["embed_bits"] < 16:
-                    tensors, rfn = quantize_embedding(m.key, m.embedding.weight.data, args["embed_bits"], device)
-                    print(f" -- Quantized: {m.key}  bpw: {args['embed_bits']}  rfn: {rfn:.6f}")
-                    q_tensors.update(tensors)
+            if linears:
+                if (
+                    len(linears) >= len(devices) and
+                    all(strategy[l.key] <= 8 for l in linears)
+                ):
+                    quantize_linears_parallel(
+                        args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state, out_sens)
                 else:
-                    q_tensors.update(m.get_tensors())
+                    quantize_linears_single(
+                        args, linears, config, strategy, idx, devices, eff_ratios("quant_tiles"), capture_H, state, out_sens)
+
+            # Collect converted module tensors. In targeted mode the unchanged
+            # tensors come from the copied checkpoint and only changed linears
+            # are replaced.
+            if copy_mode and old_q is not None:
+                for linear in linears:
+                    q_tensors.update(linear.get_tensors())
+            else:
+                for m in module:
+                    if m is module and isinstance(m, Embedding) and m.allow_table and args["embed_bits"] < 16:
+                        tensors, rfn = quantize_embedding(m.key, m.embedding.weight.data, args["embed_bits"], device)
+                        print(f" -- Quantized: {m.key}  bpw: {args['embed_bits']}  rfn: {rfn:.6f}")
+                        q_tensors.update(tensors)
+                    else:
+                        q_tensors.update(m.get_tensors())
 
             # Unload module
             if not module.caps.get("retain_during_quant"):
@@ -1778,10 +1802,11 @@ def main(args, job_state):
             module.unload()
             del q_tensors
 
-    if mtp_model:
-        quantize_side_model(mtp_model, "MTP")
-    if vision_model:
-        quantize_side_model(vision_model, "vision model")
+    if not copy_mode:
+        if mtp_model:
+            quantize_side_model(mtp_model, "MTP")
+        if vision_model:
+            quantize_side_model(vision_model, "vision model")
 
     # Compile model
     compile_model(args, model, config, tokenizer, mtp_model, vision_model)

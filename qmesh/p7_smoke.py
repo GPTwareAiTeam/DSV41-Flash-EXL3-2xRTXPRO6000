@@ -12,10 +12,10 @@ os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 
 import torch
 
-from exllamav3 import Cache, Config, Generator, Model, Tokenizer
+from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
 
-CHECKPOINT = "/models/dsv41/exl3-serve"
-PLACEMENT = os.path.join(os.path.dirname(__file__), "placement.exl3.json")
+CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
+PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 REMOTE_HOST = os.environ.get("REMOTE_HOST", "10.0.100.2")
 REMOTE_PORT = int(os.environ.get("REMOTE_PORT", "29517"))
 
@@ -28,22 +28,41 @@ def main():
     config.infer_params.moe_remote_hot = hot
     config.infer_params.remote_expert_host = {"host": REMOTE_HOST, "port": REMOTE_PORT}
     model = Model.from_config(config)
+    cache = Cache(model, max_num_tokens=4096, max_history=5)
     t0 = time.time()
     model.load(device="cuda:0", progressbar=False)
     print(f"P7_LOAD_OK {time.time() - t0:.1f}s vram={torch.cuda.memory_allocated(0)/2**30:.2f}GiB", flush=True)
 
     tokenizer = Tokenizer.from_config(config)
-    cache = Cache(model, max_num_tokens=4096)
-    generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=2048)
+    draft_model = None
+    draft_cache = None
+    if os.environ.get("DSPARK") == "1":
+        draft_config = Config.from_directory(CHECKPOINT)
+        draft_model = Model.from_config(draft_config, component="mtp")
+        draft_cache = Cache(draft_model, max_num_tokens=4096, max_history=5)
+        draft_model.load(device="cuda:0", progressbar=False)
+        print("DSPARK_LOADED", flush=True)
+    generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=2048,
+                          draft_model=draft_model, draft_cache=draft_cache,
+                          num_draft_tokens=5 if draft_model is not None else None)
+    ids = tokenizer.encode("Hi", add_bos=True, encode_special_tokens=True)
+    job = Job(input_ids=ids, max_new_tokens=5, min_new_tokens=5, sampler=GreedySampler())
+    generator.enqueue(job)
     t0 = time.time()
-    text = generator.generate(
-        prompt="Reply with exactly one word: pong",
-        max_new_tokens=8,
-        completion_only=True,
-        add_bos=True,
-        encode_special_tokens=True,
-    )
-    print(f"SMOKE_OK {time.time() - t0:.2f}s text={text!r}", flush=True)
+    marks = []
+    text = ""
+    while generator.num_remaining_jobs():
+        results = generator.iterate()
+        for result in results:
+            chunk = result.get("text", "")
+            if chunk:
+                text += chunk
+                marks.append(time.time() - t0)
+    total = time.time() - t0
+    first = marks[0] if marks else float("nan")
+    decode = (total - first) / max(len(marks) - 1, 1) if len(marks) > 1 else float("nan")
+    print(f"SMOKE_OK total={total:.3f}s first_token={first:.3f}s "
+          f"decode_per_tok={decode:.3f}s chunks={len(marks)} text={text!r}", flush=True)
 
 
 if __name__ == "__main__":
