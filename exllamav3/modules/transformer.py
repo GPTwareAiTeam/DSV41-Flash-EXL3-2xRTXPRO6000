@@ -6,6 +6,12 @@ from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
+from ..util.segment import Segment
+import os
+
+# Piecewise decode graphs (EXL3_WHOLE_GRAPH=1): each block runs graph A (attn HC mix + norm), the eager
+# attention core, then graph B (attn residual + MLP + HC apply). Each block's residual is final at its exit.
+_PIECEWISE = os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0"
 
 class TransformerBlock(Module):
 
@@ -148,6 +154,9 @@ class TransformerBlock(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
+        if _PIECEWISE and x.shape[1] == 1 and self.attn_hc is not None and self.mlp_hc is not None:
+            return self._forward_piecewise(x, params, out_dtype)
+
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
 
@@ -237,6 +246,40 @@ class TransformerBlock(Module):
             x *= self.layer_scalar_f
 
         return to2(x, out_dtype, self.out_dtype)
+
+    def _forward_piecewise(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None):
+        """Decode (seq 1) body split around the attention core. Graph A: attn HC mix + norm, outputs
+        (post, comb, y). Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply.
+        Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs of A."""
+        if not hasattr(self, "_seg_a"):
+            self._seg_a = Segment(self._piece_a, carry = ("hc_pre",))
+            self._seg_b = Segment(self._piece_b, carry = ("hc_pre",))
+        post, comb, y = self._seg_a(x, params)
+        y_attn = self.attn.forward(y, params)
+        x, = self._seg_b(x, post, comb, y_attn, params)
+        return to2(x, out_dtype, self.out_dtype)
+
+    def _piece_a(self, x, params):
+        post, comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
+        if self.attn_norm and not normed:
+            y = self.attn_norm.forward(y.half(), params, out_dtype = torch.half)
+        return post, comb, y.half()
+
+    def _piece_b(self, x, post, comb, y_attn, params):
+        if self.attn_resid_scalar is not None:
+            y_attn = y_attn * self.attn_resid_scalar
+        x = self.attn_hc.apply_(x, y_attn, post, comb, params)
+        hc_post, hc_comb, y, normed = self.mlp_hc.mix_norm(x, params, self.mlp_norm)
+        if self.mlp_norm and not normed:
+            y = self.mlp_norm.forward(y.half(), params, out_dtype = torch.half)
+        y = self.mlp.forward(y.half(), params)
+        if self.mlp_resid_scalar is not None:
+            y = y * self.mlp_resid_scalar
+        # Under HC fold, apply_ defers into params["hc_pending"]; flush it here so the update is captured in
+        # this graph (a pending apply would not run on replay and would leak across the segment boundary)
+        x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
+        hc_flush(params)
+        return x,
 
 
     def get_name(self):

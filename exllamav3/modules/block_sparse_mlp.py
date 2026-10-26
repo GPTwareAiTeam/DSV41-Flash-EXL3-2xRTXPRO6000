@@ -130,6 +130,11 @@ class MoETPAllocation(TPAllocation):
 
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
+    def _buf_get(self, device, shape, dtype, name):
+        if __import__("os").environ.get("EXL3_PRIVATE_MOE_BUFFERS") == "1":
+            return torch.empty(shape, dtype=dtype, device=device)
+        return g_tensor_cache.get(device, shape, dtype, name)
+
     def __init__(
         self,
         config: Config | None,
@@ -548,9 +553,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
         # gate pointer tables (never dereferenced, the gate GEMMs are skipped)
         if (self.support_quant_paths or self.support_bc_bszn) and not self.config.infer_params.no_reconstruct:
+            # Mixed-K layer (per-expert EXL3 rates differ): gate and up of one expert share a trellis group, so their
+            # rates must match per expert. Checked here at load time, once; the launch path has no device-side check
+            if self.gated:
+                for g, u in zip(self.gates, self.ups):
+                    assert g.inner.K == u.inner.K, \
+                        f"BlockSparseMLP: gate/up rate mismatch for an expert ({g.inner.K} vs {u.inner.K})"
             self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True) if self.gated else None
             self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
             self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
+            self.mixed_k = bool(self.multi_up.mixed_k or self.multi_down.mixed_k or
+                                (self.multi_gate is not None and self.multi_gate.mixed_k))
 
             # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
             # and an activation the fused kernel implements)
@@ -581,10 +594,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # second entry under the same name would silently double memory forever)
         bszn_rows = MAX_BSZN * numex
 
-        temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
-        temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
-        temp_activa = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), I), torch.half, "moe1_temp_activa")
-        temp_output = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), Ho), torch.float, "moe1_temp_output")
+        temp_hidden = self._buf_get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
+        temp_interm = self._buf_get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
+        temp_activa = self._buf_get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), I), torch.half, "moe1_temp_activa")
+        temp_output = self._buf_get(device, (max(TEMP_ROWS_GRAPH, bszn_rows), Ho), torch.float, "moe1_temp_output")
 
         yh = temp_hidden[:bszn_rows].view(bszn_rows, 1, Hi)
         interm_g = temp_interm[:bszn_rows].view(bszn_rows, 1, I)
@@ -599,10 +612,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Completion counters + expert-run table of the fused decode kernels
         # (BC_BlockSparseMLP.run_bszN): the kernels reset each other's counters for the next
         # call, so they only need zeroing once
-        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
+        coop_ctr = self._buf_get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
         coop_ctr.zero_()
         # Rotated up-projection input per slot for the fused kernels at bsz > 1 (yh holds the gate's)
-        had_u = g_tensor_cache.get(device, (bszn_rows, Hi), torch.half, "moe1_temp_hidden_u")
+        had_u = self._buf_get(device, (bszn_rows, Hi), torch.half, "moe1_temp_hidden_u")
 
         # Expert interval for split module (-1, -1) indicate no split
         mine, maxe = self.routing_first, self.routing_last
@@ -611,7 +624,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Routed sum of the fused decode path, one exact-width row per token (the kernel trims the
         # padded down width on the way out)
-        out_bszn = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_bszn")
+        out_bszn = self._buf_get(device, (MAX_BSZN, H), torch.float, "moe1_out_bszn")
 
         cfg = ExpertsCFG(
             yh = yh,
@@ -664,7 +677,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             gu_suh_ptr = torch.stack((g_suh_ptr, u_suh_ptr), dim = 0).T.contiguous().to(self.device)
             gu_svh_ptr = torch.stack((g_svh_ptr, u_svh_ptr), dim = 0).T.contiguous().to(self.device)
 
-            dq_temp_up = g_tensor_cache.get(device, (Hi, I), torch.half, "dq_temp")
+            dq_temp_up = self._buf_get(device, (Hi, I), torch.half, "dq_temp")
             dq_temp_down = dq_temp_up.view(I, Ho)
 
             # Per-expert bias pointer tables for the fused decode path
@@ -733,6 +746,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 down_bias_ptrs,
                 act_relu2 = self.activation_fn == "relu2",
                 sh_coop = self.shared_coop_ok(),
+                gate_k2 = self.multi_gate.k2 if (self.gated and self.mixed_k) else None,
+                up_k2 = self.multi_up.k2 if self.mixed_k else None,
+                down_k2 = self.multi_down.k2 if self.mixed_k else None,
             )
 
             # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate
@@ -745,10 +761,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 R = self.fused_rows
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)
                 self.fused_mode_buffers = FusedBuffers(
-                    temp_state_g = g_tensor_cache.get(device, (C, R, H), torch.half, "moe2_temp_state_g"),
-                    temp_state_u = g_tensor_cache.get(device, (C, R, H), torch.half, "moe2_temp_state_u"),
-                    temp_intermediate_g = g_tensor_cache.get(device, (C, R, I), torch.half, "moe2_temp_intermediate_g"),
-                    temp_intermediate_u = g_tensor_cache.get(device, (C, R, I), torch.half, "moe2_temp_intermediate_u"),
+                    temp_state_g = self._buf_get(device, (C, R, H), torch.half, "moe2_temp_state_g"),
+                    temp_state_u = self._buf_get(device, (C, R, H), torch.half, "moe2_temp_state_u"),
+                    temp_intermediate_g = self._buf_get(device, (C, R, I), torch.half, "moe2_temp_intermediate_g"),
+                    temp_intermediate_u = self._buf_get(device, (C, R, I), torch.half, "moe2_temp_intermediate_u"),
                 )
                 self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
 
@@ -1076,7 +1092,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         else:
             z = y
 
-        if self.routing_gate is not None:
+        if params.get("external_selected") is not None:
+            selected_experts = params["external_selected"]
+            routing_weights = params["external_weights"]
+        elif self.routing_gate is not None:
             selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
             if params.get("activate_all_experts") and "capture_qmaps" in params:
                 selected_experts, routing_weights = \
@@ -1297,7 +1316,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.act_limit,
                         num_active,
                         scratch, tables[0] if tables is not None else None,
-                        count_lo, count_hi, m_tile
+                        count_lo, count_hi, m_tile,
+                        multi_gate.k2 if (self.gated and self.mixed_k) else None,
+                        self.multi_up.k2 if self.mixed_k else None,
+                        self.multi_down.k2 if self.mixed_k else None
                     )
 
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency
