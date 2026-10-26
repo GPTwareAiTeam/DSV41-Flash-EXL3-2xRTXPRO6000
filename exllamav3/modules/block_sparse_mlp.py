@@ -592,7 +592,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # graph loop's TEMP_ROWS_GRAPH requirement is larger, sharing the one cache entry per name
         # (g_tensor_cache is exact-shape-keyed and never evicts -- growing a differently-shaped
         # second entry under the same name would silently double memory forever)
-        bszn_rows = MAX_BSZN * numex
+        # The fold (BC_BlockSparseMLP fold_ok) adds the shared expert as one more pick per token
+        # fold_expected() is structural; with EXL3_MOE_FOLD=0 the BC skips the fold and the extra row goes unused
+        # (over-allocation only, never written past the routed picks)
+        bszn_rows = MAX_BSZN * (numex + (1 if self.fold_expected() else 0))
 
         temp_hidden = self._buf_get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
         temp_interm = self._buf_get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
@@ -693,6 +696,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # Bound class for the fused-decode, graph and dq paths (gateless: the up module stands in
             # for the unused gate pointer args, and the gates list is empty)
             multi_gate = self.multi_gate if self.gated else self.multi_up
+            # Recorded here, when the BC reads EXL3_MOE_FOLD: fold_expected() must not depend on the env at query time
+            self.fold_recorded = os.environ.get("EXL3_MOE_FOLD", "1")[:1] != "0" and self.fold_expected()
             self.bc = ext.BC_BlockSparseMLP(
                 yh2,
                 cfg.yh,
@@ -1530,6 +1535,31 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             t[f"{self.key}.{self.per_expert_scale_key}"] = self.per_expert_scale.contiguous()
         return t
 
+
+    def fold_expected(self) -> bool:
+        """True when the BC constructor folds the shared expert into the routed fused launch (table
+        entry E = routed local count, one extra pick per token). Mirrors BC_BlockSparseMLP's fold_eligible:
+        shared coop-eligible, unrestricted routing range, no biases, no shared gate, and uniform K unless
+        mixed-K (per-expert rates then carry the shared rate)."""
+        if not self.shared_coop_ok() or self.shared_gate is not None:
+            return False
+        mine, maxe = self.routing_first, self.routing_last
+        if mine is not None and maxe - mine != self.num_experts:
+            return False
+        if any(l.inner.bias is not None for l in self.gates + self.ups + self.downs):
+            return False
+        se = self.shared_experts
+        if any(l.inner.bias is not None for l in (se.gates + se.ups + se.downs)):
+            return False
+        routed = self.gates + self.ups + self.downs
+        if not routed:
+            return False
+        if not self.mixed_k:
+            # Uniform layers: the shared expert's gate/up/down must share the routed K (one scalar per launch)
+            routed_K = routed[0].inner.K
+            if len({l.inner.K for l in routed}) > 1 or any(l.inner.K != routed_K for l in se.gates + se.ups + se.downs):
+                return False
+        return True
 
     def shared_coop_ok(self) -> bool:
         """The shared expert can run as a one-expert fused decode launch: an EXL3 GatedMLP with a

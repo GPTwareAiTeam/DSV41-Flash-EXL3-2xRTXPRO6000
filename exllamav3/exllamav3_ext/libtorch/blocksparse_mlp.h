@@ -97,6 +97,24 @@ struct BC_BlockSparseMLP
     std::vector<at::Tensor> sh_tables;      // int64 pointer tables (one expert) and scratch, kept alive
     at::Tensor sh_sel, sh_rw;               // (MAX_BSZN, 1): expert 0, weight 1
 
+    // Shared expert folded into the routed launch (expert index E = the routed local count). fold_coop_p runs
+    // the extended (E+1 expert) tables; run_bszN writes the routed picks plus column fold_topk-1 = E, weight 1,
+    // into fold_sel / fold_rw. Built only when the shared expert is eligible (see constructor)
+    bool fold_ok = false;
+    MoeCoopParams fold_coop_p;
+    float fold_K_gu = 0, fold_K_d = 0; int fold_cb = 0;
+    std::vector<at::Tensor> fold_tables;    // extended int64 pointer tables and k2 tables, kept alive
+    at::Tensor fold_sel, fold_rw;           // (MAX_BSZN, top_k + 1), allocated on first fold call for its top_k
+    int fold_E = 0;                         // table index of the folded shared expert (= routed local count)
+    int fold_topk = 0;                      // routing width the fold buffers were allocated for
+    int fold_Hi = 0, fold_I = 0, fold_Ho = 0;      // shared expert shape (fold_prepare re-prepares params from these)
+    int fold_act = 0, fold_mcg = 0, fold_mul1 = 0;   // activation and codebook flags of the shared expert
+    c10::ScalarType fold_gu_dtype = at::kHalf;       // gate/up scratch dtype (matches the constructor's interm_g)
+    float fold_limit = 0;                   // SwiGLU limit of the shared expert
+    at::Tensor fold_out;                    // routed output buffer the fold launch writes
+    at::Tensor fold_w_had_g, fold_w_had_u, fold_w_gu_g, fold_w_gu_u, fold_w_act, fold_w_d, fold_w_ctr;  // width-sized scratch
+    void fold_prepare(int rows, at::Device dev);   // rebuilds fold_coop_p against rows-sized scratch
+
 #if defined(USE_ROCM)
     // RDNA fused decode (rocm/quant/exl3_gemv_multirow_rdna.cu, exl3_rocm_moe_decode): taken by run_bszN
     // for gated SiLU experts without biases or expert-range masking; anything else keeps the kernels above
@@ -105,7 +123,6 @@ struct BC_BlockSparseMLP
     int rdna_K_gu = 0, rdna_K_d = 0, rdna_cb = 0;
     bool run_bszN_rdna(const at::Tensor& y, const at::Tensor& selected_experts, const at::Tensor& routing_weights);
 #endif
-
     int max_experts_per_token;
     int max_tokens_per_expert;
     std::vector<at::Tensor> interm_g_single;
