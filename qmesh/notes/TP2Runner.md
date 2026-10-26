@@ -28,6 +28,23 @@
 - Long-prefill fix: arena limit is 256 KiB, so `all_reduce` chunks to 65536 fp32 per call (sizes depend only on numel, identical on both ranks).
 - Head all_gather under P2P: flat gather + last-dim concat, token-identical on all prompts.
 
-## Next steps (M2 step 3, then M3)
-1. Profile one decode step (torch profiler, per-category CUDA event timing; ncu is blocked). Attack the largest item.
-2. Target >= 150 tok/s (<= 6.67 ms/tok).
+## Decode profile, P2P + `EXL3_WHOLE_GRAPH=1` (prompt 2, 16 tok, rank 0, `PROFILE=1`)
+Includes prefill. Self CUDA 454 ms, Self CPU 340 ms (16 steps; ~28 ms/step with profiler overhead).
+| kernel | CUDA ms | share | calls | avg µs |
+|---|---|---|---|---|
+| `p2p_oneshot_kernel<0>` (all-reduce) | 240.5 | 53.0% | 1456 | 165 |
+| `exl3_moe_kernel<0,128,2,16>` | 47.6 | 10.5% | 39 | 1221 |
+| `exl3_gemv_int8_sq<6,1,false>` | 27.2 | 6.0% | 1936 | 14 |
+| `exl3_moe_coop_a_mixed_k` | 26.3 | 5.8% | 640 | 41 |
+| `exl3_moe_coop_b_mixed_k` | 16.9 | 3.7% | 640 | 26 |
+| `exl3_mgemm_kernel` | 16.1 | 3.6% | 731 | 22 |
+| `p2p_oneshot_kernel<1>` (head gather) | 1.8 | 0.4% | 16 | 115 |
+[INFERENCE] The all-reduce kernel's 165 µs average is spin-wait on the peer, not transfer: transfer for a 20 KiB payload measured ~5 µs. Ranks are CPU-launch-bound (eager attention core, CPU 340 ms vs CUDA 454 ms), so each collective absorbs rank skew. Attention-core capture is not yet done (see GraphCapture.md); that is the next lever, after which skew should drop. Not yet verified.
+
+## Profiler fix
+`PROFILE=1` previously ran the extra decode on rank 0 only, so rank 0 issued collectives rank 1 never matched (`p2p_oneshot: timeout`). It now runs on both ranks; only rank 0 prints the table.
+
+ ## Next steps (M2 step 3, then M3)
+1. Verify the skew hypothesis: time the all-reduce with both ranks pre-synchronized, then with rank-skew injected.
+2. Capture the attention core in graphs (or cut its CPU launch overhead), then re-profile.
+3. Target >= 150 tok/s (<= 6.67 ms/tok); current best 20.8 ms/tok (P2P + graph, prompt 2).

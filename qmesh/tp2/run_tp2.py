@@ -224,6 +224,7 @@ def main():
         prompt = PROMPTS[idx]
         text_in = encode_messages([{"role": "user", "content": prompt}], thinking_mode = "chat")
         ids = tokenizer.encode(text_in, add_bos = False, encode_special_tokens = True)
+        last_ids = ids
         job = Job(
             input_ids = ids,
             max_new_tokens = MAX_NEW,
@@ -259,16 +260,18 @@ def main():
         with open(f"{TOKENS_OUT}.rank{RANK}.json", "w") as f:
             json.dump(out, f)
 
-    if PROFILE and RANK == 0:
+    if PROFILE:
         from torch.profiler import profile, ProfilerActivity
+        # both ranks must run the same collective sequence; only rank 0 prints the table
         with profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            job = Job(input_ids = ids, max_new_tokens = 16, min_new_tokens = 16,
+            job = Job(input_ids = last_ids, max_new_tokens = 16, min_new_tokens = 16,
                       sampler = GreedySampler(), stop_conditions = [])
             generator.enqueue(job)
             while generator.num_remaining_jobs():
                 for _ in generator.iterate():
                     pass
-        print(prof.key_averages().table(sort_by = "cuda_time_total", row_limit = 25), flush = True)
+        if RANK == 0:
+            print(prof.key_averages().table(sort_by = "cuda_time_total", row_limit = 25), flush = True)
 
     dist.barrier()
     dist.destroy_process_group()
