@@ -53,11 +53,14 @@ class Segment:
                 return tuple(out) if isinstance(out, (tuple, list)) else (out,)
             self._capture(args)
         tens = [a for a in args if isinstance(a, torch.Tensor)]
-        for dst, src in zip(self.static_in, tens):
-            dst.copy_(src, non_blocking = True)
+        # One batched copy per replay instead of one launch per input/carry tensor
         params = self._params(args)
-        for k, dst in self.carry_in.items():
-            dst.copy_(params[k], non_blocking = True)
+        dsts = list(self.static_in)
+        srcs = tens
+        if self.carry_in:
+            dsts += list(self.carry_in.values())
+            srcs += [params[k] for k in self.carry_in]
+        torch._foreach_copy_(dsts, srcs, non_blocking = True)
         self.graph.replay()
         for k, t in self.carry_out.items():
             params[k] = t
