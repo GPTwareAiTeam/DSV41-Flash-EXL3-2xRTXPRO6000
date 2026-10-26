@@ -31,7 +31,7 @@
 
 namespace exl3_moe_coop_ns {
 
-constexpr int WK = 16;                          // k-split (warps per block)
+constexpr int WK = 8;                           // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
 constexpr int PF = 4;                           // prefetch ring depth
 constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
@@ -632,7 +632,7 @@ __device__ __forceinline__ void rotate_chunk(const MoeCoopParams& p, int row, co
 // Rotation pre-kernel (bsz > 1): warp per (slot, chunk, projection) into had_g / had_u
 
 #ifdef EXL3_MOE_COOP_DEFINE_ROT
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
 {
     __shared__ int16_t sh_order[MAX_SLOTS];
@@ -674,7 +674,7 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
 
 template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
@@ -810,7 +810,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 // expert and stores the trimmed row
 
 template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_b_kernel(const MoeCoopParams p)
 {
     constexpr int TCOLS = tile_cols<WIDE>();

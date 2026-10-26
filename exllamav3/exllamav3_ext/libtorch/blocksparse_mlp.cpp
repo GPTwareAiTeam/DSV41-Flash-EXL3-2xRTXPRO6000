@@ -67,6 +67,31 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     }
 }
 
+void BC_BlockSparseMLP::fold_prepare(int rows, at::Device dev)
+{
+    // Width-sized scratch: slots_max = min over these buffers, so each must hold `rows` slots
+    const auto hopt = at::TensorOptions().dtype(at::kHalf).device(dev);
+    const auto gopt = at::TensorOptions().dtype(fold_gu_dtype).device(dev);
+    fold_w_had_g = at::empty({rows, fold_Hi}, hopt);
+    fold_w_had_u = at::empty({rows, fold_Hi}, hopt);
+    fold_w_gu_g = at::empty({rows, fold_I}, gopt);
+    fold_w_gu_u = at::empty({rows, fold_I}, gopt);
+    fold_w_act = at::empty({rows, fold_I}, hopt);
+    fold_w_d = at::empty({rows, fold_Ho}, at::TensorOptions().dtype(at::kFloat).device(dev));
+    fold_w_ctr = at::zeros({exl3_moe_coop_ctr_len(rows, MAX_BSZN, fold_I, fold_Ho)}, at::TensorOptions().dtype(at::kInt).device(dev));
+    fold_coop_p = exl3_moe_coop_prepare
+    (
+        fold_Hi, fold_tables[0], fold_tables[1], fold_tables[2], fold_tables[3], fold_tables[4], fold_tables[5],
+        fold_tables[6], fold_tables[7], fold_tables[8], c10::nullopt, c10::nullopt, c10::nullopt,
+        fold_K_gu, fold_K_gu, fold_K_d, fold_mcg, fold_mul1, fold_act, fold_limit, true,
+        fold_w_had_g, fold_w_had_u, fold_w_gu_g, fold_w_gu_u, fold_w_act, fold_w_d, fold_w_ctr, fold_out,
+        c10::nullopt, fold_K_gu, fold_K_d, fold_cb
+    );
+    fold_coop_p.min_expert = -1;
+    fold_coop_p.max_expert = -1;
+}
+
+
 void BC_BlockSparseMLP::run_bszN
 (
     const at::Tensor& y,
@@ -89,8 +114,32 @@ void BC_BlockSparseMLP::run_bszN
     if (rdna_moe && run_bszN_rdna(y, selected_experts, routing_weights)) return;
 #endif
 
+    // Fold: the shared expert is table entry E (routed local count); one launch covers routed + shared. Its
+    // output is already in the sum, so no separate shared launch and no sh_o merge
+    if (fold_ok)
+    {
+        const int top_k = (int) selected_experts.size(-1);
+        if (!fold_sel.defined() || fold_topk != top_k + 1)
+        {
+            // slots_max comes from the scratch fold_coop_p points at: the constructor's MAX_BSZN-row shared
+            // buffers cap the launch at 8 slots, so the fold scratch and params are rebuilt for this width
+            auto dev = y.device();
+            fold_topk = top_k + 1;
+            fold_sel = at::zeros({MAX_BSZN, fold_topk}, at::TensorOptions().dtype(at::kLong).device(dev));
+            fold_rw = at::zeros({MAX_BSZN, fold_topk}, at::TensorOptions().dtype(at::kHalf).device(dev));
+            fold_prepare(fold_topk * MAX_BSZN, dev);
+        }
+        fold_sel.slice(0, 0, num_tokens).slice(1, 0, top_k).copy_(selected_experts);
+        fold_rw.slice(0, 0, num_tokens).slice(1, 0, top_k).copy_(routing_weights);
+        fold_sel.slice(0, 0, num_tokens).select(1, top_k).fill_(fold_E);
+        fold_rw.slice(0, 0, num_tokens).select(1, top_k).fill_(1.0f);
+        exl3_moe_coop_run(fold_coop_p, fold_K_gu, fold_K_d, fold_cb, y,
+                          fold_sel.slice(0, 0, num_tokens).slice(1, 0, top_k + 1),
+                          fold_rw.slice(0, 0, num_tokens).slice(1, 0, top_k + 1), c10::nullopt);
+        return;
+    }
+
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds
-    // the result into the routed sum, through the sigmoid gate when there is one
     c10::optional<at::Tensor> sh_o;
     if (sh_coop)
     {
@@ -435,6 +484,49 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
             sh_sel = at::zeros({MAX_BSZN, 1}, lopt.device(dev));
             sh_rw = at::ones({MAX_BSZN, 1}, hopt);
             sh_coop = true;
+
+            // Fold: one launch over the routed tables plus the shared expert at index E (= routed local count).
+            // Needs unrestricted routing (min_expert < 0), no biases on any projection, and matching codebooks.
+            // Mixed-K gets the shared rate appended to each k2 table; uniform layers need the shared K to match.
+            const bool routed_bias = gate_bias_ptrs || up_bias_ptrs || down_bias_ptrs;
+            const bool uniform_ok = gate_k2.has_value() || (std::fabs(Kgu - gate_K) < 1e-6f && std::fabs(d->K - down_K) < 1e-6f);
+            // EXL3_MOE_FOLD=0 keeps the separate shared launch (fold-vs-separate comparison in tests)
+            const char* fold_env = std::getenv("EXL3_MOE_FOLD");
+            const bool fold_enabled = !(fold_env && fold_env[0] == '0');
+            const bool fold_eligible = fold_enabled && min_expert < 0 && !routed_bias && !shared_gate && !gb && !ub && !db && uniform_ok;
+            if (fold_eligible)
+            {
+                auto cat1 = [&] (const at::Tensor& routed, const at::Tensor& shared) { return at::cat({routed, shared}).contiguous(); };
+                at::Tensor fgt = cat1(gate_ptrs_trellis, gt), fgs = cat1(gate_ptrs_suh, gs), fgv = cat1(gate_ptrs_svh, gv);
+                at::Tensor fut = cat1(up_ptrs_trellis, ut), fus = cat1(up_ptrs_suh, us), fuv = cat1(up_ptrs_svh, uv);
+                at::Tensor fdt = cat1(down_ptrs_trellis, dt), fds = cat1(down_ptrs_suh, ds), fdv = cat1(down_ptrs_svh, dv);
+                c10::optional<at::Tensor> fk2g, fk2u, fk2d;
+                if (gate_k2.has_value())
+                {
+                    // Shared expert rate in half-bit units: 2K, uint8
+                    auto k2s = [&] (float K) { return at::tensor({(uint8_t) std::lround(2.0f * K)}, at::TensorOptions().dtype(at::kByte)).to(dev); };
+                    fk2g = cat1(*gate_k2, k2s(Kgu)); fk2u = cat1(*up_k2, k2s(Kgu)); fk2d = cat1(*down_k2, k2s(d->K));
+                }
+                fold_tables = { fgt, fgs, fgv, fut, fus, fuv, fdt, fds, fdv, had_g_sh, had_u_sh, gu_g_sh, gu_u_sh, act_out_sh, d_out_sh, ctr_sh };
+                if (fk2g) { fold_tables.push_back(*fk2g); fold_tables.push_back(*fk2u); fold_tables.push_back(*fk2d); }
+                fold_coop_p = exl3_moe_coop_prepare
+                (
+                    Hi_sh, fgt, fgs, fgv, fut, fus, fuv, fdt, fds, fdv, c10::nullopt, c10::nullopt, c10::nullopt,
+                    Kgu, Kgu, d->K, mcg_gu, mul1_gu, act_sh, se->act_limit, true,
+                    had_g_sh, had_u_sh, gu_g_sh, gu_u_sh, act_out_sh, d_out_sh, ctr_sh, out_d_sh.value(),
+                    c10::nullopt, fold_K_gu, fold_K_d, fold_cb
+                );
+                fold_coop_p.min_expert = -1;
+                fold_coop_p.max_expert = -1;
+                if (fk2g) { fold_coop_p.k2_g = fk2g->data_ptr<uint8_t>(); fold_coop_p.k2_u = fk2u->data_ptr<uint8_t>(); fold_coop_p.k2_d = fk2d->data_ptr<uint8_t>(); }
+                // Routing width is per call (top_k of selected_experts), so the fold buffers are sized in run_bszN
+                fold_E = (int) gate_ptrs_trellis.size(0);
+                fold_Hi = Hi_sh; fold_I = I_sh; fold_Ho = Ho_sh;
+                fold_act = act_sh; fold_mcg = mcg_gu; fold_mul1 = mul1_gu; fold_limit = se->act_limit;
+                fold_gu_dtype = interm_g.scalar_type();
+                fold_out = out_d_sh.value();
+                fold_ok = true;
+            }
         }
     }
     for (int i = 0; i < max_tokens_per_expert; ++i)

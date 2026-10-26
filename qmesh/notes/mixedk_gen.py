@@ -2,24 +2,29 @@
 # Mixed-K decode A/B kernels: the GEMV tile is dispatched per block on the expert's half-bit rate k2
 # (2*bits + half). Only the rates in CASES are instantiated; the host validates the tables against them.
 import sys
-SRC = '/home/treadall/qmesh-exl3-runtime/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh'
+SRC = '/home/treadall/recipe-2xrtx-tp2-moe/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh'
 OUT = sys.argv[1] if len(sys.argv) > 1 else '/tmp/mk/mixed_kernel.cuh'
 src = open(SRC).read().split('\n')
 
-def body(lo, hi):
-    return src[lo-1:hi]
+def kernel_body(name):
+    # Locate a kernel by its signature (template head, __global__, void name(...)) and return its body
+    # through the closing brace at column 0. Line numbers are not stable across edits.
+    start = None
+    for i, ln in enumerate(src):
+        if ln.startswith(f'void {name}('):
+            start = i
+            break
+    assert start is not None, name
+    assert src[start - 1].startswith('__global__'), src[start - 1]
+    assert src[start - 2].startswith('template <int bits, int cb, bool WIDE'), src[start - 3]
+    end = next(j for j in range(start, len(src)) if src[j] == '}')
+    return src[start + 1:end + 1]
 
-def strip_head(lines, name):
-    assert lines[0].startswith('template <int bits, int cb, bool WIDE'), lines[0]
-    assert lines[1].startswith('__global__'), lines[1]
-    assert lines[2].startswith(f'void {name}('), lines[2]
-    return lines[3:]
+A = kernel_body('exl3_moe_coop_a_kernel')
+B = kernel_body('exl3_moe_coop_b_kernel')
 
-A = strip_head(body(676, 805), 'exl3_moe_coop_a_kernel')
-B = strip_head(body(812, 959), 'exl3_moe_coop_b_kernel')
-
-# (k2, bits, half). k2 = 2*bits + half, mul1 rates 2, 2.5, 3, 3.5, 4
-CASES = [(4, 2, False), (5, 2, True), (6, 3, False), (7, 3, True), (8, 4, False)]
+# (k2, bits, half). k2 = 2*bits + half. mul1 rates 2, 2.5, 3, 3.5, 4 (routed) and 6 (shared expert, staged path)
+CASES = [(4, 2, False), (5, 2, True), (6, 3, False), (7, 3, True), (8, 4, False), (12, 6, False)]
 
 def gemv_lines(lines, macro, k2_expr):
     out = []
@@ -67,7 +72,7 @@ L += dispatch('MIXED_GEMV_B')
 L.append('')
 
 def kernel(name, lines):
-    out = ['template <int cb, bool WIDE>', '__global__ __launch_bounds__(THREADS)', f'void {name}(const MoeCoopParams p)']
+    out = ['template <int cb, bool WIDE>', '__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)', f'void {name}(const MoeCoopParams p)']
     return out + lines
 
 L += kernel('exl3_moe_coop_a_mixed_kernel', gemv_lines(A, 'MIXED_GEMV_A', '(is_gate ? p.k2_g : p.k2_u)[local]'))
