@@ -25,6 +25,7 @@ Full `tests/kernels/moe/`: 263 passed (259 baseline + 4 fold cases).
 - WNT=4: incorrect at bsz >= 2.
 - WK=4: A worse.
 - PF=8 for all widths: A 43.3, B 23.0. PF=8 only for bits=2: no change, reverted.
+- Two-chain ILP inside gemv_tile (per-warp k split into two independent fp16/fp32 accumulator chains, interleaved decode/MMA, fixed-order fold): A 39.01 / B 24.42 vs HEAD A 34.23 / B 19.62 (bsz1, prof_moe_tp2, reproduced). Reverted.
 - B-WIDE at bsz1: B 22.4 (worse than 19.9).
 - A ksplit forced 2/3/4 (EXL3_MOE_COOP_KSPLIT): A 38.3/42.0/44.4, B 26.1/30.4/36.9. Every split slows both. Default ksplit=1 kept.
 - Reject PF=8 ring.
