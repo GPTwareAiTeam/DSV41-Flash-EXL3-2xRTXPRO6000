@@ -31,7 +31,7 @@
 
 namespace exl3_moe_coop_ns {
 
-constexpr int WK = 16;                          // k-split (warps per block)
+constexpr int WK = 8;                           // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
 constexpr int PF = 4;                           // prefetch ring depth
 constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
