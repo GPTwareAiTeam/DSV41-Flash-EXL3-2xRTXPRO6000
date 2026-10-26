@@ -67,6 +67,17 @@ class DeepseekV41Config(Config):
         self.num_experts_per_tok = self.read_cfg(int, "text_config->num_experts_per_tok", no_default)
         self.num_shared_experts = self.read_cfg(int, "text_config->n_shared_experts", 1)
         self.routed_scaling_factor = self.read_cfg(float, "text_config->routed_scaling_factor", 1.0)
+        # TP=2 rank checkpoint (qmesh/tp2, SHARD_SPEC): each rank's files hold its own shard, so the
+        # build uses local head / o_group / routed-expert intermediate / vocab sizes. tp_size 1 is unchanged.
+        self.tp_size = self.read_cfg(int, "tp_size", 1)
+        self.tp_rank = self.read_cfg(int, "tp_rank", 0)
+        assert self.tp_size in (1, 2), "DeepseekV41: only tp_size 1 or 2 supported"
+        if self.tp_size > 1:
+            assert self.num_q_heads % self.tp_size == 0 and self.o_groups % self.tp_size == 0
+            assert self.moe_intermediate_size % self.tp_size == 0
+            self.num_q_heads //= self.tp_size
+            self.o_groups //= self.tp_size
+            self.moe_intermediate_size //= self.tp_size
         self.swiglu_limit = self.read_cfg(float, "text_config->swiglu_limit", 10.0)
 
         self.rms_norm_eps = self.read_cfg(float, "text_config->rms_norm_eps", 1e-6)
@@ -136,7 +147,7 @@ class DeepseekV41Model(Model):
             Embedding(
                 config = config,
                 key = "embed",
-                vocab_size = config.vocab_size,
+                vocab_size = config.vocab_size // config.tp_size,
                 hidden_size = config.hidden_size,
             ),
             ExpandStreams(
@@ -291,7 +302,7 @@ class DeepseekV41Model(Model):
                 key = "head",
                 qbits_key = "head_bits",
                 in_features = config.hidden_size,
-                out_features = config.vocab_size,
+                out_features = config.vocab_size // config.tp_size,
                 qmap = "block",
                 caps = {"logits_output": True},
             )
