@@ -116,10 +116,9 @@ static void check_common(torch::Tensor x, int64_t local, int64_t peer, int64_t n
     TORCH_CHECK(nblk >= 1 && nblk <= P2P_MAXBLK, "p2p: nblk out of range");
 }
 
-// Shared arena: a /dev/shm file mapped into both processes, pinned and mapped into this GPU's address space.
-// Peer-device memory access is non-functional in this container (see notes), but mapped pinned host memory is
-// readable and writable from both GPUs, so the collective uses it as the exchange buffer.
-// Returns the device-visible pointer for this process's GPU. `name` is the shm object, `create` sets it up.
+// Pinned shared-host arena (fallback transport, used when peer SM access is unavailable): a /dev/shm file mapped
+// into both processes, pinned and device-mapped for each GPU. Returns the device-visible pointer for this GPU.
+// `name` is the shm object, `create` sets it up.
 int64_t p2p_shm_arena(const std::string& name, bool create)
 {
     int fd = shm_open(name.c_str(), create ? (O_CREAT | O_RDWR) : O_RDWR, 0600);
@@ -134,6 +133,66 @@ int64_t p2p_shm_arena(const std::string& name, bool create)
     void* dev = nullptr;
     TORCH_CHECK(cudaHostGetDevicePointer(&dev, host, 0) == cudaSuccess, "p2p: cudaHostGetDevicePointer failed");
     return (int64_t) dev;
+}
+
+static int p2p_hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    TORCH_CHECK(false, "p2p: bad hex digit in IPC handle");
+    return 0;
+}
+
+// cudaIpc transport: device arena on `device`, zeroed, exported as a hex-encoded IPC handle.
+int64_t p2p_dev_arena_alloc(int64_t device)
+{
+    c10::cuda::CUDAGuard guard((c10::DeviceIndex) device);
+    void* p = nullptr;
+    TORCH_CHECK(cudaMalloc(&p, P2P_ARENA_BYTES) == cudaSuccess, "p2p: cudaMalloc arena failed");
+    TORCH_CHECK(cudaMemset(p, 0, P2P_ARENA_BYTES) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess,
+                "p2p: arena zeroing failed");
+    return (int64_t) p;
+}
+
+std::string p2p_dev_arena_handle(int64_t ptr)
+{
+    cudaIpcMemHandle_t h;
+    TORCH_CHECK(cudaIpcGetMemHandle(&h, (void*) ptr) == cudaSuccess, "p2p: cudaIpcGetMemHandle failed");
+    static const char* digits = "0123456789abcdef";
+    std::string s(2 * sizeof(h.reserved), '0');
+    for (size_t i = 0; i < sizeof(h.reserved); i++)
+    {
+        unsigned char c = (unsigned char) h.reserved[i];
+        s[2 * i] = digits[c >> 4];
+        s[2 * i + 1] = digits[c & 15];
+    }
+    return s;
+}
+
+// Opens a peer's arena on `local_device` (peer access enabled). Returns a device pointer valid on local_device.
+int64_t p2p_dev_arena_open(const std::string& hex, int64_t local_device, int64_t peer_device)
+{
+    cudaIpcMemHandle_t h;
+    TORCH_CHECK(hex.size() == 2 * sizeof(h.reserved), "p2p: IPC handle has wrong length");
+    for (size_t i = 0; i < sizeof(h.reserved); i++)
+        h.reserved[i] = (char) (p2p_hexval(hex[2 * i]) * 16 + p2p_hexval(hex[2 * i + 1]));
+    c10::cuda::CUDAGuard guard((c10::DeviceIndex) local_device);
+    cudaError_t e = cudaDeviceEnablePeerAccess((int) peer_device, 0);
+    if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled)
+    {
+        cudaGetLastError();
+        TORCH_CHECK(false, "p2p: cudaDeviceEnablePeerAccess failed: ", cudaGetErrorString(e));
+    }
+    cudaGetLastError();
+    void* p = nullptr;
+    e = cudaIpcOpenMemHandle(&p, h, cudaIpcMemLazyEnablePeerAccess);
+    if (e != cudaSuccess)
+    {
+        cudaGetLastError();
+        TORCH_CHECK(false, "p2p: cudaIpcOpenMemHandle failed: ", cudaGetErrorString(e));
+    }
+    return (int64_t) p;
 }
 
 void p2p_all_reduce_f32(torch::Tensor x, int64_t rank, int64_t local, int64_t peer, int64_t nblk)

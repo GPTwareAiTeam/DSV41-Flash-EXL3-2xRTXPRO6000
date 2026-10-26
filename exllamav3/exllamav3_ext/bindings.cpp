@@ -167,6 +167,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
     m.def("p2p_shm_arena", &p2p_shm_arena, "p2p_shm_arena");
+    m.def("p2p_dev_arena_alloc", &p2p_dev_arena_alloc, "p2p_dev_arena_alloc");
+    m.def("p2p_dev_arena_handle", &p2p_dev_arena_handle, "p2p_dev_arena_handle");
+    m.def("p2p_dev_arena_open", &p2p_dev_arena_open, "p2p_dev_arena_open");
     m.def("p2p_all_reduce_f32", &p2p_all_reduce_f32, "p2p_all_reduce_f32");
     m.def("p2p_all_gather_f32", &p2p_all_gather_f32, "p2p_all_gather_f32");
     m.def("p2p_bcast_i64", &p2p_bcast_i64, "p2p_bcast_i64");

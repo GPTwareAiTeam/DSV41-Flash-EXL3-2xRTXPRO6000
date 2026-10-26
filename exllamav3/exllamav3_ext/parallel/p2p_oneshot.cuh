@@ -5,7 +5,7 @@
 
 // One-shot 2-rank P2P collectives for small payloads, one process per GPU (rank r = cuda:r).
 //
-// Each rank owns an arena (shared pinned host memory, see p2p_shm_arena) laid out as:
+// Each rank owns an arena (device memory exported by cudaIpc, or pinned shared host memory) laid out as:
 //   [0, P2P_MAXB)          parity slot 0: payload pushed in by the peer
 //   [P2P_MAXB, 2*MAXB)     parity slot 1
 //   P2P_OFF_FLAGS          uint64 flags[2][P2P_MAXBLK]: flags[p][b] = last seq delivered to block b, parity p
@@ -29,6 +29,12 @@
 // Peer SM access is blocked in this container (IOMMU DMA-FQ + BAR1 256 MiB), so the exchange buffer lives in
 // host memory both GPUs can access. Returns the device pointer for this process's GPU as int64.
 int64_t p2p_shm_arena(const std::string& name, bool create);
+
+// cudaIpc transport: the arena is cudaMalloc'd and zeroed on this GPU. Its IPC handle is exported as hex and
+// opened by the peer process, which then writes into it over P2P. Requires peer access (see Python P2PComm).
+int64_t p2p_dev_arena_alloc(int64_t device);
+std::string p2p_dev_arena_handle(int64_t ptr);
+int64_t p2p_dev_arena_open(const std::string& hex, int64_t local_device, int64_t peer_device);
 
 // fp32 sum over both ranks, in place: x <- x_rank0 + x_rank1. numel % 4 == 0, bytes <= P2P_MAXB.
 void p2p_all_reduce_f32(torch::Tensor x, int64_t rank, int64_t local, int64_t peer, int64_t nblk);
