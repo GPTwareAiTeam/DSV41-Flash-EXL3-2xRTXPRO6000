@@ -56,6 +56,7 @@
 #include "parallel/barrier.cuh"
 #include "parallel/gather.cuh"
 #include "parallel/all_reduce.cuh"
+#include "parallel/p2p_oneshot.cuh"
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
@@ -165,6 +166,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
+    m.def("p2p_shm_arena", &p2p_shm_arena, "p2p_shm_arena");
+    m.def("p2p_all_reduce_f32", &p2p_all_reduce_f32, "p2p_all_reduce_f32");
+    m.def("p2p_all_gather_f32", &p2p_all_gather_f32, "p2p_all_gather_f32");
+    m.def("p2p_bcast_i64", &p2p_bcast_i64, "p2p_bcast_i64");
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
