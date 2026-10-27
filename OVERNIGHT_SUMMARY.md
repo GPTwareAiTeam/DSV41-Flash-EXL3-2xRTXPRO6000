@@ -51,3 +51,37 @@ event-based sampler sync, index-math hoisting (<0.15 ms/tok ceiling), fused A→
 - Side branches also committed: `tp2/moe-kernel`, `tp2/p2p-allreduce`, `tp2/dspark`, `tp2/prefill`, `tp2/attncap`.
 - Notes: `qmesh/notes/*.md` per workstream; `OVERNIGHT_STATUS.md` in the repo root has the full log.
 - Recipe A (GPU0 + GX1) and its checkpoint/branch were not touched. GPU2 untouched.
+
+## Round 2 (after community research) — final consolidated numbers
+Branch `recipe/2x-rtxpro6000-tp2` now contains everything: main + MoE tiles + DSpark + prefill + attncap.
+| configuration | ms/tok | tok/s |
+|---|---|---|
+| plain decode (`COMM=p2p`, `EXL3_WHOLE_GRAPH=1`, WARM=1) | **13.18 / 13.16 / 13.15** | 76 |
+| DSpark K=5 | **8.22 / 6.85 / 9.39** | **118 / 135 / 101** (AL 3.09/3.30/2.58, acc .716/.664/.778) |
+| prefill 2048 (single chunk, fused HC) | 556–565 ms | **3624–3682** |
+| prefill 4096 | 940–942 ms | **4346–4355** |
+
+### What round 2 added
+- **Community research** written up in `qmesh/notes/COMMUNITY_RESEARCH.md`: the 8×V100 reference engine for the *same*
+  model (philbert440 franken-v100 / 1Cat-vLLM PR #1243) and single-5090 SSD-streaming kits. Their plain decode is
+  30.5 tok/s and DSpark 65 tok/s on 8 GPUs — we are 2.5× faster than that on 2 GPUs. Their engine's techniques are
+  catalogued there (packed FP4 KV, per-layer attention graphs, decoder replay in prefill, fused HC, tiled prefill MoE,
+  Engram in RAM with hugepages, DSpark tap fix).
+- **DSpark tap saturation**: real in our tree (taps hit ~271k vs fp16 max 65504 at sequence positions 0/2) but the
+  scale fix (`EXL3_DSPARK_TAP_SCALE`, default off) is throughput-neutral here (our clamp already avoids their
+  inf/NaN cascade). AL decomposition: first draft 85.7%, later drafts 57–64% conditional.
+- **Graph-merge across block boundaries** (block N's MLP graph folded into block N+1's graph A): 80 → 40 replays/step,
+  13.6 → 13.2 ms/tok, token-identical including the DSpark verify path.
+- **Device-driven attention path fixed** (`EXL3_DSV4_B1_BATCH=1`): root cause was the batched compressor projecting
+  wkv/wgate with a plain GEMM while the eager path used a 2-expert exl3_mgemm (fp16-ulp difference flipping the newest
+  pool row). Now **bit-identical** on 3 prompts × 128 and on a 1134-token prompt crossing index_topk. This is the
+  prerequisite for capturing the attention core. It is still slower than the scalar eager path (15.9 vs 13.2) because
+  the body is still eager — capture is the remaining step.
+- **Prefill**: single-chunk default (2048: 701 → 556–565 ms, −20%), fused HC partials (bit-exact), and a measured map of
+  the remaining gap: the prefill MoE's dominant 64-row instance is **register-file-bound** (255 regs/thread, 1 block/SM,
+  16.7% warps active, 8.4% DRAM); K-tile 16, min-blocks hints, and lowering the fused threshold all measured worse.
+  The next real step there is a kernel redesign for occupancy (split the 64-row accumulator), not a knob.
+
+### Where the remaining 2× is
+- decode: the attention body still runs eagerly (host gap ~4–5 ms/step). Capture it now that the body is bit-identical.
+- prefill: MoE occupancy (30.6% of prefill at 8.4% DRAM) and the PCIe-bound all-reduce (22%, at hardware limit).
