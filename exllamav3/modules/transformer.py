@@ -7,6 +7,7 @@ from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, ML
 from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
 from ..util.segment import Segment
+import math
 import os
 
 # Piecewise decode graphs (EXL3_WHOLE_GRAPH=1): each block runs graph A (attn HC mix + norm), the eager
@@ -15,6 +16,41 @@ _PIECEWISE = os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0"
 _PIECEWISE_MAXSEQ = int(os.environ.get("EXL3_WHOLE_GRAPH_MAXSEQ", "8"))
 # Temporary A/B switch for the merged block-boundary graph (EXL3_PW_MERGE=0 keeps graph B separate). Remove at cutover
 _PW_MERGE = os.environ.get("EXL3_PW_MERGE", "1") != "0"
+
+# DSpark tap export. EXL3_DSPARK_TAP_SCALE: power-of-two scale applied before the fp16 cast. The drafter's only
+# consumer is main_proj (no bias) -> main_norm (RMSNorm, scale-invariant up to eps), so the scale is absorbed.
+# EXL3_TAP_PROBE=N logs the first N exports per layer (pre-cast magnitudes, overflow counts).
+_DSPARK_TAP_SCALE = float(os.environ.get("EXL3_DSPARK_TAP_SCALE", "1.0"))
+assert math.frexp(_DSPARK_TAP_SCALE)[0] == 0.5, "EXL3_DSPARK_TAP_SCALE must be a power of two"
+_TAP_PROBE = int(os.environ.get("EXL3_TAP_PROBE", "0"))
+_tap_probe_calls: dict = {}
+
+
+def _tap_probe(layer_idx: int, x: torch.Tensor):
+    n = _tap_probe_calls.get(layer_idx, 0)
+    if n >= _TAP_PROBE:
+        return
+    _tap_probe_calls[layer_idx] = n + 1
+    xf = x.float()
+    fin = torch.isfinite(xf)
+    mag = xf.abs().masked_fill(~fin, 0.0)
+    tok = mag.reshape(-1, mag.shape[-1]).amax(dim = -1)
+    nz = mag[mag > 0]
+    hot = (tok > 4096.0).nonzero().flatten()[:8].tolist()
+    print(f"[TAPPROBE] layer={layer_idx} dtype={x.dtype} shape={tuple(x.shape)} amax={float(mag.max()):.1f} "
+          f"nonfinite={int((~fin).sum())} ge65504={int((xf.abs() >= 65504.0).sum())} "
+          f"gt4096={int((mag > 4096.0).sum())} subfp16_min={int((nz < 6.1e-5).sum())}/{nz.numel()} "
+          f"hot_tokens={[(i, round(float(tok[i]), 1)) for i in hot]} n_tokens={tok.numel()}", flush = True)
+
+
+def _tap_to_half(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+    """Export cast for DSpark taps: fp32 scale (power of two), fp16 cast, clamp kept as a safety net."""
+    if _DSPARK_TAP_SCALE != 1.0:
+        x = x.float() * _DSPARK_TAP_SCALE
+    if _TAP_PROBE:
+        _tap_probe(layer_idx, x)
+    return x.half().clamp_(-65504.0, 65504.0)
+
 
 class TransformerBlock(Module):
 
@@ -239,12 +275,7 @@ class TransformerBlock(Module):
             # With hyperconnections the residual is a stream stack; export the stream mean as
             # the collapsed hidden state (streams start as broadcast copies of the embedding)
             x_ = x.mean(dim = 2) if self.attn_hc else x
-            if x_.dtype == torch.half:
-                s.append(x_.clamp_(-65504.0, 65504.0))
-            else:
-                x_ = x_.half()
-                x_.clamp_(-65504.0, 65504.0)
-                s.append(x_)
+            s.append(_tap_to_half(x_, self.layer_idx))
 
         if self.layer_scalar_f is not None:
             x *= self.layer_scalar_f
@@ -300,9 +331,7 @@ class TransformerBlock(Module):
             states = params.get("export_states")
             if not states:
                 states = params["export_states"] = []
-            state = x.mean(dim = 2)
-            state = state.half() if state.dtype != torch.half else state
-            states.append(state.clamp_(-65504.0, 65504.0))
+            states.append(_tap_to_half(x.mean(dim = 2), self.layer_idx))
         return to2(x, out_dtype, self.out_dtype)
 
     def _piece_ba(self, prev, x_b, post_b, comb_b, y_b, params):
