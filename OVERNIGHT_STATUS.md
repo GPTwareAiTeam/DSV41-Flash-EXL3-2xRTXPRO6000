@@ -128,3 +128,23 @@ K sweep: K=5 best; K=4 ≈ −5%; K=3 −12%; K>5 capped by `dspark_block_size=5
    (hc_mix_tiled.cu) and is unused for this path.
 5. **Overlap the prefill all-reduce** (22.3%): needs a 2-way row split with two streams (no independent
    work exists inside a layer, so a plain async issue has no window). Upper bound ~68 ms at 2048.
+
+## FINAL MEASURED NUMBERS (consolidated main, after the graph-merge win)
+Plain decode (bsz 1, greedy, 128 tok, both ranks identical):
+  13.20 / 13.27 / 13.31 ms/tok → 76 / 75 / 75 tok/s   (was 43 ms/tok at the first coherent run)
+DSpark K=5 (verify widths graphed, merged block-boundary replays):
+  8.11 / 6.83 / 9.29 ms/tok → **119 / 135 / 101 tok/s**; acceptance 0.716 / 0.664 / 0.778;
+  3.09 / 3.30 / 2.58 tokens per verify round.
+Prefill (single-chunk default): 2048 tok 580.6 ms = **3527 tok/s**; 4096 tok 989.2 ms = **4141 tok/s**.
+
+Start of session (handoff baseline): ~100 ms/tok = 10 tok/s. Net: decode ~7.6x plain, 10–13x with DSpark;
+prefill 2925 → 3527 tok/s at 2048 and 3660 → 4141 at 4096.
+
+Owner targets: 300 tok/s decode / 8000 tok/s prefill — not reached. Remaining gap is GPU kernel work
+(MoE at the verify width, prefill MoE) plus the un-captured attention core:
+- Option-2 attention capture is blocked on the device-driven attention path (EXL3_DSV4_B1_BATCH=1) not being
+  token-exact (diverges at token 11 / 72-73 vs eager) — that divergence must be root-caused first. It is the
+  same class of bug the earlier batched-path work hit; the last known fix (roped pool_r write-back) moved the
+  divergence later but did not eliminate it.
+- Everything else measured tonight and rejected (with numbers) is in the per-workstream notes:
+  qmesh/notes/{TP2Runner,MoEKernelTP2,P2PAllReduce,PrefillPerf,ShardTool,HostSlim}.md
