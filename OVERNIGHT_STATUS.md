@@ -50,3 +50,23 @@ Bandwidth floor per GPU: 1-row token ~4.8 GB → 2.9 ms; 6-row verify round ~7.5
 
 Fit: TTFT ≈ 290 ms + 0.20 ms/token. Profile of a 2048-token prefill (703 ms): MoE prefill ~236 ms (≈360 GB/s effective, **4× off** the ~58 ms byte floor), NCCL all-reduce 135 ms (≈50 GB/s = PCIe hardware limit), dsa_attn 37 ms, CUTLASS GEMMs + unaccounted ~300 ms.
 → 8000 tok/s at 2048 needs ~256 ms total: MoE must go 236 → ~60 ms and the all-reduce must be overlapped with compute.
+
+## Validation methodology (important, learned tonight)
+Greedy 128-token identity is a **very** strict gate: any fp-order change flips argmax after ~50 tokens.
+Measured: EXL3_DSV41_XFAN=1 (fused x-side projection fan, 6–8 GEMV launches → 1–2 per layer) gives
+13.16/13.21/13.25 ms/tok vs 13.50/13.71/13.58 baseline (~3% faster) but changes tokens from position
+55/97/68 onward (73/31/59 of 128 differ), with both ranks agreeing. So:
+- **A real bug shows up in the first ~10 tokens**; late divergence (>40) is usually fp chaos, not a defect.
+- Decide optimizations on coherence + speed + early-token agreement, not 128-token identity.
+- x-fan stays OFF by default (3% is not worth a documented quality change); available via EXL3_DSV41_XFAN=1.
+
+## Prefill findings
+- 2048-token prompt is served as TWO chunks (1792 + 255 rows) — see generator/job.py:1503-1513: prefill stops at the
+  final recurrent-checkpoint page boundary (256-token pages) when a recurrent cache is present. This doubles weight
+  traffic per prompt; removing it (while preserving recurrent-checkpoint semantics) is the biggest prefill lever.
+- MoE prefill: 62% of assignments on the 1792-row chunk take the **batched reconstruct** path because of the fused
+  row cap (`EXL3_MOE_FUSED_ROWS_WIDE=256`); raising the cap should move them to the fused kernel.
+- HC at prefill: the HC fold is disabled under TP2 and above 32 rows (hyperconnections.py: `"backend" not in params`
+  and `b*s <= 32`), so every layer runs 3 unfused HC launches (712 total, 54 ms). A tiled prefill HC mix is the lever.
+- Transport: prefill prefers NCCL (703 ms) over P2P (759 ms) at 40 MB payloads; decode prefers P2P (4.9 µs vs 11.8 µs
+  at 20 KB). Hybrid selection by payload size is worth ~56 ms at prefill.
