@@ -12,6 +12,7 @@ import os
 # Piecewise decode graphs (EXL3_WHOLE_GRAPH=1): each block runs graph A (attn HC mix + norm), the eager
 # attention core, then graph B (attn residual + MLP + HC apply). Each block's residual is final at its exit.
 _PIECEWISE = os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0"
+_PIECEWISE_MAXSEQ = int(os.environ.get("EXL3_WHOLE_GRAPH_MAXSEQ", "8"))
 
 class TransformerBlock(Module):
 
@@ -154,7 +155,7 @@ class TransformerBlock(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        if _PIECEWISE and x.shape[1] == 1 and self.attn_hc is not None and self.mlp_hc is not None:
+        if _PIECEWISE and 1 <= x.shape[1] <= _PIECEWISE_MAXSEQ and self.attn_hc is not None and self.mlp_hc is not None:
             return self._forward_piecewise(x, params, out_dtype)
 
         export_state = params.get("export_state_layers")
@@ -248,15 +249,19 @@ class TransformerBlock(Module):
         return to2(x, out_dtype, self.out_dtype)
 
     def _forward_piecewise(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None):
-        """Decode (seq 1) body split around the attention core. Graph A: attn HC mix + norm, outputs
+        """Decode body split around the attention core. Graph A: attn HC mix + norm, outputs
         (post, comb, y). Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply.
         Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs of A."""
-        if not hasattr(self, "_seg_a"):
-            self._seg_a = Segment(self._piece_a, carry = ("hc_pre",))
-            self._seg_b = Segment(self._piece_b, carry = ("hc_pre",))
-        post, comb, y = self._seg_a(x, params)
+        if not hasattr(self, "_segments"):
+            self._segments = {}
+        key = (tuple(x.shape), x.dtype, out_dtype)
+        if key not in self._segments:
+            self._segments[key] = (Segment(self._piece_a, carry = ("hc_pre",)),
+                                   Segment(self._piece_b, carry = ("hc_pre",)))
+        seg_a, seg_b = self._segments[key]
+        post, comb, y = seg_a(x, params)
         y_attn = self.attn.forward(y, params)
-        x, = self._seg_b(x, post, comb, y_attn, params)
+        x, = seg_b(x, post, comb, y_attn, params)
         export_state = params.get("export_state_layers")
         if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
             states = params.get("export_states")
