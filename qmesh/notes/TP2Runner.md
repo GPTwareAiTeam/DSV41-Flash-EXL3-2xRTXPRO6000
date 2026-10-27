@@ -67,3 +67,8 @@ GPU busy 209.3 ms / 15 steps = 13.95 ms/step. Launches: 1255 kernels/step; cudaL
 
 Per-step kernel counts: `p2p_oneshot` 81 (all-reduce 80 + gather 1), `exl3_gemv_int8` 161, MoE 80, HC 240, rms_norm 122, dsa_attn 40+40.
 [INFERENCE] Under the profiler the GPU is busy ~14 ms of a ~22 ms step, so the GPU is idle about 35% of the wall: the step is host-launch-bound, and the all-reduce time is mostly peer skew absorbed while the faster rank waits.
+
+## DSpark tap saturation and draft-position acceptance (measured)
+- Taps (raw fp32, before the fp16 cast): layers 36-38 reach ~271k at sink tokens 0 and 2 on prefill; 8-9 values per layer are >=65504; no NaN/inf. Decode steps are small (amax 10-50).
+- `EXL3_DSPARK_TAP_SCALE=1/64` removes saturation (post-scale max 4236). Clean A/B (K=5, 128 tok, COMM=p2p, WHOLE_GRAPH=1): AL 3.09/3.30/2.58 at scale 1 vs 2.84/3.49/2.68 at 1/64. Neutral, so the default stays 1.0.
+- Per-position acceptance, DSpark K=5, prompts 1+2 timed (77 rounds, 148 accepted drafts; prompt 0 excluded because its histogram includes an unlogged warm pass): P(a>=j) = 0.857, 0.494, 0.286, 0.182, 0.104 for j=1..5. Conditional P(draft j accepted | draft j-1 accepted) = 0.857, 0.576, 0.579, 0.636, 0.571. Round outcomes a=0..5: 11, 28, 16, 8, 6, 8. The first draft is NOT the weak point; the drop comes at draft 2 and then stays flat near 0.6.

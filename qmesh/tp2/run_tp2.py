@@ -32,6 +32,7 @@ sys.path.insert(0, "/models/dsv41/DeepSeek-V4.1-Flash-1017-orig/encoding")
 from encoding import encode_messages  # noqa: E402
 
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer  # noqa: E402
+from exllamav3.generator.generator import _DRAFT_HIST  # noqa: E402
 from exllamav3.modules.transformer import TransformerBlock  # noqa: E402
 
 OVERLAY = os.environ.get("OVERLAY", "/artifacts/tp2-overlay")
@@ -366,6 +367,8 @@ def main():
             tpr = 1 + acc / max(rnd, 1)
             log(f"SPEC {idx} accepted={acc} rejected={rej} acc_rate={acc_rate:.4f} verify_rounds={rnd} "
                 f"tokens_per_round={tpr:.3f} eff_tok_s={len(tokens) / total:.2f}")
+            if _DRAFT_HIST is not None:
+                log(f"DRAFT_HIST {idx} accepted_drafts_hist={_DRAFT_HIST[:NUM_DRAFT + 1]}")
         log(f"TIMING {idx} total={total:.3f}s eff_tok_s={len(tokens) / total:.2f}")
 
     if PROBE and "0" in out:
