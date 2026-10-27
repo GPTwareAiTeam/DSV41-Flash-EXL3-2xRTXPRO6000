@@ -166,6 +166,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
+    m.def("p2p_arena_maxb", &p2p_arena_maxb, "Compiled payload capacity per parity slot in bytes");
     m.def("p2p_shm_arena", &p2p_shm_arena, "p2p_shm_arena");
     m.def("p2p_dev_arena_alloc", &p2p_dev_arena_alloc, "p2p_dev_arena_alloc");
     m.def("p2p_dev_arena_handle", &p2p_dev_arena_handle, "p2p_dev_arena_handle");

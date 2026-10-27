@@ -15,6 +15,13 @@ import subprocess
 import sys
 
 
+def p2p_arena_define() -> str:
+    """Compile-time payload capacity per parity slot, in bytes."""
+    value = int(os.environ.get("P2P_ARENA_MAXB", str(4 * 1024 * 1024)))
+    if value <= 0 or value % 16 or value > 2147483632:
+        raise ValueError("P2P_ARENA_MAXB must be a positive multiple of 16 at most 2147483632")
+    return f"-DP2P_MAXB={value}"
+
 def find_nvcc(cuda_home: str | None = None) -> list[str] | None:
     """The nvcc command torch's cpp_extension will run, as an argument list."""
     if override := os.environ.get("PYTORCH_NVCC"):

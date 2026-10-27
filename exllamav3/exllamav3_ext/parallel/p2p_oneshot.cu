@@ -161,6 +161,8 @@ static void p2p_launch(bool stats, int64_t nblk, cudaStream_t stream, uint8_t* s
         p2p_oneshot_kernel<MODE, false><<<(unsigned) nblk, 256, 0, stream>>>(src, out, units, rank, root, local, peer);
 }
 
+int64_t p2p_arena_maxb() { return P2P_MAXB; }
+
 // Pinned shared-host arena (fallback transport, used when peer SM access is unavailable): a /dev/shm file mapped
 // into both processes, pinned and device-mapped for each GPU. Returns the device-visible pointer for this GPU.
 // `name` is the shm object, `create` sets it up.
