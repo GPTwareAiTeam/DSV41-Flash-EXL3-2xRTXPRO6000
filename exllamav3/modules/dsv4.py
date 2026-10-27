@@ -26,6 +26,9 @@ dsv4_batch_eager = os.environ.get("EXL3_DSV4_BATCH_EAGER", "1") != "0"
 # Capture the batched step as one CUDA graph per (cache layer, B, S) after two warmup
 # runs; EXL3_DSV4_BATCH_GRAPH=0 keeps the eager batched chain
 dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
+# bsz==1 single-token decode through the batched body (device-driven attention core, capturable
+# inside a piecewise segment). Defaults on with EXL3_WHOLE_GRAPH; EXL3_DSV4_B1_BATCH=0 restores eager
+dsv4_b1_batch = os.environ.get("EXL3_DSV4_B1_BATCH", "1" if os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0" else "0") != "0"
 from ..constants import PAGE_SIZE
 
 # Reference: transformers models/deepseek_v4 (paper §2)
@@ -223,7 +226,7 @@ class DSV4Compressor:
 
 
     def forward_fused(self, x, params, buf_kv, buf_gate, ovl, dest_a, dest_b, position,
-                      pool_bt = None, pool_epp = 0, stage_rel = False):
+                      pool_bt = None, pool_epp = 0, stage_rel = False, position_tensor = None):
         """Cached-path forward (bsz 1): project + window-pool + norm + rope, writing emitted
         entries straight into the per-slot pools and updating the ring/snapshot state. One
         C++ transition via the BC companion when the chunk fits its scratch, else the two
@@ -236,7 +239,7 @@ class DSV4Compressor:
         use_bc = self.bc is not None and seq <= self.BC_MAX_QLEN and \
             not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
         if use_bc:
-            self.bc.run(x[0], buf_kv, buf_gate, ovl, dest_a, dest_b, position, None, None,
+            self.bc.run(x[0], buf_kv, buf_gate, ovl, dest_a, dest_b, position, position_tensor, None,
                         pool_bt, pool_epp, stage_rel)
         else:
             kv = self.wkv.forward(x, params)[0]
@@ -244,7 +247,7 @@ class DSV4Compressor:
             ext.dsv4_compress(
                 kv, gate, buf_kv, buf_gate, ovl, self.ape, self.fused_norm_w,
                 self.norm.rms_norm_eps, self.fused_inv_freq, dest_a, dest_b, position,
-                None, self.compress_rate, None, pool_bt, pool_epp, stage_rel,
+                position_tensor, self.compress_rate, None, pool_bt, pool_epp, stage_rel,
             )
 
 
@@ -1364,6 +1367,20 @@ class DSV4Attention(Module):
         t = torch.empty((n,), dtype = torch.half, device = self.device)
         del t
 
+    def _batch_ok_b1(self, kl, pos_end):
+        """Layers the batched B=1 body can express at this step: sliding layers, and compressed
+        owners and readers while the pool is in the dense regime (entries <= index_topk, where top-k
+        keeps every causal entry and no indexer/candidate selection runs). Quantized pools, top-k-regime
+        steps and active candidate selection stay on _forward_cached_one (host decision, before any
+        state moves)."""
+        if self.q_head_norm:
+            return False
+        if self.kv_source is None:
+            return self.candidate_mode is None
+        ec = pos_end // self.compress_rate
+        return not kl.quant and ec <= self.index_topk and self.candidate_mode is None
+
+
 
     def _forward_cached(self, x, params, out_dtype):
         """attn_mode flash_attn: kernel-based path over the per-job ring state and the paged
@@ -1403,6 +1420,8 @@ class DSV4Attention(Module):
                     for i in range(bsz):
                         kl.pull(src, pages[i], rsg[i].position // m, (rsg[i].position + x.shape[1]) // m)
         if bsz == 1:
+            if dsv4_b1_batch and x.shape[1] == 1 and self._batch_ok_b1(kl, rsg[0].position + 1):
+                return self._forward_cached_batch(x, params, rsg, layer_instance, out_dtype, kl, bt)
             return self._forward_cached_one(
                 x, params, rsg[0], self._get_rsl(rsg[0], layer_instance), out_dtype,
                 kl = kl, bt_row = bt[:1] if bt is not None else None)
@@ -1458,7 +1477,7 @@ class DSV4Attention(Module):
         for rs in rsg[1:B]:
             assert self._get_rsl(rs, layer_instance) is rsl, \
                 "batched DSA path requires all jobs in one cache"
-        m = self.compress_rate if self.compressor is not None else 1
+        m = self.compress_rate if self.kv_source is not None else 1
         w = self.sliding_window
         kp = -(-self.index_topk // 32) * 32 if self.indexer is not None else 32
 
@@ -1478,8 +1497,8 @@ class DSV4Attention(Module):
                 ring_j = rsl.ring[slot]
                 ring_j[:rsl.ring_rows - shift].copy_(ring_j[shift:].clone())
                 rs.wshift = shift
-            ec = (pos0 + S) // m if self.compressor is not None else 0
-            assert self.compressor is None or ec <= bt.shape[1] * kl.epp, \
+            ec = (pos0 + S) // m if self.kv_source is not None else 0
+            assert self.kv_source is None or ec <= bt.shape[1] * kl.epp, \
                 f"DSA pool overflow: entry {ec} beyond block table ({bt.shape[1]} pages)"
             pos_l.append(pos0)
             floor_l.append(pos0 - min(w - 1, offset, pos0))
@@ -1491,7 +1510,7 @@ class DSV4Attention(Module):
         # owner's (6, MAX_B) array and block-table static, the input pointer is the only
         # patched parameter. Declines (no fan / non-exl3 projections) fall through to the
         # eager batched body below
-        if dsv4_batch_graph and B <= 8 and S <= 16 and R <= 32:
+        if dsv4_batch_graph and B <= 8 and S <= 16 and R <= 32 and self.q_head_norm:
             if not hasattr(self, "_bc_dsa_batch"):
                 self._bc_dsa_batch = {}
             bcd = self._bc_dsa_batch.get(id(rsl))
@@ -1570,6 +1589,22 @@ class DSV4Attention(Module):
                     rsl.idx_ovl, idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
                     idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None,
                     0, a_pos, m, a_slots, bt_st, kl.epp, False)
+            if self.idx_wk is not None:
+                # V4.1 indexer keys come from this owner's own compressed entry. B == 1, S == 1:
+                # the entry this step completes (if any) is re-read from the pool and keyed on
+                # device; a step without a new entry rewrites the row it read (idempotent)
+                e = (a_ec - 1).clamp(min = 0)
+                row = bt_st[0].index_select(0, (e // kl.epp).long()).long() * kl.epp + (e % kl.epp).long()
+                lat = torch.cat((kl.pool_c.view(-1, kl.D_c)[row], kl.pool_r.view(-1, kl.D_r)[row]), dim = -1)
+                keys = self._indexer_keys(lat, params, e)
+                new = (a_ec > a_pos // m).view(-1, 1)
+                # _indexer_keys ropes the copy's trailing rope slice in place; the eager path
+                # stores that roped slice in the pool (idx owners' compressor rope table is
+                # zero), so write it back for new entries. Non-new steps keep the stored row.
+                pool_r_flat = kl.pool_r.view(-1, kl.D_r)
+                pool_r_flat.index_copy_(0, row, torch.where(new, lat[:, kl.D_c:], pool_r_flat[row]))
+                idx_flat = kl.pool_idx.view(-1, kl.D_i)
+                idx_flat.index_copy_(0, row, torch.where(new, keys, idx_flat[row]))
 
         if self.compressor is not None and self.layer_type == "csa":
             if True:
@@ -1615,7 +1650,7 @@ class DSV4Attention(Module):
         # Paged pools: the split kernel reads one block-table row per job from the fixed
         # (B, num_pages) static
         qc = None
-        if self.compressor is not None:
+        if self.kv_source is not None:
             bt = bt_st
             epp = kl.epp
             pool_c = kl.pool_c_view()
@@ -1729,13 +1764,25 @@ class DSV4Attention(Module):
         positions = a_pos if a_pos is not None else \
             torch.tensor([rs.position for rs in rsg[:B]], dtype = torch.int32,
                          device = x.device)
-        ext.rope(
-            q, q, kv, kv,
-            self._rope_type(), 0, positions, None,
-            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, 1,
-            self.head_dim - self.rope_head_dim,
-        )
+        if self.q_head_norm:
+            ext.rope(
+                q, q, kv, kv,
+                self._rope_type(), 0, positions, None,
+                int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
+                self.rms_norm_eps, 0.0, 0.0, 0, 1,
+                self.head_dim - self.rope_head_dim,
+            )
+        else:
+            # V4.1 no-head-norm split (mirrors _forward_cached_one): rope the trailing q slice per row, then kv via the norm rope
+            rd = self.rope_head_dim
+            ext.rope(q[..., -rd:], q[..., -rd:], None, None, self._rope_type(), 0, positions, None,
+                     int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0)
+            ext.rope(
+                kv, kv, None, None,
+                self._rope_type(), 0, positions, None,
+                int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
+                self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
+            )
         return q_res, q, kv, comp_kv, comp_gate, idx_kv, idx_gate, q_idx
 
 
