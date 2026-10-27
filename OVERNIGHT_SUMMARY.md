@@ -85,3 +85,22 @@ Branch `recipe/2x-rtxpro6000-tp2` now contains everything: main + MoE tiles + DS
 ### Where the remaining 2× is
 - decode: the attention body still runs eagerly (host gap ~4–5 ms/step). Capture it now that the body is bit-identical.
 - prefill: MoE occupancy (30.6% of prefill at 8.4% DRAM) and the PCIe-bound all-reduce (22%, at hardware limit).
+
+## Round 3: full-block attention capture — implemented, measured, net loss (kept behind a default-off flag)
+`EXL3_DSV4_B1_BATCH=1` + piecewise capture (commit 3068d30c, merged): graph A + attention body + previous block's
+graph B in one segment, tokens identical to eager on prompts 0-2 and on a 1134-token prompt, but **15.9 ms/tok vs
+13.15 eager** — a loss. Root cause: the device-driven B1 body itself costs more GPU time at S=1 than the scalar eager
+path (it was already 15.9 vs 13.2 before capture), so removing every host launch cannot recover it. The capture
+machinery works (this is the mechanism a future faster device body would plug into); the body needs to be made at
+least as fast as the scalar path first.
+Guards in place: ring shift, top-k regime, quantized/mirrored pools all fall back to eager.
+
+## Bottom line for the owner
+- Decode: **76 tok/s plain, 118-135 tok/s with DSpark K=5** (13.15 / 6.85-9.39 ms/tok), coherent, both GPUs, ranks
+  bit-identical. The only public engine for this same model (8xV100) runs 30.5 plain / 65 with DSpark.
+- Prefill: **3.6-3.7k tok/s at 2048, 4.3-4.4k at 4096** (was 2.9k / 3.7k).
+- To reach the owner's 300 / 8000 targets the remaining work is kernel engineering, not configuration:
+  1. decode attention: either make the device-driven body faster than the scalar path (it is currently 20% slower) or
+     fuse the scalar path's ~11 ops/layer into 1-2 kernels so a capture is cheap (this is what 1Cat-vLLM has);
+  2. prefill MoE: redesign the 64-row tile to escape the register-file ceiling (255 regs/thread, 1 block/SM, 8.4% DRAM);
+  3. prefill all-reduce: at the PCIe limit, so only a 2-way row split on two streams can hide it (multi-module change).
