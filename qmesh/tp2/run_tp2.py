@@ -236,10 +236,11 @@ def main():
     cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = 5)
     model.load(device = device, max_chunk_size = MAX_CHUNK, max_output_size = MAX_NEW,
                max_batch_size = 1, progressbar = False)
-    if COMM == "p2p":
+    if COMM in ("p2p", "hybrid"):
         from exllamav3.tp2.p2p import P2PComm
         rdv = os.environ["P2P_RDV"]
-        backend = TPBackendP2P(P2PComm(RANK, world = WORLD, rendezvous_path = rdv, device = RANK))
+        p2p = TPBackendP2P(P2PComm(RANK, world = WORLD, rendezvous_path = rdv, device = RANK))
+        backend = p2p if COMM == "p2p" else TPBackendHybrid(TPBackendNCCL(), p2p)
     else:
         backend = TPBackendNCCL()
     n_blocks = set_tp_reduce(model, backend)
