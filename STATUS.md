@@ -13,6 +13,26 @@ Canonical main-branch numbers (`COMM=p2p`, graphs, `EXL3_DSV4_B1_BATCH=1`, WARM)
 - Decode is now **kernel-efficiency bound**, not host bound: one 11 ms step has ~9 ms CUDA busy and the bsz-1 MoE is at
   ~45% of DRAM while diffbot reaches ~92% with a bigger 3 bpw model on the same hardware.
 
+## Consolidated best-known numbers (main branch, both ranks agree)
+Reproduce: `cd /home/treadall/recipe-artifacts/2x-rtx-tp2 && ./run_tag.sh <unique_tag> -e COMM=p2p -e EXL3_WHOLE_GRAPH=1 \
+  -e EXL3_DSV4_B1_BATCH=1 -e MAX_NEW=128 -e PROMPT_IDS=0,1,2,3 -e IGNORE_EOS=1 -e WARM=1` (add `-e DSPARK=1 -e NUM_DRAFT=5` for spec).
+
+| config | ms/tok | tok/s | notes |
+|---|---|---|---|
+| plain decode bsz1 (p0/p1/p2) | 10.97 / 11.02 / 10.98 | 91 | captured attention core |
+| plain decode, 1134-token prompt | 14.15 | 71 | long-context KV cost |
+| DSpark K=5 (p0/p1/p2/p3) | 7.86 / 6.83 / 9.01 / 4.65 | 127 / 146 / 111 / 215 | AL 3.30/3.30/2.58/5.29, acc 0.66/0.78/0.91 |
+| prefill 2048-token prompt, chunk 2048 | 3856 tok/s | | 32K-prompt sweep, per-chunk table in PrefillPerf.md |
+| prefill 32K prompt, chunk 8192 | 4790 tok/s | | 90.2 GiB peak, safe default |
+| prefill 32K prompt, chunk 16384 | 4941 tok/s | | 93.7 GiB peak, too tight to ship |
+| multi-stream plain B2 / B4 (branch tp2/batch) | 14.62 / 19.51 per stream | 126 / 189 aggregate | 86.5 GiB peak; numerics bug open |
+| multi-stream DS K=5 B4 | 38.26-38.97 per stream | 96.8 aggregate | spec and batching do not compose |
+
+Round anatomy (DSpark K=5, measured with CUDA events): draft **1.9 ms**, target+verify **21.5 ms**, host ~3 ms; exactly ONE
+drafter forward per round (DFlash block path). MoE cost is linear in distinct expert slots (1 row = 6 slots ~ 11 ms,
+6 rows ~ 38 slots ~ 21.5 ms), so speculative decode is already at the DRAM floor per token and the remaining lever is
+kernel efficiency (bsz-1 MoE ~45% of DRAM vs diffbot ~92% on the same hardware).
+
 ## 2026-10-27 — attention-core capture lands: plain decode 13.3 -> 11.0 ms/tok
 Validated on main (`b85deac0` merged from `tp2/attncap`): **10.97 / 11.02 / 10.98 ms/tok** (prompts 0-2, both ranks
 identical) vs **13.35 / 13.35 / 13.17** before. 1134-token prompt 14.77 -> 14.15.
