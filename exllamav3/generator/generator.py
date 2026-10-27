@@ -1368,7 +1368,7 @@ class Generator:
         }
         if self.draft_recurrent:
             params["recurrent_states"] = [job.recurrent_state.draft for job in self.active_jobs if job.is_prefill_done()]
-        if self.draft_calibrator is not None:
+        if self.draft_calibrator is not None or getattr(self, "observe_draft_confidence", False):
             params["export_draft_conf"] = True
         params["sparse_head"] = self._sparse_flag
         out_state = self.draft_model.forward(
@@ -1393,6 +1393,8 @@ class Generator:
         # rows (jobs wanting less just reject earlier). The full block and
         # its scores are kept so iterate_gen can label the verified positions afterwards
         draft_conf = params.get("draft_conf")
+        if getattr(self, "observe_draft_confidence", False) and draft_conf is not None:
+            self.last_draft_confidence = draft_conf[:batch_size, 1:1 + window].float().sigmoid().mean().item()
         if self.draft_calibrator is not None and draft_conf is not None:
             conf = draft_conf[:batch_size, 1:].float().cpu()
             ids_full = new_ids[:batch_size, :].cpu()
