@@ -13,6 +13,19 @@ Canonical main-branch numbers (`COMM=p2p`, graphs, `EXL3_DSV4_B1_BATCH=1`, WARM)
 - Decode is now **kernel-efficiency bound**, not host bound: one 11 ms step has ~9 ms CUDA busy and the bsz-1 MoE is at
   ~45% of DRAM while diffbot reaches ~92% with a bigger 3 bpw model on the same hardware.
 
+## Open loose end (unverified, do not measure without checking)
+The working tree of `recipe/2x-rtxpro6000-tp2` carries an **uncommitted** kernel change to
+`exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh` (`gemv_tile`): the `r0_ok ? A2[...] : hzero` conditional is
+replaced by a `uint32_t` bit-reinterpret with a literal zero, to stop the compiler materialising a per-thread local
+value for inactive MMA rows. ncu evidence for the problem: A spends **1,290,240 local load sectors vs 1,317,141 global
+(~49%)**, B **765,250 vs 1,188,536 (~57%)**, and line-info maps the local loads to `cuda_fp16.hpp:344`
+(`__half2::operator=`) at `gemv_tile` 464-465.
+The extension builds with it (`/mnt/data12/work/exl3/tp2_ext`, 18:17) but the A/B run has **not** completed: three launch
+attempts hung with 0-byte logs and no GPU allocation (an NCCL-bootstrap-style hang, the known trap). Verify with:
+`./run_tag.sh <unique_tag> -e COMM=p2p -e EXL3_WHOLE_GRAPH=1 -e EXL3_DSV4_B1_BATCH=1 -e MAX_NEW=128 -e PROMPT_IDS=0,1,2 -e IGNORE_EOS=1 -e WARM=1 -e NCCL_SOCKET_IFNAME=lo`
+against the 10.97/11.02/10.98 ms/tok baseline with byte-identical tokens, then ncu the local-sector count and commit.
+Do not assume a speedup until that lands.
+
 ## Consolidated best-known numbers (main branch, both ranks agree)
 Reproduce: `cd /home/treadall/recipe-artifacts/2x-rtx-tp2 && ./run_tag.sh <unique_tag> -e COMM=p2p -e EXL3_WHOLE_GRAPH=1 \
   -e EXL3_DSV4_B1_BATCH=1 -e MAX_NEW=128 -e PROMPT_IDS=0,1,2,3 -e IGNORE_EOS=1 -e WARM=1` (add `-e DSPARK=1 -e NUM_DRAFT=5` for spec).
