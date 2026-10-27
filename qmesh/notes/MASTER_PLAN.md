@@ -18,6 +18,13 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
 | 9 | **Content-aware adaptive K** (prose K→3, code K→5; our cap is 5) | diffbot: k=7 vs k=3 = +33% code, −5% chat, −17% 4-stream chat | +5–15% depending on content | engine already has `dynamic_draft_tokens` + confidence calibration; it is NOT engaged for DSpark today (in progress) |
 | 10 | **bsz-1 decode MoE occupancy** — 60–63 regs, 27 KB smem, 2–3 blocks/SM, 33–43% warps | our ncu | maybe +10–20% on the MoE share | lower value than #2 because 33–43% is already usable |
 | 11 | **Larger prefill chunk (8K/16K)** | our 2048→4096 = +18% | unknown | cheap test; memory-limited |
+### New data (2026-10-27, later)
+- **Prefill chunk size matters a lot**: 2048 → 3666 tok/s, 4096 → 4324, **16384 → 5056 (+17% over 4096)**.
+  Larger chunks amortize weight reads. Testing 32768/65536 next. This is now a high-priority prefill dial.
+- **8-bit (e4m3) prefill all-reduce**: +6.5% at 2048, +6.4% at 4096, +6.9% at 16384 — but a plain global cast
+  FAILED the quality gate (prompt-3 token flip at step 11, KL 0.22 at the flip). Trying block-scaled fp8
+  (per-128 scale) next; if it still flips, drop the item.
+
 | 12 | **K=7 drafter** | diffbot: "of the +43%, draft length gives nearly all" | +30–40% on code | BLOCKED: our checkpoint has `dspark_block_size=5` |
 
 Already done / no longer candidates: mixed-K fused MoE with per-expert K tables; piecewise + block-boundary-merged CUDA
