@@ -726,9 +726,10 @@ Recurrent-state models (DeepSeek-V4) cut each prefill forward at the last full p
 final token, so the recurrent checkpoint lands there and a later identical prompt reuses it. That
 cut splits a 2048-token prompt into 1792 + 255 rows, so every layer's weights are read twice. The
 default `0` skips the cut: a 2048-token prompt runs as one 2047-row forward (580.6 ms vs 701 ms
-TTFT, rank 0, `PROMPT_LENS=2048`). Trade-off: a repeated identical prompt re-prefills up to 255
-trailing tokens (the partial page) instead of reusing the recurrent checkpoint. Set `1` to restore
-the checkpoint split.
+TTFT, rank 0, `PROMPT_LENS=2048`). Trade-off: without the last-page checkpoint, a repeated identical
+prompt resumes from the nearest interval checkpoint (`recurrent_checkpoint_interval`, 2048 for
+DeepSeek-V4) instead of the last full page, so it can re-prefill more than 255 tokens (up to the
+whole prompt for prompts shorter than the interval). Set `1` to restore the checkpoint split.
 
 ### `EXL3_MOE_FUSED_ROWS_WIDE` (default: `256`)
 
