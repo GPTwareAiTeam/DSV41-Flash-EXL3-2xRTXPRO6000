@@ -1118,6 +1118,8 @@ choice also sizes the quantizer's scratch buffers.
 Concurrent decode streams. Sets the `Cache` slot count, `Model.load(max_batch_size)` and `Generator(max_batch_size)`.
 For `BATCH > 1` the runner enqueues one job per slot (prompts cycled from `PROMPT_IDS`) and reports per-stream
 and aggregate throughput; results are keyed `<prompt idx>.<slot>`.
+Compressed indexer keys use each stream's own compressed-entry position for RoPE; repeated prompts at the same
+position therefore do not acquire different rotations merely because they occupy different batch slots.
 
 ### `CACHE_TOKENS_PER_SEQ` (default: `4096`)
 

@@ -12,6 +12,33 @@ from exllamav3.cache.cache import Cache
 
 from testlib.dsv4 import assert_logits_close, build_tiny_dsv4, fwd_cached, fwd_modules, noise_floor
 from testlib.tiny_models import DSV4_TINY
+from exllamav3.modules import dsv4
+
+
+@pytest.mark.parametrize("entries, expected", [
+    ([4, 4, 4, 4], [8, 8, 8, 8]),
+    ([1, 4, 2, 7], [2, 8, 4, 14]),
+    (4, [8, 10, 12, 14]),
+])
+def test_indexer_key_positions(monkeypatch, entries, expected):
+    class Identity:
+        def forward(self, x, params, **kwargs):
+            return x.clone()
+
+    class Attention:
+        idx_wk = Identity()
+        idx_k_norm = Identity()
+        compress_rate = 2
+        rope_head_dim = 2
+        inv_freq_compress = None
+
+    positions = []
+    monkeypatch.setattr(dsv4, "_ext_rope", lambda x, inv_freq, position_ids: positions.append(position_ids.clone()))
+    e0 = torch.tensor(entries, dtype = torch.int32) if isinstance(entries, list) else entries
+    dsv4.DSV4Attention._indexer_keys(Attention(), torch.zeros((4, 2)), {}, e0)
+    assert len(positions) == 2
+    for pos in positions:
+        assert pos.tolist() == [expected]
 
 
 @pytest.fixture(scope = "module")
