@@ -70,3 +70,13 @@ Measured: EXL3_DSV41_XFAN=1 (fused x-side projection fan, 6–8 GEMV launches �
   and `b*s <= 32`), so every layer runs 3 unfused HC launches (712 total, 54 ms). A tiled prefill HC mix is the lever.
 - Transport: prefill prefers NCCL (703 ms) over P2P (759 ms) at 40 MB payloads; decode prefers P2P (4.9 µs vs 11.8 µs
   at 20 KB). Hybrid selection by payload size is worth ~56 ms at prefill.
+
+## More results
+- **DSpark K sweep** (graph, WARM=1, 3 prompts): K=5 is best — 0.8125/0.7881/0.8272 acceptance,
+  4.14/3.82/2.60 tokens/round, **150.1/154.2/99.9 tok/s**. K=4: 142.8/152.5/94.9. K=3: 131/136/95.
+  K>5 is capped by `dspark_block_size=5` in the checkpoint, so only 3/4/5 are meaningful.
+- **Hybrid transport** (commit 05eab78d): P2P under 64 KB, NCCL above. Prefill 2048 TTFT 698.9 ms (was 703 NCCL,
+  759 P2P). Decode unchanged. Enabled via COMM=hybrid.
+- **Prefill MoE row-cap sweep**: raising `EXL3_MOE_FUSED_ROWS_WIDE` moves assignments from the batched-reconstruct
+  path to the fused kernel but is NET SLOWER (512 → 735 ms, 1024 → 808 ms vs 701 baseline). Keep 256.
+- **HC at prefill**: fold is inactive under TP2 and above 32 rows; 712 launches / 54 ms. Tiled prefill HC is the lever.
