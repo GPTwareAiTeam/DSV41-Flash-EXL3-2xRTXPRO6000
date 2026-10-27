@@ -1874,6 +1874,7 @@ class Generator:
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
+                job.verify_rounds = getattr(job, "verify_rounds", 0) + 1
                 accepted_length = 1
                 rejected = 0
                 W = batch_logits.shape[1]
