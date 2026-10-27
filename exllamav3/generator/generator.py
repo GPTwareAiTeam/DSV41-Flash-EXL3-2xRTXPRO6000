@@ -32,6 +32,8 @@ from ..util import profile_opt
 _NO_BATCH_READBACK = False
 _DSPARK_PROBE = bool(int(__import__("os").environ.get("DSPARK_PROBE", "0")))
 _DSPARK_ORACLE = None
+# EXL3_DRAFT_HIST=1: count verify rounds by accepted draft count (index = drafts accepted, 0..K), printed by the runner
+_DRAFT_HIST = [0] * 16 if __import__("os").environ.get("EXL3_DRAFT_HIST", "0") != "0" else None
 if __import__("os").environ.get("DSPARK_ORACLE"):
     import json as _json
     _DSPARK_ORACLE = _json.load(open(__import__("os").environ["DSPARK_ORACLE"]))
@@ -2041,6 +2043,8 @@ class Generator:
                 self.model.prefetch_tokens([sampled_token.item()])
 
                 accepted_lengths.append(accepted_length)
+                if _DRAFT_HIST is not None:
+                    _DRAFT_HIST[min(accepted_length - 1, len(_DRAFT_HIST) - 1)] += 1
                 j += 1
 
         if self.sparse_head is not None:
