@@ -434,6 +434,11 @@ class DSV4LayerState:
 
 
     def unstash(self, slot, stashed, position):
+        expected = [self.ring[slot, :min(self.ring_rows, position)]]
+        expected.extend(t[slot] for t in self._tensors()[1:])
+        if len(stashed) != len(expected) or any(src.shape != dst.shape or src.dtype != dst.dtype
+                                                for src, dst in zip(stashed, expected)):
+            raise ValueError("DSV4 recurrent checkpoint shape or dtype does not match the destination slot")
         it = iter(stashed)
         ring = next(it)
         self.ring[slot].zero_()  # never leave stale rows below the restored window

@@ -60,6 +60,16 @@ CACHE_TOKENS_PER_SEQ = int(os.environ.get("CACHE_TOKENS_PER_SEQ", "4096"))  # KV
 CTX_TOKENS = int(os.environ.get("CTX_TOKENS", "0"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", str(CTX_TOKENS if CTX_TOKENS else BATCH * CACHE_TOKENS_PER_SEQ)))
 KV_BITS = int(os.environ.get("KV_BITS", "16"))
+PREFIX_CACHE = os.environ.get("EXL3_PREFIX_CACHE", "0") == "1"
+PREFIX_CACHE_CAPACITY = int(os.environ.get("EXL3_PREFIX_CACHE_CAPACITY", str(4 * 1024**3)))
+PREFIX_CACHE_MIN_MATCH = int(os.environ.get("EXL3_PREFIX_CACHE_MIN_MATCH", "256"))
+PREFIX_CACHE_INTERVAL = int(os.environ.get("EXL3_PREFIX_CACHE_INTERVAL", "1024"))
+if PREFIX_CACHE_INTERVAL <= 0 or PREFIX_CACHE_INTERVAL % 256:
+    raise ValueError("EXL3_PREFIX_CACHE_INTERVAL must be a positive multiple of 256")
+if PREFIX_CACHE_CAPACITY < 0 or PREFIX_CACHE_MIN_MATCH < 0:
+    raise ValueError("prefix cache capacity and minimum match must be nonnegative")
+if PREFIX_CACHE:
+    os.environ["EXL3_PREFILL_RC_SPLIT"] = "1"
 if KV_BITS not in (8, 16):
     raise ValueError("KV_BITS must be 8 or 16")
 KV_CACHE_KWARGS = {"layer_type": CacheLayer_quant, "k_bits": 8, "v_bits": 8} if KV_BITS == 8 else {}
@@ -373,12 +383,17 @@ def main():
         log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
     # DSPARK_DYNAMIC=1: the generator's confidence calibrator sizes each round's window against DSPARK_TARGET_ACC
     # (drafter must export draft_conf; run with EXL3_DSPARK_CONF=0 so the static gate does not also cut)
-    generator = Generator(model, cache, tokenizer, max_batch_size = BATCH, max_chunk_size = max_chunk,
+    generator = Generator(model, cache, tokenizer, max_batch_size = BATCH,
+                          max_chunk_size = min(max_chunk, PREFIX_CACHE_INTERVAL) if PREFIX_CACHE else max_chunk,
                           draft_model = draft_model, draft_cache = draft_cache,
+                          recurrent_cache_size = PREFIX_CACHE_CAPACITY if PREFIX_CACHE else 0,
+                          recurrent_checkpoint_interval = PREFIX_CACHE_INTERVAL if PREFIX_CACHE else None,
+                          recurrent_checkpoint_interval_pp = PREFIX_CACHE_INTERVAL if PREFIX_CACHE else 32768,
                           num_draft_tokens = NUM_DRAFT if DSPARK else None,
                           dynamic_draft_tokens = DSPARK and DSPARK_DYNAMIC,
                           draft_confidence = DSPARK_TARGET_ACC,
                           record_draft_stats = DSPARK and (DSPARK_DYNAMIC or DSPARK_POLICY == "auto"))
+    generator.prefix_cache_min_match = PREFIX_CACHE_MIN_MATCH if PREFIX_CACHE else None
     generator.observe_draft_confidence = DSPARK_POLICY == "auto"
     generator.count_draft_forwards = DSPARK_COUNT_FORWARDS
     generator.draft_forward_count = 0
