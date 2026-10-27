@@ -15,9 +15,21 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
 | 6 | **FP8 KV cache** (DECIDED — do it) | diffbot ships fp8 KV; our engine has `k_bits=8` packed pool | ~2× KV capacity; halves KV bytes read/written | validate: attention must not get slower (packed pool adds dequant ALU) and tokens/KL within noise. Removes the earlier bogus "we're already at parity" claim |
 | 7 | **Replay trim in multi-chunk prefill** (late layers only need the last rows) | diffbot 3.7–4.6% at 34K–130K | +4% prefill | needs prefix-cache/ring semantics check |
 | 8 | **Prefix caching** (warm-prefix replay) | diffbot agentic 224 tok/s; sybil 16K prompt 16 s → 1 s on hit | large real-world gain | unmeasured by us |
-| 9 | **Speculative policy: always speculate; K is a small, noisy dial** | matched config (COMM=p2p + graphs), prompt 0, counted drafter forwards: **exactly one per round at every K** (the DFlash block path, not the MTP loop). Round cost 19.7/20.7/21.3/22.1 ms at K=2/3/4/5 (+12% from K2 to K5); AL 2.25/2.56/2.51/2.67; per-token 8.77/8.09/8.50/8.27 ms. Six-prompt sweep: K=5 beats plain everywhere (13.1 -> 4.6-9.3 ms/tok). Auto on/off lost on 3 of 6 at a bad baseline, re-run not justified | K choice = 0-8% | keep K=5 as default; K=3 is within noise and aligns to 4 verify rows; per-content K tuning is worth a few % at most, so do not spend more on it. Earlier 'K<5 dominated' and 'prose loses' claims were artifacts of unmatched configs and are retracted |
+| 9 | **Speculative policy: always speculate; K is a small dial** | matched COMM=p2p + graphs, prompt 0: one DFlash block forward per round at every K; estimated round cost 19.7/20.7/21.3/22.1 ms at K=2/3/4/5, AL 2.25/2.56/2.51/2.67, decode 8.77/8.09/8.50/8.27 ms/tok. Six-prompt matched sweep: K=5 beat plain on all six; auto on/off lost to K=5 on all six. K=2/5 event stream means: draft 1.87/1.81 ms, verify 21.47/21.09 ms, host iteration 26.13/26.06 ms (iterations include startup and non-SPEC rounds). | K choice = small | `DSPARK_POLICY=always` by default. Round cost is approximately flat in K and MoE-read bound. Earlier 'K<5 dominated' and 'prose loses' claims, based on unmatched configurations, are retracted. |
 | 10 | **bsz-1 decode MoE occupancy** — 60–63 regs, 27 KB smem, 2–3 blocks/SM, 33–43% warps | our ncu | maybe +10–20% on the MoE share | lower value than #2 because 33–43% is already usable |
 | 11 | **Larger prefill chunk (8K/16K)** | our 2048→4096 = +18% | unknown | cheap test; memory-limited |
+### New data (2026-10-27, multi-stream measured)
+- **Batching works once the B>1 core is captured**: plain per-stream 14.62 ms/tok at B2 (**126 tok/s aggregate**) and
+  19.51 ms/tok at B4 (**189 tok/s aggregate**), i.e. ~2.1x wall-clock throughput at 1.8x per-stream latency. Peak VRAM
+  86.6 GiB (B4 plain) — batching costs almost nothing in memory at these widths.
+- **Spec + batching is a substitution, not a product**: DS K=5 at B4 gives 96.8 tok/s aggregate, *below* B1 spec and far
+  below B4 plain. Reason: MoE cost is linear in distinct expert slots, and 4 streams x 6 verify rows = 24 rows ->
+  up to 144 slot reads, so batching adds no MoE amortisation while spec triples the row count. Ship policy: spec for
+  single/low-concurrency latency, plain batching for aggregate throughput.
+- **Blocker before shipping batching**: two identical prompt streams at B4 diverge from each other at position 11, so the
+  captured B>1 path is not yet numerics-safe (same class as the earlier B4-vs-B1 divergence). Also fixed: the graph
+  capture failure was `torch.bincount` (a CPU sync) inside the captured MLP — replaced with a CUDA scatter-add count.
+
 ### New data (2026-10-27, later)
 - **Prefill chunk size matters a lot**: 2048 → 3666 tok/s, 4096 → 4324, **16384 → 5056 (+17% over 4096)**.
   Larger chunks amortize weight reads. Testing 32768/65536 next. This is now a high-priority prefill dial.
