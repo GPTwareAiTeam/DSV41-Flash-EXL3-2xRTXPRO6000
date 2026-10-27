@@ -244,11 +244,22 @@ def main():
     generator = Generator(model, cache, tokenizer, max_batch_size = 1, max_chunk_size = MAX_CHUNK,
                           draft_model = draft_model, draft_cache = draft_cache,
                           num_draft_tokens = NUM_DRAFT if DSPARK else None)
+    FORCE_EXPORT = os.environ.get("FORCE_EXPORT", "0") == "1"
+    if FORCE_EXPORT and not DSPARK:
+        _export_layers = set(config.dspark_target_layer_ids)
+        _orig_forward = model.forward
+        def _forward_export(*a, params = None, **kw):
+            params["export_state_layers"] = _export_layers
+            return _orig_forward(*a, params = params, **kw)
+        model.forward = _forward_export
+        log(f"FORCE_EXPORT layers={sorted(_export_layers)}")
     dist.barrier()
 
     out = {}
-    logit_out = {}
-    for idx in PROMPT_IDS:
+    WARM = os.environ.get("WARM", "0") == "1"
+    run_ids = (PROMPT_IDS + PROMPT_IDS) if WARM else PROMPT_IDS
+    for pass_i, idx in enumerate(run_ids):
+        timed = not WARM or pass_i >= len(PROMPT_IDS)
         prompt = PROMPTS[idx]
         text_in = encode_messages([{"role": "user", "content": prompt}], thinking_mode = "chat")
         ids = tokenizer.encode(text_in, add_bos = False, encode_special_tokens = True)
@@ -263,7 +274,7 @@ def main():
         )
         generator.enqueue(job)
         t1 = time.time()
-        marks, text, tokens, eos_info, logit_rows = [], "", [], None, []
+        marks, text, tokens, eos_info, logit_rows, spec = [], "", [], None, [], None
         while generator.num_remaining_jobs():
             for result in generator.iterate():
                 if "error" in result:
@@ -276,9 +287,13 @@ def main():
                     tokens += result["token_ids"][0].tolist()
                 if "logits" in result and LOGITS_OUT:
                     logit_rows.append(result["logits"].float().cpu())
+                if "accepted_draft_tokens" in result:
+                    spec = result
                 if result.get("eos"):
                     eos_info = result.get("eos_reason")
         total = time.time() - t1
+        if not timed:
+            continue
         first = marks[0] if marks else float("nan")
         decode = (total - first) / max(len(marks) - 1, 1) if len(marks) > 1 else float("nan")
         out[str(idx)] = tokens
@@ -291,6 +306,13 @@ def main():
         log(f"PROMPT {prompt!r} prompt_tokens={ids.shape[-1]} new_tokens={len(tokens)} total={total:.3f}s "
             f"first_token_ms={first * 1e3:.1f} decode_ms_per_tok={decode * 1e3:.2f} eos={eos_info} text={text!r}")
         log(f"TOKENS {idx} {tokens}")
+        if spec is not None:
+            acc, rej, rnd = spec["accepted_draft_tokens"], spec["rejected_draft_tokens"], spec.get("verify_rounds", 0)
+            acc_rate = acc / max(acc + rej, 1)
+            tpr = 1 + acc / max(rnd, 1)
+            log(f"SPEC {idx} accepted={acc} rejected={rej} acc_rate={acc_rate:.4f} verify_rounds={rnd} "
+                f"tokens_per_round={tpr:.3f} eff_tok_s={len(tokens) / total:.2f}")
+        log(f"TIMING {idx} total={total:.3f}s eff_tok_s={len(tokens) / total:.2f}")
 
     if PROBE and "0" in out:
         # Seq>1 probe: prompt + the first N generated tokens as ONE prefill forward, then the next-token logits.
@@ -318,7 +340,44 @@ def main():
         with open(f"{TOKENS_OUT}.rank{RANK}.json", "w") as f:
             json.dump(out, f)
 
-    if PROFILE:
+    PROFILE_SEQ = [int(n) for n in os.environ.get("PROFILE_SEQ", "").split(",") if n.strip()]
+    if PROFILE and PROFILE_SEQ:
+        # Width-filtered profile: profiles exactly one model.forward call per width in PROFILE_SEQ
+        # (verify = seq 6, decode = seq 1), because torch.profiler clears events per cycle.
+        from torch.profiler import profile, ProfilerActivity
+        _orig_fwd = model.forward
+        widths, done_w = {}, set()
+        profs = {}
+        def _filtered_forward(input_ids, params = None, **kw):
+            w = int(input_ids.shape[-1])
+            widths[w] = widths.get(w, 0) + 1
+            if w not in PROFILE_SEQ or w in done_w or widths[w] < 3:
+                return _orig_fwd(input_ids, params = params, **kw)
+            done_w.add(w)
+            p = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            profs[w] = p
+            torch.cuda.synchronize()
+            p.start()
+            try:
+                return _orig_fwd(input_ids, params = params, **kw)
+            finally:
+                torch.cuda.synchronize()
+                p.stop()
+        model.forward = _filtered_forward
+        job = Job(input_ids = last_ids, max_new_tokens = 64, min_new_tokens = 64,
+                  sampler = GreedySampler(), stop_conditions = [])
+        generator.enqueue(job)
+        while generator.num_remaining_jobs():
+            for result in generator.iterate():
+                if "error" in result: raise result["error"]
+        model.forward = _orig_fwd
+        if RANK == 0:
+            log(f"PROFILE_SEQ widths_seen={sorted(widths.items())} recorded={sorted(profs)}")
+            for w in sorted(profs):
+                print(f"=== PROFILE seq={w} (one forward) ===", flush = True)
+                print(profs[w].key_averages().table(sort_by = "cuda_time_total", row_limit = 30), flush = True)
+                profs[w].export_chrome_trace(f"{os.environ.get('PROFILE_TRACE', '/artifacts/tp2logs/profile_trace.json')}.seq{w}.json")
+    if PROFILE and not PROFILE_SEQ:
         from torch.profiler import profile, ProfilerActivity
         # both ranks must run the same collective sequence; only rank 0 prints the table.
         # Profiling starts after the first emitted token, so prefill is excluded: decode steps only.
