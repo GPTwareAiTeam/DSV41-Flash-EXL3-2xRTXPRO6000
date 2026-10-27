@@ -942,7 +942,8 @@ class Job:
                 if self.generator.draft_model or self.generator.ngram_match_min or self.generator.hybrid_draft_tokens:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
-                        "rejected_draft_tokens": self.rejected_draft_tokens
+                        "rejected_draft_tokens": self.rejected_draft_tokens,
+                        "verify_rounds": getattr(self, "verify_rounds", 0)
                     })
                 if eos_reason == "stop_string":
                     self.held_text = rem_held_text
@@ -1226,6 +1227,7 @@ class Job:
             "rq_new_tokens": self.rq_new_tokens + self.new_tokens,
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "rejected_draft_tokens": self.rejected_draft_tokens,
+            "verify_rounds": getattr(self, "verify_rounds", 0),
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
             "cached": self.rq_cached if self.rq_cached is not None else (
                 self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),
