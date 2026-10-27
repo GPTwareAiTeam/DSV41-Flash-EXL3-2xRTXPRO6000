@@ -2092,20 +2092,37 @@ class Generator:
                 "block_table": block_index,
                 "cache_seqlens": p_cache_seqlens,
             }
+            tap_states = p_export_states
+            drafting_rows = [(job, a, b) for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]) if a != b]
+            drafting = [job for job, _, _ in drafting_rows]
             lengths = accepted_lengths
             if self.draft_recurrent:
                 # A row whose pair a checkpoint rewind replaced gets its window from the replay
                 # prefill instead; its length 0 skips the write (and the rollback)
-                drafting = [job for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]) if a != b]
                 update_params["recurrent_states"] = [job.recurrent_state.draft for job in drafting]
                 lengths = [0 if id(job) in rewound_jobs or job.recurrent_state is None else n
                            for job, n in zip(drafting, accepted_lengths)]
-            self.draft_model.update_kv_from_target(
-                target_hidden = p_export_states,
-                cache = self.draft_cache,
-                lengths = lengths,
-                params = update_params,
-            )
+            elif any(id(job) in rewound_jobs for job in drafting):
+                # A banned-string rewind replaced a rewound job's cache with the abandoned-window state, so its taps
+                # this round are abandoned-window rows: length 0. The paged writers take no per-row length, so those
+                # rows are dropped from the batch; the other jobs keep their rows and accepted lengths.
+                keep_jobs = [i for i, job in enumerate(drafting) if id(job) not in rewound_jobs]
+                lengths = [accepted_lengths[i] for i in keep_jobs]
+                if keep_jobs:
+                    keep_rows = [r for i in keep_jobs for r in range(drafting_rows[i][1], drafting_rows[i][2])]
+                    keep = torch.tensor(keep_rows, dtype = torch.long)
+                    tap_states = [t.index_select(0, keep.to(t.device)) for t in p_export_states]
+                    update_params["block_table"] = block_index.index_select(0, keep.to(block_index.device))
+                    update_params["cache_seqlens"] = p_cache_seqlens.index_select(0, keep.to(p_cache_seqlens.device))
+                else:
+                    tap_states = None
+            if tap_states is not None:
+                self.draft_model.update_kv_from_target(
+                    target_hidden = tap_states,
+                    cache = self.draft_cache,
+                    lengths = lengths,
+                    params = update_params,
+                )
 
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
