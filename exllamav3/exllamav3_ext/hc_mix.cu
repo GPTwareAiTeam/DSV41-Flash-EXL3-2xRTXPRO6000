@@ -116,6 +116,99 @@ void hc_mix_partials_kernel
     }
 }
 
+// Row-blocked partials for prefill row counts (one chunk per row there, so the per-row kernel re-reads all of
+// fn for every row). Each block covers RB rows and loads each fn tile once for all of them. Per-row thread
+// mapping and reduction order match hc_mix_partials_kernel, so the partials are bit-identical.
+constexpr int HC_ROWS_RB = 4;
+template <int H, int M_, typename FN_T, int RB>
+__global__ __launch_bounds__(NUM_THREADS_A)
+void hc_mix_partials_rows_kernel
+(
+    const float* __restrict__ streams,   // (R, H * D)
+    const FN_T* __restrict__ fn,         // (M, H * D)
+    float* __restrict__ partials,        // (R, chunksA, M + 1)
+    const int R,
+    const int row_len,
+    const int chunk_cols
+)
+{
+    constexpr int M = M_;
+    const int r0 = blockIdx.y * RB;
+    const int c0 = blockIdx.x * chunk_cols;
+    const int c1 = min(c0 + chunk_cols, row_len);
+    const int row_len4 = row_len / 4;
+
+    float acc[RB][M + 1];
+    #pragma unroll
+    for (int b = 0; b < RB; ++b)
+        #pragma unroll
+        for (int k = 0; k <= M; ++k) acc[b][k] = 0.0f;
+
+    for (int c = c0 / 4 + threadIdx.x; c < c1 / 4; c += NUM_THREADS_A)
+    {
+        float4 s[RB];
+        #pragma unroll
+        for (int b = 0; b < RB; ++b)
+            s[b] = (r0 + b < R) ? ((const float4*) (streams + (size_t) (r0 + b) * row_len))[c] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int b = 0; b < RB; ++b)
+        {
+            acc[b][M] = fmaf(s[b].x, s[b].x, acc[b][M]);
+            acc[b][M] = fmaf(s[b].y, s[b].y, acc[b][M]);
+            acc[b][M] = fmaf(s[b].z, s[b].z, acc[b][M]);
+            acc[b][M] = fmaf(s[b].w, s[b].w, acc[b][M]);
+        }
+        #pragma unroll
+        for (int j = 0; j < M; ++j)
+        {
+            float4 w;
+            if constexpr (std::is_same_v<FN_T, half>)
+            {
+                int2 pk = ((const int2*) fn)[(size_t) j * row_len4 + c];
+                float2 lo = __half22float2(*(const half2*) &pk.x);
+                float2 hi = __half22float2(*(const half2*) &pk.y);
+                w = make_float4(lo.x, lo.y, hi.x, hi.y);
+            }
+            else
+                w = ((const float4*) fn)[(size_t) j * row_len4 + c];
+            #pragma unroll
+            for (int b = 0; b < RB; ++b)
+            {
+                float d = fmaf(s[b].x, w.x, fmaf(s[b].y, w.y, fmaf(s[b].z, w.z, s[b].w * w.w)));
+                acc[b][j] += d;
+            }
+        }
+    }
+
+    __shared__ float red[NUM_THREADS_A / 32][RB][M + 1];
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    #pragma unroll
+    for (int b = 0; b < RB; ++b)
+        #pragma unroll
+        for (int k = 0; k <= M; ++k)
+        {
+            float v = hc_warp_sum_lane0(acc[b][k]);
+            if (lane == 0) red[warp][b][k] = v;
+        }
+    __syncthreads();
+
+    if (warp == 0)
+    {
+        for (int idx = lane; idx < RB * (M + 1); idx += 32)
+        {
+            const int b = idx / (M + 1);
+            const int k = idx % (M + 1);
+            if (r0 + b >= R) continue;
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < NUM_THREADS_A / 32; ++w)
+                v += red[w][b][k];
+            partials[((size_t) (r0 + b) * gridDim.x + blockIdx.x) * (M + 1) + k] = v;
+        }
+    }
+}
+
 // NORM (decode rows): one block per row covers all D columns and runs the following RMSNorm on the collapsed
 // row (hc_fuse.cuh)
 // CARRY: the row's own pre weights go to pre_out, and the collapse uses pre_in when it is given
@@ -1003,7 +1096,19 @@ static void hc_mix_launch
     }
     if (!head)
     {
-        if (fn_half)
+        // Prefill row counts: row-blocked partials (same per-row math; each fn tile read once per RB rows)
+        static const bool rows_blocked_on = [](){ const char* e = getenv("EXL3_HC_ROWS_BLOCKED"); return !(e && *e == '0'); }();
+        if (rows_blocked_on && n_chunks_a == 1 && R >= 512)
+        {
+            dim3 grid_r(n_chunks_a, (R + HC_ROWS_RB - 1) / HC_ROWS_RB);
+            if (fn_half)
+                hc_mix_partials_rows_kernel<4, 24, half, HC_ROWS_RB><<<grid_r, NUM_THREADS_A, 0, stream>>>
+                    (streams.data_ptr<float>(), (const half*) fn.data_ptr(), partials.data_ptr<float>(), R, row_len, chunk_cols);
+            else
+                hc_mix_partials_rows_kernel<4, 24, float, HC_ROWS_RB><<<grid_r, NUM_THREADS_A, 0, stream>>>
+                    (streams.data_ptr<float>(), (const float*) fn.data_ptr(), partials.data_ptr<float>(), R, row_len, chunk_cols);
+        }
+        else if (fn_half)
             hc_mix_partials_kernel<4, 24, half><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(half));
         else
             hc_mix_partials_kernel<4, 24, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(ARGS_A(float));
