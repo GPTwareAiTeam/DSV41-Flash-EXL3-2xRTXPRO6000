@@ -139,6 +139,30 @@ static void moe_coop_smem_optin(void* kernel, int smem)
     done[kernel] = smem;
 }
 
+// Kernel launch, optionally with programmatic stream serialization (PDL, CC >= 9.0, EXL3_MOE_PDL builds): the
+// grid may start while its predecessor drains; the kernels order every dependent access behind griddepcontrol.wait
+static void moe_coop_launch_kernel(void* kernel, int grid, int smem, void** args, cudaStream_t stream, bool pdl)
+{
+#if EXL3_MOE_PDL
+    if (pdl)
+    {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(grid);
+        cfg.blockDim = dim3(MOE_COOP_THREADS);
+        cfg.dynamicSmemBytes = smem;
+        cfg.stream = stream;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        cuda_check(cudaLaunchKernelExC(&cfg, kernel, args));
+        return;
+    }
+#endif
+    cuda_check(cudaLaunchKernel(kernel, dim3(grid), dim3(MOE_COOP_THREADS), args, smem, stream));
+}
+
 void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
 {
     MoeCoopParams p = p_in;
@@ -164,9 +188,15 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     const bool forced = moe_coop_wide_mode() >= 0;
     const bool wide_a = wide_env_a >= 0 ? wide_env_a != 0
         : forced ? moe_coop_pick_wide(p.Hi / 16, slots, device) : false;
+    // EXL3_MOE_WIDE_B_BSZ1 (default 0; A/B test with EXL3_MOE_COOP_WIDE_B=1): wide down tile at bsz 1. moe_coop_pick_wide
+    // returns false for I / 16 = 72 k-slices on CC >= Blackwell, which put B on the narrow tile at bsz 1 (1120 blocks of
+    // 9 k-slices per warp at the DSV4 TP=2 shape) despite the comment above
+#ifndef EXL3_MOE_WIDE_B_BSZ1
+#define EXL3_MOE_WIDE_B_BSZ1 0
+#endif
     const bool wide_b = wide_env_b >= 0 ? wide_env_b != 0
         : forced ? moe_coop_pick_wide(p.I / 16, slots, device)
-                 : (p.bsz > 1 || moe_coop_pick_wide(p.I / 16, slots, device));
+                 : (p.bsz > 1 || EXL3_MOE_WIDE_B_BSZ1 || moe_coop_pick_wide(p.I / 16, slots, device));
     // Mixed-K (any per-expert rate table set): the *_mixed kernels dispatch each block's tile on its expert's
     // rate, so the uniform K / half flags are not used for the projections that carry a table
     const bool mixed = p.k2_g || p.k2_u || p.k2_d;
@@ -213,8 +243,12 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
         cuda_check(cudaPeekAtLastError());
         return;
     }
-    cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, ka.smem, stream));
-    cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
+    // B may overlap A's drain (PDL): it reads only routing and weights before its griddepcontrol.wait. A is launched
+    // normally (its routing reads must follow the router). EXL3_MOE_COOP_PDL=0 disables at run time
+    static const bool pdl_env = !std::getenv("EXL3_MOE_COOP_PDL") || atoi(std::getenv("EXL3_MOE_COOP_PDL")) != 0;
+    const bool pdl_b = pdl_env && DevCtx::instance().get_cc(device) >= CC_HOPPER;
+    moe_coop_launch_kernel(ka.kernel, grid_a, ka.smem, args, stream, false);
+    moe_coop_launch_kernel(kb.kernel, grid_b, kb.smem, args, stream, pdl_b);
     cuda_check(cudaPeekAtLastError());
 }
 

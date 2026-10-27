@@ -93,22 +93,31 @@ void mixed_a_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
     }
     else
     {
-        // bsz 1: every run is a single slot; rotate its input into shared memory here. A zero
+        // bsz 1: every run is a single slot; its input is rotated into shared memory by the prologue below. A zero
         // row stride makes the tile read it whatever the slot index (which still selects the C row)
-        const SlotInfo si = slot_info(p, sh_rows[0]);
-        for (int c = warp; c < p.Hi / 128; c += WK)
-            rotate_chunk(p, si.row, suh, c, sh_A, lane);
-        __syncthreads();
         A2 = (const half2*) sh_A;
         a_stride2 = 0;
     }
+    // Block prologue, run by gemv_tile once the weight prefetch ring is in flight
+    auto prologue = [&] ()
+    {
+        pdl_wait();
+        if (!p.a_global)
+        {
+            const SlotInfo si = slot_info(p, sh_rows[0]);
+            for (int c = warp; c < p.Hi / 128; c += WK)
+                rotate_chunk(p, si.row, suh, c, sh_A, lane);
+            __syncthreads();
+        }
+    };
 
     {
         const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[local];
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        MIXED_GEMV_A((is_gate ? p.k2_g : p.k2_u)[local], B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        MIXED_GEMV_A((is_gate ? p.k2_g : p.k2_u)[local], B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage, prologue);
+        pdl_trigger();
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -191,7 +200,11 @@ void mixed_b_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
     const int group = rem % ng;
     int nrows = 0;
     if (!read_run(p, run_idx, sh_rows, nrows, sh_res)) return;
-    if (p.fused) wait_a_ready(p, sh_rows, nrows);
+    auto prologue = [&] ()
+    {
+        pdl_wait();
+        if (p.fused) wait_a_ready(p, sh_rows, nrows);
+    };
     const int local = slot_info(p, sh_rows[0]).local;
     const int kslices_all = p.I / 16;
     const int k_begin = kslices_all * ks / p.ksplit_b;
@@ -201,7 +214,7 @@ void mixed_b_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
         MIXED_GEMV_B(p.k2_d[local], B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage, prologue);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -314,9 +327,17 @@ __global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
 {
     extern __shared__ uint32_t smem_dyn[];
+#if EXL3_MOE_PDL
+    mixed_a_body<cb, WIDE>(p, blockIdx.x, smem_dyn);
+    // PDL: this grid may start before its predecessor finishes; touch the shared counters only after it
+    pdl_wait();
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
+        p.ctr_b[i] = 0;
+#else
     for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
         p.ctr_b[i] = 0;
     mixed_a_body<cb, WIDE>(p, blockIdx.x, smem_dyn);
+#endif
 }
 
 template <int cb, bool WIDE>
@@ -324,9 +345,17 @@ __global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_b_mixed_kernel(const MoeCoopParams p)
 {
     extern __shared__ uint32_t smem_dyn[];
+#if EXL3_MOE_PDL
+    mixed_b_body<cb, WIDE>(p, blockIdx.x, smem_dyn);
+    // PDL: this grid may start before its predecessor finishes; touch the shared counters only after it
+    pdl_wait();
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
+        p.ctr_a[i] = 0;
+#else
     for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
         p.ctr_a[i] = 0;
     mixed_b_body<cb, WIDE>(p, blockIdx.x, smem_dyn);
+#endif
 }
 
 template <bool WIDE_A, bool WIDE_B>
