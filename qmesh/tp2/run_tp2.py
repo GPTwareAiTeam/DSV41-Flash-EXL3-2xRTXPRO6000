@@ -44,7 +44,7 @@ MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
-COMM = os.environ.get("COMM", "nccl")  # nccl | p2p (P2PComm one-shot collectives; needs P2P_RDV = fresh dir)
+COMM = os.environ.get("COMM", "nccl")  # nccl | p2p | hybrid (hybrid: P2P <64KB, NCCL >=64KB)
 P2P_STATS_OUT = os.environ.get("P2P_STATS_OUT")  # p2p only: prefix; enables device spin/timing stats, dumped at run end to <prefix>.rank<r>.json
 PROFILE = os.environ.get("PROFILE", "0") == "1"
 TOKENS_OUT = os.environ.get("TOKENS_OUT")
@@ -153,6 +153,39 @@ class TPBackendP2P:
     def end_cpu_reduce_jobs(self):
         pass
 
+HYBRID_NCCL_MIN_BYTES = int(os.environ.get("HYBRID_NCCL_MIN_BYTES", 64 * 1024))
+
+
+class TPBackendHybrid:
+    """P2PComm for small payloads (decode), NCCL for large ones (prefill rows). The choice depends only on
+    numel and dtype, so both ranks issue the same collective sequence."""
+
+    def __init__(self, nccl: "TPBackendNCCL", p2p: "TPBackendP2P"):
+        self.nccl = nccl
+        self.p2p = p2p
+
+    def fwd_barrier(self):
+        self.p2p.fwd_barrier()
+
+    def _pick(self, tensor: torch.Tensor):
+        return self.nccl if tensor.numel() * tensor.element_size() >= HYBRID_NCCL_MIN_BYTES else self.p2p
+
+    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        self._pick(tensor).all_reduce(tensor, contribution)
+
+    def broadcast(self, tensor: torch.Tensor, src_device: int):
+        self.nccl.broadcast(tensor, src_device)
+
+    def all_gather(self, t: torch.Tensor, world: int) -> torch.Tensor:
+        return self.p2p.all_gather(t, world)
+
+    def run_cpu_reduce_jobs(self):
+        pass
+
+    def end_cpu_reduce_jobs(self):
+        pass
+
+
 def set_tp_reduce(model: Model, backend: TPBackendNCCL) -> int:
     """Enable the attention/MoE partial-sum collectives on every TP-local block, and hand the backend to
     every forward through params (Generator builds its params internally, so the entrypoints inject it)."""
@@ -200,7 +233,7 @@ def wrap_vocab_split(model: Model, rank: int, world: int, backend: TPBackendNCCL
 
     def head_fwd(x, params, out_dtype = None):
         y = orig_head(x, params, out_dtype)
-        if isinstance(backend, TPBackendP2P):
+        if isinstance(backend, (TPBackendP2P, TPBackendHybrid)):
             return backend.all_gather(y.contiguous(), world)
         parts = [torch.empty_like(y) for _ in range(world)]
         dist.all_gather(parts, y.contiguous())
@@ -226,11 +259,13 @@ def main():
     cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY)
     model.load(device = device, max_chunk_size = MAX_CHUNK, max_output_size = MAX_NEW,
                max_batch_size = 1, progressbar = False)
-    if COMM == "p2p":
+    if COMM in ("p2p", "hybrid"):
         from exllamav3.tp2.p2p import P2PComm
         rdv = os.environ["P2P_RDV"]
-        comm = P2PComm(RANK, world = WORLD, rendezvous_path = rdv, device = RANK, stats = P2P_STATS_OUT is not None)
-        backend = TPBackendP2P(comm)
+        p2p = TPBackendP2P(P2PComm(RANK, world = WORLD, rendezvous_path = rdv, device = RANK,
+                                   stats = P2P_STATS_OUT is not None))
+        backend = p2p if COMM == "p2p" else TPBackendHybrid(TPBackendNCCL(), p2p)
+        comm = p2p.comm if hasattr(p2p, "comm") else None
     else:
         comm = None
         backend = TPBackendNCCL()
@@ -261,7 +296,15 @@ def main():
         model.forward = _forward_export
         log(f"FORCE_EXPORT layers={sorted(_export_layers)}")
     dist.barrier()
-
+    # Warm pass: one short job so graph capture and allocator warmup stay out of the timed prompts
+    _warm_text = encode_messages([{"role": "user", "content": PROMPTS[PROMPT_IDS[0]]}], thinking_mode = "chat")
+    _warm_ids = tokenizer.encode(_warm_text, add_bos = False, encode_special_tokens = True)
+    _warm = Job(input_ids = _warm_ids, max_new_tokens = 8, min_new_tokens = 8,
+                sampler = GreedySampler(), stop_conditions = [])
+    generator.enqueue(_warm)
+    while generator.num_remaining_jobs():
+        for _ in generator.iterate():
+            pass
     out = {}
     WARM = os.environ.get("WARM", "0") == "1"
     run_ids = (PROMPT_IDS + PROMPT_IDS) if WARM else PROMPT_IDS
@@ -408,7 +451,7 @@ def main():
         if RANK == 0:
             log(f"PROFILE decode_steps={steps} wall_ms_per_step={wall_ms:.2f}")
             prof.export_chrome_trace(os.environ.get("PROFILE_TRACE", "/artifacts/tp2logs/profile_trace.json"))
-            print(prof.key_averages().table(sort_by = "cuda_time_total", row_limit = 40), flush = True)
+            print(prof.key_averages().table(sort_by = "self_cpu_time_total", row_limit = 45), flush = True)
 
     if P2P_STATS_OUT and COMM == "p2p":
         # Rank-tagged dump after all collectives drained (stats() syncs the device). Written on every rank.
