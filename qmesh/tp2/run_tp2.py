@@ -45,7 +45,9 @@ NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 MAX_HISTORY = max(5, NUM_DRAFT)
 MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
-CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
+CACHE_TOKENS_PER_SEQ = int(os.environ.get("CACHE_TOKENS_PER_SEQ", "4096"))  # KV pool tokens per concurrent stream
+BATCH = int(os.environ.get("BATCH", "1"))  # concurrent streams: Cache slots, Model.load + Generator max_batch_size
+CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", str(BATCH * CACHE_TOKENS_PER_SEQ)))
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
 COMM = os.environ.get("COMM", "nccl")  # nccl | p2p | hybrid (hybrid: P2P <64KB, NCCL >=64KB)
 P2P_STATS_OUT = os.environ.get("P2P_STATS_OUT")  # p2p only: prefix; enables device spin/timing stats, dumped at run end to <prefix>.rank<r>.json
@@ -268,9 +270,9 @@ def main():
     assert config.tp_size == WORLD and config.tp_rank == RANK, \
         f"checkpoint tp_size/tp_rank {config.tp_size}/{config.tp_rank} != launch {WORLD}/{RANK}"
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY)
+    cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY, max_batch_size = BATCH)
     model.load(device = device, max_chunk_size = MAX_CHUNK, max_output_size = MAX_NEW,
-               max_batch_size = 1, progressbar = False)
+               max_batch_size = BATCH, progressbar = False)
     if COMM in ("p2p", "hybrid"):
         from exllamav3.tp2.p2p import P2PComm
         rdv = os.environ["P2P_RDV"]
@@ -297,7 +299,7 @@ def main():
         log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
     # DSPARK_DYNAMIC=1: the generator's confidence calibrator sizes each round's window against DSPARK_TARGET_ACC
     # (drafter must export draft_conf; run with EXL3_DSPARK_CONF=0 so the static gate does not also cut)
-    generator = Generator(model, cache, tokenizer, max_batch_size = 1, max_chunk_size = MAX_CHUNK,
+    generator = Generator(model, cache, tokenizer, max_batch_size = BATCH, max_chunk_size = MAX_CHUNK,
                           draft_model = draft_model, draft_cache = draft_cache,
                           num_draft_tokens = NUM_DRAFT if DSPARK else None,
                           dynamic_draft_tokens = DSPARK and DSPARK_DYNAMIC,
@@ -325,6 +327,49 @@ def main():
     out = {}
     WARM = os.environ.get("WARM", "0") == "1"
     run_ids = (PROMPT_IDS + PROMPT_IDS) if WARM else PROMPT_IDS
+    if BATCH > 1:
+        # Concurrent streams: one job per slot, prompts cycled from PROMPT_IDS. All jobs are enqueued before the
+        # first iterate so the generator admits them together. Results are keyed "<prompt idx>.<slot>".
+        jobs, streams = [], []
+        for slot in range(BATCH):
+            idx = PROMPT_IDS[slot % len(PROMPT_IDS)]
+            text_in = encode_messages([{"role": "user", "content": PROMPTS[idx]}], thinking_mode = "chat")
+            ids = tokenizer.encode(text_in, add_bos = False, encode_special_tokens = True)
+            job = Job(input_ids = ids, max_new_tokens = MAX_NEW,
+                      min_new_tokens = MAX_NEW if IGNORE_EOS else 0, sampler = GreedySampler(),
+                      stop_conditions = [] if IGNORE_EOS else [tokenizer.eos_token_id])
+            jobs.append(job)
+            streams.append({"key": f"{idx}.{slot}", "idx": idx, "serial": None, "tokens": [], "marks": [],
+                            "eos": None, "prompt_tokens": ids.shape[-1]})
+            generator.enqueue(job)
+        by_serial = {j.serial_number: s for j, s in zip(jobs, streams)}
+        t1 = time.time()
+        while generator.num_remaining_jobs():
+            for result in generator.iterate():
+                if "error" in result:
+                    raise result["error"]
+                s = by_serial.get(result.get("serial"))
+                if s is None:
+                    continue
+                if "token_ids" in result:
+                    s["tokens"] += result["token_ids"][0].tolist()
+                    s["marks"].append(time.time() - t1)
+                if result.get("eos"):
+                    s["eos"] = result.get("eos_reason")
+        wall = time.time() - t1
+        agg = 0
+        for s in streams:
+            n = len(s["tokens"])
+            agg += n
+            first = s["marks"][0] if s["marks"] else float("nan")
+            decode = (s["marks"][-1] - first) / max(n - 1, 1) if n > 1 else float("nan")
+            out[s["key"]] = s["tokens"]
+            log(f"STREAM {s['key']} prompt_tokens={s['prompt_tokens']} new_tokens={n} first_token_ms={first * 1e3:.1f} "
+                f"decode_ms_per_tok={decode * 1e3:.2f} eos={s['eos']}")
+            log(f"TOKENS {s['key']} {s['tokens']}")
+        log(f"BATCH {BATCH} wall={wall:.3f}s aggregate_tok={agg} aggregate_tok_s={agg / wall:.2f} "
+            f"per_stream_tok_s={agg / wall / BATCH:.2f}")
+        run_ids = []
     for pass_i, idx in enumerate(run_ids):
         timed = not WARM or pass_i >= len(PROMPT_IDS)
         prompt = PROMPTS[idx]
