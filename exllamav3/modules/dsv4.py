@@ -2002,8 +2002,8 @@ class DSV4Attention(Module):
             qc = kl.qc()
             bt = bt_row
         else:
-            pool_c = x.new_empty((1, self.head_dim - self.rope_head_dim), dtype = torch.half)
-            pool_r = x.new_empty((1, self.rope_head_dim), dtype = torch.half)
+            pool_c = g_tensor_cache.get(device, (1, self.head_dim - self.rope_head_dim), torch.half, "dsv4_pool_c0")
+            pool_r = g_tensor_cache.get(device, (1, self.rope_head_dim), torch.half, "dsv4_pool_r0")
             bt = torch.zeros((1, 1), dtype = torch.int32, device = device)
 
         # eq. 26 de-rotation and the group-major store for the grouped o_proj are fused into
@@ -2017,7 +2017,7 @@ class DSV4Attention(Module):
             compress_rate = dense_m, scale = self.sm_scale,
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
             page_size = epp, qc = qc,
-            out = torch.empty((self.o_groups, seq, hpg * self.head_dim), dtype = torch.half, device = device),
+            out = g_tensor_cache.get(device, (self.o_groups, seq, hpg * self.head_dim), torch.half, "dsv4_attn_out"),
             # Image chunk (vision): bidirectional over the chunk, own window into history
             nc_chunk = bool(params.get("nc_chunk", False)),
         )
