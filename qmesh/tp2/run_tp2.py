@@ -51,10 +51,13 @@ NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 # previous fixed value, so K<=5 runs are unchanged.
 MAX_HISTORY = max(5, NUM_DRAFT)
 MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
-MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
-CACHE_TOKENS_PER_SEQ = int(os.environ.get("CACHE_TOKENS_PER_SEQ", "4096"))  # KV pool tokens per concurrent stream
+MAX_CHUNK_RAW = os.environ.get("MAX_CHUNK", "auto")  # "auto" -> largest chunk that fits; else a fixed row count
 BATCH = int(os.environ.get("BATCH", "1"))  # concurrent streams: Cache slots, Model.load + Generator max_batch_size
-CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", str(BATCH * CACHE_TOKENS_PER_SEQ)))
+CACHE_TOKENS_PER_SEQ = int(os.environ.get("CACHE_TOKENS_PER_SEQ", "4096"))  # KV pool tokens per concurrent stream
+# CTX_TOKENS: total KV budget in tokens across the batch (0 = derive from CACHE_TOKENS_PER_SEQ). Set this to the context
+# you want to support, e.g. 1048576 for 1M; the chunk auto-sizer then gives whatever VRAM is left to the prefill chunk.
+CTX_TOKENS = int(os.environ.get("CTX_TOKENS", "0"))
+CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", str(CTX_TOKENS if CTX_TOKENS else BATCH * CACHE_TOKENS_PER_SEQ)))
 KV_BITS = int(os.environ.get("KV_BITS", "16"))
 if KV_BITS not in (8, 16):
     raise ValueError("KV_BITS must be 8 or 16")
@@ -70,6 +73,51 @@ PROMPT_IDS = [int(i) for i in os.environ.get("PROMPT_IDS", "0,1,2").split(",")]
 RANK = int(os.environ["RANK"])
 WORLD = int(os.environ["WORLD_SIZE"])
 TAG = f"TP2R{RANK}"
+# --- prefill chunk auto-sizing -------------------------------------------------------------------------------------
+# The prefill chunk and the KV budget compete for VRAM, so rather than fixing the chunk we give the prefill chunk
+# whatever VRAM the weights and the requested context leave. Driven by MEASURED device peaks, not a synthetic model:
+# the disk size of a shard (89.81 GiB) is NOT the resident footprint (peak was 87.6 GiB at chunk 2048), so a
+# weights-plus-overhead calculation would be wrong in the unsafe direction.
+# CHUNK_PEAK_TABLE: "rows=peak_MiB" pairs sampled from `nvidia-smi` during real prefill runs, with the KV budget at
+# CHUNK_PEAK_REF_TOKENS and KV_BYTES_PER_TOKEN. Sizes outside the table are linearly extrapolated between neighbours
+# (and beyond the largest entry by the last slope), and VRAM_RESERVE_MIB is kept free for graphs, workspaces and
+# allocator slack.
+CHUNK_CANDIDATES = [int(x) for x in os.environ.get("PREFILL_CHUNK_STEPS", "16384,8192,4096,2048").split(",") if x.strip()]
+CHUNK_MIN = int(os.environ.get("PREFILL_CHUNK_MIN", "512"))
+CHUNK_PEAK_TABLE_RAW = os.environ.get("CHUNK_PEAK_TABLE", "2048=87600,4096=90600,8192=94000,16384=97100")
+CHUNK_PEAK_REF_TOKENS = int(os.environ.get("CHUNK_PEAK_REF_TOKENS", "33536"))
+VRAM_RESERVE_MIB = float(os.environ.get("VRAM_RESERVE_MIB", "2048"))  # graphs, workspaces, allocator slack
+KV_BYTES_PER_TOKEN = float(os.environ.get("KV_BYTES_PER_TOKEN", "2150" if KV_BITS == 8 else "3200"))  # per rank, pool only
+CHUNK_PEAK_TABLE = sorted((int(rows), float(mib)) for rows, mib in
+                          (pair.split("=") for pair in CHUNK_PEAK_TABLE_RAW.split(",") if pair.strip()))
+
+
+def _peak_mib(rows):
+    """Interpolated/extrapolated device peak (MiB) for a given chunk row count."""
+    pts = CHUNK_PEAK_TABLE
+    if rows <= pts[0][0]:
+        (r0, m0), (r1, m1) = pts[0], pts[1] if len(pts) > 1 else (pts[0][0] + 1, pts[0][1])
+        return m0 - (m0 - m1) * (r0 - rows) / max(1, (r1 - r0))
+    for (r0, m0), (r1, m1) in zip(pts, pts[1:]):
+        if rows <= r1:
+            return m0 + (m1 - m0) * (rows - r0) / (r1 - r0)
+    (r0, m0), (r1, m1) = pts[-2], pts[-1]
+    return m1 + (m1 - m0) * (rows - r1) / (r1 - r0)
+
+
+def resolve_max_chunk(device):
+    """MAX_CHUNK=auto -> largest candidate chunk whose measured peak, re-based to our KV budget, fits with reserve."""
+    if MAX_CHUNK_RAW != "auto":
+        return int(MAX_CHUNK_RAW), None
+    _free, total = torch.cuda.mem_get_info(device)
+    total_mib = total / (1024 * 1024)
+    kv_mib = CACHE_TOKENS * KV_BYTES_PER_TOKEN / (1024 * 1024)
+    kv_ref_mib = CHUNK_PEAK_REF_TOKENS * KV_BYTES_PER_TOKEN / (1024 * 1024)
+    limit = total_mib - VRAM_RESERVE_MIB - (kv_mib - kv_ref_mib)
+    fits = [c for c in sorted(CHUNK_CANDIDATES, reverse = True) if _peak_mib(c) <= limit]
+    chunk = fits[0] if fits else CHUNK_MIN
+    return chunk, dict(total_mib = total_mib, kv_mib = kv_mib, kv_ref_mib = kv_ref_mib, limit_mib = limit,
+                       peak_mib = _peak_mib(chunk), free_mib = _free / (1024 * 1024))
 
 PROMPTS = [
     "The capital of France is",
@@ -285,8 +333,17 @@ def main():
     assert config.tp_size == WORLD and config.tp_rank == RANK, \
         f"checkpoint tp_size/tp_rank {config.tp_size}/{config.tp_rank} != launch {WORLD}/{RANK}"
     model = Model.from_config(config)
+    max_chunk, chunk_info = resolve_max_chunk(device)
+    if chunk_info is None:
+        log(f"PREFILL_CHUNK fixed at {max_chunk} rows (MAX_CHUNK={MAX_CHUNK_RAW}), CTX_TOKENS={CACHE_TOKENS}")
+    else:
+        log(f"PREFILL_CHUNK auto -> {max_chunk} rows | total={chunk_info['total_mib']:.0f} MiB "
+            f"kv={chunk_info['kv_mib']:.0f} MiB (ref {chunk_info['kv_ref_mib']:.0f}) "
+            f"reserve={VRAM_RESERVE_MIB:.0f} MiB limit={chunk_info['limit_mib']:.0f} MiB "
+            f"predicted_peak={chunk_info['peak_mib']:.0f} MiB free_now={chunk_info['free_mib']:.0f} MiB "
+            f"CTX_TOKENS={CACHE_TOKENS}")
     cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY, max_batch_size = BATCH, **KV_CACHE_KWARGS)
-    model.load(device = device, max_chunk_size = MAX_CHUNK, max_output_size = MAX_NEW,
+    model.load(device = device, max_chunk_size = max_chunk, max_output_size = MAX_NEW,
                max_batch_size = BATCH, progressbar = False)
     if COMM in ("p2p", "hybrid"):
         from exllamav3.tp2.p2p import P2PComm
@@ -314,7 +371,7 @@ def main():
         log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
     # DSPARK_DYNAMIC=1: the generator's confidence calibrator sizes each round's window against DSPARK_TARGET_ACC
     # (drafter must export draft_conf; run with EXL3_DSPARK_CONF=0 so the static gate does not also cut)
-    generator = Generator(model, cache, tokenizer, max_batch_size = BATCH, max_chunk_size = MAX_CHUNK,
+    generator = Generator(model, cache, tokenizer, max_batch_size = BATCH, max_chunk_size = max_chunk,
                           draft_model = draft_model, draft_cache = draft_cache,
                           num_draft_tokens = NUM_DRAFT if DSPARK else None,
                           dynamic_draft_tokens = DSPARK and DSPARK_DYNAMIC,
