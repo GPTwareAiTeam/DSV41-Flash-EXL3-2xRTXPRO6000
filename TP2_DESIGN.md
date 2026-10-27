@@ -67,3 +67,13 @@ Containers: image vllm-moet:dsv41-213d5fa, `--gpus device=0,1`, CUDA_HOME=/opt/c
 (PYTHONPATH=/src/exllamav3), artifacts at /artifacts (= /home/treadall/recipe-artifacts/2x-rtx-tp2).
 Each has its own torch extension cache. GPU memory is shared between the three containers: full-model runs only
 in `exl3-tp2`; kernel microbenchmarks keep < 4 GiB per GPU.
+
+## CONVENTION (owner directive, 2026-10-27): no hardcoded values — everything is a dial
+Every tunable MUST be readable from an environment variable with a documented default, and MUST live in a named
+constant near the top of its module — never inline in a function, never repeated as a literal. Applies to: batch size,
+cache/history sizes, chunk sizes, draft length and its bounds, acceptance targets, thresholds, row/tile caps, chunking
+of collectives, retry/iteration counts, timeouts, and every A/B switch. Existing examples to copy:
+`MAX_NEW`, `MAX_CHUNK`, `CACHE_TOKENS`, `MAX_HISTORY`, `NUM_DRAFT`, `DSPARK_DYNAMIC`, `DSPARK_TARGET_ACC`, `COMM`,
+`HYBRID_NCCL_MIN_BYTES`, `EXL3_WHOLE_GRAPH_MAXSEQ`, `EXL3_PW_MERGE`, `EXL3_MOE_COOP_KSPLIT/_WIDE/_WIDE_A/_WIDE_B`,
+`EXL3_MOE_FUSED_ROWS*`, `EXL3_HC_FOLD`, `EXL3_DSV4_B1_BATCH`, `EXL3_MOE_COOP_SINGLE`, `EXL3_DSPARK_TAP_SCALE`.
+New work must add dials, not literals, and must document them in `doc/env_vars.md` (one line: name, default, why).
