@@ -47,3 +47,14 @@ A. **DSpark tap scale fix** (small, testable, potentially +40% throughput via AL
 B. Packed FP4/FP8 KV cache (memory + attention bandwidth; prerequisite for a cheap attention graph).
 C. Prefill: decoder replay for late layers, tiled prefill MoE, fused HC.
 D. Fused/merged decode attention kernels so the attention core becomes 1-2 launches per layer (then capture).
+
+## Findings after implementing the community items (2026-10-27)
+- **DSpark tap saturation: REAL but not the throughput bug here.** Our taps reach ~271k at sequence positions 0/2
+  (fp16 max 65504 → 9 saturated values per tap layer). Scaling by 1/64 removes the saturation completely
+  (`EXL3_DSPARK_TAP_SCALE`, commit 4a02976e, default off) but AL was mixed: 3.09/3.30/2.58 → 2.84/3.49/2.68.
+  Our clamp already prevented the inf/NaN cascade the community hit (they got zero drafts for 42% of steps; we don't).
+- **Acceptance decomposition** (77 verify rounds): first draft 85.7%, then 57.6 / 57.9 / 63.6 / 57.1 % conditional.
+  So the drafter chain beyond the first draft is the limiter. Community chat/prose AL 2.25–2.27 ≈ ours (2.58–2.68);
+  their code AL 4.38 vs our 3.30 — comparable content, so their drafter chain is stronger on code.
+- **Prefill fused HC** (tiled `hc_mix`, 4 rows/block, R>=512): bit-exact (maxabs 0.0), commit cf6946a1:
+  2048 3502.6 → 3542.2 tok/s, 4096 4131.5 → 4218.5 tok/s.
