@@ -7,6 +7,7 @@ These `exllamav3/` changes exist identically in BOTH recipe branches (`recipe/gp
 |---|---|---|
 | Mixed-K fused MoE (per-expert bitrate tables, decode coop + prefill) | `exllamav3_ext/quant/exl3_moe*.cu/.cuh`, `exl3_moe_coop_mixed_*`, `libtorch/blocksparse_mlp*`, `bindings.cpp`, `modules/multilinear.py`, `modules/block_sparse_mlp.py` | A: GX1 cold tier mixes 3.0/2.5/2.0. B: every layer mixes 2.0–3.5 |
 | MoE coop tile (WIDE) selection per stage | `exllamav3_ext/quant/exl3_moe_coop.cu` | kernel perf, both |
+| Persistent mixed-K A→B queue (`EXL3_MOE_COOP_SINGLE=1`, opt-in, default off) | `exllamav3_ext/quant/exl3_moe_coop*.cu/.cuh`, `exl3_moe_coop_mixed_kernel.cuh`, `comp_units/exl3_moe_coop_mixed_inst.cu`, `comp_units/exl3_moe_coop_instances.cuh`, `qmesh/notes/mixedk_gen.py`, `doc/env_vars.md` | decode bsz > 1 perf, pending bsz 1/2/6/8 benchmark |
 | Piecewise decode CUDA graphs (`EXL3_WHOLE_GRAPH=1`) | `util/segment.py`, `modules/transformer.py`, `model/model_ls.py` | both decode paths |
 | `EXL3_HC_FOLD` default on (bit-exact) | `util/backend.py`, `doc/env_vars.md` | both |
 | DSV4.1 x-fan opt-in (`EXL3_DSV41_XFAN=1`), no-head-norm rope split | `modules/dsv4.py`, `doc/env_vars.md` | both |
