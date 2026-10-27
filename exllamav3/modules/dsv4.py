@@ -26,9 +26,10 @@ dsv4_batch_eager = os.environ.get("EXL3_DSV4_BATCH_EAGER", "1") != "0"
 # Capture the batched step as one CUDA graph per (cache layer, B, S) after two warmup
 # runs; EXL3_DSV4_BATCH_GRAPH=0 keeps the eager batched chain
 dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
-# bsz==1 single-token decode through the batched body (device-driven attention core, capturable
-# inside a piecewise segment). Defaults on with EXL3_WHOLE_GRAPH; EXL3_DSV4_B1_BATCH=0 restores eager
-dsv4_b1_batch = os.environ.get("EXL3_DSV4_B1_BATCH", "1" if os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0" else "0") != "0"
+# bsz==1 single-token decode through the batched body (device-driven attention core, capturable in a
+# piecewise segment). OFF by default: measured ~2.3 ms/token SLOWER than the eager core and not
+# token-exact yet, so it stays experimental (EXL3_DSV4_B1_BATCH=1 to test it)
+dsv4_b1_batch = os.environ.get("EXL3_DSV4_B1_BATCH", "0") != "0"
 from ..constants import PAGE_SIZE
 
 # Reference: transformers models/deepseek_v4 (paper §2)
