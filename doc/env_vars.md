@@ -1147,9 +1147,20 @@ auto decode ms per token were 13.09/8.16/13.38, 13.18/5.97/13.64, 13.27/9.32/13.
 14.81/4.56/4.57, 13.27/5.21/5.26 and 13.29/9.50/13.68. Auto switched off on prompts 0, 1, 2 and 5;
 fixed K=5 was faster on all six. This experimental policy does not guarantee a speedup.
 
+In a matched prompt-0 K=2–5 rerun, the DFlash block path made one draft forward per verification round;
+estimated round costs were 19.7–22.1 ms. Earlier claims that K<5 is dominated and prose loses to plain
+are retracted: they used unmatched configurations. The round is MoE-read bound.
+
 ### `DSPARK_COUNT_FORWARDS` (default: `0`)
 
 Count DFlash drafter forward calls per single-stream prompt and report `DRAFT_FORWARDS`.
+
+### `DRAFT_TIMING` (default: `0`)
+
+With `DSPARK=1`, record per-iteration host wall time and CUDA-event stream elapsed times and call counts
+for draft and target forwards; report them after generation. Events include stream idle time, not just kernel
+execution. Captured iterations can include startup and iterations outside the reported SPEC verify-round count.
+Instrumentation adds overhead and is intended for profiling, not throughput measurement.
 
 ### `DSPARK_POLICY_THRESHOLD` (default: `2.55`), `DSPARK_POLICY_EMA_WINDOW` (default: `8`)
 
@@ -1170,3 +1181,9 @@ Comma-separated enabled lexical signal categories for prompt classification.
 ### `DSPARK_POLICY_FENCE_WEIGHT`, `DSPARK_POLICY_BRACE_WEIGHT`, `DSPARK_POLICY_KEYWORD_WEIGHT` (default: `1` each), `DSPARK_POLICY_CODE_MIN_SIGNALS` (default: `2`)
 
 Weights for code indicators and minimum weighted score for the code class.
+
+### `KV_BITS` (default: `16`)
+
+TP=2 runner and prefill benchmark cache precision. `16` uses the existing fp16 DSA pool;
+`8` packs the non-RoPE latent in 8-bit groups with fp16 scales. RoPE and indexer planes
+remain fp16. The 8-bit setting is experimental until performance and quality gates pass.
