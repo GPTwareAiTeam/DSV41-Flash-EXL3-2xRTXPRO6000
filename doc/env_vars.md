@@ -574,6 +574,14 @@ Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `
 disjoint k ranges whose partial sums the last-arriving block adds. Measured as neutral to harmful
 on every GPU here, so the default is no split. Testing knob only.
 
+### `EXL3_MOE_COOP_SINGLE` (default: `0`)
+
+Mixed-K decode MoE only (per-expert bitrate tables, mul1): `1` runs the gate/up (A) and down (B)
+stages as one persistent launch that drains a queue of A items followed by B items. Each A chunk
+publishes a ready flag; B waits on the flags of its rows before reading the activations. The
+rotation launch stays separate and runs first when `bsz > 1`. Uniform-K calls keep the two
+launches. Opt-in until benchmarked against the default two-launch path at bsz 1/2/6/8.
+
 ### `EXL3_MOE_COOP_WIDE` (default: unset)
 
 Tile geometry of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`): `0` forces
