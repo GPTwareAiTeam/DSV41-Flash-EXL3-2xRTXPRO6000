@@ -59,6 +59,13 @@ struct MoeCoopParams
     int* ctr_b;                 // (MAX_BSZN, Ho / 128) completion counters of the down stage
     int ctr_a_len;
     int ctr_b_len;
+    int* ready_a;               // (slots_max, I / 128) fused launch: 1 once the chunk's act_out is stored
+    int* queue_head;            // fused launch: next work item (atomic), reset by the last CTA to exit
+    int* exit_ctr;              // fused launch: CTAs that finished, the last one resets the scratch
+    int nA;                     // fused launch: gate/up items (queue [0, nA)), then down items [nA, nA + nB)
+    int nB;
+    int resident;               // fused launch: persistent grid size (CTAs resident across the device)
+    int fused;                  // 1: the stage bodies publish ready_a / wait on it (fused launch only)
     int ksplit_a;               // split-k blocks per chunk per stage (launcher; partial rows at slot + q * slots)
     int ksplit_b;
     int dbg;                    // diagnostics (EXL3_MOE_COOP_DBG): 1 skip A epilogue, 2 skip B reduction
@@ -159,9 +166,10 @@ void exl3_moe_coop
     const c10::optional<at::Tensor>& k2_d
 );
 
-// Length of the int32 scratch for a module: completion counters + run table (slots_max =
-// MAX_BSZN * top_k)
+// Length of the int32 scratch for a module: completion counters, run table, and the fused-launch
+// ready flags, queue head and exit counter (slots_max = MAX_BSZN * top_k)
 inline int64_t exl3_moe_coop_ctr_len(int64_t slots_max, int64_t bsz_max, int64_t I, int64_t Ho)
 {
-    return slots_max * (I / 128) + bsz_max * (Ho / 128) + 2 + (slots_max + 1) + slots_max;
+    return slots_max * (I / 128) + bsz_max * (Ho / 128) + 2 + (slots_max + 1) + slots_max
+        + slots_max * (I / 128) + 2;
 }
