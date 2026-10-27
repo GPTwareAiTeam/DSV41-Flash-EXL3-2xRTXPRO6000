@@ -270,6 +270,13 @@ class DSV4Compressor:
         if use_bc:
             self.bc.run(x[0], buf_kv, buf_gate, ovl, dest_a, dest_b, position, position_tensor, None,
                         pool_bt, pool_epp, stage_rel)
+            if _dsv4_dump_dir and bsz == 1:
+                # Diff probe: the projection BC just computed, recomputed with the Linear path
+                _kv_ref = self.wkv.forward(x, params)[0]
+                _g_ref = self.wgate.forward(x, params)[0] if self.wgate is not None else _kv_ref
+                _pos_i = int(position) if not torch.is_tensor(position) else int(position.view(-1)[0])
+                _dsv4_dump("CP", id(self) % 1000, _pos_i,
+                           0, 1, {"ck_lin": _kv_ref, "cg_lin": _g_ref, "x": x}, None, None)
         else:
             kv = self.wkv.forward(x, params)[0]
             gate = self.wgate.forward(x, params)[0] if self.wgate is not None else kv
