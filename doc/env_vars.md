@@ -1125,18 +1125,14 @@ choice also sizes the quantizer's scratch buffers.
 Concurrent decode streams. Sets the `Cache` slot count, `Model.load(max_batch_size)` and `Generator(max_batch_size)`.
 For `BATCH > 1` the runner enqueues one job per slot (prompts cycled from `PROMPT_IDS`) and reports per-stream
 and aggregate throughput; results are keyed `<prompt idx>.<slot>`.
-<<<<<<< HEAD
-=======
 Compressed indexer keys use each stream's own compressed-entry position for RoPE; repeated prompts at the same
 position therefore do not acquire different rotations merely because they occupy different batch slots.
->>>>>>> tp2/batch
 
 ### `CACHE_TOKENS_PER_SEQ` (default: `4096`)
 
 KV pool tokens per concurrent stream. `CACHE_TOKENS` defaults to `BATCH * CACHE_TOKENS_PER_SEQ`, so every stream
 has room for its prompt plus `MAX_NEW` tokens without sharing pages with another stream's shortfall.
 
-<<<<<<< HEAD
 ### `DSPARK_DYNAMIC` (default: `0`)
 
 Adaptive DSpark draft length. `1` passes `dynamic_draft_tokens` to the `Generator`, so the confidence calibrator cuts
@@ -1220,8 +1216,7 @@ Prefetch ring 8 instead of 4 for widths with <= 2 loads per slice. Bit-identical
 ### `EXL3_MOE_WIDE_B_BSZ1` / `EXL3_MOE_COOP_WIDE_B` (runtime, default: off)
 Force the wide tile for the down projection at bsz 1. Default picks narrow (`moe_coop_pick_wide` needs >= 128 kslices
 and >= 32 slots; bsz1 gives 72/6). Measured WORSE at bsz1: 67.29 vs 65.66 us/call — keep off.
-=======
+
 ### `WARM_TOKENS` (default: `8`)
 
 Number of untimed warmup tokens per stream, at the configured batch width.
->>>>>>> tp2/batch
