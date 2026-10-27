@@ -1,5 +1,18 @@
 # STATUS
 
+## 2026-10-27 (later) — spec on the captured path, and where the remaining cost is
+Canonical main-branch numbers (`COMM=p2p`, graphs, `EXL3_DSV4_B1_BATCH=1`, WARM):
+- plain: **10.97 / 11.02 / 10.98 ms/tok** (91 tok/s)
+- DSpark K=5: **7.86 / 6.83 / 9.01 / 4.65 ms/tok** on prompts 0-3; AL 3.30/3.30/2.58/**5.29**; acceptance 0.66/0.78/0.91;
+  effective 104-136 tok/s on short prompts, 123 at AL 5.29.
+- Round cost is flat at ~23 ms = target forward (~8) + 5 drafter forwards (~7) + verify (~8).
+- Spec policy **closed**: with matched flags K=5 beats plain on all six bench prompts; K<5 is dominated; `auto` lost
+  on 3 of 6. Default stays `DSPARK_POLICY=always`.
+- Prefill chunk sweep (32K prompt): 2048 -> 3856, 8192 -> **4790** (90.2 GiB peak, safe), 16384 -> 4941 (93.7 GiB, too
+  tight), 32768 OOM (needless `torch.cat` transient at block_sparse_mlp.py:1072).
+- Decode is now **kernel-efficiency bound**, not host bound: one 11 ms step has ~9 ms CUDA busy and the bsz-1 MoE is at
+  ~45% of DRAM while diffbot reaches ~92% with a bigger 3 bpw model on the same hardware.
+
 ## 2026-10-27 — attention-core capture lands: plain decode 13.3 -> 11.0 ms/tok
 Validated on main (`b85deac0` merged from `tp2/attncap`): **10.97 / 11.02 / 10.98 ms/tok** (prompts 0-2, both ranks
 identical) vs **13.35 / 13.35 / 13.17** before. 1134-token prompt 14.77 -> 14.15.
