@@ -90,7 +90,7 @@ def run_case(device, seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = Fa
     act_out = torch.empty((smax, 1, I), dtype = torch.half, device = device)
     d_out = torch.empty((smax, 1, Ho), dtype = torch.float, device = device)
     out = torch.full((8, H_out), float("nan"), dtype = torch.float, device = device)
-    ctr = torch.zeros((smax * (I // 128) + 8 * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = device)
+    ctr = torch.zeros((2 * smax * (I // 128) + 8 * (Ho // 128) + 2 * smax + 5,), dtype = torch.int, device = device)
     had_g = torch.empty((slots, Hi), dtype = torch.half, device = device); had_u = torch.empty_like(had_g)
     gtabs = gate.tabs if gated else up.tabs
     gK = gate.K if gated else up.K
@@ -218,7 +218,7 @@ def _empty_case(device, bsz, topk, shared = None, Hi = 256, H = 256):
     gu_g, gu_u, act_out = (torch.empty((smax, 1, I), dtype = torch.half, device = device) for _ in range(3))
     d_out = torch.empty((smax, 1, Ho), dtype = torch.float, device = device)
     had_g, had_u = (torch.empty((smax, max(Hi, 1)), dtype = torch.half, device = device) for _ in range(2))
-    ctr = torch.zeros((smax * (I // 128) + 8 * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = device)
+    ctr = torch.zeros((2 * smax * (I // 128) + 8 * (Ho // 128) + 2 * smax + 5,), dtype = torch.int, device = device)
     out = torch.full((8, Ho), float("nan"), dtype = torch.float, device = device)
     sh_out = sh_w = None
     ref = torch.zeros((bsz, Ho), dtype = torch.float, device = device)
