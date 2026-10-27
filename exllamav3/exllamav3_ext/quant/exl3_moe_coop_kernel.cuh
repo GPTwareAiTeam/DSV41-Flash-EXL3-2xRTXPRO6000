@@ -20,6 +20,9 @@
 //
 // The grid is sized for the no-duplicates case (slots x groups x projections); blocks past the
 // actual run count exit at once.
+//
+// Fused launch (EXL3_MOE_COOP_SINGLE=1, mixed-K): one persistent grid drains a queue of the A items [0, nA)
+// followed by the B items [nA, nA + nB). B waits on ready_a per (slot, chunk); see exl3_moe_coop_fused_mixed_kernel.
 
 #include <cuda_fp16.h>
 #include "../util.h"
@@ -669,18 +672,53 @@ void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
 __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 #endif
 
+// Fused launch (EXL3_MOE_COOP_SINGLE, mixed-K): A publishes each finished (slot, chunk) of act_out to ready_a,
+// and B waits for every (slot, chunk) of its run before reading act_out. Inert for the two-launch kernels (p.fused == 0)
+__device__ __forceinline__ void publish_a_ready(const MoeCoopParams& p, int s, int chunk, int warp)
+{
+    if (warp == 0) __threadfence();           // warp 0 stored act_out: each storing lane fences its own writes
+    __syncthreads();
+    if (threadIdx.x == 0) atomicExch(p.ready_a + (size_t) s * (p.I / 128) + chunk, 1);
+    __syncthreads();
+}
+
+__device__ __forceinline__ unsigned long long globaltimer_ns()
+{
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// Bounded wait (a broken publish protocol traps instead of hanging) until every (slot, chunk) of the run's rows is published
+__device__ __forceinline__ void wait_a_ready(const MoeCoopParams& p, const int* rows, int nrows)
+{
+    constexpr unsigned long long TIMEOUT_NS = 20000000000ull;
+    const int nch = p.I / 128;
+    const int total = nrows * nch;
+    for (int i = threadIdx.x; i < total; i += THREADS)
+    {
+        int* flag = p.ready_a + (size_t) rows[i / nch] * nch + i % nch;
+        const unsigned long long t0 = globaltimer_ns();
+        while (atomicAdd(flag, 0) == 0)
+        {
+            __nanosleep(64);
+            if (globaltimer_ns() - t0 > TIMEOUT_NS) __trap();
+        }
+    }
+    __syncthreads();
+    __threadfence();
+}
 // ---------------------------------------------------------------------------------------------
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
 // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
 
 template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
-void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+__device__ __forceinline__
+void moe_a_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
     constexpr int GPC = tile_gpc<WIDE>();
     constexpr int CPB = tile_cpb<WIDE>();
-    extern __shared__ uint32_t smem_dyn[];
     half* sh_A = (half*) smem_dyn;
     float* sh_red = (float*) (smem_dyn + p.Hi / 2);
     uint32_t* sh_stage = smem_dyn + p.Hi / 2 + WK * ROWS * COLS;
@@ -693,11 +731,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
     const int nproj = p.gated ? 2 : 1;
     const int ng = p.I / TCOLS;
 
-    // Reset the down stage's counters for this call (its previous use finished in stream order)
-    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
-        p.ctr_b[i] = 0;
 
-    const int item = blockIdx.x;
     const bool is_gate = p.gated && (item % nproj) == 0;
     const int rem = item / nproj;
     const int ks = rem % p.ksplit_a;                 // split-k index: partial output rows
@@ -757,8 +791,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
         const int s = sh_rows[r];
         const int chunk = (group * CPB + j) / GPC;
         if (!arrive_last(p.ctr_a + (size_t) s * (p.I / 128) + chunk, GPC * nproj * p.ksplit_a, &sh_flag)) continue;
-        if (p.dbg & 1) continue;
-        if (warp == 0)
+        if (warp == 0 && !(p.dbg & 1))
         {
             const int col = chunk * 128 + lane * 4;
             const size_t off = (size_t) s * p.I + col;
@@ -800,8 +833,20 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
             had128(a0, a1, a2, a3, lane);
             store_h4(p.act_out + off, a0, a1, a2, a3);
         }
+        if (p.fused) publish_a_ready(p, s, chunk, warp);
         __syncthreads();
     }
+}
+
+// Two-launch kernel A: resets the down stage's counters for this call (its previous use finished in stream order)
+template <int bits, int cb, bool WIDE, bool HALF = false>
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
+void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
+        p.ctr_b[i] = 0;
+    moe_a_body<bits, cb, WIDE, HALF>(p, blockIdx.x, smem_dyn);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -810,13 +855,12 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 // expert and stores the trimmed row
 
 template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
-void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+__device__ __forceinline__
+void moe_b_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
     constexpr int GPC = tile_gpc<WIDE>();
     constexpr int CPB = tile_cpb<WIDE>();
-    extern __shared__ uint32_t smem_dyn[];
     float* sh_red = (float*) smem_dyn;
     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
     float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS : 0));
@@ -830,17 +874,14 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
     const int lane = threadIdx.x % 32;
     const int ng = p.Ho / TCOLS;
 
-    // Reset the gate/up stage's counters for the next call
-    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
-        p.ctr_a[i] = 0;
 
-    const int item = blockIdx.x;
     const int ks = item % p.ksplit_b;
     const int rem = item / p.ksplit_b;
     const int run_idx = rem / ng;
     const int group = rem % ng;
     int nrows = 0;
     if (!read_run(p, run_idx, sh_rows, nrows, sh_res)) return;
+    if (p.fused) wait_a_ready(p, sh_rows, nrows);
     const int local = slot_info(p, sh_rows[0]).local;
     const int kslices_all = p.I / 16;
     const int k_begin = kslices_all * ks / p.ksplit_b;
@@ -956,6 +997,17 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
         }
         __syncthreads();
     }
+}
+
+// Two-launch kernel B: resets the gate/up stage's counters for the next call
+template <int bits, int cb, bool WIDE, bool HALF = false>
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
+void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
+        p.ctr_a[i] = 0;
+    moe_b_body<bits, cb, WIDE, HALF>(p, blockIdx.x, smem_dyn);
 }
 
 }  // namespace exl3_moe_coop_ns

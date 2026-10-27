@@ -37,6 +37,11 @@ def main():
     def folded():
         b.run_routed(x, fsel, frw, tb, fsc, mixed, Kvec, fsc["out"][:bsz], k2)
 
+    if os.environ.get("PROF_NCU"):
+        # Single bounded launch for Nsight Compute: no warmup, no torch.profiler
+        folded()
+        torch.cuda.synchronize()
+        return
     for _ in range(10):
         folded()
     torch.cuda.synchronize()
@@ -53,6 +58,12 @@ def main():
     print(f"layer={layer} bsz={bsz} mixed={mixed} (device us per call, per kernel)")
     for us, n, name in rows[:8]:
         print(f"  {us:9.2f} us  x{n // iters if iters else n}  {name[:110]}")
+    # Effective bandwidth: trellis bytes of the distinct experts the launch touches (routed + folded shared)
+    used = sorted(set(sel.flatten().tolist()) | {b.E})
+    nbytes = sum(ex[p][e][0].numel() * ex[p][e][0].element_size() for p in ("g", "u", "d") for e in used)
+    tot = sum(us for us, _, name in rows if "_a_" in name or "_b_" in name)
+    print(f"  experts={len(used)} trellis_bytes={nbytes / 1e6:.2f} MB  kernel_sum={tot:.2f} us  "
+          f"eff={nbytes / (tot * 1e3):.0f} GB/s")
 
 
 if __name__ == "__main__":
