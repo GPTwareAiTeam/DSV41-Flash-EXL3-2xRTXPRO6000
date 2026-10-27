@@ -461,8 +461,8 @@ __device__ __forceinline__ void gemv_tile
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
             FragB a01, a23;
-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+            reinterpret_cast<uint32_t&>(a01[0]) = r0_ok ? reinterpret_cast<const uint32_t*>(A2)[a_row0 + a_col] : 0u;
+            reinterpret_cast<uint32_t&>(a23[0]) = r0_ok ? reinterpret_cast<const uint32_t*>(A2)[a_row0 + a_col + 4] : 0u;
             a01[1] = hzero;
             a23[1] = hzero;
 
