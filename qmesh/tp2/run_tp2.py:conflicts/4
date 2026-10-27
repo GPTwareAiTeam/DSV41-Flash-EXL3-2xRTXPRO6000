@@ -1,0 +1,1 @@
+        draft_cache = Cache(draft_model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY, max_batch_size = BATCH, **KV_CACHE_KWARGS)
