@@ -155,3 +155,40 @@ Measured-and-rejected (with numbers in the per-workstream notes): cp.async smem 
 (+4.7 µs), PF=8, split-K, fused A→B single launch (slower at every bsz), K-tile 16 for the 64-row prefill MoE (255 regs),
 min-blocks=2 (spills), lowering the fused row threshold, fp32→bf16 prefill wire (0.6%), x-fan fusion (−3% but changes
 tokens from position 55), event-based sampler sync, index-math hoisting (<0.15 ms/tok ceiling).
+
+### Warm prefix reuse (2026-10-27, TP2 P2P, B1)
+
+`pcbench20261027a`, 1024-token chunks, 32 greedy output tokens, two repetitions;
+rank 0 shown (rank 1 agrees within 0.11 ms and all comparisons match). Effective
+tok/s counts the entire prompt, including reused tokens, divided by TTFT.
+
+| Prompt | rep | cold ms / tok/s | full hit ms / tok/s (tokens) | partial cold ms / tok/s | partial hit ms / tok/s (tokens) |
+|---:|---:|---:|---:|---:|---:|
+| 2048 | 0 | 936.48 / 2186.9 | 195.27 / 10488.2 (1792) | 921.15 / 2223.3 | 533.69 / 3837.4 (1024) |
+| 2048 | 1 | 890.46 / 2299.9 | 212.39 / 9642.8 (1792) | 916.03 / 2235.7 | 528.55 / 3874.7 (1024) |
+| 8192 | 0 | 3177.94 / 2577.8 | 196.30 / 41731.9 (7936) | 3178.20 / 2577.6 | 1654.98 / 4949.9 (4096) |
+| 8192 | 1 | 3178.50 / 2577.3 | 194.07 / 42210.9 (7936) | 3203.83 / 2556.9 | 1651.37 / 4960.7 (4096) |
+
+All 32 generated tokens matched the corresponding cold run for every full and
+partial hit on both ranks. Full reuse ends at the last page-aligned recurrent
+checkpoint; partial reuse also requires the intact chained page hashes and
+replays the remaining suffix. A prompt length `k*256+1` leaves its prefill end
+page-aligned and can maximize reuse. This is B1 evidence, not a batch correctness
+claim. SM telemetry and per-rank results are in `pcbench20261027a_rank{0,1}.log`.
+
+The measured 8704-token preallocated paged cache was 27,852,800 bytes per GPU
+according to `CacheLayer.storage_size()`: 3200 bytes/token, or 0.02594 GiB for
+8704 tokens; 7936 reused tokens correspond to 25,395,200 bytes (0.02365 GiB)
+within that allocation. This accounting excludes any DSA mirror pools and Python
+page-table metadata; their incremental cost was not measured. Retention uses the
+existing allocation, not an additional KV allocation. Host recurrent snapshots
+measured 67,170,304 bytes for the 2048-token cold prompt and 268,681,216 bytes
+for the 8192-token cold prompt per rank. Unreferenced pages are evicted when
+space is required using the tree policy: empty pages first, then oldest leaves,
+preserving referenced and protected chains as long as possible; checkpoint
+storage has a separate host-memory LRU budget.
+
+Runner dials: `EXL3_PREFIX_CACHE=1`, `EXL3_PREFIX_CACHE_CAPACITY` (default
+4294967296 host bytes), `EXL3_PREFIX_CACHE_MIN_MATCH` (256 tokens), and
+`EXL3_PREFIX_CACHE_INTERVAL` (1024 tokens). The interval caps prefill chunks;
+shorter chunks and checkpoint copies add cold-prefill cost.

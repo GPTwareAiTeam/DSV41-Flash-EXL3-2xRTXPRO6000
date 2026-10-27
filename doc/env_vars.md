@@ -738,6 +738,35 @@ prompt resumes from the nearest interval checkpoint (`recurrent_checkpoint_inter
 DeepSeek-V4) instead of the last full page, so it can re-prefill more than 255 tokens (up to the
 whole prompt for prompts shorter than the interval). Set `1` to restore the checkpoint split.
 
+### `EXL3_PREFIX_CACHE` (default: `0`; TP2 runner)
+
+Set to `1` to enable recurrent prefix reuse in the TP2 runner and enable
+`EXL3_PREFILL_RC_SPLIT`. The generator must stay alive between jobs. Complete
+token pages are content-hashed and retained in the existing KV allocation until
+evicted; a DSA hit also requires the matching recurrent checkpoint, including the
+SWA ring, compressor and indexer state. Only page-aligned checkpoint positions
+can be reused; the unmatched suffix is prefetched again. Sharing across batch
+jobs uses the same page table. Cold prefills may take longer because of the split.
+
+### `EXL3_PREFIX_CACHE_CAPACITY` (default: `4294967296`; TP2 runner)
+
+Maximum bytes of host RAM for recurrent checkpoints. Zero disables checkpoint
+storage. KV pages occupy the already allocated cache, sized by `CACHE_TOKENS`;
+when full, unreferenced pages are evicted. This limit does not reserve extra GPU
+memory for pages.
+
+### `EXL3_PREFIX_CACHE_MIN_MATCH` (default: `256`; TP2 runner)
+
+Minimum matching prefix length in tokens at a recurrent checkpoint before reuse.
+Checkpoints are page-aligned, so the effective minimum rounds up to a page.
+
+### `EXL3_PREFIX_CACHE_INTERVAL` (default: `1024`; TP2 runner)
+
+Checkpoint spacing in tokens, a positive multiple of the 256-token page size.
+When caching is enabled, the prefill chunk is capped at this interval to create
+intermediate checkpoints for partial-prefix hits. Smaller intervals consume more
+checkpoint RAM and may increase cold prefill time.
+
 ### `EXL3_MOE_FUSED_ROWS_WIDE` (default: `256`)
 
 Fused-tier row capacity per expert for layers that use the wide tiles (see `EXL3_MOE_MTILE`);
