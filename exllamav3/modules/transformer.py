@@ -303,6 +303,10 @@ class TransformerBlock(Module):
         Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply. A block whose graph B is
         deferred (pending = the previous block's (block, x, post, comb, y_attn)) runs that graph B inside its own
         graph A. Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs."""
+        if self.attn is not None and hasattr(self.attn, "b1_prep"):
+            b1 = self.attn.b1_prep(params)
+            if b1 is not None:
+                return self._forward_piecewise_b1(x, params, out_dtype, pending, b1)
         if not hasattr(self, "_segments"):
             self._segments = {}
         key = (tuple(x.shape), x.dtype, out_dtype, None if pending is None else id(pending[0]))
@@ -339,6 +343,53 @@ class TransformerBlock(Module):
         x, = prev._piece_b(x_b, post_b, comb_b, y_b, params)
         post, comb, y = self._piece_a(x, params)
         return x, post, comb, y
+
+    def _forward_piecewise_b1(self, x, params, out_dtype, pending, b1):
+        """Decode body with the device-driven attention core inside the segment: graph A, the attention body
+        (attn._batch_body) and graph B of the previous block (when pending) are one captured replay. The attention
+        collective runs eagerly after the replay; graph B defers exactly as in _forward_piecewise. b1 is the
+        attention's host prepass (ctx, arr, bt_st) for this step."""
+        ctx, arr, bt_st = b1
+        prev = None if pending is None else pending[0]
+        key = ("b1", tuple(x.shape), x.dtype, out_dtype, id(ctx[0]), id(ctx[1]),
+               None if prev is None else id(prev))
+        segs = self._segments.get(key)
+        if segs is None:
+            segs = (Segment(lambda *a: self._piece_b1(ctx, prev, *a), carry = ("hc_pre",)),
+                    Segment(self._piece_b, carry = ("hc_pre",)))
+            self._segments[key] = segs
+        seg_a, seg_b = segs
+        if pending is None:
+            x, post, comb, y = seg_a(x, arr, bt_st, params)
+        else:
+            _, x_b, post_b, comb_b, y_b = pending
+            x, post, comb, y = seg_a(x_b, post_b, comb_b, y_b, arr, bt_st, params)
+        if self.attn.tp_reduce:
+            self.attn.tp_collect(params["backend"], y)
+        if self._pw_defer(x, params, out_dtype):
+            params["pw_pending"] = (self, x, post, comb, y)
+            return x
+        x, = seg_b(x, post, comb, y, params)
+        export_state = params.get("export_state_layers")
+        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+            states = params.get("export_states")
+            if not states:
+                states = params["export_states"] = []
+            states.append(_tap_to_half(x.mean(dim = 2), self.layer_idx))
+        return to2(x, out_dtype, self.out_dtype)
+
+    def _piece_b1(self, ctx, prev, *a):
+        """Captured segment body: [prev block's graph B,] graph A, then the attention body on the normed input.
+        Returns (x, post, comb, y_attn) with y_attn the pre-collective attention output."""
+        if prev is None:
+            x, arr, bt_st, params = a
+        else:
+            x_b, post_b, comb_b, y_b, arr, bt_st, params = a
+            x, = prev._piece_b(x_b, post_b, comb_b, y_b, params)
+        post, comb, y = self._piece_a(x, params)
+        rsl, kl, m, w, kp = ctx
+        y_attn = self.attn._batch_body(y, arr, 1, 1, 1, rsl, kl, bt_st, m, w, kp, params, None)
+        return x, post, comb, y_attn
 
 
     def _piece_a(self, x, params):
