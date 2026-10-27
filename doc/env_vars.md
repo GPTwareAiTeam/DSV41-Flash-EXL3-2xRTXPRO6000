@@ -695,6 +695,13 @@ pages (`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge page
 (`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
 fails with a clear error otherwise. Rejected on Windows.
 
+### `EXL3_MOE_PREFILL_MTILE` (default: `0`)
+
+Override the GPU-resident fused MoE prefill row tile with `16`, `32`, `48`, or `64`;
+`0` retains the automatic tier selection. Wide tiles require the mul1 codebook and
+`EXL3_MOE_MTILE=1`; other layers retain their normal selection. Decode's no-count-readback
+path is unaffected. This controls only the fused tier, not batched reconstruction.
+
 ### `EXL3_MOE_MTILE` (default: `1`)
 
 Row tiles for the fused MoE prefill kernel. The kernel dequantizes each expert's weights once

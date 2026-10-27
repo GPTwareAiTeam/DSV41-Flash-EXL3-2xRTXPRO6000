@@ -38,6 +38,9 @@ BATCH_RECON = MOE_BATCH_RECON
 # launch
 MTILE = MOE_MTILE
 MTILE_T1, MTILE_T2 = 16, 32
+PREFILL_MTILE = int(os.environ.get("EXL3_MOE_PREFILL_MTILE", "0"))
+if PREFILL_MTILE not in (0, 16, 32, 48, 64):
+    raise ValueError("EXL3_MOE_PREFILL_MTILE must be 0, 16, 32, 48 or 64")
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
 FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
@@ -1394,7 +1397,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
                         t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
                         t2 = sum(1 for c in counts if c > MTILE_T2)
-                        if self.mtile_ok and (t1 or t2):
+                        if PREFILL_MTILE and (PREFILL_MTILE == 16 or self.mtile_ok):
+                            run_fused(len(counts), 1, self.fused_rows, PREFILL_MTILE)
+                        elif self.mtile_ok and (t1 or t2):
                             # One launch per row tile over its expert range, largest first
                             t0 = len(counts) - t1 - t2
                             if t2:
