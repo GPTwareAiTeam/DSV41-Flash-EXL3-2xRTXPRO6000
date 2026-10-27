@@ -276,7 +276,8 @@ class DSV4Compressor:
                 _g_ref = self.wgate.forward(x, params)[0] if self.wgate is not None else _kv_ref
                 _pos_i = int(position) if not torch.is_tensor(position) else int(position.view(-1)[0])
                 _dsv4_dump("CP", id(self) % 1000, _pos_i,
-                           0, 1, {"ck_lin": _kv_ref, "cg_lin": _g_ref, "x": x}, None, None)
+                           0, 1, {"ck_lin": _kv_ref, "cg_lin": _g_ref, "x": x,
+                                  "buf_kv": buf_kv, "buf_gate": buf_gate}, None, None)
         else:
             kv = self.wkv.forward(x, params)[0]
             gate = self.wgate.forward(x, params)[0] if self.wgate is not None else kv
