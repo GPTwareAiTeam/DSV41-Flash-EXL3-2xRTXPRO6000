@@ -8,6 +8,21 @@ Targets: **300 tok/s decode**, **8000 tok/s prefill**.
 Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 tok/s @2K, 362.9 aggregate @4 streams,
 11.2k prefill @40K, fp8 KV.
 
+## 0. MEASUREMENT RULES LEARNED THE HARD WAY (read before trusting any number)
+
+1. **`COMM` depends on the workload.** Measured back-to-back on main, prefill 2048-token prompt / chunk 2048:
+   **`COMM=nccl` 3399 tok/s vs `COMM=p2p` 3034 tok/s (+12% for NCCL)**. The historical 4777.7 tok/s prefill figure was
+   taken with `COMM=nccl`. Our one-shot P2P kernel wins on *decode* (10 KB payloads, 4.93 vs 11.84 us per call) and
+   loses on *prefill* (84 MB payloads chunked through a 256 KiB arena: 204,881 launches at 16 us each = **40.7% of
+   prefill CUDA time**). So "always p2p" is wrong; **hybrid** is the intended default, and the arena size is a
+   separate prefill lever under investigation.
+2. **These cards are power-capped**: ~2100 MHz against a 3090 MHz ceiling under sustained load, GPU1 flagged
+   `SW power cap`. Never compare against a number from earlier in the session; A/B back-to-back and record
+   `clocks.sm / power / throttle mask` with every result.
+3. **Capture gates silently disable the fast path.** Two separate incidents cost us 2x each: `b1_prep` vs
+   `_batch_ok_b1` disagreeing on `q_head_norm`, and a merge that restored the `B==1` restriction so `BATCH>1`
+   fell back to eager. Whenever `BATCH>1`, verify `EXL3_DSV4_B1_BATCH=1` **and** that replay counters are non-zero.
+
 ## A. SHIPPED AND VERIFIED (on `recipe/2x-rtxpro6000-tp2`)
 
 | # | change | measured gain | verification |
@@ -71,7 +86,7 @@ Batching is DONE and shipped; these are what remains.
 | 1b | **Whole-step graph** — collective in-graph, 1-4 replays/step instead of 40 | 10.84 ms/tok with ~9 ms CUDA busy: 1.5-2 ms/step of host work, of which `cudaGraphLaunch` ~0.67 ms and `_foreach_copy_` into static buffers ~0.65 ms (PROFILE=1) | external plan steps 3-4; P2P is graph-capturable, so put `tp_collect` inside the segment and merge block pairs. ~10-12% |
 | 1c | **Narrower MoE tile** (`MOE_COOP_WNT=1`, COLS 32->16 -> 1008 blocks, no reduction) | the kernel is **parallelism-limited, not coalescing-limited**: the wide tile reads perfect 128 B sectors and is 29% SLOWER (A 51.65 vs 39.92 us) because it halves the block count, and ncu shows 3 blocks/SM resident against only 2.68 available | branch `tp2/moe-wnt1` prepared (macro made overridable); needs one build + 263 tests. Attacks both B1 latency and the B8 wall |
 | 4 | **Prefill** — 4778 tok/s at chunk 8192 against an 8000 target | MoE is 30.6% of prefill at 19.5% DRAM, 33% warps, 0.98 waves, 128 regs; the tile sweep (M16/32/48/64) is FLAT within 1.8%, so tile choice is not the lever | **first resolve the 15% discrepancy**: the sweep measured 4045-4070 tok/s under the lock against the earlier 4778 — needs one GPU-idle repeat. Then profile the non-MoE 70% (AR is 22%, never profiled at prefill). Note the arithmetic: making the MoE FREE gives 6883 tok/s, so 8000 needs the other 70% to improve ~15% |
-| 3b | **Spec + batching do not compose** — DSpark K=5 at B4 is 84.8 tok/s aggregate vs 203 plain | 4 streams x 6 verify rows = 24 rows = ~144 expert slots | worth one test of the *middle*: spec at B2, and spec at B4 with K=2/K=3 (fewer verify rows per stream). If any beats plain B4 it is a free win for latency-sensitive multi-user |
+| 3b | **Spec + batching do not compose — measured negative** | B2 K5: 30.31/24.79 ms per stream, 63.27 tok/s; B2 K3: 27.80/23.88 ms, 68.78 tok/s; B4 K2: 49.91/41.79/47.86/49.91 ms, 76.45 tok/s. No clock capture, so absolute values carry a thermal/power-state caveat. Historical plain B4: 203 tok/s; B1 K5: 111–215 tok/s. | B4 K3 failed during measured batch generation with CUDA illegal memory access at `dsa_triton.py:1105` launching `_dsa_attn_combine_kernel`, reported through `_forward_cached_one` (`dsv4.py:2120`); CUDA errors are asynchronous, so the originating kernel is not established. Intended verify shape B=4, S=4, R=16; actual failing shape not logged. Full traceback: `/home/treadall/recipe-artifacts/2x-rtx-tp2/tp2logs/specgrid_1027_1793136692_b4k3_rank0.log`. |
 | 8 | **Prefix caching** | unmeasured by us; diffbot's agentic 224 tok/s rests on it (sybil: 16K prompt 16 s -> 1 s on a hit) | implement warm-prefix replay, measure TTFT on a repeated 8K/32K prefix |
 | 7 | **Replay trim in multi-chunk prefill** | diffbot 3.7-4.6% at 34K-130K | late layers only need the last rows; check prefix-cache/ring semantics first |
 | 6 | **FP8 KV, retry** | -33% pool for -2% decode once a packed-aware captured attention exists | blocked on packed-pool capture correctness; the quality gate already passed |
