@@ -32,7 +32,7 @@ sys.path.insert(0, "/models/dsv41/DeepSeek-V4.1-Flash-1017-orig/encoding")
 
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer  # noqa: E402
 from exllamav3.tp2.p2p import P2PComm  # noqa: E402
-from qmesh.tp2.run_tp2 import TPBackendNCCL, TPBackendP2P, TPBackendHybrid, set_tp_reduce, wrap_vocab_split  # noqa: E402
+from qmesh.tp2.run_tp2 import KV_CACHE_KWARGS, TPBackendNCCL, TPBackendP2P, TPBackendHybrid, set_tp_reduce, wrap_vocab_split  # noqa: E402
 
 OVERLAY = os.environ.get("OVERLAY", "/artifacts/tp2-overlay")
 PROMPT_LENS = [int(x) for x in os.environ.get("PROMPT_LENS", "256,1024,2048,4096").split(",")]
@@ -103,7 +103,7 @@ def main():
     config = Config.from_directory(os.path.join(OVERLAY, f"rank{RANK}"))
     assert config.tp_size == WORLD and config.tp_rank == RANK
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = 5)
+    cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = 5, **KV_CACHE_KWARGS)
     model.load(device = device, max_chunk_size = MAX_CHUNK, max_output_size = 8, max_batch_size = 1,
                progressbar = False)
     if COMM in ("p2p", "hybrid"):
