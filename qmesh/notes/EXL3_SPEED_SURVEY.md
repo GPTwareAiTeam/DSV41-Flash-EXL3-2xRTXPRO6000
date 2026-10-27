@@ -111,3 +111,89 @@ Not in top-5 and why: tap-scale (neutral here); cooperative MoE (not bit-exact; 
 - Bench the 8-bit AR change (change 1) with our own `bench_prefill.py` at 2K/4K/16K and a KL run; expect numbers only from that bench.
 - Measure AL at K=7 on our prompt set before any K=7 kernel work (change 5).
 - Do not claim any community number as ours until reproduced on our box.
+
+## 6. diffbot / same-hardware reference — component-level comparison
+
+Sources (read in full): `diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000` (HF) `docs/SPEED.md` (2026-10-25), `docs/FIDELITY.md`, `docs/CHANGELOG.md`, `recipe/results/RESULTS.md`, `recipe/serve/serve.sh`, `recipe/README.md`, `recipe/kernels/fp8ar/fp8ar_kernels.cu`, `recipe/kernels/rowtopk/rowtopk.cu`. Cross-hardware: sfxnz `results/RESULTS.md` (DGX Spark GB10).
+
+**Identity.** diffbot 2× is a vLLM `nightly-5555a2d8` stack with custom sm_120 kernels and an EXL3 expert path. It is NOT stock ExLlamaV3. Rows 1–2 of §1 are therefore not a pure EXL3-engine comparison. Hardware matches ours (2× RTX PRO 6000, PCIe, 300 W cap, Threadripper PRO 9995WX).
+
+**Parallelism.** TP2 for attention and dense. Routed experts are NOT EP2. 2× keeps 5,296 of 15,360 routed experts in pinned host RAM (`plan-1017-agent30-c512.json`) plus a 512-slot VRAM cache per GPU. Whether the two GPUs shard or replicate the VRAM experts is not stated in the docs read: [INFERENCE] replicated. Their 8× profile is TP4 attention + EP4 experts, all in VRAM.
+
+**Quant.** Diffbot routed experts: EXL3 3-bit MUL1 (coolbho3k LDLQ, calibration corpora from AtomicChat, 320×4096-token windows). Drafter experts: EXL3 3-bit MCG, uncalibrated. Ours is 2.565 bpw. bpw is not comparable across the two.
+
+### 6.1 Diffbot published numbers (2× TP2, `docs/SPEED.md`)
+
+| Metric | Diffbot 2× (current) | Prior release | Source |
+|---|---|---|---|
+| Fresh 40K prefill (tok/s) | 11,157–11,467 (warm); 7,700–8,000 cold | 9,031–9,125 | SPEED.md |
+| CPU-runtime prefill (tok/s) | 11,624–12,182 | — | SPEED.md |
+| Decode 2K, 1 stream (GPU / CPU experts) | 156.9 / 179.0 | 129.7 | SPEED.md |
+| Decode 46K, 1 stream | 172.8 / 210.1 | 114.4 | SPEED.md |
+| Decode 46K, 4 streams aggregate | 362.9 / 406.2 | 215.9 | SPEED.md |
+| Agentic replay 1 session | 224.1 / 261.8 | — | SPEED.md |
+| Agentic replay 4 sessions, aggregate | 110.4 / 127.8 | — | SPEED.md |
+| Power (RAPL) | ~815 W GPU / ~900 W CPU | — | SPEED.md |
+
+Our measured numbers: plain decode 13.15 ms/tok (76 tok/s); DSpark K=5 118–135 tok/s; prefill 3.6–3.7k @2048, 4.3–4.4k @4096. Diffbot decode is about 2.3× ours at 2K 1-stream, and our prefill is about 3× below theirs. These are not same-day, same-engine numbers. [INFERENCE] much of the gap is architectural (their DSpark draft, our single-chunk prefill, their replay trim, their 8-bit AR), not hardware.
+
+### 6.2 Decode components (diffbot knob → measured delta → our tree)
+
+| # | Diffbot component | Measured delta (diffbot's own A/B, dev build) | Our tree | Status |
+|---|---|---|---|---|
+| D1 | Flat decode MoE loop: 128-wide K tiles, one barrier per stage, swapped MMA operands | +13% decode at 6 rows/verify; MoE kernel time −31–36%; +3% agentic | `MoEKernelTP2.md`: bsz1 54.44 µs vs ≤45 target | partial |
+| D2 | VRAM expert cache 128–512 slots (`EXL3_HOST_CACHE=512`, `HOT=1`) | +7–10% at 1 stream, +15–20% at 4 | `TP2Prep.md:66` (Engram streams from disk; no expert cache) | absent |
+| D3 | Fused decode routing prep (`EXL3_FUSED_PREP`, `DS41_FUSE_ROUTER/HCPREP/IDX/OPROJ`) | +7–8% (fixed bench); four bit-exact fusions +6% | `TP2Runner.md:65`: other 3%, `routing_ds3_topk` 0.13 ms | absent as a set; the topk is small |
+| D4 | rowtopk: one CTA per row, radix select, valid-prefix only (`DS41_ROWTOPK=1`) | kernel 2,054 → 372 µs (384 rows × 1M width); 4-stream 46K +3.2% | ours uses a generic top-k; `TP2Runner.md:65` (0.13 ms) | absent, but small at our width |
+| D5 | CPU host experts in decode (`EXL3_HOST_OVERLAP_SMS=32`) | +17% (243.3 vs 208.3) | no equivalent; our experts all in VRAM at 2.565 bpw [INFERENCE] | n/a unless VRAM-tight |
+| D6 | Drafter experts all in VRAM | +5–9% at 4 sessions | our drafter placement not established in notes | unknown |
+| D7 | DSpark K=5 + width-keyed graphs (cudagraph sizes 1,2,4,6,8,12,16,24,32,48) | not separately quantified in SPEED.md | we have K=5 width-keyed graphs (`GraphCapture.md`) | have |
+| D8 | Hand-tuned decode loop | +3.3% | — | absent |
+| D9 | FlashInfer PCIe IPC AR (`DS41_CAR_PCIE_IPC`) | +3.6% decode | our P2P one-shot AR `p2p_oneshot.cu` (fp32 fixed-order) | have a similar path |
+| D10 | fp8 AR for decode (`DS41_FP8AR_MIN_TOKENS=256`; below 256 rows exact) | prefill-only; decode unchanged | not in tree | absent (prefill only) |
+
+Decode attribution, ranked by diffbot's own A/B (they measure against their prior build, not against naive TP2):
+1. Host-expert overlap and cold tier (D5): +17% decode at 1 stream (but their cold tier exists because 3-bit experts ≈204 GB exceed VRAM; [INFERENCE] not applicable to us if 2.565 bpw fits).
+2. VRAM expert cache (D2): +7–10% at 1 stream, +15–20% at 4.
+3. Flat MoE loop (D1): +13% decode.
+4. Fused routing prep and four decode fusions (D3): +6–8%.
+5. FlashInfer PCIe IPC AR (D9): +3.6%.
+6. Hand-tuned loop (D8): +3.3%.
+
+### 6.3 Prefill components
+
+| # | Diffbot component | Measured delta | Our tree | Status |
+|---|---|---|---|---|
+| P1 | 8-bit prefill AR (`kernels/fp8ar`, one persistent kernel, int8 + bf16 scale per 32 elements, peer P2P push, fp32 add, bit-identical on both ranks) | AR 16K: 4.04 → 1.79 ms; fresh 40K +4–6%; agentic CPU 4-session wall −11% (197→175 s); TTFT −20% | `p2p_oneshot.cu:171–198` fp32 arena; `all_reduce.cu` generic, no 8-bit codec | absent; biggest prefill item we can copy |
+| P2 | int8 decode-once MoE GEMM (`kernels/xmoe_do_i8/dof_gemm.cu`, ~1.06% GEMM error vs fp16 0.02%) | fresh 40K +6%; agentic 1-session 230.6→224.0 s; 4-session 185.8→170.5 s; decode unchanged | none (no DO kernel in tree) | absent |
+| P3 | DO (decode-once) xmoe kernel: each trellis tile decoded once per 128-row job | 1.3–1.8× faster per expert at 16–1,024 rows; cold read-once: launch −42% (4K), −61% (16K) | no tiled prefill MoE in tree (only COMMUNITY_RESEARCH item 4) | absent |
+| P4 | Replay trim (`patches/vllm/v41-replay-final-window.diff`): skip replay of layers 20–39 for chunks >128 rows the final window cannot read | fresh 12K/34K/70K/130K: 1.10/3.26/6.49/11.95 s → 1.08/3.11/6.19/11.51 s; DSpark acceptance on multi-chunk prompts 3.52→3.62 | our `max_chunk_size=2048` (`TP2Bringup.md:6`); no replay trim | absent |
+| P5 | Chunk size `MAX_BATCHED=16384` (diffbot) vs ours 2048 | not separately measured by diffbot | `TP2Bringup.md:6` | open: test |
+| P6 | CPU host experts in prefill wall (`EXL3_HOST_OVERLAP_SMS_PREFILL=64`, `CPU_EXPERTS_PREFILL=1`) | −6/−9% wall; fresh 40K 9.2K→10.5K | n/a | not applicable at 2.565 bpw [INFERENCE] |
+
+Prefill attribution, ranked by diffbot's own A/B:
+1. Their large chunk plus DO kernel (P3 + P5): the bulk of the 9.0K → 11.2K jump; the DO kernel is the one diffbot ties to tile-reuse at 16K+ rows [INFERENCE for the split between P3 and P5].
+2. 8-bit prefill AR (P1): +4–6% fresh prefill, and the agentic wall-time win is larger (−11%) because it removes AR latency from TTFT.
+3. int8 DO GEMM (P2): +6% fresh.
+4. Replay trim (P4): 1–6% on multi-chunk prompts.
+
+### 6.4 Per-kernel ms
+
+Diffbot publishes no per-kernel ms table in its docs. sfxnz (cross-hardware, GB10) gives per-step composition: Round 5 device-busy per decode step: p2b MoE ~35%, dense projections ~42%, NCCL AR ~11%, eltwise/topk/norm/MLA ~12%, sparse_mla 1.2%. Round 7 after COOP: p2b 48%, dense 28%, NCCL 17.5%. Our per-kernel numbers are in `TP2Runner.md:65` and `MoEKernelTP2.md`. [INFERENCE] the AR share is our next target, since ours is a fp32 AR and diffbot's is int8.
+
+### 6.5 Implementable items for us (ranked by expected value)
+
+1. **8-bit prefill AR** (P1). Port `fp8ar` quantize-push-dequant-add into `p2p_oneshot.cu`, gated at ≥256 rows, with exact fp32 path retained as fallback. Expected: AR 16K −2.2 ms per AR [secondary, diffbot's measurement]; prefill +4–6%. Gate: same-day KL pair within +3% per corpus.
+2. **Int8 DO prefill MoE** (P2+P3). Requires a tiled decode-once MoE path. Our `MoEKernelTP2.md` work is the decode side; the prefill DO path is new work. Expected +6% fresh prefill [secondary]; larger if the tile-reuse win (1.3–1.8×) carries to our shape [INFERENCE].
+3. **Replay trim** (P4). Needs a final-window read analysis for our DSpark replay. Expected 1–6% on multi-chunk prompts [secondary]. Check our `max_chunk_size=2048` against their 16384 first (P5).
+4. **Expert VRAM cache** (D2). Only if our experts do not all fit VRAM at 2.565 bpw. [INFERENCE] they fit, so this is low priority.
+5. **Fused decode routing prep and rowtopk** (D3, D4). +6–8% decode [secondary] for a set of fusions; rowtopk alone +3.2% at 4 streams. Our topk is 0.13 ms, so the rowtopk gain is small for us [INFERENCE].
+
+Not copying: CPU host experts (D5, P6), e4m3 variants (failed KL), K=7 drafter (D-note: −14..−17% on 4-stream, positive only at 1 stream).
+
+### 6.6 Checks for main
+
+- Confirm our VRAM footprint at 2.565 bpw before ranking item 4.
+- Bench P1 at 2K/4K/16K with our `bench_prefill.py` before any kernel change. Compare against the 3.6–3.7k @2048 and 4.3–4.4k @4096 baseline.
+- Use the same-day KL pair (+3% limit) for any lossy change (P1 8-bit AR and P2 int8 are both lossy).
+- Diffbot numbers are dev-build, same-day, A/B against their own prior build. Do not cite them as independent.
