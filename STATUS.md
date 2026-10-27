@@ -1,4 +1,16 @@
-# STATUS — Recipe B (2× RTX PRO 6000 Max-Q, TP2)
+# STATUS
+
+## 2026-10-27 — attention-core capture lands: plain decode 13.3 -> 11.0 ms/tok
+Validated on main (`b85deac0` merged from `tp2/attncap`): **10.97 / 11.02 / 10.98 ms/tok** (prompts 0-2, both ranks
+identical) vs **13.35 / 13.35 / 13.17** before. 1134-token prompt 14.77 -> 14.15.
+Root cause of the earlier "capture is slower" readings: `b1_prep` required `q_head_norm=True` while `_batch_ok_b1`
+required `False`, so the captured body never ran and every measurement was the eager fallback. Gates removed,
+capture restricted to S==1.
+**Tokens byte-identical** (both ranks, 4 prompts x 128 tokens, including the 1134-token prompt).
+Spec decode on the captured path: 9.46 / 6.88 / 9.09 / **4.61** ms/tok (AL 2.51 / 3.24 / 2.48 / **5.29**) — the long
+prompt reaches 119.6 tok/s. Round cost stays ~22-24 ms, so the remaining spec cost is NOT host overhead.
+
+ — Recipe B (2× RTX PRO 6000 Max-Q, TP2)
 
 Last update: 2026-10-26. Not formally started by the owner; results below came from an unapproved detour
 and are kept for reference. Details in `qmesh/notes/TP2Prep.md`, `qmesh/notes/TP2Bringup.md`.
