@@ -67,7 +67,9 @@ def _dsv4_dump(tag, layer, pos, ec, m, tensors, kl, bt_row):
         if kl.D_i:
             d["pool_idx"] = kl.pool_idx.view(-1, kl.D_i)[ri].float().cpu()
     _os.makedirs(_dsv4_dump_dir, exist_ok = True)
-    torch.save(d, f"{_dsv4_dump_dir}/{tag}_L{layer}_p{pos}.pt")
+    import torch.distributed as _dist
+    _rk = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+    torch.save(d, f"{_dsv4_dump_dir}/r{_rk}_{tag}_L{layer}_p{pos}.pt")
 
 
 class DSV4CompressorState:
