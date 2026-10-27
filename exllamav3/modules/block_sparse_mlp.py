@@ -615,7 +615,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Completion counters + expert-run table of the fused decode kernels
         # (BC_BlockSparseMLP.run_bszN): the kernels reset each other's counters for the next
         # call, so they only need zeroing once
-        coop_ctr = self._buf_get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
+        coop_ctr = self._buf_get(device, (2 * bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 5,), torch.int, "moe1_coop_ctr")
         coop_ctr.zero_()
         # Rotated up-projection input per slot for the fused kernels at bsz > 1 (yh holds the gate's)
         had_u = self._buf_get(device, (bszn_rows, Hi), torch.half, "moe1_temp_hidden_u")
