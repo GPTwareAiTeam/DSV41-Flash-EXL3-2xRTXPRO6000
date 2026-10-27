@@ -170,9 +170,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("p2p_dev_arena_alloc", &p2p_dev_arena_alloc, "p2p_dev_arena_alloc");
     m.def("p2p_dev_arena_handle", &p2p_dev_arena_handle, "p2p_dev_arena_handle");
     m.def("p2p_dev_arena_open", &p2p_dev_arena_open, "p2p_dev_arena_open");
-    m.def("p2p_all_reduce_f32", &p2p_all_reduce_f32, "p2p_all_reduce_f32");
-    m.def("p2p_all_gather_f32", &p2p_all_gather_f32, "p2p_all_gather_f32");
-    m.def("p2p_bcast_i64", &p2p_bcast_i64, "p2p_bcast_i64");
+    m.def("p2p_all_reduce_f32", &p2p_all_reduce_f32, "p2p_all_reduce_f32", py::arg("x"), py::arg("rank"),
+          py::arg("local"), py::arg("peer"), py::arg("nblk"), py::arg("stats") = false);
+    m.def("p2p_all_gather_f32", &p2p_all_gather_f32, "p2p_all_gather_f32", py::arg("x"), py::arg("out"),
+          py::arg("rank"), py::arg("local"), py::arg("peer"), py::arg("nblk"), py::arg("stats") = false);
+    m.def("p2p_bcast_i64", &p2p_bcast_i64, "p2p_bcast_i64", py::arg("x"), py::arg("out"), py::arg("rank"),
+          py::arg("root"), py::arg("local"), py::arg("peer"), py::arg("nblk"), py::arg("stats") = false);
+    m.def("p2p_stats_read", &p2p_stats_read, "p2p_stats_read", py::arg("local"), py::arg("device"));
+    m.def("p2p_stats_reset", &p2p_stats_reset, "p2p_stats_reset", py::arg("local"), py::arg("device"));
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");

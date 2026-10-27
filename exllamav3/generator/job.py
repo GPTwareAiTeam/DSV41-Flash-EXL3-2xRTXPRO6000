@@ -1,5 +1,6 @@
 from __future__ import annotations
 import torch
+import os
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .generator import Generator
@@ -942,7 +943,8 @@ class Job:
                 if self.generator.draft_model or self.generator.ngram_match_min or self.generator.hybrid_draft_tokens:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
-                        "rejected_draft_tokens": self.rejected_draft_tokens
+                        "rejected_draft_tokens": self.rejected_draft_tokens,
+                        "verify_rounds": getattr(self, "verify_rounds", 0)
                     })
                 if eos_reason == "stop_string":
                     self.held_text = rem_held_text
@@ -1226,6 +1228,7 @@ class Job:
             "rq_new_tokens": self.rq_new_tokens + self.new_tokens,
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "rejected_draft_tokens": self.rejected_draft_tokens,
+            "verify_rounds": getattr(self, "verify_rounds", 0),
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
             "cached": self.rq_cached if self.rq_cached is not None else (
                 self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),
@@ -1500,7 +1503,7 @@ class Job:
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
             recurrent_last_page = False
-            if self.generator.recurrent_cache is not None:
+            if self.generator.recurrent_cache is not None and os.environ.get("EXL3_PREFILL_RC_SPLIT", "0") != "0":
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
                 if prefill_start < last_page_b <= prefill_end:

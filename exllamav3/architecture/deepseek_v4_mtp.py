@@ -180,10 +180,11 @@ class DeepseekV4MTPModel(Model):
 
         # Markov bigram head (per-token logit bias in the sampling loop) and confidence
         # head (per-position draft-length score), unquantized
+        tp_size = getattr(config, "tp_size", 1)
         self.markov_w1 = Embedding(
             config = config,
             key = f"{last}.markov_head.markov_w1",
-            vocab_size = config.vocab_size,
+            vocab_size = config.vocab_size // tp_size,
             hidden_size = config.dspark_markov_rank,
             allow_table = False,
         )
@@ -193,7 +194,7 @@ class DeepseekV4MTPModel(Model):
             config = config,
             key = f"{last}.markov_head.markov_w2",
             in_features = config.dspark_markov_rank,
-            out_features = config.vocab_size,
+            out_features = config.vocab_size // tp_size,
             qmap = None,
         )
         self.confidence = Linear(
@@ -333,14 +334,25 @@ class DeepseekV4MTPModel(Model):
         if getattr(self, "_markov_w1_dev", None) is None:
             self._markov_w1_dev = to_dev(self.markov_w1.embedding.weight.data, dev)
         w2 = self.markov_w2
+        tp = self.config.tp_size
         out = torch.empty((b, s + 1), dtype = torch.long, device = dev)
         out[:, 0] = seed[:, -1]
         embs = []
         for i in range(s):
-            emb = F.embedding(out[:, i], self._markov_w1_dev).half()
+            if tp > 1:
+                local_ids = out[:, i] - self.config.tp_rank * self.markov_w1.vocab_size
+                mask = (local_ids >= 0) & (local_ids < self.markov_w1.vocab_size)
+                emb = F.embedding(torch.where(mask, local_ids, torch.zeros_like(local_ids)), self._markov_w1_dev).float()
+                emb = emb * mask.unsqueeze(-1).float()
+                params["backend"].all_reduce(emb)
+                emb = emb.half()
+            else:
+                emb = F.embedding(out[:, i], self._markov_w1_dev).half()
             embs.append(emb)
-            bias = w2.forward(emb.unsqueeze(1), params)
-            logits[:, i] += bias[:, 0].float()
+            bias = w2.forward(emb.unsqueeze(1), params).float()
+            if tp > 1:
+                bias = params["backend"].all_gather(bias, tp)
+            logits[:, i] += bias[:, 0]
             out[:, i + 1] = torch.argmax(logits[:, i], dim = -1)
 
         # Confidence-capped draft length: proj(cat([pre-norm hidden, markov emb])) per
