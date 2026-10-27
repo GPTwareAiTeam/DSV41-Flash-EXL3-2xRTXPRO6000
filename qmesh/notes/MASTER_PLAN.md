@@ -15,7 +15,7 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
 | 6 | **FP8 KV cache** (DECIDED — do it) | diffbot ships fp8 KV; our engine has `k_bits=8` packed pool | ~2× KV capacity; halves KV bytes read/written | validate: attention must not get slower (packed pool adds dequant ALU) and tokens/KL within noise. Removes the earlier bogus "we're already at parity" claim |
 | 7 | **Replay trim in multi-chunk prefill** (late layers only need the last rows) | diffbot 3.7–4.6% at 34K–130K | +4% prefill | needs prefix-cache/ring semantics check |
 | 8 | **Prefix caching** (warm-prefix replay) | diffbot agentic 224 tok/s; sybil 16K prompt 16 s → 1 s on hit | large real-world gain | unmeasured by us |
-| 9 | **Speculative on/off policy (not K size)** | our K sweep 2026-10-27: round cost K=5 ~34 ms, K=3 ~67 ms, K=2 ~70 ms — the drafter emits a full 5-token block regardless, so K<5 wastes draft work and K=5 is optimal on all 6 prompts; prompt 2 (AL 2.0) is slower with spec than plain | +10-15% on low-acceptance content, never a loss | content classifier seeds a spec-on/off (or confidence-cut) decision, not K; revisit K once the per-round host cost is captured |
+| 9 | ~~Speculative on/off policy~~ **CLOSED: always speculate, K=5** | matched-config sweep (COMM=p2p, graphs on), six prompts: plain 13.09/13.18/13.27/14.81/13.27/13.29 vs K=5 8.16/5.97/9.32/4.56/5.21/9.50 ms/tok — spec wins on every prompt (1.6x on prose, 2.5x on JSON); K<5 is strictly dominated (drafter runs a per-position loop, so a shorter window saves verify rows but not draft passes). Auto on/off lost on 3 of 6 | +0% | keep `DSPARK_POLICY=always`; **the real lever is the draft loop itself** (item 13) |
 | 10 | **bsz-1 decode MoE occupancy** — 60–63 regs, 27 KB smem, 2–3 blocks/SM, 33–43% warps | our ncu | maybe +10–20% on the MoE share | lower value than #2 because 33–43% is already usable |
 | 11 | **Larger prefill chunk (8K/16K)** | our 2048→4096 = +18% | unknown | cheap test; memory-limited |
 ### New data (2026-10-27, later)
@@ -25,6 +25,7 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
   FAILED the quality gate (prompt-3 token flip at step 11, KL 0.22 at the flip). Trying block-scaled fp8
   (per-128 scale) next; if it still flips, drop the item.
 
+| 13 | **Cheapen the draft loop** — 5 sequential drafter forwards/round, each with a vocab-split head + sampler sync | our code (`generator.py:1258`) + ms/round ~23 | 2x spec: 23 -> ~12 ms/round | biggest remaining spec item; candidates: one batched head gather for all 5 positions instead of 5, keep ids on device, count host syncs |
 | 12 | **K=7 drafter** | diffbot: "of the +43%, draft length gives nearly all" | +30–40% on code | BLOCKED: our checkpoint has `dspark_block_size=5` |
 
 Already done / no longer candidates: mixed-K fused MoE with per-expert K tables; piecewise + block-boundary-merged CUDA
