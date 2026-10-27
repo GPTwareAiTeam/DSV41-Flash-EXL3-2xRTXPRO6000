@@ -12,6 +12,19 @@ Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 t
 
 | # | change | measured gain | verification |
 |---|---|---|---|
+| 3 | **Multi-stream decode (continuous batching)** -- owner's call. `BATCH` dial through Model.load/Cache/Generator, per-width warmup, graph-safe expert counting (no `torch.bincount` sync), per-row block table, and the real bug: `_indexer_keys` built RoPE positions as `arange(n) + e0`, so at B>1 the rows rotated the compressed pool at positions 4,5,6,7 instead of 4,4,4,4 | **B1 10.84 ms/tok (92 tok/s) -> B2 13.91 (133.8 aggregate) -> B4 17.89 (202.99 aggregate)** = **2.2x throughput**, peak 86.5 GiB/GPU | four IDENTICAL B4 prompts give byte-identical 128-token streams with graphs on; layer-2 attention row diff 0 at pos 9 with pool_c/pool_r/ring byte-equal; B4-captured vs eager logits max KL 0.016-0.024, mean 0.0008-0.0015 (fp-order only) |
+| 1 | **Capture the decode attention core** (piecewise segments + cross-block graph merge) | plain **13.15 -> 10.97 ms/tok** | tokens byte-identical, 4 prompts x 128 tokens x 2 ranks. Root cause of every earlier failure: `b1_prep` required `q_head_norm=True` while `_batch_ok_b1` required `False`, so the capture never ran |
+| 2 | **Kill the local-memory load in `gemv_tile`** (the `r0_ok ? A2[...] : hzero` conditional took the address of a per-thread const) | MoE **67.31 -> 65.76 us/call @bsz1 (1.024x)**, 1.018x @bsz6 | bitwise identical; ncu had shown A at 1,290,240 local load sectors vs 1,317,141 global (~49%), B 765,250 vs 1,188,536 (~57%) |
+| 3b | **Prefetch hoist (C1) + PDL launch of kernel B (C5)** from the external review kit | **62.54 us/call (1.076x)** @bsz1, 1.052x @bsz6; in-model 10.97/11.02/10.98 -> 10.80/10.91/10.85 | bitwise identical; mixed-K header regenerates byte-identically from the patched base header |
+| 11 | **Prefill chunk and auto sizing** -- `MAX_CHUNK` 8192 (4778 tok/s @32K prompt); `MAX_CHUNK=auto` sizes the chunk from the measured peak table against the `CTX_TOKENS` KV budget, so 1M context costs one chunk step (8192 -> 4096) | prefill 3.9k -> 4.78k | 2 reps per size, sampled device peak |
+| 9 | **Speculative policy: always speculate**; one DFlash block forward per round at every K; round cost ~flat in K | K choice worth <=8% | matched config; `DSPARK_POLICY=always` |
+
+**IMPORTANT:** batching requires `EXL3_DSV4_B1_BATCH=1`. Without it, B>1 silently falls back to the eager batched
+body and B4 measures 39 ms/token instead of 17.89. This is the *second* time a capture gate has cost us a 2x.
+
+
+| # | change | measured gain | verification |
+|---|---|---|---|
 | 1 | **Capture the decode attention core** (piecewise segments + cross-block graph merge) | plain **13.15 -> 10.97 ms/tok** | tokens byte-identical, 4 prompts x 128 tokens x 2 ranks. Root cause of every earlier failure: `b1_prep` required `q_head_norm=True` while `_batch_ok_b1` required `False`, so the capture never ran and every "capture is slower" reading was the eager fallback |
 | 2 | **Kill the local-memory load in `gemv_tile`** — the `r0_ok ? A2[...] : hzero` conditional took the address of a per-thread const, so the false branch became a local-memory load; replaced with a uint32 reinterpret plus a literal zero | MoE **67.31 -> 65.76 us/call @bsz1 (1.024x)**, 197.34 -> 193.88 @bsz6 (1.018x) | bitwise identical. ncu had shown A at **1,290,240 local load sectors vs 1,317,141 global (~49%)**, B 765,250 vs 1,188,536 (~57%), line-mapped to `cuda_fp16.hpp:344` |
 | 3 | **Hoist the trellis prefetch ring ahead of the prologue (C1) + PDL-launch kernel B (C5)**, from the external review kit | **62.54 us/call @bsz1 (1.076x)**, 187.56 @bsz6 (1.052x); C1 alone 1.054x, C5 adds ~2% | bitwise identical; in-model **10.97/11.02/10.98 -> 10.80/10.91/10.85 ms/tok**, tokens byte-identical to the pre-patch baseline |
