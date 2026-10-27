@@ -218,7 +218,15 @@ def main():
     tokenizer = Tokenizer.from_config(config)
     generator = Generator(model, cache, tokenizer, max_batch_size = 1, max_chunk_size = MAX_CHUNK)
     dist.barrier()
-
+    # Warm pass: one short job so graph capture and allocator warmup stay out of the timed prompts
+    _warm_text = encode_messages([{"role": "user", "content": PROMPTS[PROMPT_IDS[0]]}], thinking_mode = "chat")
+    _warm_ids = tokenizer.encode(_warm_text, add_bos = False, encode_special_tokens = True)
+    _warm = Job(input_ids = _warm_ids, max_new_tokens = 8, min_new_tokens = 8,
+                sampler = GreedySampler(), stop_conditions = [])
+    generator.enqueue(_warm)
+    while generator.num_remaining_jobs():
+        for _ in generator.iterate():
+            pass
     out = {}
     for idx in PROMPT_IDS:
         prompt = PROMPTS[idx]
@@ -284,7 +292,7 @@ def main():
         if RANK == 0:
             log(f"PROFILE decode_steps={steps} wall_ms_per_step={wall_ms:.2f}")
             prof.export_chrome_trace(os.environ.get("PROFILE_TRACE", "/artifacts/tp2logs/profile_trace.json"))
-            print(prof.key_averages().table(sort_by = "cuda_time_total", row_limit = 40), flush = True)
+            print(prof.key_averages().table(sort_by = "self_cpu_time_total", row_limit = 45), flush = True)
 
     dist.barrier()
     dist.destroy_process_group()
