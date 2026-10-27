@@ -158,6 +158,14 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_m32[] =
     exl3_moe_kernel_k6_n128_cb2_m32(), exl3_moe_kernel_k7_n128_cb2_m32(), exl3_moe_kernel_k8_n128_cb2_m32()
 };
 
+// 48-row tile instances, [K], N = 128 shape, mul1 codebook only
+fp_exl3_moe_kernel exl3_moe_kernel_instances_m48[] =
+{
+    exl3_moe_kernel_k0_n128_cb2_m48(), exl3_moe_kernel_k1_n128_cb2_m48(), exl3_moe_kernel_k2_n128_cb2_m48(),
+    exl3_moe_kernel_k3_n128_cb2_m48(), exl3_moe_kernel_k4_n128_cb2_m48(), exl3_moe_kernel_k5_n128_cb2_m48(),
+    exl3_moe_kernel_k6_n128_cb2_m48(), exl3_moe_kernel_k7_n128_cb2_m48(), exl3_moe_kernel_k8_n128_cb2_m48()
+};
+
 // 64-row tile instances, [K], N = 128 shape, mul1 codebook only
 fp_exl3_moe_kernel exl3_moe_kernel_instances_m64[] =
 {
@@ -177,6 +185,11 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_h[] =
 fp_exl3_moe_kernel exl3_moe_kernel_instances_h_m32[] =
 {
     exl3_moe_kernel_h1_n128_cb2_m32(), exl3_moe_kernel_h2_n128_cb2_m32(), exl3_moe_kernel_h3_n128_cb2_m32()
+};
+
+fp_exl3_moe_kernel exl3_moe_kernel_instances_h_m48[] =
+{
+    exl3_moe_kernel_h1_n128_cb2_m48(), exl3_moe_kernel_h2_n128_cb2_m48(), exl3_moe_kernel_h3_n128_cb2_m48()
 };
 
 fp_exl3_moe_kernel exl3_moe_kernel_instances_h_m64[] =
@@ -248,8 +261,8 @@ inputs:
         launch's row tile); num_active must count the experts inside the range
 
     m_tile:
-        rows per GEMM tile: 16 (any codebook; N = 128 or 256 tile shape by dims), 32 or 64
-        (mul1 codebook, N = 128 instances). Worth it for experts holding more than 16 / 32 rows
+        rows per GEMM tile: 16 (any codebook; N = 128 or 256 tile shape by dims), 32, 48 or 64
+        (mul1 codebook, N = 128 instances).
 
     num_active:
         number of experts with 0 < token count <= max_tokens_per_expert, i.e. the number of experts this kernel
@@ -467,9 +480,11 @@ void exl3_moe
         TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
         if (half_k)
-            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_h_m64[K - 1] : exl3_moe_kernel_instances_h_m32[K - 1];
+            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_h_m64[K - 1] :
+                     m_tile >= 48 ? exl3_moe_kernel_instances_h_m48[K - 1] : exl3_moe_kernel_instances_h_m32[K - 1];
         else
-            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
+            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] :
+                     m_tile >= 48 ? exl3_moe_kernel_instances_m48[K] : exl3_moe_kernel_instances_m32[K];
     }
 #endif
 

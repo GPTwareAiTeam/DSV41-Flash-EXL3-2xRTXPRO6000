@@ -104,15 +104,21 @@ def test_fused_row_tiles_match_single_launch(device, dims):
     run(33, CAP, 64, -1, tiered)
     run(17, 32, 32, -1, tiered)
     run(1, 16, 16, -1, tiered)
+    m48 = torch.full((A, Hd), float("nan"), dtype = torch.float, device = device)
+    run(1, CAP, 48, -1, m48)
     torch.cuda.synchronize()
     assert not torch.isnan(single).any() and not torch.isnan(tiered).any(), "an expert was skipped"
+    assert not torch.isnan(m48).any(), "an expert was skipped by M48"
     if Hd % 256 == 0 and Id % 256 == 0:
         # The single launch takes the N = 256 instance here while the wide tiles are N = 128 kernels: a different
         # column tiling reduces k in a different order, so rounding-level agreement is the bound
         assert (tiered - single).abs().max().item() <= 2e-3 * single.abs().max().item(), \
             "N = 128 tiles vs N = 256 launch beyond fp32 rounding"
+        assert (m48 - single).abs().max().item() <= 2e-3 * single.abs().max().item(), \
+            "M48 vs N = 256 launch beyond fp32 rounding"
     else:
         assert torch.equal(single, tiered), "row-tile launches differ from the single 16-row launch"
+        assert torch.equal(single, m48), "M48 differs from the single 16-row launch"
     # Production geometry (per-launch active counts widen the groups): a different k-slice split changes the
     # reduction order, so only agreement to fp32 rounding is expected
     prod = torch.full((A, Hd), float("nan"), dtype = torch.float, device = device)

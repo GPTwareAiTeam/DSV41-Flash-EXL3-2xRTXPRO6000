@@ -51,6 +51,7 @@ HIP_EXCLUDED_SOURCES = {
     # shape table / dispatch carry USE_ROCM arms. The M-tiled MoE instances exist for the CUDA kernel only
     # (EXL3_MOE_MTILE)
     "quant/comp_units/exl3_moe_inst_*_m32.cu",
+    "quant/comp_units/exl3_moe_inst_*_m48.cu",
     "quant/comp_units/exl3_moe_inst_*_m64.cu",
 }
 

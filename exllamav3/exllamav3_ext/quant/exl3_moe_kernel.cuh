@@ -247,8 +247,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         had_gather_gu_in();
 
         // GEMM over the expert's rows in tiles of M_TILE. The wide instances finish an
-        // expert's remainder with the largest smaller tile that covers it (64 -> 32 -> 16) so a
-        // 96-row expert runs 64 + 32 instead of two 64-row tiles with half of one idle
+        // expert's remainder with a smaller tile that covers it, avoiding mostly idle rows.
         auto gemm = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K,
                         const int size_k, const int size_n)
         {
@@ -262,6 +261,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
                     else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
                 }
+#if !defined(USE_ROCM)
+                else if constexpr (M_TILE == 48)
+                {
+                    if (size_m > 32)      { moe_gemm_tile<t_bits, cb, 48, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 48; }
+                    else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                }
+#endif
                 else if constexpr (M_TILE == 32)
                 {
                     if (size_m > 16)      { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
