@@ -1416,6 +1416,62 @@ class DSV4Attention(Module):
         ec = pos_end // self.compress_rate
         return not kl.quant and ec <= self.index_topk and self.candidate_mode is None
 
+    def b1_prep(self, params):
+        """Piecewise capture prepass for one bsz-1 decode step (S == 1): the host half of
+        _forward_cached_batch. Resolves the cache and stages the per-job state array and block-table static
+        that the device-driven body reads. Returns ((rsl, kl, m, w, kp), arr, bt_st) when the captured body serves
+        this step, or None with no state touched for the eager path: ring shifts, top-k regime switches, mirrored pools."""
+        if not dsv4_b1_batch or not self.num_q_heads or not self.q_head_norm:
+            return None
+        if params.get("attn_mode") != "flash_attn" or params.get("prefill"):
+            return None
+        rsg = params.get("recurrent_states")
+        if not rsg or len(rsg) != 1:
+            return None
+        rs = rsg[0]
+        layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+        rsl = self._get_rsl(rs, layer_instance)
+        pos0 = rs.position
+        offset = pos0 - rs.window_beg
+        if offset + 1 > rsl.ring_rows:
+            return None
+        kl = None
+        if self.kv_source is not None:
+            if "block_table" not in params:
+                return None
+            owner = self.kv_owner if self.kv_owner is not None else self
+            kl = owner.tp_cache_lookup[rs.cache] if self.tp_mode \
+                else rs.cache.layers[(self.kv_source, layer_instance[1])]
+            if self.kv_owner is not None and kl.device != self.device:
+                return None
+        if not self._batch_ok_b1(kl, pos0 + 1):
+            return None
+        m = self.compress_rate if self.kv_source is not None else 1
+        w = self.sliding_window
+        kp = -(-self.index_topk // 32) * 32 if self.indexer is not None else 32
+        ec = (pos0 + 1) // m if self.kv_source is not None else 0
+        gkey = ("b1", id(rsl), id(kl))
+        st = self._bgraph_state.get(gkey)
+        if st is None:
+            st = dict(
+                pins = [torch.empty((6, 1), dtype = torch.int32, pin_memory = True) for _ in range(8)],
+                pin_i = 0,
+                arr = torch.empty((6, 1), dtype = torch.int32, device = self.device),
+                bt_st = torch.zeros((1, kl.num_pages if kl is not None else 1), dtype = torch.int32,
+                                    device = self.device),
+            )
+            self._bgraph_state[gkey] = st
+        pin = st["pins"][st["pin_i"]]
+        st["pin_i"] = (st["pin_i"] + 1) % len(st["pins"])
+        pin.copy_(torch.tensor([[pos0], [pos0 - min(w - 1, offset, pos0)], [rs.window_beg], [ec], [rs.slot],
+                                [kp]], dtype = torch.int32))
+        st["arr"].copy_(pin, non_blocking = True)
+        if kl is not None:
+            bt = get_for_device(params, "block_table", self.device)
+            npr = min(bt.shape[1], kl.num_pages)
+            st["bt_st"][:, :npr].copy_(bt[:1, :npr])
+        return (rsl, kl, m, w, kp), st["arr"], st["bt_st"]
+
 
 
     def _forward_cached(self, x, params, out_dtype):
