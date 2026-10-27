@@ -34,6 +34,8 @@ from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Token
 from exllamav3.modules.transformer import TransformerBlock  # noqa: E402
 
 OVERLAY = os.environ.get("OVERLAY", "/artifacts/tp2-overlay")
+DSPARK = os.environ.get("DSPARK", "0") == "1"
+NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
@@ -41,6 +43,8 @@ IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
 COMM = os.environ.get("COMM", "nccl")  # nccl | p2p (P2PComm one-shot collectives; needs P2P_RDV = fresh dir)
 PROFILE = os.environ.get("PROFILE", "0") == "1"
 TOKENS_OUT = os.environ.get("TOKENS_OUT")
+LOGITS_OUT = os.environ.get("LOGITS_OUT")
+PROBE = [int(n) for n in os.environ.get("PROBE", "").split(",") if n.strip()]
 PROMPT_IDS = [int(i) for i in os.environ.get("PROMPT_IDS", "0,1,2").split(",")]
 RANK = int(os.environ["RANK"])
 WORLD = int(os.environ["WORLD_SIZE"])
@@ -72,6 +76,12 @@ class TPBackendNCCL:
     def broadcast(self, tensor: torch.Tensor, src_device: int):
         dist.broadcast(tensor, src = src_device)
 
+    def all_gather(self, t: torch.Tensor, world: int) -> torch.Tensor:
+        """Concatenate the per-rank t along the last dim, in rank order, on both ranks (== cat(parts, -1))."""
+        assert world == 2
+        parts = [torch.empty_like(t) for _ in range(world)]
+        dist.all_gather(parts, t.contiguous())
+        return torch.cat(parts, dim = -1)
     def run_cpu_reduce_jobs(self):
         pass
 
@@ -119,8 +129,16 @@ class TPBackendP2P:
         """Concatenate the per-rank t along the last dim, in rank order, on both ranks (== cat(parts, -1))."""
         assert world == 2
         t = t.contiguous()
-        flat = torch.empty(2 * t.numel(), dtype = torch.float32, device = t.device)
-        self.comm.all_gather(t.float().reshape(-1), flat)
+        n = t.numel()
+        src = t.float().reshape(-1)
+        flat = torch.empty(2 * n, dtype = torch.float32, device = t.device)
+        # chunk to the arena size; both ranks issue the same sequence (sizes depend only on numel)
+        for off in range(0, n, P2P_CHUNK):
+            m = min(P2P_CHUNK, n - off)
+            part = torch.empty(2 * m, dtype = torch.float32, device = t.device)
+            self.comm.all_gather(src[off:off + m].contiguous(), part)
+            flat[off:off + m].copy_(part[:m])
+            flat[n + off:n + off + m].copy_(part[m:])
         shards = flat.view(2, *t.shape)
         return torch.cat([shards[0], shards[1]], dim = -1).to(t.dtype)
 
@@ -216,10 +234,20 @@ def main():
         f"max_alloc_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f}")
 
     tokenizer = Tokenizer.from_config(config)
-    generator = Generator(model, cache, tokenizer, max_batch_size = 1, max_chunk_size = MAX_CHUNK)
+    draft_model = draft_cache = None
+    if DSPARK:
+        draft_model = Model.from_config(config, component = "mtp")
+        draft_cache = Cache(draft_model, max_num_tokens = CACHE_TOKENS, max_history = 5)
+        draft_model.load(device = device, progressbar = False)
+        n_draft = set_tp_reduce(draft_model, backend)
+        log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
+    generator = Generator(model, cache, tokenizer, max_batch_size = 1, max_chunk_size = MAX_CHUNK,
+                          draft_model = draft_model, draft_cache = draft_cache,
+                          num_draft_tokens = NUM_DRAFT if DSPARK else None)
     dist.barrier()
 
     out = {}
+    logit_out = {}
     for idx in PROMPT_IDS:
         prompt = PROMPTS[idx]
         text_in = encode_messages([{"role": "user", "content": prompt}], thinking_mode = "chat")
@@ -231,10 +259,11 @@ def main():
             min_new_tokens = MAX_NEW if IGNORE_EOS else 0,
             sampler = GreedySampler(),
             stop_conditions = [] if IGNORE_EOS else [tokenizer.eos_token_id],
+            return_logits = bool(LOGITS_OUT),
         )
         generator.enqueue(job)
         t1 = time.time()
-        marks, text, tokens, eos_info = [], "", [], None
+        marks, text, tokens, eos_info, logit_rows = [], "", [], None, []
         while generator.num_remaining_jobs():
             for result in generator.iterate():
                 if "error" in result:
@@ -245,17 +274,46 @@ def main():
                     marks.append(time.time() - t1)
                 if "token_ids" in result:
                     tokens += result["token_ids"][0].tolist()
+                if "logits" in result and LOGITS_OUT:
+                    logit_rows.append(result["logits"].float().cpu())
                 if result.get("eos"):
                     eos_info = result.get("eos_reason")
         total = time.time() - t1
         first = marks[0] if marks else float("nan")
         decode = (total - first) / max(len(marks) - 1, 1) if len(marks) > 1 else float("nan")
         out[str(idx)] = tokens
+        if LOGITS_OUT and logit_rows:
+            top = []
+            for row in logit_rows:
+                v, i = torch.topk(row.reshape(-1, row.shape[-1]), 2, dim = -1)
+                top.append({"top1": int(i[-1, 0]), "top2": int(i[-1, 1]), "gap": float(v[-1, 0] - v[-1, 1])})
+            logit_out[str(idx)] = top
         log(f"PROMPT {prompt!r} prompt_tokens={ids.shape[-1]} new_tokens={len(tokens)} total={total:.3f}s "
             f"first_token_ms={first * 1e3:.1f} decode_ms_per_tok={decode * 1e3:.2f} eos={eos_info} text={text!r}")
         log(f"TOKENS {idx} {tokens}")
 
+    if PROBE and "0" in out:
+        # Seq>1 probe: prompt + the first N generated tokens as ONE prefill forward, then the next-token logits.
+        # Compared against the 1-token-decode reference (logit_out["0"][N]) to isolate the multi-row target path.
+        ids0 = tokenizer.encode(encode_messages([{"role": "user", "content": PROMPTS[0]}], thinking_mode = "chat"),
+                                add_bos = False, encode_special_tokens = True)
+        for n in PROBE:
+            pj = Job(input_ids = torch.cat([ids0, torch.tensor([out["0"][:n]], dtype = ids0.dtype)], dim = -1),
+                     max_new_tokens = 1, min_new_tokens = 1, sampler = GreedySampler(), stop_conditions = [],
+                     return_logits = True)
+            generator.enqueue(pj)
+            got = None
+            while generator.num_remaining_jobs():
+                for r in generator.iterate():
+                    if "error" in r: raise r["error"]
+                    if "logits" in r: got = r["logits"].float().cpu()
+                    if "token_ids" in r: probe_tok = r["token_ids"][0].tolist()
+            v, i = torch.topk(got.reshape(-1, got.shape[-1])[-1], 2)
+            log(f"PROBE n={n} next_tok={probe_tok} top1={int(i[0])} top2={int(i[1])} gap={float(v[0]-v[1]):.5f}")
     log(f"MEM max_alloc_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f}")
+    if LOGITS_OUT:
+        with open(f"{LOGITS_OUT}.rank{RANK}.json", "w") as f:
+            json.dump(logit_out, f)
     if TOKENS_OUT:
         with open(f"{TOKENS_OUT}.rank{RANK}.json", "w") as f:
             json.dump(out, f)
