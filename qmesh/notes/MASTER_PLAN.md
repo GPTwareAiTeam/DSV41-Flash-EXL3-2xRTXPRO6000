@@ -18,6 +18,14 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
 | 9 | **Speculative policy: always speculate; K is a small dial** | matched COMM=p2p + graphs, prompt 0: one DFlash block forward per round at every K; estimated round cost 19.7/20.7/21.3/22.1 ms at K=2/3/4/5, AL 2.25/2.56/2.51/2.67, decode 8.77/8.09/8.50/8.27 ms/tok. Six-prompt matched sweep: K=5 beat plain on all six; auto on/off lost to K=5 on all six. K=2/5 event stream means: draft 1.87/1.81 ms, verify 21.47/21.09 ms, host iteration 26.13/26.06 ms (iterations include startup and non-SPEC rounds). | K choice = small | `DSPARK_POLICY=always` by default. Round cost is approximately flat in K and MoE-read bound. Earlier 'K<5 dominated' and 'prose loses' claims, based on unmatched configurations, are retracted. |
 | 10 | **bsz-1 decode MoE occupancy** — 60–63 regs, 27 KB smem, 2–3 blocks/SM, 33–43% warps | our ncu | maybe +10–20% on the MoE share | lower value than #2 because 33–43% is already usable |
 | 11 | **Larger prefill chunk (8K/16K)** | our 2048→4096 = +18% | unknown | cheap test; memory-limited |
+### Round anatomy, fully attributed (DSpark K=5, CUDA events + K sweep)
+`round ~22 ms = target forward 11.0 + verify ~6.0 + draft 1.9 + host ~3.1`. Round cost is flat in K
+(19.7 / 20.7 / 21.3 / 22.1 ms for K=2/3/4/5), so the verify rows are a minor term: going 6 rows -> 3 rows saves 1.4 ms.
+**Every remaining decode lever therefore reduces to the single-token target forward = the bsz-1 MoE kernels.**
+ncu on those: A 43.4 us at 42.2% DRAM, B 28.2 us at 32.5% DRAM, 80 regs/thread, 3 blocks/SM (register-limited),
+43.8% occupancy, long-scoreboard 44% -> latency-bound, not bandwidth-bound. Levers in order: occupancy (force fewer
+regs / more warps), memory-level parallelism, then layout.
+
 ### New data (2026-10-27, multi-stream measured)
 - **Batching works once the B>1 core is captured**: plain per-stream 14.62 ms/tok at B2 (**126 tok/s aggregate**) and
   19.51 ms/tok at B4 (**189 tok/s aggregate**), i.e. ~2.1x wall-clock throughput at 1.8x per-stream latency. Peak VRAM
