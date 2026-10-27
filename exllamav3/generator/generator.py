@@ -1371,6 +1371,8 @@ class Generator:
         if self.draft_calibrator is not None or getattr(self, "observe_draft_confidence", False):
             params["export_draft_conf"] = True
         params["sparse_head"] = self._sparse_flag
+        if getattr(self, "count_draft_forwards", False):
+            self.draft_forward_count += 1
         out_state = self.draft_model.forward(
             input_ids = batch_ids,
             params = params,

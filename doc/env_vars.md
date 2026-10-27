@@ -1147,6 +1147,10 @@ auto decode ms per token were 13.09/8.16/13.38, 13.18/5.97/13.64, 13.27/9.32/13.
 14.81/4.56/4.57, 13.27/5.21/5.26 and 13.29/9.50/13.68. Auto switched off on prompts 0, 1, 2 and 5;
 fixed K=5 was faster on all six. This experimental policy does not guarantee a speedup.
 
+### `DSPARK_COUNT_FORWARDS` (default: `0`)
+
+Count DFlash drafter forward calls per single-stream prompt and report `DRAFT_FORWARDS`.
+
 ### `DSPARK_POLICY_THRESHOLD` (default: `2.55`), `DSPARK_POLICY_EMA_WINDOW` (default: `8`)
 
 Acceptance-length cutoff and EMA time constant in speculative rounds.

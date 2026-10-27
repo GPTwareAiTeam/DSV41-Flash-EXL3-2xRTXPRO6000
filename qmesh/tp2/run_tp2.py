@@ -32,6 +32,7 @@ sys.path.insert(0, "/models/dsv41/DeepSeek-V4.1-Flash-1017-orig/encoding")
 from encoding import encode_messages  # noqa: E402
 
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer  # noqa: E402
+from exllamav3 import CacheLayer_quant  # noqa: E402
 from exllamav3.generator.generator import _DRAFT_HIST  # noqa: E402
 from exllamav3.modules.transformer import TransformerBlock  # noqa: E402
 
@@ -43,6 +44,7 @@ DSPARK = os.environ.get("DSPARK", "0") == "1"
 DSPARK_DYNAMIC = os.environ.get("DSPARK_DYNAMIC", "0") == "1"
 DSPARK_TARGET_ACC = float(os.environ.get("DSPARK_TARGET_ACC", "0.7"))
 DSPARK_POLICY = os.environ.get("DSPARK_POLICY", "always")
+DSPARK_COUNT_FORWARDS = os.environ.get("DSPARK_COUNT_FORWARDS", "0") == "1"
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 # Recurrent-cache history must cover the speculative pass width (generator requires max_history >= K); 5 is the
 # previous fixed value, so K<=5 runs are unchanged.
@@ -52,6 +54,10 @@ MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 CACHE_TOKENS_PER_SEQ = int(os.environ.get("CACHE_TOKENS_PER_SEQ", "4096"))  # KV pool tokens per concurrent stream
 BATCH = int(os.environ.get("BATCH", "1"))  # concurrent streams: Cache slots, Model.load + Generator max_batch_size
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", str(BATCH * CACHE_TOKENS_PER_SEQ)))
+KV_BITS = int(os.environ.get("KV_BITS", "16"))
+if KV_BITS not in (8, 16):
+    raise ValueError("KV_BITS must be 8 or 16")
+KV_CACHE_KWARGS = {"layer_type": CacheLayer_quant, "k_bits": 8, "v_bits": 8} if KV_BITS == 8 else {}
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
 COMM = os.environ.get("COMM", "nccl")  # nccl | p2p | hybrid (hybrid: P2P <64KB, NCCL >=64KB)
 P2P_STATS_OUT = os.environ.get("P2P_STATS_OUT")  # p2p only: prefix; enables device spin/timing stats, dumped at run end to <prefix>.rank<r>.json
@@ -278,7 +284,7 @@ def main():
     assert config.tp_size == WORLD and config.tp_rank == RANK, \
         f"checkpoint tp_size/tp_rank {config.tp_size}/{config.tp_rank} != launch {WORLD}/{RANK}"
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY, max_batch_size = BATCH)
+    cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY, max_batch_size = BATCH, **KV_CACHE_KWARGS)
     model.load(device = device, max_chunk_size = MAX_CHUNK, max_output_size = MAX_NEW,
                max_batch_size = BATCH, progressbar = False)
     if COMM in ("p2p", "hybrid"):
@@ -301,7 +307,7 @@ def main():
     draft_model = draft_cache = None
     if DSPARK:
         draft_model = Model.from_config(config, component = "mtp")
-        draft_cache = Cache(draft_model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY)
+        draft_cache = Cache(draft_model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY, **KV_CACHE_KWARGS)
         draft_model.load(device = device, progressbar = False)
         n_draft = set_tp_reduce(draft_model, backend)
         log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
@@ -314,6 +320,8 @@ def main():
                           draft_confidence = DSPARK_TARGET_ACC,
                           record_draft_stats = DSPARK and (DSPARK_DYNAMIC or DSPARK_POLICY == "auto"))
     generator.observe_draft_confidence = DSPARK_POLICY == "auto"
+    generator.count_draft_forwards = DSPARK_COUNT_FORWARDS
+    generator.draft_forward_count = 0
     FORCE_EXPORT = os.environ.get("FORCE_EXPORT", "0") == "1"
     if FORCE_EXPORT and not DSPARK:
         _export_layers = set(config.dspark_target_layer_ids)
@@ -397,6 +405,7 @@ def main():
         policy_off = DSPARK_POLICY == "auto" and policy_ema < content_seed.POLICY_THRESHOLD
         if DSPARK_POLICY == "auto":
             generator.num_draft_tokens = 0 if policy_off else NUM_DRAFT
+        draft_forward_start = generator.draft_forward_count
         if DSPARK_POLICY == "auto":
             log(f"POLICY {idx} class={policy_class} seed_al={policy_ema:.3f} speculative={not policy_off}")
         generator.enqueue(job)
@@ -432,6 +441,8 @@ def main():
         total = time.time() - t1
         if not timed:
             continue
+        if DSPARK_COUNT_FORWARDS:
+            log(f"DRAFT_FORWARDS {idx} count={generator.draft_forward_count - draft_forward_start}")
         first = marks[0] if marks else float("nan")
         decode = (total - first) / max(len(marks) - 1, 1) if len(marks) > 1 else float("nan")
         out[str(idx)] = tokens
