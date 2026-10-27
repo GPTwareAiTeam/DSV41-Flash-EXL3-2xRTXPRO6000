@@ -1597,8 +1597,13 @@ class DSV4Attention(Module):
                 row = bt_st[0].index_select(0, (e // kl.epp).long()).long() * kl.epp + (e % kl.epp).long()
                 lat = torch.cat((kl.pool_c.view(-1, kl.D_c)[row], kl.pool_r.view(-1, kl.D_r)[row]), dim = -1)
                 keys = self._indexer_keys(lat, params, e)
-                idx_flat = kl.pool_idx.view(-1, kl.D_i)
                 new = (a_ec > a_pos // m).view(-1, 1)
+                # _indexer_keys ropes the copy's trailing rope slice in place; the eager path
+                # stores that roped slice in the pool (idx owners' compressor rope table is
+                # zero), so write it back for new entries. Non-new steps keep the stored row.
+                pool_r_flat = kl.pool_r.view(-1, kl.D_r)
+                pool_r_flat.index_copy_(0, row, torch.where(new, lat[:, kl.D_c:], pool_r_flat[row]))
+                idx_flat = kl.pool_idx.view(-1, kl.D_i)
                 idx_flat.index_copy_(0, row, torch.where(new, keys, idx_flat[row]))
 
         if self.compressor is not None and self.layer_type == "csa":
