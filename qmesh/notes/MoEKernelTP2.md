@@ -28,7 +28,7 @@ Full `tests/kernels/moe/`: 263 passed (259 baseline + 4 fold cases).
 - Two-chain ILP inside gemv_tile (per-warp k split into two independent fp16/fp32 accumulator chains, interleaved decode/MMA, fixed-order fold): A 39.01 / B 24.42 vs HEAD A 34.23 / B 19.62 (bsz1, prof_moe_tp2, reproduced). Reverted.
 - B-WIDE at bsz1: B 22.4 (worse than 19.9).
 - A ksplit forced 2/3/4 (EXL3_MOE_COOP_KSPLIT): A 38.3/42.0/44.4, B 26.1/30.4/36.9. Every split slows both. Default ksplit=1 kept.
-- Reject PF=8 ring.
+- cp.async smem trellis ring (per-warp, RING_NS slots of 128 words, PF=RING_NS-1; sm_75 sync fallback). Same-harness bsz1 / bsz6 (A/B us): HEAD 34.16/19.25, 216.75/97.05. NS=8: 49.43/23.03, 324.71/110.51. NS=4: 38.83/19.65, 206.98/98.68. Worse at bsz1; rejected. Patch kept at `recipe-artifacts/2x-rtx-tp2/ring_ns4.patch` (not committed). Cause: per-slice wait_group + __syncwarp on critical path; occupancy not limited (NS=8: A 4, B 5 blocks/SM).
 
 ## Diagnostics
 - Kernel B reduction costs ~1.1 us (DBG=2 skip: 18.8 vs 19.9).
