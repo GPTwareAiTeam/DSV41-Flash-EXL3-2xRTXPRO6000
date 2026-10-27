@@ -45,6 +45,7 @@ DSPARK_DYNAMIC = os.environ.get("DSPARK_DYNAMIC", "0") == "1"
 DSPARK_TARGET_ACC = float(os.environ.get("DSPARK_TARGET_ACC", "0.7"))
 DSPARK_POLICY = os.environ.get("DSPARK_POLICY", "always")
 DSPARK_COUNT_FORWARDS = os.environ.get("DSPARK_COUNT_FORWARDS", "0") == "1"
+DRAFT_TIMING = os.environ.get("DRAFT_TIMING", "0") == "1"
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 # Recurrent-cache history must cover the speculative pass width (generator requires max_history >= K); 5 is the
 # previous fixed value, so K<=5 runs are unchanged.
@@ -322,6 +323,38 @@ def main():
     generator.observe_draft_confidence = DSPARK_POLICY == "auto"
     generator.count_draft_forwards = DSPARK_COUNT_FORWARDS
     generator.draft_forward_count = 0
+    draft_timing_rounds = []
+    if DRAFT_TIMING and DSPARK:
+        # Events measure stream elapsed time, including any idle gaps, not kernel-only time.
+        current_events = None
+        def timed_forward(original, component):
+            def call(*args, **kwargs):
+                if current_events is None:
+                    return original(*args, **kwargs)
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    end.record()
+                    current_events.append((component, start, end))
+            return call
+        model.forward = timed_forward(model.forward, "target")
+        draft_model.forward = timed_forward(draft_model.forward, "draft")
+        original_iterate = generator.iterate
+        def timed_iterate(*args, **kwargs):
+            nonlocal current_events
+            events = []
+            current_events = events
+            start = time.perf_counter()
+            try:
+                return original_iterate(*args, **kwargs)
+            finally:
+                wall = time.perf_counter() - start
+                current_events = None
+                if any(component == "draft" for component, _, _ in events):
+                    draft_timing_rounds.append((wall, events))
+        generator.iterate = timed_iterate
     FORCE_EXPORT = os.environ.get("FORCE_EXPORT", "0") == "1"
     if FORCE_EXPORT and not DSPARK:
         _export_layers = set(config.dspark_target_layer_ids)
@@ -342,6 +375,7 @@ def main():
         for _ in generator.iterate():
             pass
     out = {}
+    logit_out = {}
     WARM = os.environ.get("WARM", "0") == "1"
     run_ids = (PROMPT_IDS + PROMPT_IDS) if WARM else PROMPT_IDS
     if BATCH > 1:
@@ -496,6 +530,14 @@ def main():
                     if "token_ids" in r: probe_tok = r["token_ids"][0].tolist()
             v, i = torch.topk(got.reshape(-1, got.shape[-1])[-1], 2)
             log(f"PROBE n={n} next_tok={probe_tok} top1={int(i[0])} top2={int(i[1])} gap={float(v[0]-v[1]):.5f}")
+    if draft_timing_rounds:
+        torch.cuda.synchronize(device)
+        for i, (wall, events) in enumerate(draft_timing_rounds):
+            draft = [start.elapsed_time(end) for component, start, end in events if component == "draft"]
+            target = [start.elapsed_time(end) for component, start, end in events if component == "target"]
+            log(f"DRAFT_TIMING iteration={i} wall_ms={wall * 1000:.3f} "
+                f"draft_n={len(draft)} draft_ms={sum(draft):.3f} "
+                f"target_n={len(target)} target_ms={sum(target):.3f}")
     log(f"MEM max_alloc_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f}")
     if LOGITS_OUT:
         with open(f"{LOGITS_OUT}.rank{RANK}.json", "w") as f:
