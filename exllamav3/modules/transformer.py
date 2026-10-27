@@ -257,6 +257,14 @@ class TransformerBlock(Module):
         post, comb, y = self._seg_a(x, params)
         y_attn = self.attn.forward(y, params)
         x, = self._seg_b(x, post, comb, y_attn, params)
+        export_state = params.get("export_state_layers")
+        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+            states = params.get("export_states")
+            if not states:
+                states = params["export_states"] = []
+            state = x.mean(dim = 2)
+            state = state.half() if state.dtype != torch.half else state
+            states.append(state.clamp_(-65504.0, 65504.0))
         return to2(x, out_dtype, self.out_dtype)
 
     def _piece_a(self, x, params):

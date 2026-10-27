@@ -119,7 +119,10 @@ class DSparkAttention(DSV4Attention):
             ))
         o = torch.stack(outs, dim = 0).permute(0, 2, 1, 3)      # (bsz, s, G, hpg * D)
         o = torch.cat([self.wo_a[g].forward(o[:, :, g].contiguous(), params) for g in range(self.o_groups)], dim = -1)
-        return self.wo_b.forward(o, params, out_dtype = out_dtype or self.out_dtype)
+        y = self.wo_b.forward(o, params, out_dtype = out_dtype or self.out_dtype)
+        if self.tp_reduce:
+            self.tp_collect(params["backend"], y)
+        return y
 
 
     def update_kv_rows(self, main_x: torch.Tensor, params: dict):

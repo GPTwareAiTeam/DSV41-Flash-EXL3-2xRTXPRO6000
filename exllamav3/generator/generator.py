@@ -30,6 +30,11 @@ from ..util import profile_opt
 # Test hook: True forces the per-position serial speculative-window readback instead of the batched
 # (launch-all-samplers, one pinned stage, one synchronize) path
 _NO_BATCH_READBACK = False
+_DSPARK_PROBE = bool(int(__import__("os").environ.get("DSPARK_PROBE", "0")))
+_DSPARK_ORACLE = None
+if __import__("os").environ.get("DSPARK_ORACLE"):
+    import json as _json
+    _DSPARK_ORACLE = _json.load(open(__import__("os").environ["DSPARK_ORACLE"]))
 
 class Generator:
 
@@ -796,7 +801,9 @@ class Generator:
         if self.sparse_head is not None and draft_window > 0:
             self._sparse_flag = self.sparse_head.round_flag()
             round_start = time.perf_counter()
-        if self.draft_model and draft_window > 0:
+        if self.draft_model and draft_window > 0 and _DSPARK_ORACLE is not None:
+            draft_tokens = self._oracle_draft(draft_window)
+        elif self.draft_model and draft_window > 0:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_window)
             elif self.mtp_draft:
@@ -1160,6 +1167,20 @@ class Generator:
 
         return self.draft_ids_pinned[:, :window]
 
+
+    def _oracle_draft(self, window: int):
+        # Probe only: propose NON-SPEC baseline tokens as drafts (single-prompt oracle, index by generated count).
+        # Every verify becomes a cached multi-row step on the true continuation, so any row whose target argmax
+        # differs from the baseline is a pure target bug, independent of the drafter.
+        base = _DSPARK_ORACLE["0"]
+        rows = []
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            for seq in job.sequences:
+                n = job.new_tokens
+                chunk = base[n:n + window]
+                rows.append(chunk + [base[-1]] * (window - len(chunk)))
+        return torch.tensor(rows, dtype = torch.long)
 
     def iterate_draftmodel_mtp_gen(self, results: list, window: int):
 
@@ -1768,6 +1789,11 @@ class Generator:
         # Reject the trailing draft positions after the last accepted token at index i: count them, roll back the
         # job's recurrent state and return cache pages to the accepted position
         def reject_remainder(job_, j_, i_, batch_states_):
+            if _DSPARK_PROBE and batch_states_ is not None:
+                st_ = batch_states_[j_]
+                print(f"[REJ] pos={st_.position} window_beg={st_.window_beg} wshift={st_.wshift} "
+                      f"last_history={st_.last_history} i={i_} W={batch_logits.shape[1]} "
+                      f"rejected={batch_logits.shape[1] - 1 - i_} kv_pos={job_.sequences[0].kv_position}", flush=True)
             num_rejected = batch_logits.shape[1] - 1 - i_
             if num_rejected == 0:
                 return 0
@@ -1903,6 +1929,12 @@ class Generator:
                         next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                             token_logits,
                         )
+                    if _DSPARK_PROBE and draft_tokens is not None:
+                        _tl = token_logits[0, 0].float()
+                        _tv, _ti = torch.topk(_tl, 2)
+                        print(f"[VROW] seqlen={job.sequences[0].kv_position} i={i} W={W} "
+                              f"draft={int(draft_tokens[j, i]) if i < draft_tokens.shape[1] else -1} argmax={int(_ti[0])} top2={int(_ti[1])} "
+                              f"gap={float(_tv[0] - _tv[1]):.5f}", flush=True)
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,
@@ -2084,6 +2116,11 @@ class Generator:
                 if a_idx == b_idx:
                     continue
                 accepted_length = accepted_lengths[accepted_idx]
+                if _DSPARK_PROBE:
+                    print(f"[CARRY] a={a_idx} b={b_idx} accepted_length={accepted_length} "
+                          f"batch_ids={batch_ids[a_idx:b_idx, :].tolist()} "
+                          f"target_hidden_shape={tuple(target_hidden.shape)} "
+                          f"p_cache_seqlens={p_cache_seqlens[a_idx:b_idx].tolist()}", flush=True)
                 accepted_idx += 1
 
                 # A banned-string rewind invalidated this job's carry; leave it unset so drafting pauses until the
