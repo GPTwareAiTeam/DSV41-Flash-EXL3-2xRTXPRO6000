@@ -18,6 +18,17 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
 | 9 | **Speculative policy: always speculate; K is a small dial** | matched COMM=p2p + graphs, prompt 0: one DFlash block forward per round at every K; estimated round cost 19.7/20.7/21.3/22.1 ms at K=2/3/4/5, AL 2.25/2.56/2.51/2.67, decode 8.77/8.09/8.50/8.27 ms/tok. Six-prompt matched sweep: K=5 beat plain on all six; auto on/off lost to K=5 on all six. K=2/5 event stream means: draft 1.87/1.81 ms, verify 21.47/21.09 ms, host iteration 26.13/26.06 ms (iterations include startup and non-SPEC rounds). | K choice = small | `DSPARK_POLICY=always` by default. Round cost is approximately flat in K and MoE-read bound. Earlier 'K<5 dominated' and 'prose loses' claims, based on unmatched configurations, are retracted. |
 | 10 | **bsz-1 decode MoE occupancy** — 60–63 regs, 27 KB smem, 2–3 blocks/SM, 33–43% warps | our ncu | maybe +10–20% on the MoE share | lower value than #2 because 33–43% is already usable |
 | 11 | **Larger prefill chunk (8K/16K)** | our 2048→4096 = +18% | unknown | cheap test; memory-limited |
+### Prefill chunk: settled (2 reps each, sampled device peak)
+| prompt | chunk | TTFT ms | tok/s | peak (smi) | headroom |
+|---|---|---|---|---|---|
+| 32768 | 8192 | 6858 / 6909 | 4778 / 4743 | 93.9 GiB | **3997 MiB** (ship) |
+| 32768 | 16384 | 6777 / 6875 | 4835 / 4766 | 97.1 GiB | 751 MiB (not shippable) |
+| 32768 | 32768 | OOM (36 MiB free) | — | 97.2 GiB | 663 MiB |
+| 2048 | 2048 | 573.9 / 573.9 | 3569 / 3569 | 90.9 GiB | 7021 MiB |
+| 2048 | 4096 | 573.8 / 570.1 | 3569 / 3592 | 94.7 GiB | 3222 MiB |
+**`PREFILL_CHUNK` default = 8192.** 16384 buys +1.2% for 3.2 GiB, so it is not worth shipping. Remaining gap to the
+8000 tok/s target is the MoE (30.6% of prefill) — see the tile/occupancy item.
+
 ### Decode MoE: what the profiler actually says (and what is ruled out)
 A kernel at 32768-token-free decode (layer 3, uniform random routing, 50 warm iters): **A 34.93 us at 42.2% DRAM, B 20.47 us
 at 32.5% DRAM; 80 regs/thread, 22.5 KB smem, 3 blocks/SM register-limited, 43.8% occupancy, long-scoreboard 44%.**
