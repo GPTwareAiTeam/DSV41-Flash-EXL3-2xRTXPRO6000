@@ -1276,8 +1276,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Count how many assignments per expert. With few enough total assignments no
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused.
+                # scatter_add_ rather than torch.bincount: bincount performs an internal device->host
+                # step, which aborts CUDA graph capture (it broke capture whenever the spec verify
+                # width ran at batch > 1). A scatter_add_ over a zeroed int64 buffer is device-only,
+                # synchronous-free and gives identical counts.
+                expert_count = torch.zeros(E + 1, dtype = torch.int64, device = flat_expert_local.device)
+                expert_count.scatter_add_(0, flat_expert_local,
+                                          torch.ones_like(flat_expert_local, dtype = torch.int64))
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
                 else:
