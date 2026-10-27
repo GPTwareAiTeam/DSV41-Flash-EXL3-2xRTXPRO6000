@@ -33,6 +33,20 @@ Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 t
 | **Adaptive K / auto spec on-off** | `auto` lost to fixed K=5 on 3 of 6 prompts at matched flags; content-dependent K is worth <=8% |
 | also rejected earlier | cp.async smem trellis ring, two-chain ILP (+4.7 us), PF=8, split-K on A, fused A->B single launch, K-tile 16 at 64 rows, `__launch_bounds__` min-blocks=2 (spills, -10.8%), lowering `EXL3_MOE_FUSED_ROWS_WIDE`, batched B=1 attention path (+2.3 ms/tok), fp32->bf16 prefill wire, event-based sampler sync, index-math hoisting |
 
+### Decode MoE: the parallelism scaling law (new, 2026-10-27)
+Measured with the standalone bench at bsz1, same build:
+| tile | cols | A blocks | A us | call us |
+|---|---|---|---|---|
+| narrow (default) | 32 | 504 | **39.92** | **65.66** |
+| wide `WIDE_A=1` | 128 | 252 | 51.65 | 72.75 (+11%) |
+| wide `WIDE_B=1` | 128 | - | B 27.87 | 67.29 (+2.5%) |
+Wide reads 128 B per row (a full sector, ideal) yet is **29% slower on A**. So the kernel is NOT sector/coalescing
+limited -- it is limited by **parallelism**: wide cuts the block count 2x and occupancy falls with it, while ncu reports
+3 blocks/SM resident against only 2.68 blocks/SM *available*. That inverts the usual advice and says the next experiment
+is a **narrower** tile (COLS 32 -> 16, 1008 blocks, and no reduction because the split is over output columns, unlike the
+ksplit variants that lost). Needs a rebuild and must keep 263 kernel tests green; the 8 bpw staging assumes COLS=32 so
+check `tile_wn`/`STAGE_WORDS` assumptions first.
+
 ## C. LEFT TO DO (ordered by measured headroom)
 
 | # | change | why it is worth it | evidence / next step |
