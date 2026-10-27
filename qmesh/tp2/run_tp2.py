@@ -37,6 +37,8 @@ from exllamav3.modules.transformer import TransformerBlock  # noqa: E402
 
 OVERLAY = os.environ.get("OVERLAY", "/artifacts/tp2-overlay")
 DSPARK = os.environ.get("DSPARK", "0") == "1"
+DSPARK_DYNAMIC = os.environ.get("DSPARK_DYNAMIC", "0") == "1"
+DSPARK_TARGET_ACC = float(os.environ.get("DSPARK_TARGET_ACC", "0.7"))
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 # Recurrent-cache history must cover the speculative pass width (generator requires max_history >= K); 5 is the
 # previous fixed value, so K<=5 runs are unchanged.
@@ -288,9 +290,14 @@ def main():
         draft_model.load(device = device, progressbar = False)
         n_draft = set_tp_reduce(draft_model, backend)
         log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
+    # DSPARK_DYNAMIC=1: the generator's confidence calibrator sizes each round's window against DSPARK_TARGET_ACC
+    # (drafter must export draft_conf; run with EXL3_DSPARK_CONF=0 so the static gate does not also cut)
     generator = Generator(model, cache, tokenizer, max_batch_size = 1, max_chunk_size = MAX_CHUNK,
                           draft_model = draft_model, draft_cache = draft_cache,
-                          num_draft_tokens = NUM_DRAFT if DSPARK else None)
+                          num_draft_tokens = NUM_DRAFT if DSPARK else None,
+                          dynamic_draft_tokens = DSPARK and DSPARK_DYNAMIC,
+                          draft_confidence = DSPARK_TARGET_ACC,
+                          record_draft_stats = DSPARK and DSPARK_DYNAMIC)
     FORCE_EXPORT = os.environ.get("FORCE_EXPORT", "0") == "1"
     if FORCE_EXPORT and not DSPARK:
         _export_layers = set(config.dspark_target_layer_ids)
@@ -367,6 +374,13 @@ def main():
             tpr = 1 + acc / max(rnd, 1)
             log(f"SPEC {idx} accepted={acc} rejected={rej} acc_rate={acc_rate:.4f} verify_rounds={rnd} "
                 f"tokens_per_round={tpr:.3f} eff_tok_s={len(tokens) / total:.2f}")
+            if DSPARK_DYNAMIC and job.draft_stats:
+                # draft_stats rows: (position, window, accepted-drafts) per verify round
+                wins = [w for _, w, _ in job.draft_stats]
+                acc_drafts = [a for _, _, a in job.draft_stats]
+                hist = {w: wins.count(w) for w in sorted(set(wins))}
+                log(f"DYN {idx} rounds={len(wins)} mean_window={sum(wins) / len(wins):.3f} "
+                    f"window_hist={hist} mean_accepted={sum(acc_drafts) / len(acc_drafts):.3f}")
             if _DRAFT_HIST is not None:
                 log(f"DRAFT_HIST {idx} accepted_drafts_hist={_DRAFT_HIST[:NUM_DRAFT + 1]}")
         log(f"TIMING {idx} total={total:.3f}s eff_tok_s={len(tokens) / total:.2f}")
