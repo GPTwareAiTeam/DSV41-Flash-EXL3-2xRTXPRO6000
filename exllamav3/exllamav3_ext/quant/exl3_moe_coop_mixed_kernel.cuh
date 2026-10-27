@@ -39,13 +39,12 @@ constexpr int mixed_smem_b() { return smem_red_bytes() + WK * STAGE_WORDS * 4 + 
     }
 
 template <int cb, bool WIDE>
-__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
-void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
+__device__ __forceinline__
+void mixed_a_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
     constexpr int GPC = tile_gpc<WIDE>();
     constexpr int CPB = tile_cpb<WIDE>();
-    extern __shared__ uint32_t smem_dyn[];
     half* sh_A = (half*) smem_dyn;
     float* sh_red = (float*) (smem_dyn + p.Hi / 2);
     uint32_t* sh_stage = smem_dyn + p.Hi / 2 + WK * ROWS * COLS;
@@ -58,11 +57,7 @@ void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
     const int nproj = p.gated ? 2 : 1;
     const int ng = p.I / TCOLS;
 
-    // Reset the down stage's counters for this call (its previous use finished in stream order)
-    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
-        p.ctr_b[i] = 0;
 
-    const int item = blockIdx.x;
     const bool is_gate = p.gated && (item % nproj) == 0;
     const int rem = item / nproj;
     const int ks = rem % p.ksplit_a;                 // split-k index: partial output rows
@@ -122,8 +117,7 @@ void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
         const int s = sh_rows[r];
         const int chunk = (group * CPB + j) / GPC;
         if (!arrive_last(p.ctr_a + (size_t) s * (p.I / 128) + chunk, GPC * nproj * p.ksplit_a, &sh_flag)) continue;
-        if (p.dbg & 1) continue;
-        if (warp == 0)
+        if (warp == 0 && !(p.dbg & 1))
         {
             const int col = chunk * 128 + lane * 4;
             const size_t off = (size_t) s * p.I + col;
@@ -165,18 +159,18 @@ void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
             had128(a0, a1, a2, a3, lane);
             store_h4(p.act_out + off, a0, a1, a2, a3);
         }
+        if (p.fused) publish_a_ready(p, s, chunk, warp);
         __syncthreads();
     }
 }
 
 template <int cb, bool WIDE>
-__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
-void exl3_moe_coop_b_mixed_kernel(const MoeCoopParams p)
+__device__ __forceinline__
+void mixed_b_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
 {
     constexpr int TCOLS = tile_cols<WIDE>();
     constexpr int GPC = tile_gpc<WIDE>();
     constexpr int CPB = tile_cpb<WIDE>();
-    extern __shared__ uint32_t smem_dyn[];
     float* sh_red = (float*) smem_dyn;
     uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
     float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + WK * STAGE_WORDS);
@@ -190,17 +184,14 @@ void exl3_moe_coop_b_mixed_kernel(const MoeCoopParams p)
     const int lane = threadIdx.x % 32;
     const int ng = p.Ho / TCOLS;
 
-    // Reset the gate/up stage's counters for the next call
-    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
-        p.ctr_a[i] = 0;
 
-    const int item = blockIdx.x;
     const int ks = item % p.ksplit_b;
     const int rem = item / p.ksplit_b;
     const int run_idx = rem / ng;
     const int group = rem % ng;
     int nrows = 0;
     if (!read_run(p, run_idx, sh_rows, nrows, sh_res)) return;
+    if (p.fused) wait_a_ready(p, sh_rows, nrows);
     const int local = slot_info(p, sh_rows[0]).local;
     const int kslices_all = p.I / 16;
     const int k_begin = kslices_all * ks / p.ksplit_b;
@@ -314,6 +305,43 @@ void exl3_moe_coop_b_mixed_kernel(const MoeCoopParams p)
                 if (col + 2 < p.H_out) dst[2] = o2;
             }
         }
+        __syncthreads();
+    }
+}
+
+template <int cb, bool WIDE>
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
+void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
+        p.ctr_b[i] = 0;
+    mixed_a_body<cb, WIDE>(p, blockIdx.x, smem_dyn);
+}
+
+template <int cb, bool WIDE>
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
+void exl3_moe_coop_b_mixed_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
+        p.ctr_a[i] = 0;
+    mixed_b_body<cb, WIDE>(p, blockIdx.x, smem_dyn);
+}
+
+template <bool WIDE_A, bool WIDE_B>
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
+void exl3_moe_coop_fused_mixed_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    __shared__ int next_item;
+    for (;;)
+    {
+        if (threadIdx.x == 0) next_item = atomicAdd(p.queue_head, 1);
+        __syncthreads();
+        if (next_item >= p.nA + p.nB) break;
+        if (next_item < p.nA) mixed_a_body<2, WIDE_A>(p, next_item, smem_dyn);
+        else mixed_b_body<2, WIDE_B>(p, next_item - p.nA, smem_dyn);
         __syncthreads();
     }
 }

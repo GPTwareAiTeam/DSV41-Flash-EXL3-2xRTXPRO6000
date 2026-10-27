@@ -95,7 +95,7 @@ def scratch(smax):
     d["act_out"] = torch.empty((smax, 1, I), dtype = torch.half, device = DEV)
     d["d_out"] = torch.empty((smax, 1, H), dtype = torch.float, device = DEV)
     d["out"] = torch.full((8, H), float("nan"), dtype = torch.float, device = DEV)
-    d["ctr"] = torch.zeros((smax * (I // 128) + 8 * (H // 128) + 2 * smax + 3,), dtype = torch.int, device = DEV)
+    d["ctr"] = torch.zeros((2 * smax * (I // 128) + 8 * (H // 128) + 2 * smax + 5,), dtype = torch.int, device = DEV)
     d["had_g"] = torch.empty((smax, H), dtype = torch.half, device = DEV)
     d["had_u"] = torch.empty_like(d["had_g"])
     return d

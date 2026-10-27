@@ -93,3 +93,5 @@ EXL3_MOE_COOP_INST_DECL_H(3)
 // Per-expert mixed-K decode kernels (mul1, exl3_moe_coop_mixed_inst.cu)
 MoeCoopKernel exl3_moe_coop_kernel_a_mixed(int Hi, bool wide);
 MoeCoopKernel exl3_moe_coop_kernel_b_mixed(bool wide);
+// Fused mixed-K persistent kernel (A then B queue, EXL3_MOE_COOP_SINGLE=1): one launch for both stages
+MoeCoopKernel exl3_moe_coop_kernel_fused_mixed(int Hi, bool wide_a, bool wide_b);
