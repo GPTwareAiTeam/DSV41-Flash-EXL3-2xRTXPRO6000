@@ -103,6 +103,39 @@ Batching is DONE and shipped; these are what remains.
 **`PREFILL_CHUNK` default = 8192.** 16384 buys +1.2% for 3.2 GiB, so it is not worth shipping. Remaining gap to the
 8000 tok/s target is the MoE (30.6% of prefill) — see the tile/occupancy item.
 
+### Prefill diagnostic: collective modes and rank-0 kernel profile
+
+The 4777.7 / 4742.8 tok/s historical 32K/8192 baseline was **NCCL**, not P2P: `tp2logs/final32768_8192_rank0.log` records `COMM=nccl`, `CACHE_TOKENS=33536`. It is not a matched baseline for the P2P tile sweep or current P2P measurements (`CACHE_TOKENS=33280`); neither the collective nor the cache-size contribution has been isolated by a matched comparison. Do not attribute the difference to a regression or thermal state without that comparison. NCCL's earlier ~22% share refers to 2048-token prefill, not the present P2P workload.
+
+Two idle-start launches per tree, each with two timed reps after warmup, `PROMPT_LENS=32768 CHUNKS=8192 COMM=p2p TORCH_CUDA_ARCH_LIST=12.0a`, unique rendezvous:
+
+| Tree | launch | rank 0 rep 0 / rep 1 tok/s |
+|---|---|---|
+| clean main d0483826 | pd_main_20261027a | 3896.0 / 3862.3 |
+| clean main d0483826 | pd_main_20261027b | 3900.4 / 3879.9 |
+| modified prefill tree 10512231 | pd_idle_20261027a | 3890.8 / 3884.9 |
+| modified prefill tree 10512231 | pd_idle_20261027b | 3825.4 / 3778.2 |
+
+The trees are not a controlled source-only comparison: the prefill tree has uncommitted edits. An idle check before the first run showed GPUs 0/1 at 0% and 3/2 MiB. One active prefill snapshot showed GPU0 2100/3090 MHz, 77 C, 261 W, throttle mask 0; GPU1 2077/3090 MHz, 80 C, 272.85 W, mask 0x4. This snapshot does not establish a thermal cause. The added M48 dispatch is not selected by the default Python policy, which passes 16, 32, or 64 only.
+
+Rank-0 torch profiler, clean main, 32K prompt in 8192-token chunks, P2P: unprofiled TTFT 8405.5 ms, profiled TTFT 8566.6 ms. A 32768-token single chunk OOMed before profiling: the MoE scratch requested 2.96 GiB with 1.65 GiB free. Profile below is the achievable 8192-chunk workload, not single-chunk. Percentages use total kernel-event time 7982.31 ms, not wall time; attribution of generic kernels to MoE can be ambiguous, so generic GEMM/index kernels are labelled rather than claimed non-MoE. DRAM utilization was not measured.
+
+| Kernel | time ms | kernel-time % | calls |
+|---|---:|---:|---:|
+| P2P oneshot all-reduce | 3282.04 | 41.12 | 204881 |
+| CUTLASS s16816 f16 256x128 | 600.10 | 7.52 | 1596 |
+| DSA attention | 587.14 | 7.36 | 160 |
+| HC apply | 313.73 | 3.93 | 392 |
+| HC mix partials | 213.83 | 2.68 | 316 |
+| DSA indexer | 174.92 | 2.19 | 1024 |
+| HC mix finalize | 134.53 | 1.69 | 396 |
+| vectorized add | 57.92 | 0.73 | 166 |
+| index select small | 52.12 | 0.65 | 14814 |
+| routing GEMM i8 (MoE routing) | 44.10 | 0.55 | 156 |
+
+The 40.70% P2P share reported by torch's self-CUDA table uses its 8065 ms denominator, which includes non-kernel events. P2P issues 204881 launches, consistent with its 256 KiB payload limit; reducing large-prefill collective launch/chunk overhead is the clearest measured opportunity, subject to correctness and matched A/B. Treat the old 30.6% MoE share as a different workload, not a measured share here. As a purely hypothetical bound, removing all 3282 ms of measured P2P kernel time from the profiled 8566.6 ms TTFT gives ~6201 tok/s; this is not an achieved throughput or a physical hardware ceiling and assumes no overlap or secondary effects. A hardware ceiling cannot be determined from this profile alone.
+
+
 ### H1 (issue-bound) vs H2 (memory-bound): settled as H2
 Their decision rule was issue-active >= 80% => issue-bound. Measured on our card with the standalone bench
 (`ncu --graph-profiling node`, one call each):
