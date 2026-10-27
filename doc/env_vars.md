@@ -1110,3 +1110,16 @@ Forces the quantizer's dense trellis specializations (`quantize_tiles_optimized.
 off (`0`) regardless of the per-architecture dispatch (on for every K on sm_120; per K and codebook
 on Ada and Ampere where measured faster; the original kernels elsewhere). For experiments only: the
 choice also sizes the quantizer's scratch buffers.
+
+## TP=2 runner (`qmesh/tp2/run_tp2.py`)
+
+### `BATCH` (default: `1`)
+
+Concurrent decode streams. Sets the `Cache` slot count, `Model.load(max_batch_size)` and `Generator(max_batch_size)`.
+For `BATCH > 1` the runner enqueues one job per slot (prompts cycled from `PROMPT_IDS`) and reports per-stream
+and aggregate throughput; results are keyed `<prompt idx>.<slot>`.
+
+### `CACHE_TOKENS_PER_SEQ` (default: `4096`)
+
+KV pool tokens per concurrent stream. `CACHE_TOKENS` defaults to `BATCH * CACHE_TOKENS_PER_SEQ`, so every stream
+has room for its prompt plus `MAX_NEW` tokens without sharing pages with another stream's shortfall.
