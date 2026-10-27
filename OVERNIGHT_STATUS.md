@@ -80,3 +80,51 @@ Measured: EXL3_DSV41_XFAN=1 (fused x-side projection fan, 6–8 GEMV launches �
 - **Prefill MoE row-cap sweep**: raising `EXL3_MOE_FUSED_ROWS_WIDE` moves assignments from the batched-reconstruct
   path to the fused kernel but is NET SLOWER (512 → 735 ms, 1024 → 808 ms vs 701 baseline). Keep 256.
 - **HC at prefill**: fold is inactive under TP2 and above 32 rows; 712 launches / 54 ms. Tiled prefill HC is the lever.
+
+## FINAL STATE (evening→morning)
+Branch `recipe/2x-rtxpro6000-tp2` (worktree /home/treadall/recipe-2xrtx-tp2) = everything merged:
+MoE per-stage tiles, DSpark (K=5) with verify-width graphs, single-chunk prefill, hybrid transport,
+allocation-churn fix, docs. All other worktrees clean; nothing uncommitted.
+
+### Decode (bsz 1, greedy, 128 tokens, both ranks identical)
+| config | ms/tok | tok/s |
+|---|---|---|
+| plain, COMM=p2p, piecewise graphs | **13.50 / 13.71 / 13.58** | 74 / 73 / 74 |
+| plain, COMM=hybrid | 13.96 / 13.93 / 13.87 | 72 |
+| **DSpark K=5, COMM=p2p, width graphs** | **8.30 / 6.98 / 9.53** | **116–132** (best single run 154) |
+| DSpark K=5, MoE wide-A override | 7.45 / 7.22 / 10.18 | 129 / 128 / 93 |
+Acceptance 0.64–0.83 (varies per prompt and run ±0.05), 2.5–3.8 tokens per verify round.
+K sweep: K=5 best; K=4 ≈ −5%; K=3 −12%; K>5 capped by `dspark_block_size=5`.
+
+### Prefill (TTFT, single prompt, both ranks agree)
+| length | chunk | TTFT | tok/s |
+|---|---|---|---|
+| 2048 | 2048 (single chunk, new default) | 580.6 ms | **3527** |
+| 2048 | 512 | 366 ms | — |
+| 4096 | 4096 (single chunk) | 989.2 ms | **4141** |
+| 4096 | split (EXL3_PREFILL_RC_SPLIT=1) | 1106.6 ms | 3702 |
+
+### Gap to the owner's targets
+- decode 300 tok/s: at 116–132 (best 154). Needs ~2.3×; bottleneck is GPU work in the 6-row verify forward
+  (MoE 42%, all-reduce 17%, dense 19%) plus ~4-5 ms/step of host overhead that only attention capture removes.
+- prefill 8000 tok/s: at 3527–4141. Needs ~2×; kernel split at 2048: MoE 30.6%, all-reduce 22.3%,
+  dense GEMM 21.3%, other 12.7%, HC 8.5%, MoE-recon 4.5%. GPU is 93% busy, so it is kernel work, not host.
+
+### Highest-value remaining work (in priority order)
+1. **Capture the decode attention core into a graph.** It is the only way to remove the remaining
+   ~4–5 ms/step of host overhead: 80 `cudaGraphLaunch` + ~490 `cudaLaunchKernel` per step
+   (`cudaLaunchKernel` 23.6% and `cudaGraphLaunch` 12.9% of self CPU). Design: route the eager core's
+   `ext.*` calls through the engine's patchable `Graph` (graph.cu, `record_param`/`GP_*`), capture per layer
+   with the position scalars patchable, and select variants by host parity (the m=2 new-pool-entry branch
+   alternates with position parity; single ENTRY variant for m=1 layers). Eager fallback for the top-k
+   regime switch (ec > 512) and ring shift/rebase steps. Blocked previously only by effort, not by design.
+2. **MoE at the verify width (36 slots)**: 282 µs/layer per GPU, ~688 GB/s vs 1.65 TB/s peak. Split-K, tile
+   geometry, register/cp.async rings and the fused single-launch all measured and rejected; what is left is
+   a deeper restructure (warp-specialized producer/consumer, TMA-style bulk copies) — needs ncu counters,
+   which now work in the moe container (`--cap-add SYS_ADMIN`, real binary at
+   /opt/nvidia/nsight-compute/2026.1.1/ncu; also copied into exl3-tp2-prefill).
+3. **Prefill MoE 30.6%**: same kernel family; the 64-row instance is 88 ms of the 168 ms.
+4. **HC 8.5% at prefill**: the fold is inactive under TP and above 32 rows; a tiled prefill HC mix exists
+   (hc_mix_tiled.cu) and is unused for this path.
+5. **Overlap the prefill all-reduce** (22.3%): needs a 2-way row split with two streams (no independent
+   work exists inside a layer, so a plain async issue has no window). Upper bound ~68 ms at 2048.
