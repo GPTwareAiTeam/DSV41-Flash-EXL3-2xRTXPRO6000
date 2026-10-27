@@ -37,6 +37,9 @@ from exllamav3.modules.transformer import TransformerBlock  # noqa: E402
 OVERLAY = os.environ.get("OVERLAY", "/artifacts/tp2-overlay")
 DSPARK = os.environ.get("DSPARK", "0") == "1"
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
+# Recurrent-cache history must cover the speculative pass width (generator requires max_history >= K); 5 is the
+# previous fixed value, so K<=5 runs are unchanged.
+MAX_HISTORY = max(5, NUM_DRAFT)
 MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
@@ -220,7 +223,7 @@ def main():
     assert config.tp_size == WORLD and config.tp_rank == RANK, \
         f"checkpoint tp_size/tp_rank {config.tp_size}/{config.tp_rank} != launch {WORLD}/{RANK}"
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = 5)
+    cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY)
     model.load(device = device, max_chunk_size = MAX_CHUNK, max_output_size = MAX_NEW,
                max_batch_size = 1, progressbar = False)
     if COMM == "p2p":
@@ -241,7 +244,7 @@ def main():
     draft_model = draft_cache = None
     if DSPARK:
         draft_model = Model.from_config(config, component = "mtp")
-        draft_cache = Cache(draft_model, max_num_tokens = CACHE_TOKENS, max_history = 5)
+        draft_cache = Cache(draft_model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY)
         draft_model.load(device = device, progressbar = False)
         n_draft = set_tp_reduce(draft_model, backend)
         log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
