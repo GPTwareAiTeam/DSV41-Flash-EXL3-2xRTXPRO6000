@@ -1501,7 +1501,7 @@ class Job:
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
             recurrent_last_page = False
-            if self.generator.recurrent_cache is not None and os.environ.get("EXL3_PREFILL_NO_RC_SPLIT", "0") == "0":
+            if self.generator.recurrent_cache is not None and os.environ.get("EXL3_PREFILL_RC_SPLIT", "0") != "0":
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
                 if prefill_start < last_page_b <= prefill_end:
