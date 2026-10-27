@@ -1418,6 +1418,8 @@ class DSV4Attention(Module):
         rsg = params["recurrent_states"]
         bsz = x.shape[0]
         assert len(rsg) >= bsz
+        if _dsv4_dump_dir and bsz == 1:
+            _dsv4_dump("X", self.layer_idx, rsg[0].position, 0, 1, {"x": x}, None, None)
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
         kl = bt = None
         if self.kv_source is not None:
