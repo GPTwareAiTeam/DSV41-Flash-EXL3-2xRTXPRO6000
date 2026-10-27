@@ -1,24 +1,50 @@
-# TP=2 DeepSeek-V4.1 EXL3 — master plan (ordered by expected gain)
+# TP=2 DeepSeek-V4.1 EXL3 — master plan (status board, 2026-10-27)
 
-Current: plain decode **13.15–13.18 ms/tok (76 tok/s)**, DSpark K=5 **6.85–9.39 ms/tok (118/135/101)**,
-prefill **3.6–3.7k tok/s @2048**, **4.3–4.4k @4096**. Targets: 300 tok/s decode, 8000 prefill.
-Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156.9 tok/s @2K**, 172.8 @46K,
-362.9 aggregate at 4 streams, **11.2k prefill @40K**, fp8 KV, DSpark k=5.
+**Current, all measured on this card, both ranks agreeing:**
+plain decode **10.80 / 10.91 / 10.85 ms/tok (92 tok/s)** · DSpark K=5 **7.86 / 6.83 / 9.01 / 4.65 ms/tok**
+(111-215 tok/s, AL 3.30/3.30/2.58/5.29) · multi-stream plain **B4 = 189 tok/s aggregate** (branch, not shippable) ·
+prefill **4778 tok/s** (32K prompt, chunk 8192).
+Targets: **300 tok/s decode**, **8000 tok/s prefill**.
+Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 tok/s @2K, 362.9 aggregate @4 streams,
+11.2k prefill @40K, fp8 KV.
 
-| # | Change | Source | Expected | Notes |
-|---|---|---|---|---|
-| 1 | **Capture the decode attention core** (kill ~490 kernel + 40 graph launches/step ≈ 4–5 ms/step) | our profile | 13.15 → ~9 ms/tok plain; DSpark → ~175 | the `q_head_norm` gate contradiction (b1_prep vs _batch_ok_b1) meant capture was never actually exercised; fix in progress |
-| 2 | **Verify-width MoE occupancy** — 255 regs/thread → 1 block/SM, 16.7% warps, 8.4% DRAM | our ncu | verify round 22 → ~15 ms → DSpark ~190–200 | escape the register ceiling: split the 64-row accumulator across block-groups, or int8 decode-once (weights reused by 6 rows → 6× amortization) |
-| 3 | **Continuous batching / multi-stream decode** (`max_batch_size>1`) | **owner's call (raised in review 2026-10-27)**; corroborated by diffbot 157→363 tok/s @4 streams, sybil 8 slots/713 tok/s aggregate, 1Cat `max-num-seqs 6` | up to ~3× *throughput* | biggest untapped lever; MoE weights are read once per expert-run and shared across rows, so per-token cost falls with rows. Our runner is hardcoded bsz 1. Caveat: diffbot needed "batch-invariant dense GEMMs" — naive batching perturbs per-stream tokens, so this needs a batch-invariance gate, not just a speed run |
-| 4 | **Prefill MoE occupancy (replaces int8 decode-once)** | code inspection: our prefill kernel ALREADY reuses each decoded weight fragment across up to 64 rows, so int8 decode-once (diffbot's +6%) has little left to give. The real problem is 255 regs/thread -> 1 block/SM -> ~12.5% occupancy at **8.4% of DRAM** | target +20-40% prefill | with DRAM at 8.4% we can afford extra weight reads: raise threads/block with half the accumulators each and broadcast the fragment through smem. Rejected already: int8 (needs activation quantisation), K-tile 16, `FUSED_ROWS_WIDE` lower |
-| 5 | **8-bit prefill all-reduce** | diffbot: AR 16K 4.04 → 1.79 ms (−11% 4-session wall) | +10% prefill (our AR = 22%) | fp32 accumulate, low-bit wire; KL gate |
-| 6 | **FP8 KV — quality is fine, capture is the blocker (CLOSED as negative)** | committed `0e685633` in tp2/fp8kv: KV16 11.42/11.42/11.33, KV8-eager 15.02/14.69/14.52, experimental KV8-captured 11.15/11.20/11.15 but **numerically wrong** (first divergence at generated token 11-12; agrees with KV16 on only 12/128 positions vs 21/128 for eager KV8). Quality on the eager path: common-prefix KL 0.0081/0.0003/0.0065/0.0017/0.0013 nats over prompts 0-4, top-1 20/20 | 0% today | pool 3200 -> 2150 bytes/token/rank (**-33%**; 60 GiB/rank pool-only budget ~= 30M tokens, capped by the 1M max_position). **Prerequisite: a packed-pool-aware captured attention.** Root cause found in code: `_batch_ok_b1` gated capture on `not kl.quant`, so packed pools silently fell back to eager (+30% decode). Default stays `KV_BITS=16` |
-| 7 | **Replay trim in multi-chunk prefill** (late layers only need the last rows) | diffbot 3.7–4.6% at 34K–130K | +4% prefill | needs prefix-cache/ring semantics check |
-| 8 | **Prefix caching** (warm-prefix replay) | diffbot agentic 224 tok/s; sybil 16K prompt 16 s → 1 s on hit | large real-world gain | unmeasured by us |
-| 9 | **Speculative policy: always speculate; K is a small dial** | matched COMM=p2p + graphs, prompt 0: one DFlash block forward per round at every K; estimated round cost 19.7/20.7/21.3/22.1 ms at K=2/3/4/5, AL 2.25/2.56/2.51/2.67, decode 8.77/8.09/8.50/8.27 ms/tok. Six-prompt matched sweep: K=5 beat plain on all six; auto on/off lost to K=5 on all six. K=2/5 event stream means: draft 1.87/1.81 ms, verify 21.47/21.09 ms, host iteration 26.13/26.06 ms (iterations include startup and non-SPEC rounds). | K choice = small | `DSPARK_POLICY=always` by default. Round cost is approximately flat in K and MoE-read bound. Earlier 'K<5 dominated' and 'prose loses' claims, based on unmatched configurations, are retracted. |
-| 10 | **bsz-1 decode MoE occupancy** — 60–63 regs, 27 KB smem, 2–3 blocks/SM, 33–43% warps | our ncu | maybe +10–20% on the MoE share | lower value than #2 because 33–43% is already usable |
-| 11 | **Larger prefill chunk (8K/16K)** | our 2048→4096 = +18% | unknown | cheap test; memory-limited |
-### Prefill chunk: settled (2 reps each, sampled device peak)
+## A. SHIPPED AND VERIFIED (on `recipe/2x-rtxpro6000-tp2`)
+
+| # | change | measured gain | verification |
+|---|---|---|---|
+| 1 | **Capture the decode attention core** (piecewise segments + cross-block graph merge) | plain **13.15 -> 10.97 ms/tok** | tokens byte-identical, 4 prompts x 128 tokens x 2 ranks. Root cause of every earlier failure: `b1_prep` required `q_head_norm=True` while `_batch_ok_b1` required `False`, so the capture never ran and every "capture is slower" reading was the eager fallback |
+| 2 | **Kill the local-memory load in `gemv_tile`** — the `r0_ok ? A2[...] : hzero` conditional took the address of a per-thread const, so the false branch became a local-memory load; replaced with a uint32 reinterpret plus a literal zero | MoE **67.31 -> 65.76 us/call @bsz1 (1.024x)**, 197.34 -> 193.88 @bsz6 (1.018x) | bitwise identical. ncu had shown A at **1,290,240 local load sectors vs 1,317,141 global (~49%)**, B 765,250 vs 1,188,536 (~57%), line-mapped to `cuda_fp16.hpp:344` |
+| 3 | **Hoist the trellis prefetch ring ahead of the prologue (C1) + PDL-launch kernel B (C5)**, from the external review kit | **62.54 us/call @bsz1 (1.076x)**, 187.56 @bsz6 (1.052x); C1 alone 1.054x, C5 adds ~2% | bitwise identical; in-model **10.97/11.02/10.98 -> 10.80/10.91/10.85 ms/tok**, tokens byte-identical to the pre-patch baseline |
+| 11 | **Prefill chunk and auto sizing**: `MAX_CHUNK` 8192 (4778 tok/s @32K prompt, 4.0 GiB headroom); `MAX_CHUNK=auto` sizes the chunk from the measured peak table against the `CTX_TOKENS` KV budget, so 1M context costs one chunk step (8192 -> 4096) rather than a collapse | prefill **3.9k -> 4.78k** | 2 reps per size, sampled device peak |
+| 9 | **Speculative policy: always speculate.** One DFlash block forward per round at every K; round cost ~flat in K (19.7/20.7/21.3/22.1 ms for K=2/3/4/5); K=5 beat plain on all six bench prompts | K choice worth <=8% | matched config; `DSPARK_POLICY=always` default. Two earlier claims of mine ("K<5 dominated", "prose loses") came from unmatched configs and are retracted |
+
+## B. MEASURED AND REJECTED (do not retry without new information)
+
+| change | result |
+|---|---|
+| **8-bit prefill all-reduce** | +6.4-6.9% prefill but **fails the coherence gate** (prompt-3 token flip at step 11, KL 0.22). Block-128 scaling fixes the tokens yet sits outside the logit-noise floor (max raw logit delta 1.4-2.0) |
+| **FP8 KV cache** | quality is fine (KL 0.008/0.0003/0.0065/0.0017/0.0013, top-1 20/20) and the pool drops **3200 -> 2150 bytes/token/rank (-33%)**, but packed pools lose the capture (`_batch_ok_b1` gates on `not kl.quant`) and the bypassed capture is numerically wrong (diverges at generated token ~12; agrees 12/128 vs 21/128 for eager). Default `KV_BITS=16` |
+| **Wide tile for kernel B at bsz1** (`EXL3_MOE_COOP_WIDE_B=1`) | **worse**: 67.29 vs 65.66 us/call, B 27.87 vs 25.38. Side note: the launcher comment claiming "bsz 1 keeps B wide" is wrong — `moe_coop_pick_wide(72, 6)` is false on Blackwell |
+| **ksplit 2 / 3 on kernel A** (wave alignment: 1008 = 5.36 waves, 1512 = 8.04) | **worse**: k=3 A 42.43 us vs k=1 34.93 (-21.5%), k=2 38.13. Wave quantisation is not the limiter |
+| **Issue-bound hypothesis (H1)** | refuted: issue_active **45.8% A / 42.7% B** against DRAM 47.8% / 33.3% — neither engine saturated. It is **memory latency/granularity** (44% long-scoreboard), so the PRMT byte-window / drop-staging-for-6bpw branch is the wrong direction |
+| **int8 decode-once for prefill MoE** | our kernel already reuses each decoded weight fragment across up to 64 rows, so diffbot's +6% lever is largely spent; the defect is occupancy/tile choice |
+| **Verify-width MoE "255 registers"** | false premise: at rows=6 it is **80 regs, 3 blocks/SM, 46%/39% DRAM**, and per token verify costs 48 us against 55 us for a 1-row step — verify is already efficient |
+| **Adaptive K / auto spec on-off** | `auto` lost to fixed K=5 on 3 of 6 prompts at matched flags; content-dependent K is worth <=8% |
+| also rejected earlier | cp.async smem trellis ring, two-chain ILP (+4.7 us), PF=8, split-K on A, fused A->B single launch, K-tile 16 at 64 rows, `__launch_bounds__` min-blocks=2 (spills, -10.8%), lowering `EXL3_MOE_FUSED_ROWS_WIDE`, batched B=1 attention path (+2.3 ms/tok), fp32->bf16 prefill wire, event-based sampler sync, index-math hoisting |
+
+## C. LEFT TO DO (ordered by measured headroom)
+
+| # | change | why it is worth it | evidence / next step |
+|---|---|---|---|
+| 3 | **Ship multi-stream decode** (owner's call) — plumbing done, `BATCH` dial live, **B4 = 189 tok/s aggregate** vs 91 single-stream | largest remaining throughput lever (~2.1x); MoE weight reads amortise across rows | **blocked on correctness**: with 4 IDENTICAL prompts the captured path diverges at token 11 while eager is bit-identical. Localised to **layer 2, the first ratio-2 compressed layer**, so the compressor's per-row page indexing is the suspect. Already fixed: graph-capture `torch.bincount` sync, `bt_st[0]` used for every row. Gate: four duplicate streams byte-identical |
+| 4 | **Prefill MoE tile/occupancy** | prefill is 4778 against an 8000 target and the MoE is 30.6% of it at **19.5% DRAM, 33% warps, 0.98 waves, 128 regs** | at chunk 8192 each expert receives ~128 rows but the kernel picks **M16**, i.e. possibly ~8x redundant weight reads. Sweep M16/32/48/64 and report traffic per tile |
+| 1b | **Remaining host gap** | 10.8 ms/tok with ~9 ms CUDA busy leaves 1.5-2 ms/step of launch/copy overhead | external plan steps 3-4 (one graph per step variant, device-driven `b1_prep`, collective in-graph); needs nsys to say sync-bound vs Python-bound |
+| 3b | **Spec round cost** | round is 20-22 ms = target forward 11.0 + verify ~6.0 + draft 1.9 + host ~3.1, and it is MoE-slot-linear | follows from the MoE latency work; a verify that touches fewer distinct experts is the only independent lever |
+| 8 | **Prefix caching** | unmeasured by us; diffbot's agentic 224 tok/s rests on it (sybil: 16K prompt 16 s -> 1 s on hit) | implement warm-prefix replay, measure TTFT on a repeated 8K/32K prefix |
+| 7 | **Replay trim in multi-chunk prefill** | diffbot 3.7-4.6% at 34K-130K | late layers only need the last rows; check prefix-cache/ring semantics first |
+| 6 | **FP8 KV, retry** | -33% pool for -2% decode once a packed-aware captured attention exists | needs the packed-pool capture correctness work; the quality gate already passed |
+| 12 | **K=7 drafter** | diffbot: draft length gives nearly all of a +43% on code | BLOCKED on weights: our checkpoint is `dspark_block_size=5` |
+### Appendix: prefill chunk measurements (2 reps each, sampled device peak)
 | prompt | chunk | TTFT ms | tok/s | peak (smi) | headroom |
 |---|---|---|---|---|---|
 | 32768 | 8192 | 6858 / 6909 | 4778 / 4743 | 93.9 GiB | **3997 MiB** (ship) |
