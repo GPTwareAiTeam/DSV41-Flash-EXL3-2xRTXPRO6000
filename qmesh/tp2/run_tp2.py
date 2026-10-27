@@ -66,6 +66,11 @@ PROMPTS = [
         "Paragraph %d: the river wound through the valley past terraced fields of barley, "
         "where farmers repaired stone walls each spring and traded seed in the market town. " % i
         for i in range(1, 36)),
+    # index 4: code-heavy (fenced block, braces, def/return)
+    "Write a Python class `LRUCache` with get and put methods, then show a ```python fenced example that uses it.",
+    # index 5: structured JSON (keys, braces, schema-shaped output)
+    "Return only a JSON object describing a user with keys name, age, email, and a list field roles of strings. "
+    "Use valid JSON with no commentary.",
 ]
 
 
