@@ -1299,7 +1299,8 @@ class DSV4Attention(Module):
     def _indexer_keys(self, lat, params, e0):
         n = lat.shape[0]
         k = self.idx_k_norm.forward(self.idx_wk.forward(lat.unsqueeze(0), params), params, out_dtype = torch.half)
-        pos = ((torch.arange(n, dtype = torch.int, device = lat.device) + e0) * self.compress_rate).unsqueeze(0)
+        positions = e0 if isinstance(e0, torch.Tensor) else torch.arange(n, dtype = torch.int, device = lat.device) + e0
+        pos = (positions * self.compress_rate).unsqueeze(0)
         for t in (k, lat):
             _ext_rope(t.view(1, n, 1, -1)[..., -self.rope_head_dim:], self.inv_freq_compress, position_ids = pos)
         return k[0]
@@ -1424,15 +1425,15 @@ class DSV4Attention(Module):
         if params.get("attn_mode") != "flash_attn" or params.get("prefill"):
             return None
         rsg = params.get("recurrent_states")
-        if not rsg or len(rsg) != 1:
+        if not rsg:
             return None
         rs = rsg[0]
+        B = len(rsg)
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
         rsl = self._get_rsl(rs, layer_instance)
-        pos0 = rs.position
-        offset = pos0 - rs.window_beg
-        if offset + 1 > rsl.ring_rows:
-            return None
+        for state in rsg:
+            if self._get_rsl(state, layer_instance) is not rsl or state.position - state.window_beg + 1 > rsl.ring_rows:
+                return None
         kl = None
         if self.kv_source is not None:
             if "block_table" not in params:
@@ -1442,32 +1443,34 @@ class DSV4Attention(Module):
                 else rs.cache.layers[(self.kv_source, layer_instance[1])]
             if self.kv_owner is not None and kl.device != self.device:
                 return None
-        if not self._batch_ok_b1(kl, pos0 + 1):
+        if any(not self._batch_ok_b1(kl, state.position + 1) for state in rsg):
             return None
         m = self.compress_rate if self.kv_source is not None else 1
         w = self.sliding_window
         kp = -(-self.index_topk // 32) * 32 if self.indexer is not None else 32
-        ec = (pos0 + 1) // m if self.kv_source is not None else 0
-        gkey = ("b1", id(rsl), id(kl))
+        gkey = ("b1", id(rsl), id(kl), B)
         st = self._bgraph_state.get(gkey)
         if st is None:
             st = dict(
-                pins = [torch.empty((6, 1), dtype = torch.int32, pin_memory = True) for _ in range(8)],
+                pins = [torch.empty((6, B), dtype = torch.int32, pin_memory = True) for _ in range(8)],
                 pin_i = 0,
-                arr = torch.empty((6, 1), dtype = torch.int32, device = self.device),
-                bt_st = torch.zeros((1, kl.num_pages if kl is not None else 1), dtype = torch.int32,
+                arr = torch.empty((6, B), dtype = torch.int32, device = self.device),
+                bt_st = torch.zeros((B, kl.num_pages if kl is not None else 1), dtype = torch.int32,
                                     device = self.device),
             )
             self._bgraph_state[gkey] = st
         pin = st["pins"][st["pin_i"]]
         st["pin_i"] = (st["pin_i"] + 1) % len(st["pins"])
-        pin.copy_(torch.tensor([[pos0], [pos0 - min(w - 1, offset, pos0)], [rs.window_beg], [ec], [rs.slot],
-                                [kp]], dtype = torch.int32))
+        pos = [state.position for state in rsg]
+        floor = [state.position - min(w - 1, state.position - state.window_beg, state.position) for state in rsg]
+        ec = [(state.position + 1) // m if self.kv_source is not None else 0 for state in rsg]
+        pin.copy_(torch.tensor([pos, floor, [state.window_beg for state in rsg], ec,
+                                [state.slot for state in rsg], [kp] * B], dtype = torch.int32))
         st["arr"].copy_(pin, non_blocking = True)
         if kl is not None:
             bt = get_for_device(params, "block_table", self.device)
             npr = min(bt.shape[1], kl.num_pages)
-            st["bt_st"][:, :npr].copy_(bt[:1, :npr])
+            st["bt_st"][:, :npr].copy_(bt[:B, :npr])
         return (rsl, kl, m, w, kp), st["arr"], st["bt_st"]
 
 
@@ -1682,11 +1685,9 @@ class DSV4Attention(Module):
                     idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None,
                     0, a_pos, m, a_slots, bt_st, kl.epp, False)
             if self.idx_wk is not None:
-                # V4.1 indexer keys come from this owner's own compressed entry. B == 1, S == 1:
-                # the entry this step completes (if any) is re-read from the pool and keyed on
-                # device; a step without a new entry rewrites the row it read (idempotent)
+                # Each job uses its own block-table row for the newly compressed entry.
                 e = (a_ec - 1).clamp(min = 0)
-                row = bt_st[0].index_select(0, (e // kl.epp).long()).long() * kl.epp + (e % kl.epp).long()
+                row = bt_st.gather(1, (e // kl.epp).long().unsqueeze(1)).squeeze(1).long() * kl.epp + (e % kl.epp).long()
                 lat = torch.cat((kl.pool_c.view(-1, kl.D_c)[row], kl.pool_r.view(-1, kl.D_r)[row]), dim = -1)
                 keys = self._indexer_keys(lat, params, e)
                 new = (a_ec > a_pos // m).view(-1, 1)

@@ -303,7 +303,7 @@ class TransformerBlock(Module):
         Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply. A block whose graph B is
         deferred (pending = the previous block's (block, x, post, comb, y_attn)) runs that graph B inside its own
         graph A. Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs."""
-        if x.shape[0] == 1 and x.shape[1] == 1 and self.attn is not None and hasattr(self.attn, "b1_prep"):
+        if x.shape[1] == 1 and self.attn is not None and hasattr(self.attn, "b1_prep"):
             b1 = self.attn.b1_prep(params)
             if b1 is not None:
                 return self._forward_piecewise_b1(x, params, out_dtype, pending, b1)
@@ -390,7 +390,7 @@ class TransformerBlock(Module):
             x, = prev._piece_b(x_b, post_b, comb_b, y_b, params)
         post, comb, y = self._piece_a(x, params)
         rsl, kl, m, w, kp = ctx
-        y_attn = self.attn._batch_body(y, arr, 1, 1, 1, rsl, kl, bt_st, m, w, kp, params, None)
+        y_attn = self.attn._batch_body(y, arr, y.shape[0], 1, y.shape[0], rsl, kl, bt_st, m, w, kp, params, None)
         return x, post, comb, y_attn
 
 
