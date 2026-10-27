@@ -17,6 +17,11 @@
 #ifndef MOE_M64_MINB
 #define MOE_M64_MINB 1             // min resident blocks/SM for the 64-row instance; 2 measured slower (spills)
 #endif
+// K tile of the 64-row instance: 16 gives 256-thread blocks (smaller register/smem footprint per block, so two
+// blocks co-reside per SM). 32 is the other option (512 threads, one block per SM)
+#ifndef MOE_M64_TILESIZE_K
+#define MOE_M64_TILESIZE_K 16
+#endif
 
 #define EXL3_MOE_KERNEL_ARGS                    \
     const half* __restrict__ hidden_state,      \

@@ -476,7 +476,9 @@ void exl3_moe
     // Launch. All blocks of the grid must be co-resident for the group barriers, so groups * width <= the
     // co-resident slots. With a known number of active experts, launch only as many groups as there are
     // experts and widen them to use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT
-    int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
+    // Block width follows the instance's K tile: the 64-row CUDA instance runs MOE_M64_TILESIZE_K
+    const int kt_launch = (m_tile >= 64) ? MOE_M64_TILESIZE_K : MOE_TILESIZE_K;
+    int block_dim = EXL3_GEMM_BASE_THREADS * kt_launch / 16;
 #if defined(USE_ROCM)
     // Slots: WGPs x blocks per WGP (pipelined kernel: 2 when the runtime confirms it, cached per instance).
     // The buffers were sized by exl3_moe_max_concurrency; a mainloop switch after allocation only lowers the
