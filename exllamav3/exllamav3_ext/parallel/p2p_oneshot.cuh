@@ -24,11 +24,14 @@
 //
 // All collectives must be issued on the same stream, in the same order, with the same sizes on both ranks.
 
-#define P2P_MAXB (256 * 1024)
+#ifndef P2P_MAXB
+#define P2P_MAXB (4 * 1024 * 1024)
+#endif
+static_assert(P2P_MAXB > 0 && P2P_MAXB % 16 == 0, "P2P_MAXB must be a positive multiple of 16");
 #define P2P_MAXBLK 8
-#define P2P_OFF_FLAGS (2 * P2P_MAXB)
-#define P2P_OFF_STATE (2 * P2P_MAXB + 256)
-#define P2P_OFF_STATS (2 * P2P_MAXB + 512)
+#define P2P_OFF_FLAGS (2LL * P2P_MAXB)
+#define P2P_OFF_STATE (2LL * P2P_MAXB + 256)
+#define P2P_OFF_STATS (2LL * P2P_MAXB + 512)
 #define P2P_STATS_RING 256
 #define P2P_STATS_TOT_FIELDS 5  // calls, spins, push_ns, wait_ns, total_ns
 #define P2P_STATS_REC_FIELDS 7  // seq, meta, spins, t_start, t_pushed, t_waited, t_end
@@ -52,6 +55,8 @@ int64_t p2p_shm_arena(const std::string& name, bool create);
 int64_t p2p_dev_arena_alloc(int64_t device);
 std::string p2p_dev_arena_handle(int64_t ptr);
 int64_t p2p_dev_arena_open(const std::string& hex, int64_t local_device, int64_t peer_device);
+// Compiled payload capacity in bytes per parity slot.
+int64_t p2p_arena_maxb();
 
 // fp32 sum over both ranks, in place: x <- x_rank0 + x_rank1. numel % 4 == 0, bytes <= P2P_MAXB.
 // stats: record per-invocation device diagnostics into the local arena (opt-in; off = original kernel).
