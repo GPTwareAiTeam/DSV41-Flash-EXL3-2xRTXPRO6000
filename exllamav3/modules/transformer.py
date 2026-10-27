@@ -16,6 +16,8 @@ _PIECEWISE = os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0"
 _PIECEWISE_MAXSEQ = int(os.environ.get("EXL3_WHOLE_GRAPH_MAXSEQ", "8"))
 # Temporary A/B switch for the merged block-boundary graph (EXL3_PW_MERGE=0 keeps graph B separate). Remove at cutover
 _PW_MERGE = os.environ.get("EXL3_PW_MERGE", "1") != "0"
+_PW_TPCOLLECT = os.environ.get("EXL3_PW_TPCOLLECT", "0") == "1"
+_PW_PAIR = os.environ.get("EXL3_PW_PAIR", "0") == "1"
 
 # DSpark tap export. EXL3_DSPARK_TAP_SCALE: power-of-two scale applied before the fp16 cast. The drafter's only
 # consumer is main_proj (no bias) -> main_norm (RMSNorm, scale-invariant up to eps), so the scale is absorbed.
@@ -306,6 +308,19 @@ class TransformerBlock(Module):
         if x.shape[1] == 1 and self.attn is not None and hasattr(self.attn, "b1_prep"):
             b1 = self.attn.b1_prep(params)
             if b1 is not None:
+                pair = params.get("pw_pair")
+                if (_PW_PAIR and _PW_MERGE and _PW_TPCOLLECT and pair and
+                    getattr(params.get("backend"), "piecewise_p2p_capture", False) and
+                    not params.get("export_state_layers") and out_dtype is None and self.out_dtype is None):
+                    nxt, after = pair
+                    if (type(nxt) is TransformerBlock and nxt is not self and nxt.device == self.device and
+                        nxt.attn_hc is not None and nxt.mlp_hc is not None and nxt.out_dtype is None and
+                        nxt.attn is not None and hasattr(nxt.attn, "b1_prep") and
+                        self.attn.tp_owner is None and nxt.attn.tp_owner is None and
+                        nxt.layer_idx != self.layer_idx):
+                        b1_next = nxt.attn.b1_prep(params)
+                        if b1_next is not None:
+                            return self._forward_piecewise_pair(x, params, pending, b1, nxt, b1_next, after)
                 return self._forward_piecewise_b1(x, params, out_dtype, pending, b1)
         if not hasattr(self, "_segments"):
             self._segments = {}
@@ -347,17 +362,19 @@ class TransformerBlock(Module):
     def _forward_piecewise_b1(self, x, params, out_dtype, pending, b1):
         """Decode body with the device-driven attention core inside the segment: graph A, the attention body
         (attn._batch_body) and graph B of the previous block (when pending) are one captured replay. The attention
-        collective runs eagerly after the replay; graph B defers exactly as in _forward_piecewise. b1 is the
-        attention's host prepass (ctx, arr, bt_st) for this step."""
+        collective runs eagerly unless P2P capture is enabled; graph B defers exactly as in _forward_piecewise.
+        b1 is the attention's host prepass (ctx, arr, bt_st) for this step."""
         ctx, arr, bt_st = b1
         prev = None if pending is None else pending[0]
+        capture_collect = (_PW_TPCOLLECT and self.attn.tp_owner is None and
+                           getattr(params.get("backend"), "piecewise_p2p_capture", False))
         key = ("b1", tuple(x.shape), x.dtype, out_dtype, id(ctx[0]), id(ctx[1]),
-               None if prev is None else id(prev))
+               None if prev is None else id(prev), capture_collect)
         if not hasattr(self, "_segments"):
             self._segments = {}
         segs = self._segments.get(key)
         if segs is None:
-            segs = (Segment(lambda *a: self._piece_b1(ctx, prev, *a), carry = ("hc_pre",)),
+            segs = (Segment(lambda *a: self._piece_b1(ctx, prev, capture_collect, *a), carry = ("hc_pre",)),
                     Segment(self._piece_b, carry = ("hc_pre",)))
             self._segments[key] = segs
         seg_a, seg_b = segs
@@ -366,7 +383,7 @@ class TransformerBlock(Module):
         else:
             _, x_b, post_b, comb_b, y_b = pending
             x, post, comb, y = seg_a(x_b, post_b, comb_b, y_b, arr, bt_st, params)
-        if self.attn.tp_reduce:
+        if self.attn.tp_reduce and not capture_collect:
             self.attn.tp_collect(params["backend"], y)
         if self._pw_defer(x, params, out_dtype):
             params["pw_pending"] = (self, x, post, comb, y)
@@ -380,9 +397,51 @@ class TransformerBlock(Module):
             states.append(_tap_to_half(x.mean(dim = 2), self.layer_idx))
         return to2(x, out_dtype, self.out_dtype)
 
-    def _piece_b1(self, ctx, prev, *a):
-        """Captured segment body: [prev block's graph B,] graph A, then the attention body on the normed input.
-        Returns (x, post, comb, y_attn) with y_attn the pre-collective attention output."""
+    def _forward_piecewise_pair(self, x, params, pending, b1, nxt, b1_next, after):
+        ctx, arr, bt = b1
+        next_ctx, next_arr, next_bt = b1_next
+        prev = None if pending is None else pending[0]
+        key = ("pair", id(nxt), tuple(x.shape), x.dtype, id(ctx[0]), id(ctx[1]),
+               id(next_ctx[0]), id(next_ctx[1]), id(bt), id(next_bt), None if prev is None else id(prev))
+        if not hasattr(self, "_segments"):
+            self._segments = {}
+        segs = self._segments.get(key)
+        if segs is None:
+            segs = (Segment(lambda *a: self._piece_pair(nxt, ctx, next_ctx, prev, *a), carry = ("hc_pre",)),
+                    Segment(nxt._piece_b, carry = ("hc_pre",)))
+            self._segments[key] = segs
+        seg, seg_b = segs
+        old_next = params.get("pw_next")
+        params["pw_next"] = after
+        try:
+            defer = nxt._pw_defer(x, params, None)
+        finally:
+            params["pw_next"] = old_next
+        if pending is None:
+            x, post, comb, y = seg(x, arr, bt, next_arr, next_bt, params)
+        else:
+            _, x_b, post_b, comb_b, y_b = pending
+            x, post, comb, y = seg(x_b, post_b, comb_b, y_b, arr, bt, next_arr, next_bt, params)
+        params["pw_skip_next"] = True
+        if defer:
+            params["pw_pending"] = (nxt, x, post, comb, y)
+            return x
+        x, = seg_b(x, post, comb, y, params)
+        return to2(x, None, nxt.out_dtype)
+
+    def _piece_pair(self, nxt, ctx, next_ctx, prev, *args):
+        if prev is None:
+            x, arr, bt, next_arr, next_bt, params = args
+            x, post, comb, y = self._piece_b1(ctx, None, True, x, arr, bt, params)
+        else:
+            x_b, post_b, comb_b, y_b, arr, bt, next_arr, next_bt, params = args
+            x, post, comb, y = self._piece_b1(ctx, prev, True, x_b, post_b, comb_b, y_b, arr, bt, params)
+        # HC scratch is shared across blocks: B(N) must complete before A(N+1).
+        x, = self._piece_b(x, post, comb, y, params)
+        return nxt._piece_b1(next_ctx, None, True, x, next_arr, next_bt, params)
+
+    def _piece_b1(self, ctx, prev, capture_collect, *a):
+        """Previous block's graph B, graph A, attention body, and optionally the attention collective."""
         if prev is None:
             x, arr, bt_st, params = a
         else:
@@ -391,6 +450,8 @@ class TransformerBlock(Module):
         post, comb, y = self._piece_a(x, params)
         rsl, kl, m, w, kp = ctx
         y_attn = self.attn._batch_body(y, arr, y.shape[0], 1, y.shape[0], rsl, kl, bt_st, m, w, kp, params, None)
+        if capture_collect and self.attn.tp_reduce:
+            self.attn.tp_collect(params["backend"], y_attn)
         return x, post, comb, y_attn
 
 
