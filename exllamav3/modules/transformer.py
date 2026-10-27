@@ -13,6 +13,8 @@ import os
 # attention core, then graph B (attn residual + MLP + HC apply). Each block's residual is final at its exit.
 _PIECEWISE = os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0"
 _PIECEWISE_MAXSEQ = int(os.environ.get("EXL3_WHOLE_GRAPH_MAXSEQ", "8"))
+# Temporary A/B switch for the merged block-boundary graph (EXL3_PW_MERGE=0 keeps graph B separate). Remove at cutover
+_PW_MERGE = os.environ.get("EXL3_PW_MERGE", "1") != "0"
 
 class TransformerBlock(Module):
 
@@ -154,9 +156,10 @@ class TransformerBlock(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
-
+        pending = params.pop("pw_pending", None)
         if _PIECEWISE and 1 <= x.shape[1] <= _PIECEWISE_MAXSEQ and self.attn_hc is not None and self.mlp_hc is not None:
-            return self._forward_piecewise(x, params, out_dtype)
+            return self._forward_piecewise(x, params, out_dtype, pending)
+        assert pending is None, "deferred piecewise MLP half reached a non-piecewise block"
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
@@ -248,19 +251,49 @@ class TransformerBlock(Module):
 
         return to2(x, out_dtype, self.out_dtype)
 
-    def _forward_piecewise(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None):
-        """Decode body split around the attention core. Graph A: attn HC mix + norm, outputs
-        (post, comb, y). Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply.
-        Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs of A."""
+    def _pw_defer(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None) -> bool:
+        """True when this block's MLP half may stay pending and run inside the next block's graph A (one replay per
+        block boundary instead of two). The driver names the next module in params["pw_next"]; the next block must
+        take the piecewise path too (same shape gate as forward)"""
+        nxt = params.get("pw_next")
+        if not _PW_MERGE or type(nxt) is not TransformerBlock or nxt.attn_hc is None or nxt.mlp_hc is None:
+            return False
+        if not (1 <= x.shape[1] <= _PIECEWISE_MAXSEQ) or params.get("prefill"):
+            return False
+        if out_dtype is not None or self.out_dtype is not None:
+            return False
+        export_state = params.get("export_state_layers")
+        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+            return False
+        return nxt.device == self.device
+
+    def _forward_piecewise(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None, pending = None):
+        """Decode body split around the attention core. Graph A: attn HC mix + norm, outputs (post, comb, y).
+        Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply. A block whose graph B is
+        deferred (pending = the previous block's (block, x, post, comb, y_attn)) runs that graph B inside its own
+        graph A. Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs."""
         if not hasattr(self, "_segments"):
             self._segments = {}
-        key = (tuple(x.shape), x.dtype, out_dtype)
-        if key not in self._segments:
-            self._segments[key] = (Segment(self._piece_a, carry = ("hc_pre",)),
-                                   Segment(self._piece_b, carry = ("hc_pre",)))
-        seg_a, seg_b = self._segments[key]
-        post, comb, y = seg_a(x, params)
+        key = (tuple(x.shape), x.dtype, out_dtype, None if pending is None else id(pending[0]))
+        segs = self._segments.get(key)
+        if segs is None:
+            if pending is None:
+                segs = (Segment(self._piece_a, carry = ("hc_pre",)), Segment(self._piece_b, carry = ("hc_pre",)))
+            else:
+                prev = pending[0]
+                segs = (Segment(lambda *a: self._piece_ba(prev, *a), carry = ("hc_pre",)),
+                        Segment(self._piece_b, carry = ("hc_pre",)))
+            self._segments[key] = segs
+        seg_a, seg_b = segs
+        if pending is None:
+            post, comb, y = seg_a(x, params)
+        else:
+            _, x_b, post_b, comb_b, y_b = pending
+            x, post, comb, y = seg_a(x_b, post_b, comb_b, y_b, params)
         y_attn = self.attn.forward(y, params)
+        if self._pw_defer(x, params, out_dtype):
+            params["pw_pending"] = (self, x, post, comb, y_attn)
+            return x
         x, = seg_b(x, post, comb, y_attn, params)
         export_state = params.get("export_state_layers")
         if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
@@ -271,6 +304,13 @@ class TransformerBlock(Module):
             state = state.half() if state.dtype != torch.half else state
             states.append(state.clamp_(-65504.0, 65504.0))
         return to2(x, out_dtype, self.out_dtype)
+
+    def _piece_ba(self, prev, x_b, post_b, comb_b, y_b, params):
+        """Previous block's graph B (its deferred MLP half), then this block's graph A"""
+        x, = prev._piece_b(x_b, post_b, comb_b, y_b, params)
+        post, comb, y = self._piece_a(x, params)
+        return x, post, comb, y
+
 
     def _piece_a(self, x, params):
         post, comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)

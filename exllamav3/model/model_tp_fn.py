@@ -276,6 +276,8 @@ def mp_model_forward(
             x = x[..., -num:, :].contiguous()
         if prefill:
             params["prefill"] = (idx == last_kv_module_idx)
+        # A block may defer its MLP half into the next block's graph (see TransformerBlock._pw_defer)
+        params["pw_next"] = modules[idx + 1] if idx + 1 < len(modules) else None
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
         if stream_hash and x is not None:
@@ -285,8 +287,10 @@ def mp_model_forward(
         if prefill and idx == last_kv_module_idx:
             backend.end_cpu_reduce_jobs()
             del params["prefill"]
+            params.pop("pw_next", None)
             return None
 
+    params.pop("pw_next", None)
     backend.end_cpu_reduce_jobs()
     return x
 
