@@ -25,8 +25,12 @@ So both are **latency-bound**: plenty of DRAM headroom, warps waiting on loads.
 - **Wave quantisation ruled out**: A has 504 blocks (2.68 waves of 188 SMs), but `ksplit=3` (1512 blocks, 8.04 waves) is
   **21.5% SLOWER** (A 42.43 us vs 34.93) because the split cost beats the removed partial wave. k=2 also worse (38.13).
   Default stays ksplit=1.
-- **Local-memory traffic ruled out**: a first reading of 49.8%/57.6% local L1 sectors was a misread; the SASS export has
-  **zero LDL** instructions (12,992 warp STL, all `STL [R1], RZ`).
+- **Local-memory traffic is REAL and is the top lead** (a mid-investigation retraction was itself wrong — the raw counters
+  are authoritative): A **1,290,240 local load sectors vs 1,317,141 global (~49%)**, B **765,250 vs 1,188,536 (~57%)**.
+  "Zero LDL in SASS" only means the compiler emitted **generic addressing** (`LD.E`), not that the traffic is absent.
+  A C array indexed by a runtime value is guaranteed local; prime suspects are the codebook lookup, per-expert pointer
+  tables and per-K-tile bit-offset arrays. Fix by moving those tables to `__constant__` (uniform lane access) or
+  `__shared__` (divergent), or replacing the lookup with arithmetic/`__shfl_sync`/a constant-folded `switch`.
 - **Two-chain ILP** was already rejected (+4.7 us). Remaining candidates: more warps per block on B (1120 blocks, 5.96
   waves, 512 threads/block), and prefetch depth/width per warp.
 
