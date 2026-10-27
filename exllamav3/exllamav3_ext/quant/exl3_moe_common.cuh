@@ -14,6 +14,9 @@
 #define MOE_TILESIZE_M 16          // default row tile; the 32 / 64 row tiles are separate kernel instances
 #define MOE_SH_STAGES 3
 #define MOE_FRAG_STAGES 3
+#ifndef MOE_M64_MINB
+#define MOE_M64_MINB 1             // min resident blocks/SM for the 64-row instance; 2 measured slower (spills)
+#endif
 
 #define EXL3_MOE_KERNEL_ARGS                    \
     const half* __restrict__ hidden_state,      \
