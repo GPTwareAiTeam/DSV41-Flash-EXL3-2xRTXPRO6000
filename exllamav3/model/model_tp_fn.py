@@ -271,6 +271,8 @@ def mp_model_forward(
         local_context["_hash_passes"] = local_context.get("_hash_passes", 0) + 1
 
     for idx, module in enumerate(modules):
+        if params.pop("pw_skip_next", False):
+            continue
         logits_layer = module.caps.get("logits_output")
         if logits_layer and (num := params.get("last_tokens_only")):
             x = x[..., -num:, :].contiguous()
@@ -278,6 +280,8 @@ def mp_model_forward(
             params["prefill"] = (idx == last_kv_module_idx)
         # A block may defer its MLP half into the next block's graph (see TransformerBlock._pw_defer)
         params["pw_next"] = modules[idx + 1] if idx + 1 < len(modules) else None
+        params["pw_pair"] = ((modules[idx + 1], modules[idx + 2] if idx + 2 < len(modules) else None)
+                             if not prefill and not stream_hash and idx + 1 < len(modules) else None)
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
         if stream_hash and x is not None:
@@ -288,9 +292,12 @@ def mp_model_forward(
             backend.end_cpu_reduce_jobs()
             del params["prefill"]
             params.pop("pw_next", None)
+            params.pop("pw_pair", None)
             return None
 
     params.pop("pw_next", None)
+    params.pop("pw_pair", None)
+    params.pop("pw_skip_next", None)
     backend.end_cpu_reduce_jobs()
     return x
 

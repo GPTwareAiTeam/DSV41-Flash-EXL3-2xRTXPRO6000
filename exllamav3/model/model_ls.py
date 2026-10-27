@@ -498,6 +498,8 @@ class Model_LSMixin(ABC):
         from ..modules.transformer import TransformerBlock
         mods = self.fwd_modules
         for i, (module, instance, idx) in enumerate(mods):
+            if params.pop("pw_skip_next", False):
+                continue
             params["layer_instance"] = instance
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
                 x = x[..., -num:, :].contiguous()
@@ -505,11 +507,15 @@ class Model_LSMixin(ABC):
             # A block may leave its final residual add (or, piecewise, its whole MLP half) to the next block
             nxt = mods[i + 1][0] if i + 1 < len(mods) else None
             params["pw_next"] = nxt
+            params["pw_pair"] = ((nxt, mods[i + 2][0] if i + 2 < len(mods) else None)
+                                 if nxt is not None and mods[i + 1][1] == instance else None)
             params["resid_defer"] = not _PIECEWISE and (
                 type(module) is TransformerBlock and type(nxt) is TransformerBlock and nxt.device == module.device
             )
             x = module.forward(x, params)
         params.pop("pw_next", None)
+        params.pop("pw_pair", None)
+        params.pop("pw_skip_next", None)
         params.pop("resid_defer", None)
         pending = params.pop("resid_pending", None)
         if pending is not None:
