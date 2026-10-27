@@ -515,13 +515,16 @@ void exl3_moe
         num_groups = MIN(num_groups, num_active);
         group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
     }
-    const int launch_smem = smem_max;
+    // The 64-row K-tile-16 instance needs ~45 KB of dynamic smem, so its request lets two blocks co-reside per SM.
+    // Other instances keep the device request
+    const int launch_smem_m64 = exl3_gemm_smem_bytes(64, MOE_M64_TILESIZE_K, 128, MOE_SH_STAGES, 2, 2, false, false);
+    const int launch_smem = (m_tile >= 64 && kt_launch == 16) ? launch_smem_m64 : smem_max;
 #endif
     dim3 grid_dim(group_size, 1, num_groups);
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, launch_smem);
         moe_kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
