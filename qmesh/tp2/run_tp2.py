@@ -293,7 +293,7 @@ def main():
     draft_model = draft_cache = None
     if DSPARK:
         draft_model = Model.from_config(config, component = "mtp")
-        draft_cache = Cache(draft_model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY)
+        draft_cache = Cache(draft_model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY, max_batch_size = BATCH)
         draft_model.load(device = device, progressbar = False)
         n_draft = set_tp_reduce(draft_model, backend)
         log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
