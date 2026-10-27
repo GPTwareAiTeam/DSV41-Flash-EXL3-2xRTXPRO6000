@@ -167,6 +167,7 @@ class DSV4Compressor:
         self.norm = norm if norm is not None else RMSNorm(cfg, f"{key}.norm", attn.rms_norm_eps)
         self.ape = None  # (compress_rate, proj_width) fp32, loaded by DSV4Attention.load
         self.bc = None   # BC_DSV4Compressor companion (cached path), built lazily
+        self.mg_pair = False   # 2-expert wkv/wgate exl3_mgemm available (set in _build_fused)
         self.fused_ready = False
         self.fused_inv_freq = None
         self.fused_norm_w = None
@@ -244,6 +245,12 @@ class DSV4Compressor:
             )
             args["mg_indices"] = torch.arange(2, dtype = torch.long, device = device).unsqueeze(0)
 
+        self.mg_pair = args.get("mg_suh") is not None
+        if self.mg_pair:
+            self.mg_pair_tables = (args["mg_trellis"], args["mg_suh"], args["mg_svh"], args["mg_indices"])
+            self.mg_pair_K = wkv_i.K
+            self.mg_pair_mcg = wkv_i.mcg
+            self.mg_pair_mul1 = wkv_i.mul1
         self.bc = ext.BC_DSV4Compressor(**args)
 
 
@@ -1771,8 +1778,20 @@ class DSV4Attention(Module):
             if self.compressor is not None:
                 if not self.compressor.fused_ready:
                     self.compressor._build_fused()
-                comp_kv = self.compressor.wkv.forward(xf, params)[0]
-                comp_gate = self.compressor.wgate.forward(xf, params)[0]
+                comp = self.compressor
+                if comp.mg_pair:
+                    # Same 2-expert exl3_mgemm the eager BC compressor runs (wkv, wgate share
+                    # the input), so the projected rows match eager bit-for-bit
+                    mg_tr, mg_suh, mg_svh, mg_idx = comp.mg_pair_tables
+                    ah = g_tensor_cache.get(x.device, (2, rows, self.hidden_size), torch.half, "dsv4_comp_ah")
+                    cc = g_tensor_cache.get(x.device, (2, rows, comp.wkv.out_features), torch.half, "dsv4_comp_mg")
+                    ext.exl3_mgemm(xf, mg_tr, cc, mg_suh, ah, mg_svh, mg_idx, None,
+                                   comp.mg_pair_K, -1, comp.mg_pair_mcg, comp.mg_pair_mul1,
+                                   -1, -1, 0, 1, None, None)
+                    comp_kv, comp_gate = cc[0], cc[1]
+                else:
+                    comp_kv = comp.wkv.forward(xf, params)[0]
+                    comp_gate = comp.wgate.forward(xf, params)[0]
             if self.indexer is not None:
                 if not self.indexer.fused_ready:
                     self.indexer._build_fused()
