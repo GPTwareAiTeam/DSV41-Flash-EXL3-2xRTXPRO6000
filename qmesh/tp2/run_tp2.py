@@ -45,6 +45,7 @@ NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 MAX_HISTORY = max(5, NUM_DRAFT)
 MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
+WARM_TOKENS = int(os.environ.get("WARM_TOKENS", "8"))  # untimed warmup length at the configured batch width
 CACHE_TOKENS_PER_SEQ = int(os.environ.get("CACHE_TOKENS_PER_SEQ", "4096"))  # KV pool tokens per concurrent stream
 BATCH = int(os.environ.get("BATCH", "1"))  # concurrent streams: Cache slots, Model.load + Generator max_batch_size
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", str(BATCH * CACHE_TOKENS_PER_SEQ)))
@@ -318,9 +319,10 @@ def main():
     # Warm pass: one short job so graph capture and allocator warmup stay out of the timed prompts
     _warm_text = encode_messages([{"role": "user", "content": PROMPTS[PROMPT_IDS[0]]}], thinking_mode = "chat")
     _warm_ids = tokenizer.encode(_warm_text, add_bos = False, encode_special_tokens = True)
-    _warm = Job(input_ids = _warm_ids, max_new_tokens = 8, min_new_tokens = 8,
-                sampler = GreedySampler(), stop_conditions = [])
-    generator.enqueue(_warm)
+    for _ in range(BATCH):
+        _warm = Job(input_ids = _warm_ids, max_new_tokens = WARM_TOKENS, min_new_tokens = WARM_TOKENS,
+                    sampler = GreedySampler(), stop_conditions = [])
+        generator.enqueue(_warm)
     while generator.num_remaining_jobs():
         for _ in generator.iterate():
             pass

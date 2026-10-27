@@ -1123,3 +1123,7 @@ and aggregate throughput; results are keyed `<prompt idx>.<slot>`.
 
 KV pool tokens per concurrent stream. `CACHE_TOKENS` defaults to `BATCH * CACHE_TOKENS_PER_SEQ`, so every stream
 has room for its prompt plus `MAX_NEW` tokens without sharing pages with another stream's shortfall.
+
+### `WARM_TOKENS` (default: `8`)
+
+Number of untimed warmup tokens per stream, at the configured batch width.
