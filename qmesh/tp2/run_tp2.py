@@ -11,7 +11,8 @@ Collectives (torch.distributed NCCL, see TPBackendNCCL):
   greedy sampling is identical on both ranks.
 
 Env: OVERLAY (dir holding rank0/ rank1/), MAX_NEW (64), PROMPT_IDS (0,1,2), IGNORE_EOS (0|1),
-INIT_METHOD (file://...), TOKENS_OUT (optional json path), PROFILE (0|1).
+INIT_METHOD (file://...), TOKENS_OUT (optional json path), PROFILE (0|1), COMM (nccl|p2p), P2P_RDV (fresh dir, p2p),
+P2P_STATS_OUT (optional prefix, p2p: enables device spin/timing stats, dumped to <prefix>.rank<r>.json at run end).
 """
 from __future__ import annotations
 
@@ -41,6 +42,7 @@ MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
 COMM = os.environ.get("COMM", "nccl")  # nccl | p2p (P2PComm one-shot collectives; needs P2P_RDV = fresh dir)
+P2P_STATS_OUT = os.environ.get("P2P_STATS_OUT")  # p2p only: prefix; enables device spin/timing stats, dumped at run end to <prefix>.rank<r>.json
 PROFILE = os.environ.get("PROFILE", "0") == "1"
 TOKENS_OUT = os.environ.get("TOKENS_OUT")
 LOGITS_OUT = os.environ.get("LOGITS_OUT")
@@ -224,8 +226,10 @@ def main():
     if COMM == "p2p":
         from exllamav3.tp2.p2p import P2PComm
         rdv = os.environ["P2P_RDV"]
-        backend = TPBackendP2P(P2PComm(RANK, world = WORLD, rendezvous_path = rdv, device = RANK))
+        comm = P2PComm(RANK, world = WORLD, rendezvous_path = rdv, device = RANK, stats = P2P_STATS_OUT is not None)
+        backend = TPBackendP2P(comm)
     else:
+        comm = None
         backend = TPBackendNCCL()
     n_blocks = set_tp_reduce(model, backend)
     local_v, full_v = wrap_vocab_split(model, RANK, WORLD, backend)
@@ -402,6 +406,11 @@ def main():
             log(f"PROFILE decode_steps={steps} wall_ms_per_step={wall_ms:.2f}")
             prof.export_chrome_trace(os.environ.get("PROFILE_TRACE", "/artifacts/tp2logs/profile_trace.json"))
             print(prof.key_averages().table(sort_by = "cuda_time_total", row_limit = 40), flush = True)
+
+    if P2P_STATS_OUT and COMM == "p2p":
+        # Rank-tagged dump after all collectives drained (stats() syncs the device). Written on every rank.
+        path = comm.dump_stats(P2P_STATS_OUT)
+        log(f"P2P_STATS dumped {path}")
 
     dist.barrier()
     dist.destroy_process_group()
