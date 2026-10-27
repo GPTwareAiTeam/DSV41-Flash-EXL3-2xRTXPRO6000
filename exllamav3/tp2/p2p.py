@@ -34,7 +34,7 @@ import torch
 
 from ..ext import exllamav3_ext as ext
 
-ARENA_MAXB = 256 * 1024  # bytes of payload per parity slot (must match P2P_MAXB in p2p_oneshot.cuh)
+ARENA_MAXB = ext.p2p_arena_maxb()  # compiled bytes of payload per parity slot
 MAX_BLOCKS = 8  # must match P2P_MAXBLK
 STATS_RING = 256  # must match P2P_STATS_RING
 STATS_TOT_FIELDS = 5  # calls, spins, push_ns, wait_ns, total_ns (must match p2p_oneshot.cuh)
@@ -87,11 +87,11 @@ class P2PComm:
 
         if mode == "dev":
             local = ext.p2p_dev_arena_alloc(self.rank)
-            payload = {"transport": "dev", "handle": ext.p2p_dev_arena_handle(local)}
+            payload = {"transport": "dev", "handle": ext.p2p_dev_arena_handle(local), "arena_maxb": ARENA_MAXB}
         else:
             name = "/p2p_" + hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:16]
             local = ext.p2p_shm_arena(f"{name}.{self.rank}", True)
-            payload = {"transport": "host", "handle": f"{name}.{self.rank}"}
+            payload = {"transport": "host", "handle": f"{name}.{self.rank}", "arena_maxb": ARENA_MAXB}
 
         tmp = mine + ".tmp"
         with open(tmp, "w") as f:
@@ -107,6 +107,8 @@ class P2PComm:
             peer_payload = json.load(f)
         if peer_payload["transport"] != mode:
             raise RuntimeError(f"P2PComm: transport mismatch: local {mode}, peer {peer_payload['transport']}")
+        if peer_payload.get("arena_maxb") != ARENA_MAXB:
+            raise RuntimeError(f"P2PComm: arena size mismatch: local {ARENA_MAXB}, peer {peer_payload.get('arena_maxb')}")
 
         if mode == "dev":
             peer_arena = ext.p2p_dev_arena_open(peer_payload["handle"], self.rank, self.peer)

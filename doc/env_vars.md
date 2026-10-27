@@ -1120,6 +1120,29 @@ choice also sizes the quantizer's scratch buffers.
 
 ## TP=2 runner (`qmesh/tp2/run_tp2.py`)
 
+### `COMM` (default: `p2p`)
+
+Selects `p2p`, `hybrid`, or `nccl` for the TP=2 runner. For prefill, `COMM=hybrid` is
+recommended: it uses P2P for small all-reduces (typically decode) and NCCL for larger ones
+(typically prefill), combining low launch overhead with efficient large transfers. All-gathers
+use P2P and broadcasts use NCCL in hybrid mode. The all-reduce threshold is
+`HYBRID_NCCL_MIN_BYTES` (default `65536` bytes); payloads at or above it use NCCL. Hybrid may
+differ numerically from other modes when its collective routes differ. Both ranks must use the
+same settings. Hybrid and P2P require `P2P_RDV` to name a fresh shared rendezvous directory.
+
+### `P2P_ARENA_MAXB` (default: `4194304`, 4 MiB)
+
+Build-time P2P extension payload capacity in bytes per arena parity slot. Must be a positive
+multiple of 16, at most `2147483632`. Set it before building/loading the extension; both ranks
+must use the same build. Larger values increase the arena allocation on each rank.
+
+### `P2P_CHUNK` (default: compiled arena payload size / 4)
+
+Maximum number of fp32 elements per P2P collective in the TP=2 runner (including the prefill
+benchmark that uses its backend). Must be a positive multiple of 4 and no larger than the compiled
+arena payload in fp32 elements. Set the same value on both ranks so their collective sequences match.
+This dial is independent of the model's prefill `MAX_CHUNK` row count.
+
 ### `BATCH` (default: `1`)
 
 Concurrent decode streams. Sets the `Cache` slot count, `Model.load(max_batch_size)` and `Generator(max_batch_size)`.

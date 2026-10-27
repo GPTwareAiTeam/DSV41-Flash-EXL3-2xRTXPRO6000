@@ -31,6 +31,7 @@ extra_cuda_cflags = cuda_flags.cuda_cflags(
     debug = ext_debug,
     hip = bool(torch_version.hip),
 ) if precompile and torch else []
+extra_cuda_cflags.append(cuda_flags.p2p_arena_define())
 
 if windows:
     # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
