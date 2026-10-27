@@ -55,7 +55,7 @@ def _dsv4_dump(tag, layer, pos, ec, m, tensors, kl, bt_row):
         return
     import os as _os
     d = {k: v.detach().float().cpu().clone() for k, v in tensors.items() if v is not None}
-    if kl is not None and kl.pool_r is not None and ec > 0:
+    if kl is not None and kl.pool_r is not None and ec > 0 and bt_row is not None:
         epp = kl.epp
         e = torch.arange(ec, device = kl.pool_r.device)
         ri = bt_row[0, e // epp].long() * epp + e % epp
@@ -1710,7 +1710,7 @@ class DSV4Attention(Module):
 
         if _dsv4_dump_dir:
             _dsv4_dump("B", self.layer_idx, int(a_pos[0]), int(a_ec[0]), m,
-                       {"q": q, "kv": kv, "out": out}, kl, bt_st[:1])
+                       {"q": q, "kv": kv, "out": out}, kl, bt_st[:1] if kl is not None else None)
         # Ring appends (shift already applied in the prepass): batched, slot-indexed
         ext.dsv4_ring_append(kv.reshape(R, self.head_dim), rsl.ring, a_pos, a_beg, a_slots)
         return self._project_o_grouped(out.unsqueeze(1), params, out_dtype,
