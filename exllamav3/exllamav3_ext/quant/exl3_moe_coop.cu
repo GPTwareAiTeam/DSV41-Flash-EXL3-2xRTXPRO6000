@@ -191,6 +191,28 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
         const int rot_grid = CEIL_DIVIDE(rot_items, MOE_COOP_THREADS / 32);
         exl3_moe_coop_ns::exl3_moe_coop_rot_kernel<<<rot_grid, MOE_COOP_THREADS, 0, stream>>>(p);
     }
+    static const bool single = std::getenv("EXL3_MOE_COOP_SINGLE") && atoi(std::getenv("EXL3_MOE_COOP_SINGLE")) != 0;
+    if (single && mixed)
+    {
+        // One persistent launch for A then B (queue of grid_a + grid_b items). The fused kernel does not zero its
+        // counters, so they are cleared here in stream order before the launch: queue head, ready flags, A/B counters
+        MoeCoopKernel kf = exl3_moe_coop_kernel_fused_mixed(p.Hi, wide_a, wide_b);
+        moe_coop_smem_optin(kf.kernel, kf.smem);
+        int per_sm = 0;
+        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kf.kernel, MOE_COOP_THREADS, kf.smem));
+        int n_sm = 0;
+        cuda_check(cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, device));
+        p.fused = 1;
+        p.nA = grid_a;
+        p.nB = grid_b;
+        p.resident = std::max(1, std::min(per_sm * n_sm, grid_a + grid_b));
+        cuda_check(cudaMemsetAsync(p.queue_head, 0, sizeof(int), stream));
+        cuda_check(cudaMemsetAsync(p.ctr_a, 0, sizeof(int) * (p.ctr_a_len + p.ctr_b_len), stream));
+        cuda_check(cudaMemsetAsync(p.ready_a, 0, sizeof(int) * p.ctr_a_len, stream));
+        cuda_check(cudaLaunchKernel(kf.kernel, dim3(p.resident), dim3(MOE_COOP_THREADS), args, kf.smem, stream));
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
     cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, ka.smem, stream));
     cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
     cuda_check(cudaPeekAtLastError());
@@ -273,6 +295,9 @@ MoeCoopParams exl3_moe_coop_prepare
     p.ctr_a = (int*) ctr.data_ptr();
     p.ctr_b = p.ctr_a + p.ctr_a_len;
     p.runs = p.ctr_b + p.ctr_b_len;
+    p.ready_a = p.runs + (2 + (slots_max + 1) + slots_max);
+    p.queue_head = p.ready_a + p.ctr_a_len;
+    p.exit_ctr = p.queue_head + 1;
     p.rows_max = rows_max;
 
     p.g_trellis = (const int64_t*) g_trellis.data_ptr();
