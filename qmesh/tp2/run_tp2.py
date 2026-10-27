@@ -361,6 +361,12 @@ def main():
         log(f"PROMPT {prompt!r} prompt_tokens={ids.shape[-1]} new_tokens={len(tokens)} total={total:.3f}s "
             f"first_token_ms={first * 1e3:.1f} decode_ms_per_tok={decode * 1e3:.2f} eos={eos_info} text={text!r}")
         log(f"TOKENS {idx} {tokens}")
+        seg_replays = 0
+        for blk in model.modules:
+            for segs in getattr(blk, "_segments", {}).values():
+                for seg in (segs if isinstance(segs, tuple) else (segs,)):
+                    seg_replays += getattr(seg, "replays", 0)
+        log(f"SEG_REPLAYS {idx} {seg_replays}")
         if spec is not None:
             acc, rej, rnd = spec["accepted_draft_tokens"], spec["rejected_draft_tokens"], spec.get("verify_rounds", 0)
             acc_rate = acc / max(acc + rej, 1)
