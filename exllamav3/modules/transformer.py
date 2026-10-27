@@ -353,6 +353,8 @@ class TransformerBlock(Module):
         prev = None if pending is None else pending[0]
         key = ("b1", tuple(x.shape), x.dtype, out_dtype, id(ctx[0]), id(ctx[1]),
                None if prev is None else id(prev))
+        if not hasattr(self, "_segments"):
+            self._segments = {}
         segs = self._segments.get(key)
         if segs is None:
             segs = (Segment(lambda *a: self._piece_b1(ctx, prev, *a), carry = ("hc_pre",)),
