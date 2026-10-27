@@ -502,12 +502,14 @@ class Model_LSMixin(ABC):
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
                 x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)
-            # A block may leave its final residual add to the next block's input norm (same device)
+            # A block may leave its final residual add (or, piecewise, its whole MLP half) to the next block
             nxt = mods[i + 1][0] if i + 1 < len(mods) else None
+            params["pw_next"] = nxt
             params["resid_defer"] = not _PIECEWISE and (
                 type(module) is TransformerBlock and type(nxt) is TransformerBlock and nxt.device == module.device
             )
             x = module.forward(x, params)
+        params.pop("pw_next", None)
         params.pop("resid_defer", None)
         pending = params.pop("resid_pending", None)
         if pending is not None:
