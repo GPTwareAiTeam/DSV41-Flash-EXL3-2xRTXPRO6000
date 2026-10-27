@@ -20,6 +20,24 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
 
 ## Attention
 
+### `EXL3_PW_TPCOLLECT` (default: `0`)
+
+When set to `1`, capture the decode attention TP all-reduce inside the piecewise CUDA graph for the TP2 runner's P2P backend. Requires `EXL3_WHOLE_GRAPH=1` and the captured single-token attention path. NCCL and hybrid backends retain the eager attention collective.
+
+### `EXL3_PW_PAIR` (default: `0`)
+
+When set to `1`, combine consecutive eligible single-token decode blocks into one piecewise graph. Requires `EXL3_WHOLE_GRAPH=1`, `EXL3_PW_TPCOLLECT=1`, `EXL3_PW_MERGE=1`, captured DSV4 attention and the TP2 P2P backend; ineligible blocks use the existing path.
+
+On TP=2 RTX PRO 6000 Blackwell Max-Q, a same-session comparison with P2P and 128 greedy tokens measured:
+
+| Mode | B1 decode ms/token (prompts 0, 1, 2) | B4 aggregate tok/s | Graph launches/step | `cudaGraphLaunch` CPU ms/step | `_foreach_copy_` CPU ms/step |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | 11.45, 11.59, 11.56 | 194.09 | 43 | 2.030 | 2.146 |
+| Collective capture | 11.23, 11.42, 11.33 | not measured | 43 | 1.683 | 1.681 |
+| Collective capture and pairing | 11.30, 11.35, 11.34 | 198.76 | 29 | 1.781 | 1.314 |
+
+The launch counts and CPU times are from an instrumented single-forward trace, not unprofiled latency. Greedy output JSON was byte-identical on both ranks for all three B1 prompts and for B4. The baseline was slower than a prior main-branch measurement (B1 10.84 ms/token, B4 17.89 ms/token); the cause is unresolved, so compare these back-to-back numbers within this session rather than treating them as main-branch absolute performance.
+
 ### `EXL3_GRAPHS` (default: `1` on CUDA, `0` on ROCm)
 
 Whether the decode paths capture their kernel sequences into device graphs and replay them. With
@@ -1125,18 +1143,14 @@ choice also sizes the quantizer's scratch buffers.
 Concurrent decode streams. Sets the `Cache` slot count, `Model.load(max_batch_size)` and `Generator(max_batch_size)`.
 For `BATCH > 1` the runner enqueues one job per slot (prompts cycled from `PROMPT_IDS`) and reports per-stream
 and aggregate throughput; results are keyed `<prompt idx>.<slot>`.
-<<<<<<< HEAD
-=======
 Compressed indexer keys use each stream's own compressed-entry position for RoPE; repeated prompts at the same
 position therefore do not acquire different rotations merely because they occupy different batch slots.
->>>>>>> tp2/batch
 
 ### `CACHE_TOKENS_PER_SEQ` (default: `4096`)
 
 KV pool tokens per concurrent stream. `CACHE_TOKENS` defaults to `BATCH * CACHE_TOKENS_PER_SEQ`, so every stream
 has room for its prompt plus `MAX_NEW` tokens without sharing pages with another stream's shortfall.
 
-<<<<<<< HEAD
 ### `DSPARK_DYNAMIC` (default: `0`)
 
 Adaptive DSpark draft length. `1` passes `dynamic_draft_tokens` to the `Generator`, so the confidence calibrator cuts
@@ -1220,8 +1234,6 @@ Prefetch ring 8 instead of 4 for widths with <= 2 loads per slice. Bit-identical
 ### `EXL3_MOE_WIDE_B_BSZ1` / `EXL3_MOE_COOP_WIDE_B` (runtime, default: off)
 Force the wide tile for the down projection at bsz 1. Default picks narrow (`moe_coop_pick_wide` needs >= 128 kslices
 and >= 32 slots; bsz1 gives 72/6). Measured WORSE at bsz1: 67.29 vs 65.66 us/call — keep off.
-=======
 ### `WARM_TOKENS` (default: `8`)
 
 Number of untimed warmup tokens per stream, at the configured batch width.
->>>>>>> tp2/batch

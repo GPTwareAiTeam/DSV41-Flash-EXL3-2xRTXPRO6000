@@ -173,6 +173,7 @@ class TPBackendP2P:
     """Collective backend on P2PComm (one-shot cudaIpc / pinned-host one-shot all-reduce, fp32 only).
     Same hook surface as TPBackendNCCL. Non-fp32 tensors go through an fp32 staging buffer; the payload must
     fit the P2P arena (<= 256 KiB fp32), and every rank must issue the same sequence of collectives."""
+    piecewise_p2p_capture = True
 
     def __init__(self, comm):
         self.comm = comm
