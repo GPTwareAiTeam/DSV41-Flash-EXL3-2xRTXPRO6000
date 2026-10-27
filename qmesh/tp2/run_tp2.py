@@ -11,7 +11,7 @@ Collectives (torch.distributed NCCL, see TPBackendNCCL):
   greedy sampling is identical on both ranks.
 
 Env: OVERLAY (dir holding rank0/ rank1/), MAX_NEW (64), PROMPT_IDS (0,1,2), IGNORE_EOS (0|1),
-INIT_METHOD (file://...), TOKENS_OUT (optional json path), PROFILE (0|1), COMM (nccl|p2p), P2P_RDV (fresh dir, p2p),
+INIT_METHOD (file://...), TOKENS_OUT (optional json path), PROFILE (0|1), COMM (p2p|hybrid|nccl), P2P_RDV (fresh dir, p2p/hybrid),
 P2P_STATS_OUT (optional prefix, p2p: enables device spin/timing stats, dumped to <prefix>.rank<r>.json at run end).
 """
 from __future__ import annotations
@@ -35,6 +35,7 @@ from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Token
 from exllamav3 import CacheLayer_quant  # noqa: E402
 from exllamav3.generator.generator import _DRAFT_HIST  # noqa: E402
 from exllamav3.modules.transformer import TransformerBlock  # noqa: E402
+from exllamav3.tp2.p2p import ARENA_MAXB  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import content_seed  # noqa: E402
@@ -64,7 +65,7 @@ if KV_BITS not in (8, 16):
     raise ValueError("KV_BITS must be 8 or 16")
 KV_CACHE_KWARGS = {"layer_type": CacheLayer_quant, "k_bits": 8, "v_bits": 8} if KV_BITS == 8 else {}
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
-COMM = os.environ.get("COMM", "nccl")  # nccl | p2p | hybrid (hybrid: P2P <64KB, NCCL >=64KB)
+COMM = os.environ.get("COMM", "p2p")  # nccl | p2p | hybrid (hybrid: P2P <64KB, NCCL >=64KB)
 P2P_STATS_OUT = os.environ.get("P2P_STATS_OUT")  # p2p only: prefix; enables device spin/timing stats, dumped at run end to <prefix>.rank<r>.json
 PROFILE = os.environ.get("PROFILE", "0") == "1"
 TOKENS_OUT = os.environ.get("TOKENS_OUT")
@@ -166,13 +167,16 @@ class TPBackendNCCL:
 
     def end_cpu_reduce_jobs(self):
         pass
-P2P_CHUNK = 256 * 1024 // 4  # fp32 elements per P2P arena payload (ARENA_MAXB = 256 KiB, multiple of 4 floats)
+P2P_CHUNK = int(os.environ.get("P2P_CHUNK", str(ARENA_MAXB // 4)))  # fp32 elements
+if P2P_CHUNK <= 0 or P2P_CHUNK % 4 or P2P_CHUNK > ARENA_MAXB // 4:
+    raise ValueError(f"P2P_CHUNK must be a positive multiple of 4 fp32 elements, at most {ARENA_MAXB // 4}")
 
 
 class TPBackendP2P:
     """Collective backend on P2PComm (one-shot cudaIpc / pinned-host one-shot all-reduce, fp32 only).
-    Same hook surface as TPBackendNCCL. Non-fp32 tensors go through an fp32 staging buffer; the payload must
-    fit the P2P arena (<= 256 KiB fp32), and every rank must issue the same sequence of collectives."""
+    Same hook surface as TPBackendNCCL. Non-fp32 tensors go through an fp32 staging buffer; payloads are
+    chunked to fit the P2P arena (ARENA_MAXB, 4 MiB by default), and every rank must issue the same sequence
+    of collectives."""
     piecewise_p2p_capture = True
 
     def __init__(self, comm):

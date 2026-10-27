@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
-from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, patch_hip_ninja_file_writer, use_rocm_sdk_devel
+from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, patch_hip_ninja_file_writer, p2p_arena_define, use_rocm_sdk_devel
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -94,6 +94,7 @@ else:
         debug = ext_debug,
         hip = bool(torch.version.hip),
     )
+    extra_cuda_cflags.append(p2p_arena_define())
 
     if windows:
         # TODO: preprocessor and lean_and_mean flags are needed for Windows cu132 build, verify that they don't break

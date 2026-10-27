@@ -6,7 +6,7 @@ Launch like the runner (qmesh/tp2/launch_tp2.sh, one process per rank). Env:
   REPS          (2)                   timed repetitions per (length, chunk), after one warm pass
   MAX_CHUNK     (max of CHUNKS and PROMPT_LENS, else 4096)  model load-time chunk ceiling
   CACHE_TOKENS  (max prompt + 512)    KV cache tokens
-  COMM          nccl | p2p (P2P_RDV required for p2p)
+  COMM          nccl (default) | p2p | hybrid (P2P_RDV required for p2p/hybrid); hybrid recommended for prefill
 
 Timing: time from generator.enqueue() to the first token result, excluding model load. Each trial uses a unique
 prefix so the prefix/page cache cannot shortcut the prefill. Prompts are exact token counts (ids are truncated
