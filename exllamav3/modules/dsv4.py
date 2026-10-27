@@ -44,6 +44,34 @@ def _ext_rope(x, inv_freq, position = 0, position_ids = None, positions = None):
     )
 
 
+# Diff instrumentation (EXL3_DSV4_DIFF_DUMP=<dir>): eager-only dumps of per-layer per-step
+# tensors at the same program point in the scalar and batched paths. Off by default.
+_dsv4_dump_dir = os.environ.get("EXL3_DSV4_DIFF_DUMP", "")
+_dsv4_dump_n = {}
+
+def _dsv4_dump(tag, layer, pos, ec, m, tensors, kl, bt_row):
+    """tensors: name -> tensor (post-step values). Pool rows 0..ec-1 are read through bt_row."""
+    if not _dsv4_dump_dir:
+        return
+    import os as _os
+    d = {k: v.detach().float().cpu().clone() for k, v in tensors.items() if v is not None}
+    if kl is not None and kl.pool_r is not None and ec > 0 and bt_row is not None:
+        epp = kl.epp
+        e = torch.arange(ec, device = kl.pool_r.device)
+        ri = bt_row[0, e // epp].long() * epp + e % epp
+        d["pool_r"] = kl.pool_r.view(-1, kl.D_r)[ri].float().cpu()
+        if kl.quant:
+            d["pool_s"] = kl.pool_s.view(-1, kl.G)[ri].float().cpu()
+        else:
+            d["pool_c"] = kl.pool_c.view(-1, kl.D_c)[ri].float().cpu()
+        if kl.D_i:
+            d["pool_idx"] = kl.pool_idx.view(-1, kl.D_i)[ri].float().cpu()
+    _os.makedirs(_dsv4_dump_dir, exist_ok = True)
+    import torch.distributed as _dist
+    _rk = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+    torch.save(d, f"{_dsv4_dump_dir}/r{_rk}_{tag}_L{layer}_p{pos}.pt")
+
+
 class DSV4CompressorState:
     """
     Cross-chunk state interface for one compressor (one entry name in HF terms). The
@@ -139,6 +167,7 @@ class DSV4Compressor:
         self.norm = norm if norm is not None else RMSNorm(cfg, f"{key}.norm", attn.rms_norm_eps)
         self.ape = None  # (compress_rate, proj_width) fp32, loaded by DSV4Attention.load
         self.bc = None   # BC_DSV4Compressor companion (cached path), built lazily
+        self.mg_pair = False   # 2-expert wkv/wgate exl3_mgemm available (set in _build_fused)
         self.fused_ready = False
         self.fused_inv_freq = None
         self.fused_norm_w = None
@@ -216,6 +245,12 @@ class DSV4Compressor:
             )
             args["mg_indices"] = torch.arange(2, dtype = torch.long, device = device).unsqueeze(0)
 
+        self.mg_pair = args.get("mg_suh") is not None
+        if self.mg_pair:
+            self.mg_pair_tables = (args["mg_trellis"], args["mg_suh"], args["mg_svh"], args["mg_indices"])
+            self.mg_pair_K = wkv_i.K
+            self.mg_pair_mcg = wkv_i.mcg
+            self.mg_pair_mul1 = wkv_i.mul1
         self.bc = ext.BC_DSV4Compressor(**args)
 
 
@@ -1392,6 +1427,8 @@ class DSV4Attention(Module):
         rsg = params["recurrent_states"]
         bsz = x.shape[0]
         assert len(rsg) >= bsz
+        if _dsv4_dump_dir and bsz == 1:
+            _dsv4_dump("X", self.layer_idx, rsg[0].position, 0, 1, {"x": x}, None, None)
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
         kl = bt = None
         if self.kv_source is not None:
@@ -1682,6 +1719,10 @@ class DSV4Attention(Module):
             ),
         )
 
+        if _dsv4_dump_dir:
+            _dsv4_dump("B", self.layer_idx, int(a_pos[0]), int(a_ec[0]), m,
+                       {"q": q, "kv": kv, "out": out, "ck": comp_kv, "cg": comp_gate}, kl,
+                       bt_st[:1] if bt_st is not None else None)
         # Ring appends (shift already applied in the prepass): batched, slot-indexed
         ext.dsv4_ring_append(kv.reshape(R, self.head_dim), rsl.ring, a_pos, a_beg, a_slots)
         return self._project_o_grouped(out.unsqueeze(1), params, out_dtype,
@@ -1729,8 +1770,20 @@ class DSV4Attention(Module):
             if self.compressor is not None:
                 if not self.compressor.fused_ready:
                     self.compressor._build_fused()
-                comp_kv = self.compressor.wkv.forward(xf, params)[0]
-                comp_gate = self.compressor.wgate.forward(xf, params)[0]
+                comp = self.compressor
+                if comp.mg_pair:
+                    # Same 2-expert exl3_mgemm the eager BC compressor runs (wkv, wgate share
+                    # the input), so the projected rows match eager bit-for-bit
+                    mg_tr, mg_suh, mg_svh, mg_idx = comp.mg_pair_tables
+                    ah = g_tensor_cache.get(x.device, (2, rows, self.hidden_size), torch.half, "dsv4_comp_ah")
+                    cc = g_tensor_cache.get(x.device, (2, rows, comp.wkv.out_features), torch.half, "dsv4_comp_mg")
+                    ext.exl3_mgemm(xf, mg_tr, cc, mg_suh, ah, mg_svh, mg_idx, None,
+                                   comp.mg_pair_K, -1, comp.mg_pair_mcg, comp.mg_pair_mul1,
+                                   -1, -1, 0, 1, None, None)
+                    comp_kv, comp_gate = cc[0], cc[1]
+                else:
+                    comp_kv = comp.wkv.forward(xf, params)[0]
+                    comp_gate = comp.wgate.forward(xf, params)[0]
             if self.indexer is not None:
                 if not self.indexer.fused_ready:
                     self.indexer._build_fused()
@@ -2021,6 +2074,11 @@ class DSV4Attention(Module):
             # Image chunk (vision): bidirectional over the chunk, own window into history
             nc_chunk = bool(params.get("nc_chunk", False)),
         )
+        if _dsv4_dump_dir:
+            _dsv4_dump("S", self.layer_idx, pos0, ec, dense_m,
+                       {"q": q, "kv": kv, "out": out, "ck": fouts[2] if fouts is not None else None,
+                        "cg": fouts[3] if fouts is not None else None}, kl,
+                       bt_row if kl is not None else None)
 
         # Ring update after attention: the shift/rebase branches move rows the kernel
         # reads in place (the kernel addresses the PRE-update ring via ring_beg). Keep the

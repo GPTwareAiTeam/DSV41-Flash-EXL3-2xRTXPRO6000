@@ -60,6 +60,10 @@ PROMPTS = [
     "The capital of France is",
     "Write a Python function that returns the nth Fibonacci number.",
     "List three primary colors and explain why they matter in painting.",
+    "Summarize the following passage in one sentence: " + "".join(
+        "Paragraph %d: the river wound through the valley past terraced fields of barley, "
+        "where farmers repaired stone walls each spring and traded seed in the market town. " % i
+        for i in range(1, 36)),
 ]
 
 
