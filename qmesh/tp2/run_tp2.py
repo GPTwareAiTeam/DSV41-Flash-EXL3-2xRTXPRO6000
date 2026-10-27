@@ -38,7 +38,7 @@ MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
-COMM = os.environ.get("COMM", "nccl")  # nccl | p2p (P2PComm one-shot collectives; needs P2P_RDV = fresh dir)
+COMM = os.environ.get("COMM", "nccl")  # nccl | p2p | hybrid (P2PComm one-shot collectives; needs P2P_RDV = fresh dir)
 PROFILE = os.environ.get("PROFILE", "0") == "1"
 TOKENS_OUT = os.environ.get("TOKENS_OUT")
 PROMPT_IDS = [int(i) for i in os.environ.get("PROMPT_IDS", "0,1,2").split(",")]
@@ -130,6 +130,39 @@ class TPBackendP2P:
     def end_cpu_reduce_jobs(self):
         pass
 
+HYBRID_NCCL_MIN_BYTES = int(os.environ.get("HYBRID_NCCL_MIN_BYTES", 64 * 1024))
+
+
+class TPBackendHybrid:
+    """P2PComm for small payloads (decode), NCCL for large ones (prefill rows). The choice depends only on
+    numel and dtype, so both ranks issue the same collective sequence."""
+
+    def __init__(self, nccl: "TPBackendNCCL", p2p: "TPBackendP2P"):
+        self.nccl = nccl
+        self.p2p = p2p
+
+    def fwd_barrier(self):
+        self.p2p.fwd_barrier()
+
+    def _pick(self, tensor: torch.Tensor):
+        return self.nccl if tensor.numel() * tensor.element_size() >= HYBRID_NCCL_MIN_BYTES else self.p2p
+
+    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        self._pick(tensor).all_reduce(tensor, contribution)
+
+    def broadcast(self, tensor: torch.Tensor, src_device: int):
+        self.nccl.broadcast(tensor, src_device)
+
+    def all_gather(self, t: torch.Tensor, world: int) -> torch.Tensor:
+        return self.p2p.all_gather(t, world)
+
+    def run_cpu_reduce_jobs(self):
+        pass
+
+    def end_cpu_reduce_jobs(self):
+        pass
+
+
 def set_tp_reduce(model: Model, backend: TPBackendNCCL) -> int:
     """Enable the attention/MoE partial-sum collectives on every TP-local block, and hand the backend to
     every forward through params (Generator builds its params internally, so the entrypoints inject it)."""
@@ -177,7 +210,7 @@ def wrap_vocab_split(model: Model, rank: int, world: int, backend: TPBackendNCCL
 
     def head_fwd(x, params, out_dtype = None):
         y = orig_head(x, params, out_dtype)
-        if isinstance(backend, TPBackendP2P):
+        if isinstance(backend, (TPBackendP2P, TPBackendHybrid)):
             return backend.all_gather(y.contiguous(), world)
         parts = [torch.empty_like(y) for _ in range(world)]
         dist.all_gather(parts, y.contiguous())
