@@ -1367,11 +1367,19 @@ class DSV4Attention(Module):
         t = torch.empty((n,), dtype = torch.half, device = self.device)
         del t
 
-    def _batch_ok_b1(self):
-        """Dense sliding layers the batched B=1 body can express: no compressor, no indexer, no candidate
-        selection, no head-norm. Owners and shared-selection readers stay on _forward_cached_one."""
-        return (not self.q_head_norm and self.candidate_mode is None and self.idx_wk is None
-                and self.indexer_mode is None and self.compressor is None)
+    def _batch_ok_b1(self, kl, pos_end):
+        """Layers the batched B=1 body can express at this step: sliding layers, and compressed
+        owners and readers while the pool is in the dense regime (entries <= index_topk, where top-k
+        keeps every causal entry and no indexer/candidate selection runs). Quantized pools, top-k-regime
+        steps and active candidate selection stay on _forward_cached_one (host decision, before any
+        state moves)."""
+        if self.q_head_norm:
+            return False
+        if self.kv_source is None:
+            return self.candidate_mode is None
+        ec = pos_end // self.compress_rate
+        return not kl.quant and ec <= self.index_topk and self.candidate_mode is None
+
 
 
     def _forward_cached(self, x, params, out_dtype):
@@ -1412,7 +1420,7 @@ class DSV4Attention(Module):
                     for i in range(bsz):
                         kl.pull(src, pages[i], rsg[i].position // m, (rsg[i].position + x.shape[1]) // m)
         if bsz == 1:
-            if dsv4_b1_batch and x.shape[1] == 1 and self._batch_ok_b1():
+            if dsv4_b1_batch and x.shape[1] == 1 and self._batch_ok_b1(kl, rsg[0].position + 1):
                 return self._forward_cached_batch(x, params, rsg, layer_instance, out_dtype, kl, bt)
             return self._forward_cached_one(
                 x, params, rsg[0], self._get_rsl(rsg[0], layer_instance), out_dtype,
@@ -1469,7 +1477,7 @@ class DSV4Attention(Module):
         for rs in rsg[1:B]:
             assert self._get_rsl(rs, layer_instance) is rsl, \
                 "batched DSA path requires all jobs in one cache"
-        m = self.compress_rate if self.compressor is not None else 1
+        m = self.compress_rate if self.kv_source is not None else 1
         w = self.sliding_window
         kp = -(-self.index_topk // 32) * 32 if self.indexer is not None else 32
 
@@ -1489,8 +1497,8 @@ class DSV4Attention(Module):
                 ring_j = rsl.ring[slot]
                 ring_j[:rsl.ring_rows - shift].copy_(ring_j[shift:].clone())
                 rs.wshift = shift
-            ec = (pos0 + S) // m if self.compressor is not None else 0
-            assert self.compressor is None or ec <= bt.shape[1] * kl.epp, \
+            ec = (pos0 + S) // m if self.kv_source is not None else 0
+            assert self.kv_source is None or ec <= bt.shape[1] * kl.epp, \
                 f"DSA pool overflow: entry {ec} beyond block table ({bt.shape[1]} pages)"
             pos_l.append(pos0)
             floor_l.append(pos0 - min(w - 1, offset, pos0))
@@ -1581,6 +1589,17 @@ class DSV4Attention(Module):
                     rsl.idx_ovl, idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
                     idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None,
                     0, a_pos, m, a_slots, bt_st, kl.epp, False)
+            if self.idx_wk is not None:
+                # V4.1 indexer keys come from this owner's own compressed entry. B == 1, S == 1:
+                # the entry this step completes (if any) is re-read from the pool and keyed on
+                # device; a step without a new entry rewrites the row it read (idempotent)
+                e = (a_ec - 1).clamp(min = 0)
+                row = bt_st[0].index_select(0, (e // kl.epp).long()).long() * kl.epp + (e % kl.epp).long()
+                lat = torch.cat((kl.pool_c.view(-1, kl.D_c)[row], kl.pool_r.view(-1, kl.D_r)[row]), dim = -1)
+                keys = self._indexer_keys(lat, params, e)
+                idx_flat = kl.pool_idx.view(-1, kl.D_i)
+                new = (a_ec > a_pos // m).view(-1, 1)
+                idx_flat.index_copy_(0, row, torch.where(new, keys, idx_flat[row]))
 
         if self.compressor is not None and self.layer_type == "csa":
             if True:
@@ -1626,7 +1645,7 @@ class DSV4Attention(Module):
         # Paged pools: the split kernel reads one block-table row per job from the fixed
         # (B, num_pages) static
         qc = None
-        if self.compressor is not None:
+        if self.kv_source is not None:
             bt = bt_st
             epp = kl.epp
             pool_c = kl.pool_c_view()
