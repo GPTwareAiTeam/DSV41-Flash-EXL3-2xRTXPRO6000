@@ -62,6 +62,7 @@ class Segment:
             srcs += [params[k] for k in self.carry_in]
         torch._foreach_copy_(dsts, srcs, non_blocking = True)
         self.graph.replay()
+        self.replays = getattr(self, "replays", 0) + 1
         for k, t in self.carry_out.items():
             params[k] = t
         return self.static_out
