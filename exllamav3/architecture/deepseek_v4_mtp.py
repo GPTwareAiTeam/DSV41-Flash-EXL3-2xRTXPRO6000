@@ -363,6 +363,11 @@ class DeepseekV4MTPModel(Model):
         me = to_dev(torch.stack(embs, dim = 1), cdev).half()
         conf = self.confidence.forward(torch.cat((xpre, me), dim = -1), params)
         cs = torch.sigmoid(conf.float().squeeze(-1))
+        if params.get("export_draft_conf"):
+            # Raw confidence logits for the generator's calibrator (binned 1.0 wide, so logits, not sigmoid).
+            # Column 0 is the seed position, which the generator crops (draft_conf[:, 1:]); layout (bsz, block + 1)
+            logit = conf.float().squeeze(-1)
+            params["draft_conf"] = torch.cat((torch.zeros_like(logit[:, :1]), logit), dim = 1)
         if self._conf_stats is not None:
             self._conf_stats.append(cs[0].tolist())
         keep = cs >= self.draft_conf_threshold
