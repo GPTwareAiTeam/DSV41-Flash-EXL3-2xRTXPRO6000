@@ -29,6 +29,19 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
 **`PREFILL_CHUNK` default = 8192.** 16384 buys +1.2% for 3.2 GiB, so it is not worth shipping. Remaining gap to the
 8000 tok/s target is the MoE (30.6% of prefill) — see the tile/occupancy item.
 
+### H1 (issue-bound) vs H2 (memory-bound): settled as H2
+Their decision rule was issue-active >= 80% => issue-bound. Measured on our card with the standalone bench
+(`ncu --graph-profiling node`, one call each):
+| kernel | grid | issue_active | DRAM | us |
+|---|---|---|---|---|
+| `exl3_moe_coop_a_mixed<2,0>` | 504x256 | **45.8%** | **47.8%** | 44.6 |
+| `exl3_moe_coop_b_mixed<2,0>` | 1120x256 | **42.7%** | **33.3%** | 27.6 |
+Neither engine is saturated: it is **memory latency/granularity**, consistent with 44% long-scoreboard. So the
+issue-cutting branch (PRMT byte windows, dropping staging for 6 bpw) is the WRONG direction; latency hiding is right.
+- `EXL3_MOE_COOP_WIDE_B=1` at bsz1 (the obvious "wider per-warp span"): **worse** — 67.29 vs 65.66 us/call, B 27.87 vs
+  25.38. Confirms the note in `exl3_moe_coop.cu` that bsz1 keeps B narrow, in the face of the comment saying otherwise.
+  Keep narrow at bsz1.
+
 ### Decode MoE: what the profiler actually says (and what is ruled out)
 A kernel at 32768-token-free decode (layer 3, uniform random routing, 50 warm iters): **A 34.93 us at 42.2% DRAM, B 20.47 us
 at 32.5% DRAM; 80 regs/thread, 22.5 KB smem, 3 blocks/SM register-limited, 43.8% occupancy, long-scoreboard 44%.**
