@@ -340,7 +340,59 @@ __device__ __forceinline__ bool read_run(const MoeCoopParams& p, int run_idx, in
 // 2/3/4 bpw; other widths stage each k-slice's tile words in shared memory and decode with
 // dq_dispatch
 
-template <int bits, int cb, bool WIDE, bool HALF = false>
+// Candidate switches (each one bit-identical to the baseline arithmetic; see OPTIMIZATION_NOTES.md):
+//   EXL3_MOE_HOIST     issue the trellis prefetch ring before the block prologue (bsz-1 input rotation, fused /
+//                      PDL waits), so the first DRAM round trip overlaps the prologue instead of following it
+//   EXL3_MOE_HALF_REG  2.5 / 3.5 (and 1.5) bpw decode from registers by lane shuffles, as exl3_gemv_kernel does,
+//                      instead of staging every k-slice through shared memory
+//   EXL3_MOE_DEEP_PF   prefetch ring depth 8 (was 4) for widths with <= 2 warp loads per k-slice; keeps the fold
+//                      cadence (FOLD = 4), so the fp16 -> fp32 rounding points are unchanged
+//   EXL3_MOE_PDL       programmatic dependent launch: kernel B (and A) start while the previous kernel drains and
+//                      prefetch weights before griddepcontrol.wait; counters are reset after the wait
+#ifndef EXL3_MOE_HOIST
+#define EXL3_MOE_HOIST 1
+#endif
+#ifndef EXL3_MOE_HALF_REG
+#define EXL3_MOE_HALF_REG 0
+#endif
+#ifndef EXL3_MOE_DEEP_PF
+#define EXL3_MOE_DEEP_PF 0
+#endif
+#ifndef EXL3_MOE_PDL
+#define EXL3_MOE_PDL 1
+#endif
+
+// griddepcontrol (sm_90+): no-ops when the launch carries no programmatic-serialization attribute
+__device__ __forceinline__ void pdl_wait()
+{
+#if EXL3_MOE_PDL && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger()
+{
+#if EXL3_MOE_PDL && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+struct NoPre { __device__ __forceinline__ void operator()() const {} };
+
+template <int bits, bool HALF>
+constexpr bool tile_reg_k() { return HALF ? (EXL3_MOE_HALF_REG != 0) : tile_reg<bits>(); }
+
+template <int bits, bool HALF>
+constexpr int tile_loads()
+{
+    constexpr bool REG = tile_reg_k<bits, HALF>();
+    constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;
+    return REG ? (HALF ? (bits == 1 ? WNT / 2 : WNT) : (bits == 2 ? WNT / 2 : WNT)) : CEIL_DIVIDE(WNT * TWORDS, 32);
+}
+
+template <int bits, bool HALF>
+constexpr int tile_pf() { return (EXL3_MOE_DEEP_PF && tile_loads<bits, HALF>() <= 2) ? 8 : PF; }
+
+template <int bits, int cb, bool WIDE, bool HALF = false, typename Pre = NoPre>
 __device__ __forceinline__ void gemv_tile
 (
     const uint32_t* __restrict__ B32,
@@ -356,14 +408,18 @@ __device__ __forceinline__ void gemv_tile
     int ntiles,
     int group,                          // block column group of tile_cols<WIDE>() columns
     float* __restrict__ sh_red,         // [WKK][ROWS][TCOLS]
-    uint32_t* __restrict__ sh_stage     // [WK][STAGE_WORDS], staged widths only
+    uint32_t* __restrict__ sh_stage,    // [WK][STAGE_WORDS], staged widths only
+    Pre pre = Pre()                     // block prologue, run after the prefetch ring is issued (block-uniform)
 )
 {
-    constexpr bool REG = HALF ? false : tile_reg<bits>();
+    constexpr bool REG = tile_reg_k<bits, HALF>();
     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr int GWORDS = WNT * TWORDS;                                        // uint32 per warp per k-slice
-    constexpr int LOADS = REG ? (bits == 2 ? WNT / 2 : WNT) : CEIL_DIVIDE(GWORDS, 32);
-    constexpr int LSTRIDE = (REG && bits == 3) ? 24 : 32;
+    constexpr bool HALF_TWO = HALF && bits == 1;                                // 1.5 bpw: two tiles per load
+    constexpr int LOADS = tile_loads<bits, HALF>();
+    constexpr int LSTRIDE = (REG && HALF) ? (HALF_TWO ? 2 * TWORDS : TWORDS) : (REG && bits == 3) ? 24 : 32;
+    constexpr int PFD = tile_pf<bits, HALF>();
+    static_assert(PFD % FOLD == 0, "fold cadence must divide the ring depth");
     constexpr int WN = tile_wn<WIDE>();
     constexpr int WKK = tile_wk<WIDE>();
     constexpr int TCOLS = tile_cols<WIDE>();
@@ -379,20 +435,69 @@ __device__ __forceinline__ void gemv_tile
     const int myn = max(0, min(chunk, k_end - ks0));
     const size_t slice_stride = (size_t) ntiles * TWORDS;
 
-    // A fragment row of this lane: rows[lane / 4] of the run
+    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane;
+    [[maybe_unused]] uint32_t* stage = sh_stage + warp * STAGE_WORDS;
+
+    auto ld_b = [&] (int i, int l) -> uint32_t
+    {
+        if constexpr (REG && HALF)
+            return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+        else if constexpr (REG && bits == 3)
+            return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+        else if constexpr (!REG)
+            return (l * 32 + lane < GWORDS) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+        else
+            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+    };
+
+    // Prefetch ring first: the loads depend only on the weight pointer, not on the prologue
+    uint32_t pf[PFD][LOADS];
+#if EXL3_MOE_HOIST
+    #pragma unroll
+    for (int d = 0; d < PFD; ++d)
+        if (d < myn)
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l)
+                pf[d][l] = ld_b(d, l);
+    pre();
+#else
+    pre();
+    #pragma unroll
+    for (int d = 0; d < PFD; ++d)
+        if (d < myn)
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l)
+                pf[d][l] = ld_b(d, l);
+#endif
+
+    // A fragment row of this lane: rows[lane / 4] of the run (rows[] may be written by the prologue's caller only)
     const int r0 = lane >> 2;
     const bool r0_ok = r0 < nrows;
     const size_t a_row0 = r0_ok ? (size_t) rows[r0] * a_stride2 : 0;
     const half2 hzero = __half2half2(__ushort_as_half(0));
 
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
-    if constexpr (bits == 2)
+    [[maybe_unused]] uint32_t x_pack = 0;
+    if constexpr (HALF)
+    {
+        // Same lane constants as exl3_gemv_kernel's half-integer path / dq8_half: word indices (< TWORDS) and
+        // funnel shifts of both window groups, six 5-bit fields
+        constexpr int bits2 = 2 * bits + 1;
+        constexpr int gspan = 18 + 3 * bits;
+        const int t_offset = lane << 3;
+        const int e7 = ((t_offset >> 1) + 4) * bits2 + 128 * bits2;
+        const int e3 = e7 - 2 * bits2;
+        const uint32_t hi7 = ((e7 - 1) / 32) % TWORDS, lo7 = ((e7 - gspan) / 32) % TWORDS, s7 = ((e7 - 1) / 32 + 1) * 32 - e7;
+        const uint32_t hi3 = ((e3 - 1) / 32) % TWORDS, lo3 = ((e3 - gspan) / 32) % TWORDS, s3 = ((e3 - 1) / 32 + 1) * 32 - e3;
+        x_pack = lo7 | (hi7 << 5) | (s7 << 10) | (lo3 << 15) | (hi3 << 20) | (s3 << 25);
+    }
+    else if constexpr (bits == 2)
     {
         int i1 = lane >> 1;
         x_src_b = i1;
         x_src_a = (i1 + 15) & 15;
     }
-    if constexpr (bits == 3)
+    else if constexpr (bits == 3)
     {
         int t_offset = lane << 3;
         int b1 = (t_offset + 257) * 3;
@@ -403,35 +508,15 @@ __device__ __forceinline__ void gemv_tile
         x_src_a = i0 % 24;
         x_src_b = i2 % 24;
     }
-
-    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane;
-    [[maybe_unused]] uint32_t* stage = sh_stage + warp * STAGE_WORDS;
-
-    auto ld_b = [&] (int i, int l) -> uint32_t
-    {
-        if constexpr (REG && bits == 3)
-            return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
-        else if constexpr (!REG)
-            return (l * 32 + lane < GWORDS) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
-        else
-            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
-    };
-
-    uint32_t pf[PF][LOADS];
-    #pragma unroll
-    for (int d = 0; d < PF; ++d)
-        if (d < myn)
-            #pragma unroll
-            for (int l = 0; l < LOADS; ++l)
-                pf[d][l] = ld_b(d, l);
+    #define XPK(i) ((x_pack >> (5 * (i))) & 31u)   // 0: lo7, 1: hi7, 2: s7, 3: lo3, 4: hi3, 5: s3
 
     FragC_h ch[WNT][2] = {};
     float2 acc0[WNT][2] = {};
 
-    for (int ib = 0; ib < myn; ib += PF)
+    for (int ib = 0; ib < myn; ib += PFD)
     {
         #pragma unroll
-        for (int d = 0; d < PF; ++d)
+        for (int d = 0; d < PFD; ++d)
         {
             const int i = ib + d;
             if (i >= myn) break;
@@ -441,11 +526,11 @@ __device__ __forceinline__ void gemv_tile
             for (int l = 0; l < LOADS; ++l)
                 bw[l] = pf[d][l];
 
-            if (i + PF < myn)
+            if (i + PFD < myn)
             {
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(i + PF, l);
+                    pf[d][l] = ld_b(i + PFD, l);
             }
 
             if constexpr (!REG)
@@ -473,6 +558,16 @@ __device__ __forceinline__ void gemv_tile
                 if constexpr (!REG)
                 {
                     dq_dispatch<bits, cb, HALF>(stage + t * TWORDS, lane << 3, f0, f1);
+                }
+                else if constexpr (HALF)
+                {
+                    const uint32_t w = HALF_TWO ? bw[t >> 1] : bw[t];
+                    const int base = HALF_TWO ? (t & 1) * TWORDS : 0;
+                    uint32_t a7 = __shfl_sync(0xffffffffu, w, base + XPK(0));
+                    uint32_t b7 = __shfl_sync(0xffffffffu, w, base + XPK(1));
+                    uint32_t a3 = __shfl_sync(0xffffffffu, w, base + XPK(3));
+                    uint32_t b3 = __shfl_sync(0xffffffffu, w, base + XPK(4));
+                    exl3_gemv_ns::dq8_regs_half<bits, cb>(a7, b7, XPK(2), a3, b3, XPK(5), f0, f1);
                 }
                 else if constexpr (bits == 4)
                 {
@@ -512,6 +607,7 @@ __device__ __forceinline__ void gemv_tile
             }
         }
     }
+    #undef XPK
 
     // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
     // tile*16 + frag*8 + 2*(l%4) (+1)
@@ -767,22 +863,31 @@ void moe_a_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
     }
     else
     {
-        // bsz 1: every run is a single slot; rotate its input into shared memory here. A zero
+        // bsz 1: every run is a single slot; its input is rotated into shared memory by the prologue below. A zero
         // row stride makes the tile read it whatever the slot index (which still selects the C row)
-        const SlotInfo si = slot_info(p, sh_rows[0]);
-        for (int c = warp; c < p.Hi / 128; c += WK)
-            rotate_chunk(p, si.row, suh, c, sh_A, lane);
-        __syncthreads();
         A2 = (const half2*) sh_A;
         a_stride2 = 0;
     }
+    // Block prologue, run by gemv_tile once the weight prefetch ring is in flight
+    auto prologue = [&] ()
+    {
+        pdl_wait();
+        if (!p.a_global)
+        {
+            const SlotInfo si = slot_info(p, sh_rows[0]);
+            for (int c = warp; c < p.Hi / 128; c += WK)
+                rotate_chunk(p, si.row, suh, c, sh_A, lane);
+            __syncthreads();
+        }
+    };
 
     {
         const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[local];
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage, prologue);
+        pdl_trigger();
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -844,9 +949,17 @@ __global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 {
     extern __shared__ uint32_t smem_dyn[];
+#if EXL3_MOE_PDL
+    moe_a_body<bits, cb, WIDE, HALF>(p, blockIdx.x, smem_dyn);
+    // PDL: this grid may start before its predecessor finishes; touch the shared counters only after it
+    pdl_wait();
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
+        p.ctr_b[i] = 0;
+#else
     for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
         p.ctr_b[i] = 0;
     moe_a_body<bits, cb, WIDE, HALF>(p, blockIdx.x, smem_dyn);
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -881,7 +994,11 @@ void moe_b_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
     const int group = rem % ng;
     int nrows = 0;
     if (!read_run(p, run_idx, sh_rows, nrows, sh_res)) return;
-    if (p.fused) wait_a_ready(p, sh_rows, nrows);
+    auto prologue = [&] ()
+    {
+        pdl_wait();
+        if (p.fused) wait_a_ready(p, sh_rows, nrows);
+    };
     const int local = slot_info(p, sh_rows[0]).local;
     const int kslices_all = p.I / 16;
     const int k_begin = kslices_all * ks / p.ksplit_b;
@@ -891,7 +1008,7 @@ void moe_b_body(const MoeCoopParams& p, int item, uint32_t* smem_dyn)
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
         gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage, prologue);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -1005,9 +1122,17 @@ __global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_b_kernel(const MoeCoopParams p)
 {
     extern __shared__ uint32_t smem_dyn[];
+#if EXL3_MOE_PDL
+    moe_b_body<bits, cb, WIDE, HALF>(p, blockIdx.x, smem_dyn);
+    // PDL: this grid may start before its predecessor finishes; touch the shared counters only after it
+    pdl_wait();
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
+        p.ctr_a[i] = 0;
+#else
     for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
         p.ctr_a[i] = 0;
     moe_b_body<bits, cb, WIDE, HALF>(p, blockIdx.x, smem_dyn);
+#endif
 }
 
 }  // namespace exl3_moe_coop_ns

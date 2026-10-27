@@ -1187,3 +1187,23 @@ Weights for code indicators and minimum weighted score for the code class.
 TP=2 runner and prefill benchmark cache precision. `16` uses the existing fp16 DSA pool;
 `8` packs the non-RoPE latent in 8-bit groups with fp16 scales. RoPE and indexer planes
 remain fp16. The 8-bit setting is experimental until performance and quality gates pass.
+
+### `EXL3_MOE_HOIST` (compile-time, default: on)
+Decode MoE: issue the trellis prefetch ring before the bsz-1 input rotation (the rotation is passed to `gemv_tile` as a
+prologue functor), and before the PDL/fused waits. Bit-identical; measured +3% at bsz1 in bench_moe_coop.py.
+
+### `EXL3_MOE_PDL` (compile-time, default: on) / `EXL3_MOE_COOP_PDL` (runtime, default: 1)
+Programmatic dependent launch of decode MoE kernel B: B's blocks start while A drains, read routing and prefetch
+weights, then `griddepcontrol.wait` before touching `act_out` or the counters. `EXL3_MOE_COOP_PDL=0` disables at runtime
+(no rebuild). Measured +2% on top of HOIST at bsz1, +1.8% at bsz6. Safe for B only; A would need its wait before routing,
+which removes the gain, so A is unchanged.
+
+### `EXL3_MOE_HALF_REG` (compile-time, default: off)
+2.5/3.5 bpw decode by lane shuffles instead of smem staging. Bit-identical; modelled 0.995x (no gain) — left off.
+
+### `EXL3_MOE_DEEP_PF` (compile-time, default: off)
+Prefetch ring 8 instead of 4 for widths with <= 2 loads per slice. Bit-identical; modelled 0.945x at bsz6 — left off.
+
+### `EXL3_MOE_WIDE_B_BSZ1` / `EXL3_MOE_COOP_WIDE_B` (runtime, default: off)
+Force the wide tile for the down projection at bsz 1. Default picks narrow (`moe_coop_pick_wide` needs >= 128 kslices
+and >= 32 slots; bsz1 gives 72/6). Measured WORSE at bsz1: 67.29 vs 65.66 us/call — keep off.
