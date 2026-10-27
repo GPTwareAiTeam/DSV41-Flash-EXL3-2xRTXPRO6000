@@ -1409,8 +1409,6 @@ class DSV4Attention(Module):
         keeps every causal entry and no indexer/candidate selection runs). Quantized pools, top-k-regime
         steps and active candidate selection stay on _forward_cached_one (host decision, before any
         state moves)."""
-        if self.q_head_norm:
-            return False
         if self.kv_source is None:
             return self.candidate_mode is None
         ec = pos_end // self.compress_rate
@@ -1421,7 +1419,7 @@ class DSV4Attention(Module):
         _forward_cached_batch. Resolves the cache and stages the per-job state array and block-table static
         that the device-driven body reads. Returns ((rsl, kl, m, w, kp), arr, bt_st) when the captured body serves
         this step, or None with no state touched for the eager path: ring shifts, top-k regime switches, mirrored pools."""
-        if not dsv4_b1_batch or not self.num_q_heads or not self.q_head_norm:
+        if not dsv4_b1_batch or not self.num_q_heads:
             return None
         if params.get("attn_mode") != "flash_attn" or params.get("prefill"):
             return None
