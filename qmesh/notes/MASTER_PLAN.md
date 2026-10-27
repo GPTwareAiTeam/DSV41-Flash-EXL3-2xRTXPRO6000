@@ -24,6 +24,7 @@ Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 t
    fell back to eager. Whenever `BATCH>1`, verify `EXL3_DSV4_B1_BATCH=1` **and** that replay counters are non-zero.
 
 ## A. SHIPPED AND VERIFIED (on `recipe/2x-rtxpro6000-tp2`)
+| 8 | **Prefix caching** (`EXL3_PREFIX_CACHE`) -- commit `036f32da` | **8192-token prompt TTFT 3178 -> 196 ms (16x)**, 2048 -> 936 -> 195 ms (4.8x); partial hits ~1.9x (2048: 921 -> 534, 8192: 3178 -> 1655); effective throughput 2578 -> 41,732 tok/s on a full 8K hit | all 8 full/partial comparisons token-identical on BOTH ranks; KV cost 3200 B/token/GPU from a preallocated pool (no extra allocation); reuse stops at the last page-aligned recurrent checkpoint, so `k*256+1` prompt lengths maximise hits |
 
 | # | change | measured gain | verification |
 |---|---|---|---|
