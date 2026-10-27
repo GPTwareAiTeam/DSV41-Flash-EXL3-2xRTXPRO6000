@@ -15,7 +15,7 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
 | 6 | **FP8 KV cache** (DECIDED — do it) | diffbot ships fp8 KV; our engine has `k_bits=8` packed pool | ~2× KV capacity; halves KV bytes read/written | validate: attention must not get slower (packed pool adds dequant ALU) and tokens/KL within noise. Removes the earlier bogus "we're already at parity" claim |
 | 7 | **Replay trim in multi-chunk prefill** (late layers only need the last rows) | diffbot 3.7–4.6% at 34K–130K | +4% prefill | needs prefix-cache/ring semantics check |
 | 8 | **Prefix caching** (warm-prefix replay) | diffbot agentic 224 tok/s; sybil 16K prompt 16 s → 1 s on hit | large real-world gain | unmeasured by us |
-| 9 | ~~Speculative on/off policy~~ **CLOSED: always speculate, K=5** | matched COMM=p2p and EXL3_WHOLE_GRAPH=1, six prompts: plain 13.09/13.18/13.27/14.81/13.27/13.29, K=5 8.16/5.97/9.32/4.56/5.21/9.50, auto 13.38/13.64/13.39/4.57/5.26/13.68 ms/tok; auto switched off on 0, 1, 2 and 5 and lost on those four | +0% | `DSPARK_POLICY=always`; repeat K sweep after host-gap capture. Draft-pass count and K<5 timing cause remain under investigation. |
+| 9 | **Speculative policy: always speculate; K is a small, noisy dial** | matched config (COMM=p2p + graphs), prompt 0, counted drafter forwards: **exactly one per round at every K** (the DFlash block path, not the MTP loop). Round cost 19.7/20.7/21.3/22.1 ms at K=2/3/4/5 (+12% from K2 to K5); AL 2.25/2.56/2.51/2.67; per-token 8.77/8.09/8.50/8.27 ms. Six-prompt sweep: K=5 beats plain everywhere (13.1 -> 4.6-9.3 ms/tok). Auto on/off lost on 3 of 6 at a bad baseline, re-run not justified | K choice = 0-8% | keep K=5 as default; K=3 is within noise and aligns to 4 verify rows; per-content K tuning is worth a few % at most, so do not spend more on it. Earlier 'K<5 dominated' and 'prose loses' claims were artifacts of unmatched configs and are retracted |
 | 10 | **bsz-1 decode MoE occupancy** — 60–63 regs, 27 KB smem, 2–3 blocks/SM, 33–43% warps | our ncu | maybe +10–20% on the MoE share | lower value than #2 because 33–43% is already usable |
 | 11 | **Larger prefill chunk (8K/16K)** | our 2048→4096 = +18% | unknown | cheap test; memory-limited |
 ### New data (2026-10-27, later)
@@ -25,7 +25,7 @@ Reference on identical hardware (diffbot, 2×RTX PRO 6000 TP2, EXL3 3bpw): **156
   FAILED the quality gate (prompt-3 token flip at step 11, KL 0.22 at the flip). Trying block-scaled fp8
   (per-128 scale) next; if it still flips, drop the item.
 
-| 13 | **Cheapen the draft loop** — 5 sequential drafter forwards/round, each with a vocab-split head + sampler sync | our code (`generator.py:1258`) + ms/round ~23 | 2x spec: 23 -> ~12 ms/round | biggest remaining spec item; candidates: one batched head gather for all 5 positions instead of 5, keep ids on device, count host syncs |
+| 13 | ~~Cheapen the draft loop~~ **retracted** — the DFlash block path already drafts the whole block in ONE forward (`generator.py:1374`, `iterate_draftmodel_dflash_gen`); the per-position loop at 1258 is the MTP path, unused here | counted forwards per round: 1 at every K | — | the reducible cost is the block forward itself and the verify, both dominated by MoE weight reads |
 | 12 | **K=7 drafter** | diffbot: "of the +43%, draft length gives nearly all" | +30–40% on code | BLOCKED: our checkpoint has `dspark_block_size=5` |
 
 Already done / no longer candidates: mixed-K fused MoE with per-expert K tables; piecewise + block-boundary-merged CUDA
