@@ -35,10 +35,14 @@ from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Token
 from exllamav3.generator.generator import _DRAFT_HIST  # noqa: E402
 from exllamav3.modules.transformer import TransformerBlock  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import content_seed  # noqa: E402
+
 OVERLAY = os.environ.get("OVERLAY", "/artifacts/tp2-overlay")
 DSPARK = os.environ.get("DSPARK", "0") == "1"
 DSPARK_DYNAMIC = os.environ.get("DSPARK_DYNAMIC", "0") == "1"
 DSPARK_TARGET_ACC = float(os.environ.get("DSPARK_TARGET_ACC", "0.7"))
+DSPARK_POLICY = os.environ.get("DSPARK_POLICY", "always")
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 # Recurrent-cache history must cover the speculative pass width (generator requires max_history >= K); 5 is the
 # previous fixed value, so K<=5 runs are unchanged.
@@ -259,6 +263,10 @@ def wrap_vocab_split(model: Model, rank: int, world: int, backend: TPBackendNCCL
 
 
 def main():
+    if DSPARK_POLICY not in ("always", "auto"):
+        raise ValueError("DSPARK_POLICY must be always or auto")
+    if DSPARK_POLICY == "auto" and (not DSPARK or BATCH != 1 or DSPARK_DYNAMIC):
+        raise ValueError("DSPARK_POLICY=auto requires DSPARK=1, BATCH=1 and DSPARK_DYNAMIC=0")
     torch.cuda.set_device(RANK)
     dist.init_process_group(backend = "nccl", rank = RANK, world_size = WORLD,
                             init_method = os.environ["INIT_METHOD"])
@@ -304,7 +312,8 @@ def main():
                           num_draft_tokens = NUM_DRAFT if DSPARK else None,
                           dynamic_draft_tokens = DSPARK and DSPARK_DYNAMIC,
                           draft_confidence = DSPARK_TARGET_ACC,
-                          record_draft_stats = DSPARK and DSPARK_DYNAMIC)
+                          record_draft_stats = DSPARK and (DSPARK_DYNAMIC or DSPARK_POLICY == "auto"))
+    generator.observe_draft_confidence = DSPARK_POLICY == "auto"
     FORCE_EXPORT = os.environ.get("FORCE_EXPORT", "0") == "1"
     if FORCE_EXPORT and not DSPARK:
         _export_layers = set(config.dspark_target_layer_ids)
@@ -384,11 +393,28 @@ def main():
             stop_conditions = [] if IGNORE_EOS else [tokenizer.eos_token_id],
             return_logits = bool(LOGITS_OUT),
         )
+        policy_class, policy_ema = content_seed.seed_acceptance(prompt)
+        policy_off = DSPARK_POLICY == "auto" and policy_ema < content_seed.POLICY_THRESHOLD
+        if DSPARK_POLICY == "auto":
+            generator.num_draft_tokens = 0 if policy_off else NUM_DRAFT
+        if DSPARK_POLICY == "auto":
+            log(f"POLICY {idx} class={policy_class} seed_al={policy_ema:.3f} speculative={not policy_off}")
         generator.enqueue(job)
         t1 = time.time()
         marks, text, tokens, eos_info, logit_rows, spec = [], "", [], None, [], None
         while generator.num_remaining_jobs():
-            for result in generator.iterate():
+            stats_before = len(job.draft_stats)
+            results = generator.iterate()
+            if DSPARK_POLICY == "auto" and not policy_off and len(job.draft_stats) > stats_before:
+                for _, window, accepted in job.draft_stats[stats_before:]:
+                    predicted = 1 + window * generator.last_draft_confidence
+                    observed = (1 - content_seed.POLICY_CONF_WEIGHT) * (1 + accepted) + content_seed.POLICY_CONF_WEIGHT * predicted
+                    policy_ema += (observed - policy_ema) / content_seed.POLICY_EMA_WINDOW
+                if policy_ema < content_seed.POLICY_THRESHOLD:
+                    policy_off = True
+                    generator.num_draft_tokens = 0
+                    log(f"POLICY_OFF {idx} generated={job.new_tokens} ema_al={policy_ema:.3f}")
+            for result in results:
                 if "error" in result:
                     raise result["error"]
                 chunk = result.get("text", "")

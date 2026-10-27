@@ -1123,3 +1123,41 @@ and aggregate throughput; results are keyed `<prompt idx>.<slot>`.
 
 KV pool tokens per concurrent stream. `CACHE_TOKENS` defaults to `BATCH * CACHE_TOKENS_PER_SEQ`, so every stream
 has room for its prompt plus `MAX_NEW` tokens without sharing pages with another stream's shortfall.
+
+### `DSPARK_DYNAMIC` (default: `0`)
+
+Adaptive DSpark draft length. `1` passes `dynamic_draft_tokens` to the `Generator`, so the confidence calibrator cuts
+each round's window at the first position whose calibrated acceptance falls below `DSPARK_TARGET_ACC`. The drafter
+exports raw confidence logits under `export_draft_conf`. Also logs the per-round window histogram (`DYN` lines).
+Pair with `EXL3_DSPARK_CONF=0` so the drafter's static gate does not also cut the window.
+
+### `DSPARK_TARGET_ACC` (default: `0.7`)
+
+Target conditional acceptance probability for `DSPARK_DYNAMIC`. Passed to the `Generator` as `draft_confidence`. Lower
+values keep longer drafts; the calibrator only cuts where the estimated acceptance drops below this value.
+
+### `DSPARK_POLICY` (default: `always`)
+
+`auto` seeds an acceptance-length estimate from prompt content and permanently disables speculation for the
+request when the estimate falls below the threshold. Requires `DSPARK=1`, `BATCH=1`, `DSPARK_DYNAMIC=0`.
+The EMA observes realized verification acceptance; no observations are available after switching off.
+
+### `DSPARK_POLICY_THRESHOLD` (default: `2.55`), `DSPARK_POLICY_EMA_WINDOW` (default: `8`)
+
+Acceptance-length cutoff and EMA time constant in speculative rounds.
+
+### `DSPARK_POLICY_CONF_WEIGHT` (default: `0.25`)
+
+Weight of the drafter confidence-head estimate relative to realized acceptance in the policy EMA.
+
+### `DSPARK_POLICY_SEED_PROSE`, `DSPARK_POLICY_SEED_CODE`, `DSPARK_POLICY_SEED_JSON` (defaults: `2.6`, `4.0`, `2.4`)
+
+Initial acceptance-length estimates for each prompt class.
+
+### `DSPARK_POLICY_FEATURES` (default: `fence,braces,keyword,json`)
+
+Comma-separated enabled lexical signal categories for prompt classification.
+
+### `DSPARK_POLICY_FENCE_WEIGHT`, `DSPARK_POLICY_BRACE_WEIGHT`, `DSPARK_POLICY_KEYWORD_WEIGHT` (default: `1` each), `DSPARK_POLICY_CODE_MIN_SIGNALS` (default: `2`)
+
+Weights for code indicators and minimum weighted score for the code class.
