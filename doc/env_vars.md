@@ -1142,6 +1142,11 @@ values keep longer drafts; the calibrator only cuts where the estimated acceptan
 request when the estimate falls below the threshold. Requires `DSPARK=1`, `BATCH=1`, `DSPARK_DYNAMIC=0`.
 The EMA observes realized verification acceptance; no observations are available after switching off.
 
+On six 128-token prompts with `COMM=p2p`, `EXL3_WHOLE_GRAPH=1`, and `EXL3_DSPARK_CONF=0`, plain / fixed K=5 /
+auto decode ms per token were 13.09/8.16/13.38, 13.18/5.97/13.64, 13.27/9.32/13.39,
+14.81/4.56/4.57, 13.27/5.21/5.26 and 13.29/9.50/13.68. Auto switched off on prompts 0, 1, 2 and 5;
+fixed K=5 was faster on all six. This experimental policy does not guarantee a speedup.
+
 ### `DSPARK_POLICY_THRESHOLD` (default: `2.55`), `DSPARK_POLICY_EMA_WINDOW` (default: `8`)
 
 Acceptance-length cutoff and EMA time constant in speculative rounds.
