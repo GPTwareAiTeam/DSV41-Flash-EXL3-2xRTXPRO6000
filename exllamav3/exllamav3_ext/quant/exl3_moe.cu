@@ -476,9 +476,7 @@ void exl3_moe
     // Launch. All blocks of the grid must be co-resident for the group barriers, so groups * width <= the
     // co-resident slots. With a known number of active experts, launch only as many groups as there are
     // experts and widen them to use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT
-    // Block width follows the instance's K tile: the 64-row CUDA instance runs MOE_M64_TILESIZE_K
-    const int kt_launch = (m_tile >= 64) ? MOE_M64_TILESIZE_K : MOE_TILESIZE_K;
-    int block_dim = EXL3_GEMM_BASE_THREADS * kt_launch / 16;
+    int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
 #if defined(USE_ROCM)
     // Slots: WGPs x blocks per WGP (pipelined kernel: 2 when the runtime confirms it, cached per instance).
     // The buffers were sized by exl3_moe_max_concurrency; a mainloop switch after allocation only lowers the
@@ -515,16 +513,13 @@ void exl3_moe
         num_groups = MIN(num_groups, num_active);
         group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
     }
-    // The 64-row K-tile-16 instance needs ~45 KB of dynamic smem, so its request lets two blocks co-reside per SM.
-    // Other instances keep the device request
-    const int launch_smem_m64 = exl3_gemm_smem_bytes(64, MOE_M64_TILESIZE_K, 128, MOE_SH_STAGES, 2, 2, false, false);
-    const int launch_smem = (m_tile >= 64 && kt_launch == 16) ? launch_smem_m64 : smem_max;
+    const int launch_smem = smem_max;
 #endif
     dim3 grid_dim(group_size, 1, num_groups);
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, launch_smem);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
         moe_kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
