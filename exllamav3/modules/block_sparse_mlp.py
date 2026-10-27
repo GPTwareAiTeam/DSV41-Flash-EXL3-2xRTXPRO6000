@@ -83,6 +83,62 @@ _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
 _replicated_router_types = ("std", "std_bias", "dots", "sqrtsp", "sqrtsp_hash")
 _routing_check_stats = {}
 
+# Prefill sub-path recorder (EXL3_MOE_PATH_LOG=1): per call, which tier each expert ran through
+# (fused exl3_moe tile launches, batched reconstruct groups, per-expert graph/dq/torch loop) and
+# whether the fused-all fast path was taken. Aggregated per row count, printed at exit by pid
+_moe_path_on = os.environ.get("EXL3_MOE_PATH_LOG", "0") != "0"
+_moe_path_stats = {}
+
+def _moe_path_record(module, num_tokens, top_k, expert_count_list, groups, min_rows, num_ex, fused_on):
+    import atexit
+    rows = num_tokens
+    st = _moe_path_stats.get(rows)
+    if st is None:
+        st = _moe_path_stats[rows] = {
+            "calls": 0, "mixed_k": 0, "mtile": 0, "fused_all": 0, "fused_exp": 0, "fused_assign": 0,
+            "launch_t0": 0, "launch_t1": 0, "launch_t2": 0, "group_launches": 0, "group_exp": 0,
+            "pe_graph": 0, "pe_dq": 0, "pe_torch": 0, "pe_assign": 0, "max_count": 0, "layers": set()}
+        if len(_moe_path_stats) == 1:
+            def report():
+                for r, s in sorted(_moe_path_stats.items()):
+                    n = max(s["calls"], 1)
+                    print(f" -- moe-path (pid {os.getpid()}) rows={r} layers={len(s['layers'])} calls={s['calls']} "
+                          f"mixed_k={s['mixed_k']} mtile={s['mtile']} fused_all={s['fused_all']} "
+                          f"fused_exp/call={s['fused_exp'] / n:.1f} fused_assign/call={s['fused_assign'] / n:.1f} "
+                          f"launches t0/t1/t2/call={s['launch_t0'] / n:.1f}/{s['launch_t1'] / n:.1f}/{s['launch_t2'] / n:.1f} "
+                          f"batched_groups/call={s['group_launches'] / n:.1f} batched_exp/call={s['group_exp'] / n:.1f} "
+                          f"per_expert/call graph/dq/torch={s['pe_graph'] / n:.1f}/{s['pe_dq'] / n:.1f}/{s['pe_torch'] / n:.1f} "
+                          f"per_expert_assign/call={s['pe_assign'] / n:.1f} max_count={s['max_count']}", flush = True)
+            atexit.register(report)
+    st["calls"] += 1
+    st["layers"].add(id(module))
+    st["mixed_k"] += int(bool(module.mixed_k))
+    st["mtile"] += int(bool(module.mtile_ok))
+    if expert_count_list is None:
+        st["fused_all"] += 1
+        return
+    counts = expert_count_list[:num_ex]
+    st["max_count"] = max(st["max_count"], max(counts) if counts else 0)
+    if fused_on:
+        mt = bool(getattr(module, "mtile_ok", False))
+        fc = [c for c in counts if 0 < c <= module.fused_rows]
+        st["fused_exp"] += len(fc); st["fused_assign"] += sum(fc)
+        st["launch_t0"] += sum(1 for c in fc if c <= MTILE_T1) if mt else (1 if fc else 0)
+        st["launch_t1"] += sum(1 for c in fc if MTILE_T1 < c <= MTILE_T2) if mt else 0
+        st["launch_t2"] += sum(1 for c in fc if c > MTILE_T2) if mt else 0
+    st["group_launches"] += len(groups)
+    grouped = set(e for g in groups for e in g)
+    st["group_exp"] += len(grouped)
+    for e in range(num_ex):
+        c = counts[e]
+        if c > min_rows and e not in grouped:
+            st["pe_assign"] += c
+            if module.bc is not None and module.support_quant_paths:
+                st["pe_graph" if c <= TEMP_ROWS_GRAPH else "pe_dq"] += 1
+            else:
+                st["pe_torch"] += 1
+
+
 def _routing_check_compare(key, local_sel, local_w, sel, w):
     import atexit
     # Stats split by row-count class: single-row calls (fixed-order routing GEMV), other
@@ -1327,6 +1383,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.multi_down.k2 if self.mixed_k else None
                     )
 
+                if _moe_path_on:
+                    _moe_path_record(self, num_tokens, top_k, expert_count_list, groups, min_rows, num_ex,
+                                     self.fused_mode_buffers is not None)
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency
                 if self.fused_mode_buffers is not None:
                     if expert_count_list is None:

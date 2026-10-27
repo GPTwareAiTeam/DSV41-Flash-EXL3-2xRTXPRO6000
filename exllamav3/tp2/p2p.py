@@ -12,6 +12,15 @@ sizes, on the same stream.
 Setup: P2PComm(rank, world=2, rendezvous_path=<dir>, nblk=1). rendezvous_path is a directory that must not already
 contain rank files (use a fresh directory per run). Each rank writes <dir>/rank<r>.json with its transport and
 handle, then waits for the peer's file. Both ranks can construct concurrently; no kernel runs during setup.
+
+Diagnostics (opt-in, off by default; production kernels are the non-stats instantiation):
+  P2PComm(..., stats=True) or env P2P_STATS=1 makes every collective record device-side stats into the local arena:
+  per block, the number of acquire-spin iterations and globaltimer stamps (push / wait / combine), accumulated
+  totals plus a ring of the last STATS_RING invocations. Read with comm.stats() (synchronizes the device) and
+  write a rank-tagged JSON with comm.dump_stats(path_prefix) -> f"{prefix}.rank{rank}.json". Recording is plain
+  device stores, so it is graph-capture safe; the ring is indexed by device-side seq, so replays are recorded too.
+  Interpretation: a large wait_ns with spins > 0 means the block waited on the peer (peer lateness or the peer's
+  transfer into our arena); small wait_ns with push_ns large means the cost is the local P2P write itself.
 """
 
 from __future__ import annotations
@@ -27,13 +36,18 @@ from ..ext import exllamav3_ext as ext
 
 ARENA_MAXB = 256 * 1024  # bytes of payload per parity slot (must match P2P_MAXB in p2p_oneshot.cuh)
 MAX_BLOCKS = 8  # must match P2P_MAXBLK
+STATS_RING = 256  # must match P2P_STATS_RING
+STATS_TOT_FIELDS = 5  # calls, spins, push_ns, wait_ns, total_ns (must match p2p_oneshot.cuh)
+STATS_REC_FIELDS = 7  # seq, meta, spins, t_start, t_pushed, t_waited, t_end (must match P2PStatRec)
+STATS_ENV = "P2P_STATS"  # "1" enables device stats on every P2PComm built in this process
 
 _RENDEZVOUS_TIMEOUT_S = 120.0
+_MODES = {0: "all_reduce", 1: "all_gather", 2: "bcast"}
 
 
 class P2PComm:
     def __init__(self, rank: int, world: int = 2, rendezvous_path: str = "", nblk: int = MAX_BLOCKS,
-                 device: int | None = None, transport: str = "auto"):
+                 device: int | None = None, transport: str = "auto", stats: bool | None = None):
         if world != 2:
             raise ValueError("P2PComm supports exactly 2 ranks")
         if rank not in (0, 1):
@@ -51,6 +65,7 @@ class P2PComm:
         self.nblk = nblk
         self.device = torch.device("cuda", device if device is not None else rank)
         torch.cuda.set_device(self.device)
+        self.stats_enabled = (os.environ.get(STATS_ENV, "0") == "1") if stats is None else bool(stats)
 
         peer_ok = torch.cuda.can_device_access_peer(rank, self.peer)
         if transport == "auto":
@@ -102,13 +117,13 @@ class P2PComm:
     def all_reduce_(self, t: torch.Tensor) -> torch.Tensor:
         """In-place fp32 sum over both ranks. Bit-identical result on both ranks (rank0 + rank1, fixed order)."""
         self._check_device(t)
-        ext.p2p_all_reduce_f32(t, self.rank, self.local, self.peer_arena, self.nblk)
+        ext.p2p_all_reduce_f32(t, self.rank, self.local, self.peer_arena, self.nblk, self.stats_enabled)
         return t
 
     def all_gather(self, t: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """out <- [rank0 | rank1] (flattened along dim 0 concatenation of the two payloads). out.numel == 2*t.numel."""
         self._check_device(t)
-        ext.p2p_all_gather_f32(t, out, self.rank, self.local, self.peer_arena, self.nblk)
+        ext.p2p_all_gather_f32(t, out, self.rank, self.local, self.peer_arena, self.nblk, self.stats_enabled)
         return out
 
     def bcast_i64(self, t: torch.Tensor, root: int, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -116,13 +131,66 @@ class P2PComm:
         self._check_device(t)
         if out is None:
             out = torch.empty_like(t)
-        ext.p2p_bcast_i64(t, out, self.rank, root, self.local, self.peer_arena, self.nblk)
+        ext.p2p_bcast_i64(t, out, self.rank, root, self.local, self.peer_arena, self.nblk, self.stats_enabled)
         return out
 
     def barrier(self) -> None:
         """Synchronizes the two ranks through a 1-element all-reduce on the current stream."""
         t = torch.zeros(4, dtype=torch.float32, device=self.device)
         self.all_reduce_(t)
+
+    def reset_stats(self) -> None:
+        """Zeroes the device-side stats. Synchronizes the device."""
+        ext.p2p_stats_reset(self.local, self.device.index)
+
+    def stats(self) -> dict:
+        """Snapshot of the device-side stats of this rank. Synchronizes the device; call after collectives drained.
+
+        Returns {"rank", "transport", "nblk", "enabled", "blocks": [...]} where each block entry has:
+          calls, spins, push_ns, wait_ns, total_ns  (running totals over the block's invocations)
+          recent: last <= STATS_RING invocations of that block, oldest first, each
+                  {seq, mode, grid, units, spins, push_ns, wait_ns, combine_ns, total_ns, t_start_ns}
+        Timestamps are per-GPU globaltimer; durations are the meaningful cross-rank quantities.
+        """
+        raw = ext.p2p_stats_read(self.local, self.device.index)
+        tot_n = MAX_BLOCKS * STATS_TOT_FIELDS
+        totals, recs = raw[:tot_n], raw[tot_n:]
+        blocks = []
+        for b in range(self.nblk):
+            t = totals[b * STATS_TOT_FIELDS:(b + 1) * STATS_TOT_FIELDS]
+            calls, spins, push, wait, total = t
+            base = b * STATS_RING * STATS_REC_FIELDS
+            recent = []
+            for slot in range(STATS_RING):
+                r = recs[base + slot * STATS_REC_FIELDS: base + (slot + 1) * STATS_REC_FIELDS]
+                seq, meta, rspins, t0, tp, tw, te = r
+                if seq == 0:
+                    continue
+                recent.append({
+                    "seq": seq,
+                    "mode": _MODES.get(meta & 0xFF, "?"),
+                    "grid": (meta >> 8) & 0xFF,
+                    "units": meta >> 16,
+                    "spins": rspins,
+                    "push_ns": tp - t0,
+                    "wait_ns": tw - tp,
+                    "combine_ns": te - tw,
+                    "total_ns": te - t0,
+                    "t_start_ns": t0,
+                })
+            recent.sort(key = lambda r: r["seq"])
+            blocks.append({"block": b, "calls": calls, "spins": spins, "push_ns": push, "wait_ns": wait,
+                           "total_ns": total, "recent": recent})
+        return {"rank": self.rank, "transport": self.transport, "nblk": self.nblk,
+                "enabled": self.stats_enabled, "blocks": blocks}
+
+    def dump_stats(self, prefix: str) -> str:
+        """Writes stats() to f"{prefix}.rank{rank}.json" and returns the path. Synchronizes the device."""
+        path = f"{prefix}.rank{self.rank}.json"
+        with open(path + ".tmp", "w") as f:
+            json.dump(self.stats(), f)
+        os.replace(path + ".tmp", path)
+        return path
 
     def _check_device(self, t: torch.Tensor) -> None:
         if t.device != self.device:

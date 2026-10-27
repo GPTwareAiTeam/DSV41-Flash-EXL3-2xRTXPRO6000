@@ -20,7 +20,19 @@
 // mode 0: all-reduce fp32 in place: x <- x_rank0 + x_rank1 (fixed operand order on both ranks)
 // mode 1: all-gather: out <- [x_rank0 | x_rank1]
 // mode 2: broadcast: out <- x_root
-template <int MODE>
+//
+// STATS=true (opt-in diagnostics, separate instantiation; STATS=false compiles to the original kernel):
+// thread 0 of each block records, per invocation, the acquire-spin iteration count and globaltimer stamps
+//   t_start   kernel entry (before push)
+//   t_pushed  payload pushed + release flag published
+//   t_waited  peer's flag observed (spin ends)
+//   t_end     combine done, sequence advanced
+// so push = t_pushed - t_start (transfer posting + P2P writes), wait = t_waited - t_pushed (peer lateness plus
+// peer-to-local transfer; spins > 0 means the block actually spun), combine = t_end - t_waited (local reads).
+// Totals are accumulated in the arena and a per-block ring keeps the last P2P_STATS_RING invocations. Each
+// (block, ring slot) has one writer (block b on this rank, serialized on the stream), so plain stores suffice.
+// Note: globaltimer is per-GPU; compare stamps across ranks only through the shared seq, not absolute values.
+template <int MODE, bool STATS>
 __global__ void __launch_bounds__(256) p2p_oneshot_kernel
 (
     uint8_t* __restrict__ src,
@@ -49,11 +61,15 @@ __global__ void __launch_bounds__(256) p2p_oneshot_kernel
     uint64_t* peer_flag = (uint64_t*) (peer_arena + P2P_OFF_FLAGS) + p * P2P_MAXBLK + b;
     uint64_t* local_flag = (uint64_t*) (local_arena + P2P_OFF_FLAGS) + p * P2P_MAXBLK + b;
 
+    uint64_t t_start = 0, t_pushed = 0, t_waited = 0, spins = 0;
+    if (STATS && threadIdx.x == 0) t_start = globaltimer_ns();
+
     // 1. Push my stripe into the peer's slot[p], then publish it with a system-scope release flag.
     for (int64_t i = u0 + threadIdx.x; i < u1; i += blockDim.x) peer_slot[i] = my_src[i];
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) stg_release_sys_u64(peer_flag, seq);
+    if (STATS && threadIdx.x == 0) t_pushed = globaltimer_ns();
 
     // 2. Wait until the peer's stripe for this block has arrived in my slot[p].
     if (threadIdx.x == 0)
@@ -61,6 +77,7 @@ __global__ void __launch_bounds__(256) p2p_oneshot_kernel
         uint64_t deadline = globaltimer_ns() + P2P_TIMEOUT_NS;
         while (ldg_acquire_sys_u64(local_flag) < seq)
         {
+            if (STATS) spins++;
             if (globaltimer_ns() > deadline)
             {
                 printf("p2p_oneshot: timeout rank %d block %d seq %llu mode %d\n", rank, b,
@@ -68,6 +85,7 @@ __global__ void __launch_bounds__(256) p2p_oneshot_kernel
                 __trap();
             }
         }
+        if (STATS) t_waited = globaltimer_ns();
     }
     __syncthreads();
 
@@ -106,7 +124,24 @@ __global__ void __launch_bounds__(256) p2p_oneshot_kernel
 
     // 4. Advance the device-side sequence number (graph replays see the new value).
     __syncthreads();
-    if (threadIdx.x == 0) *local_state = seq;
+    if (threadIdx.x == 0)
+    {
+        if (STATS)
+        {
+            const uint64_t t_end = globaltimer_ns();
+            const uint64_t meta = (uint64_t) MODE | ((uint64_t) gridDim.x << 8) | ((uint64_t) units << 16);
+            uint64_t* tot = (uint64_t*) (local_arena + P2P_OFF_STATS) + b * P2P_STATS_TOT_FIELDS;
+            tot[0] += 1;
+            tot[1] += spins;
+            tot[2] += t_pushed - t_start;
+            tot[3] += t_waited - t_pushed;
+            tot[4] += t_end - t_start;
+            P2PStatRec* rec = (P2PStatRec*) (local_arena + P2P_OFF_STATS_RECS)
+                              + (b * P2P_STATS_RING + (int) ((seq - 1) % P2P_STATS_RING));
+            *rec = P2PStatRec{seq, meta, spins, t_start, t_pushed, t_waited, t_end};
+        }
+        *local_state = seq;
+    }
 }
 
 static void check_common(torch::Tensor x, int64_t local, int64_t peer, int64_t nblk)
@@ -114,6 +149,16 @@ static void check_common(torch::Tensor x, int64_t local, int64_t peer, int64_t n
     TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "p2p: input must be a contiguous CUDA tensor");
     TORCH_CHECK(local != 0 && peer != 0, "p2p: arena not set up");
     TORCH_CHECK(nblk >= 1 && nblk <= P2P_MAXBLK, "p2p: nblk out of range");
+}
+
+template <int MODE>
+static void p2p_launch(bool stats, int64_t nblk, cudaStream_t stream, uint8_t* src, uint8_t* out, int64_t units,
+                       int rank, int root, uint8_t* local, uint8_t* peer)
+{
+    if (stats)
+        p2p_oneshot_kernel<MODE, true><<<(unsigned) nblk, 256, 0, stream>>>(src, out, units, rank, root, local, peer);
+    else
+        p2p_oneshot_kernel<MODE, false><<<(unsigned) nblk, 256, 0, stream>>>(src, out, units, rank, root, local, peer);
 }
 
 // Pinned shared-host arena (fallback transport, used when peer SM access is unavailable): a /dev/shm file mapped
@@ -195,7 +240,7 @@ int64_t p2p_dev_arena_open(const std::string& hex, int64_t local_device, int64_t
     return (int64_t) p;
 }
 
-void p2p_all_reduce_f32(torch::Tensor x, int64_t rank, int64_t local, int64_t peer, int64_t nblk)
+void p2p_all_reduce_f32(torch::Tensor x, int64_t rank, int64_t local, int64_t peer, int64_t nblk, bool stats)
 {
     check_common(x, local, peer, nblk);
     TORCH_CHECK(x.dtype() == torch::kFloat, "p2p_all_reduce_f32: fp32 only");
@@ -203,12 +248,13 @@ void p2p_all_reduce_f32(torch::Tensor x, int64_t rank, int64_t local, int64_t pe
     c10::cuda::CUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     int64_t units = x.numel() / 4;
-    p2p_oneshot_kernel<0><<<(unsigned) nblk, 256, 0, stream>>>((uint8_t*) x.data_ptr(), (uint8_t*) x.data_ptr(),
-        units, (int) rank, 0, (uint8_t*) local, (uint8_t*) peer);
+    p2p_launch<0>(stats, nblk, stream, (uint8_t*) x.data_ptr(), (uint8_t*) x.data_ptr(), units, (int) rank, 0,
+                  (uint8_t*) local, (uint8_t*) peer);
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "p2p_all_reduce_f32 launch failed");
 }
 
-void p2p_all_gather_f32(torch::Tensor x, torch::Tensor out, int64_t rank, int64_t local, int64_t peer, int64_t nblk)
+void p2p_all_gather_f32(torch::Tensor x, torch::Tensor out, int64_t rank, int64_t local, int64_t peer, int64_t nblk,
+                        bool stats)
 {
     check_common(x, local, peer, nblk);
     TORCH_CHECK(x.dtype() == torch::kFloat && out.dtype() == torch::kFloat, "p2p_all_gather_f32: fp32 only");
@@ -219,13 +265,13 @@ void p2p_all_gather_f32(torch::Tensor x, torch::Tensor out, int64_t rank, int64_
     c10::cuda::CUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     int64_t units = x.numel() / 4;
-    p2p_oneshot_kernel<1><<<(unsigned) nblk, 256, 0, stream>>>((uint8_t*) x.data_ptr(), (uint8_t*) out.data_ptr(),
-        units, (int) rank, 0, (uint8_t*) local, (uint8_t*) peer);
+    p2p_launch<1>(stats, nblk, stream, (uint8_t*) x.data_ptr(), (uint8_t*) out.data_ptr(), units, (int) rank, 0,
+                  (uint8_t*) local, (uint8_t*) peer);
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "p2p_all_gather_f32 launch failed");
 }
 
 void p2p_bcast_i64(torch::Tensor x, torch::Tensor out, int64_t rank, int64_t root, int64_t local, int64_t peer,
-                   int64_t nblk)
+                   int64_t nblk, bool stats)
 {
     check_common(x, local, peer, nblk);
     TORCH_CHECK(x.dtype() == torch::kInt64 && out.dtype() == torch::kInt64, "p2p_bcast_i64: int64 only");
@@ -235,7 +281,31 @@ void p2p_bcast_i64(torch::Tensor x, torch::Tensor out, int64_t rank, int64_t roo
     c10::cuda::CUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     int64_t units = x.numel() / 2;
-    p2p_oneshot_kernel<2><<<(unsigned) nblk, 256, 0, stream>>>((uint8_t*) x.data_ptr(), (uint8_t*) out.data_ptr(),
-        units, (int) rank, (int) root, (uint8_t*) local, (uint8_t*) peer);
+    p2p_launch<2>(stats, nblk, stream, (uint8_t*) x.data_ptr(), (uint8_t*) out.data_ptr(), units, (int) rank,
+                  (int) root, (uint8_t*) local, (uint8_t*) peer);
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "p2p_bcast_i64 launch failed");
+}
+
+// Diagnostics. The stats region is read/written with cudaMemcpy, which works for both the cudaMalloc arena and the
+// mapped pinned host arena (cudaMemset is not valid on the latter). Both synchronize the device first.
+static const size_t P2P_STATS_BYTES = P2P_ARENA_BYTES - P2P_OFF_STATS;
+
+std::vector<int64_t> p2p_stats_read(int64_t local, int64_t device)
+{
+    c10::cuda::CUDAGuard guard((c10::DeviceIndex) device);
+    TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess, "p2p_stats_read: sync failed");
+    std::vector<uint64_t> host(P2P_STATS_BYTES / 8);
+    TORCH_CHECK(cudaMemcpy(host.data(), (void*) (local + P2P_OFF_STATS), P2P_STATS_BYTES, cudaMemcpyDefault)
+                    == cudaSuccess, "p2p_stats_read: copy failed");
+    return std::vector<int64_t>(host.begin(), host.end());
+}
+
+void p2p_stats_reset(int64_t local, int64_t device)
+{
+    c10::cuda::CUDAGuard guard((c10::DeviceIndex) device);
+    TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess, "p2p_stats_reset: sync failed");
+    std::vector<uint8_t> zero(P2P_STATS_BYTES, 0);
+    TORCH_CHECK(cudaMemcpy((void*) (local + P2P_OFF_STATS), zero.data(), P2P_STATS_BYTES, cudaMemcpyDefault)
+                    == cudaSuccess, "p2p_stats_reset: copy failed");
+    TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess, "p2p_stats_reset: sync failed");
 }
