@@ -40,6 +40,37 @@ def test_indexer_key_positions(monkeypatch, entries, expected):
     for pos in positions:
         assert pos.tolist() == [expected]
 
+@pytest.mark.parametrize("entries", [4, [4, 4, 4, 4], [1, 4, 2, 7]])
+def test_indexer_key_fused_rope_bitwise(monkeypatch, device, entries):
+    class Projection:
+        def forward(self, x, params):
+            return x[..., :6].clone()
+
+    class Identity:
+        def forward(self, x, params, **kwargs):
+            return x
+
+    class Attention:
+        idx_wk = Projection()
+        idx_k_norm = Identity()
+        compress_rate = 2
+        rope_head_dim = 4
+        inv_freq_compress = torch.tensor([1.0, 0.01], dtype = torch.float32, device = device)
+
+    torch.manual_seed(13)
+    original = torch.randn((4, 10), dtype = torch.half, device = device)
+    e0 = torch.tensor(entries, dtype = torch.int32, device = device) if isinstance(entries, list) else entries
+    lat_separate = original.clone()
+    lat_fused = original.clone()
+    monkeypatch.delenv("EXL3_DSV4_FUSED_INDEXER_ROPE", raising = False)
+    k_separate = dsv4.DSV4Attention._indexer_keys(Attention(), lat_separate, {}, e0)
+    monkeypatch.setenv("EXL3_DSV4_FUSED_INDEXER_ROPE", "1")
+    k_fused = dsv4.DSV4Attention._indexer_keys(Attention(), lat_fused, {}, e0)
+    assert torch.equal(k_fused.view(torch.int16), k_separate.view(torch.int16))
+    assert torch.equal(lat_fused.view(torch.int16), lat_separate.view(torch.int16))
+    assert torch.equal(lat_fused[:, :-4], original[:, :-4])
+
+
 
 @pytest.fixture(scope = "module")
 def model_cache(tmp_path_factory, device):
