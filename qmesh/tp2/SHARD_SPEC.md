@@ -75,15 +75,3 @@ norms (`*norm*`), `ffn.gate.*` (incl. `bias_vl`), compressor and indexer (includ
 4. Byte-exact reconstruction (rank0 ⊕ rank1 == source) for ≥64 routed experts (16 per K tier, all layers incl. MTP)
    plus shared experts, wq_b, wo_b, wo_a slices, head, embed, markov, aligner, sinks, and vision fused layers.
    `verify_shards.py` re-derives roles and shapes itself and does not reuse `shard_tool.plan()`.
-
-## External DSpark drafter overlay
-
-`qmesh/tp2/drafter_overlay.py` builds a separate TP2 overlay from diffbot's
-`drafter-code-k7` pack without modifying the target checkpoint. Pass `--drafter`
-with that pack's directory, `--base` with the existing rank overlay (including
-engram files), `--index-root` with the original sharded checkpoint, and `--out`
-with a new directory. `--block-size` sets `dspark_block_size` in copied rank
-configs; `--verify` reconstructs the mapped drafter tensors from both ranks.
-The tool rewrites the mixed MTP shards while retaining their non-MTP tensors,
-and symlinks the remaining files. Keep the base overlay available while using it.
-See `CREDITS.md` for the drafter's source and license.
