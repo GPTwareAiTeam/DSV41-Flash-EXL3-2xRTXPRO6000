@@ -86,4 +86,13 @@ with a new directory. `--block-size` sets `dspark_block_size` in copied rank
 configs; `--verify` reconstructs the mapped drafter tensors from both ranks.
 The tool rewrites the mixed MTP shards while retaining their non-MTP tensors,
 and symlinks the remaining files. Keep the base overlay available while using it.
+
+For the TP2 runner, `DSPARK_HEAD=ours` (default) uses `OVERLAY`; `DSPARK_HEAD=diffbot`
+selects a previously generated diffbot overlay at `DSPARK_DIFFBOT_OVERLAY` (default
+`/work/k7db_overlay`). The overlay must contain both rank directories and remain available
+along with its symlinked base. This changes the head and overlay config, not the target
+weights; generate the desired `--block-size` ahead of time.
+
+`LONG_PROMPT_FILE` optionally appends a UTF-8 transcript file to benchmark prompts instead
+of generating synthetic long filler. Use a sanitized, non-secret transcript.
 See `CREDITS.md` for the drafter's source and license.
