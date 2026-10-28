@@ -23,6 +23,23 @@ Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 t
   `nonzero` syncs can be replaced with a device-side count + fixed-capacity gather for the parts that do not need
   exact tie semantics.
 
+### Per-step kernel census at 24k (the host-bound path, from `tp2logs/profile_trace.json`)
+Per profiled decode step: 631 `cudaLaunchKernel`, 84 `cuLaunchKernelEx`, 42 cooperative launches, 43 graph launches;
+**1503.8 GPU kernels per step including graph nodes.** Grouped:
+| group | kernels/step |
+|---|---|
+| **bookkeeping (PyTorch elementwise/copies/allocations)** | **676.6** |
+| HC mixes | 240 |
+| dense projections | 238.6 |
+| MoE | 160 |
+| attention (40 split + 40 combine) | 88.6 |
+| collectives | 82 |
+| indexer, identified (8 score + 8 native topk + 2 candidate topk) | 18 |
+Bookkeeping is the largest group and it also hides part of the indexer/candidate work, so it is the first target: it is
+PyTorch-level ops, not arithmetic. Concrete candidates already identified: merge the q and KV rope into one launch
+(1 x 40 per step, needs an extension capability and bitwise verification), fuse the attention split/combine pair,
+reduce the six HC mixes per layer, and chain buffers instead of `_foreach_copy_`.
+
 ### Long-context capture past 1K: NOT FEASIBLE without redesigning candidate use (established 2026-10-27)
 Three independent walls, each verified:
 1. **`nonzero()` synchronises the host.** Eager `_indexer_topk` (`dsv4.py` ~1349-1353) does CUDA `nonzero()` plus a
