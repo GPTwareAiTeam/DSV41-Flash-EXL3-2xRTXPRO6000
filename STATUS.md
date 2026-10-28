@@ -1,33 +1,21 @@
 # STATUS
 
-## 2026-10-27 (later) — spec on the captured path, and where the remaining cost is
-Canonical main-branch numbers (`COMM=p2p`, graphs, `EXL3_DSV4_B1_BATCH=1`, WARM):
+This file preserves historical measurements below, not a current runbook. For current priorities and long-context results see `qmesh/notes/MASTER_PLAN.md`. Batch correctness remains unresolved for diverse prompts; identical-prompt checks alone do not establish general correctness.
+
+## 2026-10-27 (historical) — spec on the captured path
+Measurements used `COMM=p2p`, graphs, `EXL3_DSV4_B1_BATCH=1`, WARM:
 - plain: **10.97 / 11.02 / 10.98 ms/tok** (91 tok/s)
-- DSpark K=5: **7.86 / 6.83 / 9.01 / 4.65 ms/tok** on prompts 0-3; AL 3.30/3.30/2.58/**5.29**; acceptance 0.66/0.78/0.91;
-  effective 104-136 tok/s on short prompts, 123 at AL 5.29.
-- Round cost is flat at ~23 ms = target forward (~8) + 5 drafter forwards (~7) + verify (~8).
-- Spec policy **closed**: with matched flags K=5 beats plain on all six bench prompts; K<5 is dominated; `auto` lost
-  on 3 of 6. Default stays `DSPARK_POLICY=always`.
-- Prefill chunk sweep (32K prompt): 2048 -> 3856, 8192 -> **4790** (90.2 GiB peak, safe), 16384 -> 4941 (93.7 GiB, too
-  tight), 32768 OOM (needless `torch.cat` transient at block_sparse_mlp.py:1072).
-- Decode is now **kernel-efficiency bound**, not host bound: one 11 ms step has ~9 ms CUDA busy and the bsz-1 MoE is at
-  ~45% of DRAM while diffbot reaches ~92% with a bigger 3 bpw model on the same hardware.
+- DSpark K=5: **7.86 / 6.83 / 9.01 / 4.65 ms/tok** on prompts 0-3, or **127 / 146 / 111 / 215 tok/s**; AL 3.30/3.30/2.58/5.29.
+- Round anatomy measured one DFlash block forward, not five sequential drafter forwards: draft ~1.9 ms, target+verify ~21.5 ms, host ~3 ms. Timings depend on configuration.
+- In one matched six-prompt comparison K=5 beat plain and `auto` lost on 3 of 6; this does not establish that K<5 is dominated in all workloads. Long-context results are content-dependent (see master plan).
+- Historical 32K prefill sweep reported 2048 -> 3856, 8192 -> **4790**, 16384 -> 4941 tok/s, and 32768 OOM. Do not attribute these prefill figures to the P2P recipe below: the documented 4777.7 tok/s 32K/8192 baseline used NCCL (`tp2logs/final32768_8192_rank0.log`); the transport for this earlier 4790 sweep is not established here.
+- The short-decode profile suggested kernel-efficiency headroom; it does not establish the bottleneck of long-context decode.
 
-## Open loose end (unverified, do not measure without checking)
-The working tree of `recipe/2x-rtxpro6000-tp2` carries an **uncommitted** kernel change to
-`exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh` (`gemv_tile`): the `r0_ok ? A2[...] : hzero` conditional is
-replaced by a `uint32_t` bit-reinterpret with a literal zero, to stop the compiler materialising a per-thread local
-value for inactive MMA rows. ncu evidence for the problem: A spends **1,290,240 local load sectors vs 1,317,141 global
-(~49%)**, B **765,250 vs 1,188,536 (~57%)**, and line-info maps the local loads to `cuda_fp16.hpp:344`
-(`__half2::operator=`) at `gemv_tile` 464-465.
-The extension builds with it (`/mnt/data12/work/exl3/tp2_ext`, 18:17) but the A/B run has **not** completed: three launch
-attempts hung with 0-byte logs and no GPU allocation (an NCCL-bootstrap-style hang, the known trap). Verify with:
-`./run_tag.sh <unique_tag> -e COMM=p2p -e EXL3_WHOLE_GRAPH=1 -e EXL3_DSV4_B1_BATCH=1 -e MAX_NEW=128 -e PROMPT_IDS=0,1,2 -e IGNORE_EOS=1 -e WARM=1 -e NCCL_SOCKET_IFNAME=lo`
-against the 10.97/11.02/10.98 ms/tok baseline with byte-identical tokens, then ncu the local-sector count and commit.
-Do not assume a speedup until that lands.
+## Historical loose end — resolved
+The `gemv_tile` local-load fix was subsequently measured and shipped: **67.31 -> 65.76 us/call** at bsz1, bitwise identical; see the shipped section of the master plan. Earlier bootstrap hangs and the incomplete A/B are not current blockers.
 
-## Consolidated best-known numbers (main branch, both ranks agree)
-Reproduce: `cd /home/treadall/recipe-artifacts/2x-rtx-tp2 && ./run_tag.sh <unique_tag> -e COMM=p2p -e EXL3_WHOLE_GRAPH=1 \
+## Historical measurements (both ranks agreed in these runs)
+Historical decode recipe (not a reproduction of the prefill figures): `cd /home/treadall/recipe-artifacts/2x-rtx-tp2 && ./run_tag.sh <unique_tag> -e COMM=p2p -e EXL3_WHOLE_GRAPH=1 \
   -e EXL3_DSV4_B1_BATCH=1 -e MAX_NEW=128 -e PROMPT_IDS=0,1,2,3 -e IGNORE_EOS=1 -e WARM=1` (add `-e DSPARK=1 -e NUM_DRAFT=5` for spec).
 
 | config | ms/tok | tok/s | notes |
@@ -38,13 +26,10 @@ Reproduce: `cd /home/treadall/recipe-artifacts/2x-rtx-tp2 && ./run_tag.sh <uniqu
 | prefill 2048-token prompt, chunk 2048 | 3856 tok/s | | 32K-prompt sweep, per-chunk table in PrefillPerf.md |
 | prefill 32K prompt, chunk 8192 | 4790 tok/s | | 90.2 GiB peak, safe default |
 | prefill 32K prompt, chunk 16384 | 4941 tok/s | | 93.7 GiB peak, too tight to ship |
-| multi-stream plain B2 / B4 (branch tp2/batch) | 14.62 / 19.51 per stream | 126 / 189 aggregate | 86.5 GiB peak; numerics bug open |
-| multi-stream DS K=5 B4 | 38.26-38.97 per stream | 96.8 aggregate | spec and batching do not compose |
+| multi-stream plain B2 / B4 (branch tp2/batch) | 14.62 / 19.51 per stream | 126 / 189 aggregate | historical branch result; numerics bug was open |
+| multi-stream DS K=5 B4 | 38.26-38.97 per stream | 96.8 aggregate | historical result; spec and batching performed poorly in this run |
 
-Round anatomy (DSpark K=5, measured with CUDA events): draft **1.9 ms**, target+verify **21.5 ms**, host ~3 ms; exactly ONE
-drafter forward per round (DFlash block path). MoE cost is linear in distinct expert slots (1 row = 6 slots ~ 11 ms,
-6 rows ~ 38 slots ~ 21.5 ms), so speculative decode is already at the DRAM floor per token and the remaining lever is
-kernel efficiency (bsz-1 MoE ~45% of DRAM vs diffbot ~92% on the same hardware).
+Round anatomy (DSpark K=5, measured with CUDA events): draft **1.9 ms**, target+verify **21.5 ms**, host ~3 ms; exactly ONE drafter forward per round (DFlash block path). These measurements do not establish a DRAM floor or generalize to every workload.
 
 ## 2026-10-27 — attention-core capture lands: plain decode 13.3 -> 11.0 ms/tok
 Validated on main (`b85deac0` merged from `tp2/attncap`): **10.97 / 11.02 / 10.98 ms/tok** (prompts 0-2, both ranks
@@ -56,10 +41,9 @@ capture restricted to S==1.
 Spec decode on the captured path: 9.46 / 6.88 / 9.09 / **4.61** ms/tok (AL 2.51 / 3.24 / 2.48 / **5.29**) — the long
 prompt reaches 119.6 tok/s. Round cost stays ~22-24 ms, so the remaining spec cost is NOT host overhead.
 
- — Recipe B (2× RTX PRO 6000 Max-Q, TP2)
+## Historical bring-up — Recipe B (2× RTX PRO 6000 Max-Q, TP2)
 
-Last update: 2026-10-26. Not formally started by the owner; results below came from an unapproved detour
-and are kept for reference. Details in `qmesh/notes/TP2Prep.md`, `qmesh/notes/TP2Bringup.md`.
+The following 2026-10-26 bring-up results are retained for reference; later work supersedes the open items below. Details in `qmesh/notes/TP2Prep.md`, `qmesh/notes/TP2Bringup.md`.
 
 ## Measured (GPU0 + GPU1, native backend unless noted)
 | Config | Load | Peak alloc GPU0 / GPU1 | Decode ms/token |
@@ -76,12 +60,10 @@ and are kept for reference. Details in `qmesh/notes/TP2Prep.md`, `qmesh/notes/TP
 - All-reduce (1,5120) fp32: CPU helper 14.8 µs; on-device ring ~19–21 µs.
 - fp32 ring vs CPU bf16-wire reduce diverge greedily after 11–17 tokens (ring chosen as reference).
 
-## Memory
-- GPU0 free after TP2 load: 7.43 GiB. DSpark drafter needs ~7.74 GiB (7.12 + 0.62 private LM head) → short ~0.31 GiB on GPU0; GPU1 has ~8.3 GiB free. Not resolved.
-
-## Not done
-- DSpark under TP2 (placement), one-shot P2P all-reduce kernel (`qmesh/p2p/p2p_reduce_bench.py` written, never completed a run).
-- The last TP2Bringup agent was killed mid-run while moving the drafter to GPU1. Checked: no `exllamav3/architecture/` edits exist; its only changes are in `qmesh/tp2_bench.py` (DSpark options), copied here as-is.
+## Historical memory and open items (2026-10-26)
+- At that point GPU0 free after TP2 load was 7.43 GiB; the estimated DSpark drafter requirement was ~7.74 GiB. Later DSpark runs succeeded.
+- DSpark under TP2 and the one-shot P2P all-reduce were not yet completed in the bring-up; both were measured subsequently.
+- The last TP2Bringup agent was killed mid-run while moving the drafter to GPU1; this is historical context, not the current state.
 
 ## Artifacts outside git
 - `/home/treadall/recipe-artifacts/2x-rtx-tp2/tp2logs/` (148 MB of bench logs/traces)

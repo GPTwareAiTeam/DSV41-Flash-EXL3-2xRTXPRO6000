@@ -1,9 +1,9 @@
 # TP=2 DeepSeek-V4.1 EXL3 — master plan (status board, 2026-10-27)
 
-**Current, all measured on this card, both ranks agreeing:**
+**Historical measurements on this card, both ranks agreeing (see priorities below for current work):**
 plain decode **10.80 / 10.91 / 10.85 ms/tok (92 tok/s)** · DSpark K=5 **7.86 / 6.83 / 9.01 / 4.65 ms/tok**
-(111-215 tok/s, AL 3.30/3.30/2.58/5.29) · multi-stream plain **B4 = 189 tok/s aggregate** (branch, not shippable) ·
-prefill **4778 tok/s** (32K prompt, chunk 8192).
+(111-215 tok/s, AL 3.30/3.30/2.58/5.29) · historical multi-stream plain **B4 = 189 tok/s aggregate**; batch correctness remains unresolved ·
+prefill **4778 tok/s** (32K prompt, chunk 8192, NCCL).
 Targets: **300 tok/s decode**, **8000 tok/s prefill**.
 Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 tok/s @2K, 362.9 aggregate @4 streams,
 11.2k prefill @40K, fp8 KV.
@@ -17,13 +17,9 @@ Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 t
   the per-phase split as a source enumeration, not a profiler readout.
 - Top GPU consumers by op: `aten::matmul` 6.8 ms / 204 calls, `aten::mm` 6.8 ms / 189, `aten::index` 2.6 ms / 399,
   `aten::_foreach_copy_` 2.0 ms / 645, `aten::copy_` 1.5 ms / 1449.
-- **Conclusion: long-context decode is HOST-bound, not KV-bound.** The lever is fewer launches and fewer syncs in the
-  eager attention path - not a bigger capture and not KV bandwidth. Concretely: capture the attention body for the
-  top-k regime is blocked (see above), but the *launch count* of the eager path can be attacked directly, and the
-  `nonzero` syncs can be replaced with a device-side count + fixed-capacity gather for the parts that do not need
-  exact tie semantics.
+- The eager path has many launches and syncs, making launch reduction a promising target; this profile alone does not establish a host-versus-KV bottleneck. Device-side count and fixed-capacity gather would need to preserve the required selection semantics.
 
-### Per-step kernel census at 24k (the host-bound path, from `tp2logs/profile_trace.json`)
+### Per-step kernel census at 24k (from `tp2logs/profile_trace.json`)
 Per profiled decode step: 631 `cudaLaunchKernel`, 84 `cuLaunchKernelEx`, 42 cooperative launches, 43 graph launches;
 **1503.8 GPU kernels per step including graph nodes.** Grouped:
 | group | kernels/step |
@@ -40,27 +36,12 @@ PyTorch-level ops, not arithmetic. Concrete candidates already identified: merge
 (1 x 40 per step, needs an extension capability and bitwise verification), fuse the attention split/combine pair,
 reduce the six HC mixes per layer, and chain buffers instead of `_foreach_copy_`.
 
-### Long-context capture: tie rate measured at 84% (closes the item quantitatively)
-At 24,166-24,485 positions, candidate-source layer 20, 320 timed decode steps: the 2048th and 2049th candidate scores
-were **exactly equal on 269/320 steps (84.06%)**, identical on both ranks (not independent samples); all 8 warmup steps
-also tied. Evidence: `tp2logs/topk_ties_1028b.csv.rank{0,1}`.
-So ties are the normal case, not an edge case: **no device-side or fixed-capacity selector can reproduce eager's
-`topk` ordering without changing numerics on ~84% of steps.** Capture past 1K is therefore impossible without
-redefining selection, and the remaining lever for long-context decode is the eager path's launch count (631/step).
-This also explains why an FP8-KV packed-capture attempt diverged so quickly earlier in the project.
+### Long-context capture: candidate tie rate measured at 84%
+At 24,166-24,485 positions, candidate-source layer 20, 320 timed decode steps: the 2048th and 2049th candidate scores were **exactly equal on 269/320 steps (84.06%)**, identical on both ranks (not independent samples); all 8 warmup steps also tied. Evidence: `tp2logs/topk_ties_1028b.csv.rank{0,1}`.
+Ties make eager ordering an important correctness constraint, not a proof that device-side selection is impossible. In particular, the existing graph-capturable `dsa_topk.cu` selector documents tie-order parity; the candidate-block `topk` and dynamic mask still need an equivalent validated implementation. The earlier FP8 packed-capture divergence has not been causally attributed to these ties.
 
-### Long-context capture past 1K: NOT FEASIBLE without redesigning candidate use (established 2026-10-27)
-Three independent walls, each verified:
-1. **`nonzero()` synchronises the host.** Eager `_indexer_topk` (`dsv4.py` ~1349-1353) does CUDA `nonzero()` plus a
-   data-dependent boolean index (`ent[ent < ec]`), producing a dynamic shape. Neither is graph-capturable, and the
-   sync-per-layer is what the capture exists to remove.
-2. **A fixed-capacity `torch.topk` cannot reproduce eager's tie order.** Proven on CPU: `torch.ones(3).topk(1)` returns
-   index 0, while padding one `-inf` and taking topk(1) returns index 1 — masking changes the algorithm's ordering, so a
-   sentinel cannot fix it. Eager's width is `ec//8+1` (W ~ 3022 at 24k, ~12500 at 100k) selecting **2048 blocks**, and
-   reproducing that exactly by hand is a research project.
-3. **Doing selection outside the graph** would preserve correctness but reintroduces the per-layer host sync.
-Therefore decode past ~1024 positions stays eager. The remaining lever is to make the **eager path** cheaper, which needs
-the cost breakdown (target forward vs attention at 24k vs indexer/candidate selection vs host) rather than capture work.
+### Long-context capture past 1K: current implementation limitations (2026-10-27)
+The eager candidate path uses CUDA `nonzero()` and data-dependent indexing, which synchronize or produce dynamic shapes unsuitable for graph capture. Padding can change `torch.topk` tie order: on CPU `torch.ones(3).topk(1)` and the same input padded with `-inf` choose different indices. This example rules out naive padding, not every fixed-capacity selector. Selection outside the graph retains the per-layer host synchronization. The current capture gate therefore falls back to eager past roughly 1024 positions; a capture-safe candidate implementation needs correctness validation.
 
 ### Long-context: what helps and what hurts (measured 2026-10-27)
 - **Long-context speculation is content- and prompt-dependent, not categorically harmful.** P2P, 32 generated tokens,
@@ -76,29 +57,22 @@ the cost breakdown (target forward vs attention at 24k vs indexer/candidate sele
   | Mixed 20k / 3 | 16.88 / 17.11 / 16.80 | 16.42 / 8.77 / 9.49 | .5789 / .6897 / .6786 | 2.375 / 2.818 / 2.727 | 1.600 / 20.799 / 24.549 |
   | JSON 20k / 5 | 16.87 / 17.40 / 17.02 | 13.34 / 13.18 / 9.21 | .6818 / .3673 / .6333 | 3.500 / 2.385 / 2.583 | 1.604 / 43.124 / 47.014 |
 
-  Round splits are individual instrumented iterations, not matched-width averages; verify width and other work vary by round,
-  so they do not establish a causal K comparison. At long context the target forward dominates the round, so speculation
-  amortises it; value tracks acceptance and accepted tokens per round, which are content-dependent. Acceptance alone is
-  not a reliable threshold: mixed prompt 1 wins at .4878. Synthetic fillers repeat the same content and can induce loops;
-  these results are not a substitute for real agent transcripts or measurements at 60k–100k. A prior repeated-prose run
-  gave 19.89 vs 16.58 ms/tok at 24,167 tokens, acceptance .33 / AL 1.71; it does not support a blanket rule.
+  Round splits are individual instrumented iterations, not matched-width averages; verify width and other work vary by round, so they do not establish a causal K comparison. These are timing comparisons, not identity-matched output comparisons: matched plain/spec token files diverged for 5 of 12 short/code/mixed/JSON prompt pairs, first at positions 17–26 (`slc_*_tokens.rank0.json`). Cross-rank agreement does not establish equality with plain greedy. Synthetic fillers can induce loops; these results are not a substitute for real agent transcripts or 60k–100k measurements. A prior repeated-prose run gave 19.89 vs 16.58 ms/tok at 24,167 tokens, acceptance .33 / AL 1.71; it does not support a blanket rule.
   A hybrid speculative arm hung once; its cause is unconfirmed. A P2P prose retest completed. The measured K=5 arms
   ended before a separate capture run, and K=3/JSON arms started after it ended; no overlap required reruns.
-- **Prefix caching is the big lever for agent loops, and it is now the default** (`EXL3_PREFIX_CACHE=1`). Final numbers,
-  checkpoints at 8192-token chunk boundaries: 20k zero-hit **4269-4288 ms** -> full hit **108-117 ms (55x)**; 60k
-  **13253-13436 ms** -> **153-154 ms (~130x)**; two alternating distinct 60k contexts both hit; a 60k context growing
-  ~1k per turn keeps **98%+ cached** (61k/62k/63k TTFT **524/513/491 ms**). Verified cost-free where it cannot help:
+- **Prefix caching is default-on** (`EXL3_PREFIX_CACHE=1`). In `tp2logs/longprefix1027e_rank0.log` (hybrid),
+  checkpoints at 8192-token chunk boundaries: 20k zero-hit **4269-4288 ms** -> full hit **108-117 ms (~36-40x)**; 60k
+  **13253-13436 ms** -> **153-154 ms (~86-88x)**; two alternating distinct 60k contexts both hit; a 60k context growing
+  ~1k per turn keeps **98%+ cached** (61k/62k/63k TTFT **524/513/491 ms**). Short-context measurements:
   short-context decode 10.83/10.86/10.84 with the cache on vs 10.77/10.84/10.83 off, tokens byte-identical.
-- **Superseded figures**: an earlier configuration capped the prefill chunk at 1024, costing ~35% on cold runs and needing
-  59 checkpoints (~1.98 GB of host RAM) per 60k context. Both are fixed by checkpointing at chunk boundaries - cold is now
-  level with the no-cache baseline, and a 60k context costs **268 MB of host RAM per rank** (8 checkpoints) plus
+- **Superseded figures**: an earlier configuration used roughly 1024-token checkpoint spacing and needed 59 checkpoints (~1.98 GB of host RAM) per 60k context. Its log reports chunk=8192 despite the denser checkpoints; the later boundary configuration reduced checkpoint count and cold cost. A 60k context costs **268 MB of host RAM per rank** (8 checkpoints) plus
   **183 MiB of GPU KV**. The 4 GiB `EXL3_PREFIX_CACHE_CAPACITY` is the host checkpoint budget, not GPU memory.
-- **The auto-chunker does not reserve the drafter**: with `DSPARK=1` at 24k the default chunk 8192 OOMs (needs ~640 MiB
-  more), so long-context spec runs need `MAX_CHUNK=2048` today.
+- Auto chunk sizing now reserves an additional 2048 MiB for DSpark by default; this empirical
+  allowance is based on the observed 8192-row OOM and is not a guarantee for every context.
 
-### Prefix caching is default-on and free at short context (verified)
+### Prefix caching: short-context measurements
 Short-context decode with `EXL3_PREFIX_CACHE=1` (the new default) vs off: **10.83/10.86/10.84 vs 10.77/10.84/10.83 ms/tok**,
-tokens byte-identical on both ranks. So enabling it costs nothing where it cannot help, and buys 55-130x TTFT where it can.
+tokens byte-identical on both ranks. In these runs short-context overhead was within the observed variation, and measured full-hit TTFT speedups were ~36-40x at 20k and ~86-88x at 60k.
 Its only cost is host RAM: 268 MB per rank per 60k-token context (8 checkpoints at 8192-token boundaries), plus
 183 MiB of GPU KV for that context.
 
@@ -110,39 +84,32 @@ Measured in the runner (end-to-end, `COMM=hybrid`, chunk 8192, graphs on, `EXL3_
 | 60417 | 13068 ms | **4624** | **16.88** |
 | ~24k with `WARM=1` | 1843 ms | (artefact: native page reuse from the warm pass) | 16.50 |
 Short-context decode for comparison: 10.77-10.84 ms/tok.
-**Two hard limits for this workload:**
-1. **The captured decode path stops at ~1024 positions**: `_batch_ok_b1` requires the compressed pool in its dense regime
-   (`ec = (pos+1)/m <= index_topk = 512`, m=2), and the captured body implements no top-k indexer selection. Beyond that
-   every decode step falls back to eager. That plus KV reads is the 10.8 -> 16.6 ms/tok penalty.
-2. **The same gate breaks batching for long prompts**: a batch containing ANY row past that limit drops the whole batch to
-   eager (measured 81.6 vs 31.7 ms/token at B8). So all the batching numbers above are short-prompt only.
-Prefill is ~4.6-4.8k tok/s at these lengths, i.e. a 100k prompt costs ~21 s TTFT cold; prefix caching is the lever that matters
-(`EXL3_PREFIX_CACHE`, merged into main at `8ec9c9c8`, default off, verified 16x at 8k).
+**Current implementation limits for this workload:**
+1. The captured decode path stops at ~1024 positions: `_batch_ok_b1` requires the compressed pool in its dense regime (`ec <= index_topk = 512`, m=2), and the captured body has no top-k indexer selection. Beyond that decode falls back to eager. The measured long/short gap cannot be attributed wholly to the gate without a controlled comparison.
+2. A batch containing any row past that gate drops the whole batch to eager (historically 81.6 vs 31.7 ms/token at B8). Fast batching figures are short-prompt measurements; correctness for diverse batches remains unresolved.
+Prefill was ~4.6-4.8k tok/s at these lengths, implying ~21 s for 100k cold at that rate. Prefix caching is now default-on; see measured long-context hits above.
 
-### Captured-NCCL hang: root-caused and fixed (commit `10e820fe`, note `qmesh/notes/SpecCollectiveHang.md`)
-`COMM=hybrid` routes an all-reduce to NCCL once the payload is >= 64 KB. A speculative verify step at 4 rows stages
-4 x 5120 x 4 = **81,920 B**, so under graph capture it issued **NCCL inside a captured region** - which cannot be replayed
-and hangs the box. Traced evidence: `step 54 seq 3849 shape (1,4,5120) 81920 bytes transport=nccl capture=True`, with
-both ranks' collective sequences *matching* (so it was never a rank-divergence problem), followed by the exact original
-symptom: generation completes, then both ranks block at the final barrier.
-Fix (three layers): `_pick` returns **P2P whenever the stream is capturing**; NCCL capture guards; and a startup
-rejection `DSPARK=1 with COMM=hybrid is unsafe: use COMM=p2p`. Verified afterwards: decode 10.78/10.86/10.79 ms/tok
-(unchanged) and hybrid prefill 4760 tok/s (unchanged), so the guard is free.
-**Rule for the repo: NCCL must never be inside a captured region; with hybrid, any captured collective over 64 KB hangs.**
+### Captured-NCCL hang: unresolved causal mechanism
+The hybrid speculative long-context run reached its final barrier and hung; the trace showed
+an NCCL reduction during capture, but does not establish the internal cause. Hybrid now selects
+transport by phase: P2P for all decode reductions, payload-based NCCL/P2P for prefill, and no
+piecewise graph capture during hybrid prefill. Rank-zero speculative decisions are synchronized.
+The combined graph path requires validation, especially at long context; see `SpecCollectiveHang.md`.
 
-### Post-merge verification (2026-10-27, after prefix-cache + collective-capture + 4 MiB arena)
-Short-context decode **10.83/10.86/10.84 ms/tok** (was 10.77/10.84/10.83) and **B4 17.94 ms/tok per stream /
-206.02 tok/s aggregate** (was 17.89 / 203.0), tokens byte-identical. So the four merges cost nothing and the
-prefix cache being on by default is free at short context.
+### Historical post-merge measurements (2026-10-27)
+Short-context decode **10.83/10.86/10.84 ms/tok** (was 10.77/10.84/10.83) and **B4 17.94 ms/tok per stream / 206.02 tok/s aggregate** (was 17.89 / 203.0). The recorded token comparisons do not establish correctness for diverse batches.
 
 ## 0. MEASUREMENT RULES LEARNED THE HARD WAY (read before trusting any number)
 
 1. **`COMM` depends on the workload.** Measured back-to-back on main, prefill 2048-token prompt / chunk 2048:
    **`COMM=nccl` 3399 tok/s vs `COMM=p2p` 3034 tok/s (+12% for NCCL)**. The historical 4777.7 tok/s prefill figure was
    taken with `COMM=nccl`. Our one-shot P2P kernel wins on *decode* (10 KB payloads, 4.93 vs 11.84 us per call) and
-   loses on *prefill* (84 MB payloads chunked through a 256 KiB arena: 204,881 launches at 16 us each = **40.7% of
-   prefill CUDA time**). So "always p2p" is wrong; **hybrid** is the intended default, and the arena size is a
-   separate prefill lever under investigation.
+   loses on *prefill* (84 MB payloads chunked through the arena). Per-call cost depends on arena size, so always quote it:
+   **256 KiB arena: 204,881 calls at 16.0 us = 3.282 s, 40.7% of prefill CUDA time** (`tp2logs/pd_prof8_20261027_rank0.log:18`; repeat `arena_sweep_256_p2p_1028_rank0.log:19`: 14.5 us, 2.976 s, 38.7%);
+   **4 MiB arena: 12,881 calls at 194.1 us = 2.500 s, 34.4%** (`tp2logs/arena4m_1027_rank0.log:19`,
+   `arena_sweep_4_p2p_1028_rank0.log:19`). Same kernel; each 4 MiB call carries 16x the bytes. So "always p2p" is not
+   optimal for both phases; **hybrid** is an available workload-dependent option, while the runner default is P2P.
+   Arena size is a separate prefill lever.
 2. **These cards are power-capped**: ~2100 MHz against a 3090 MHz ceiling under sustained load, GPU1 flagged
    `SW power cap`. Never compare against a number from earlier in the session; A/B back-to-back and record
    `clocks.sm / power / throttle mask` with every result.
@@ -156,11 +123,11 @@ prefix cache being on by default is free at short context.
 
 | # | change | measured gain | verification |
 |---|---|---|---|
-| 3 | **Multi-stream decode (continuous batching)** -- owner's call. `BATCH` dial through Model.load/Cache/Generator, per-width warmup, graph-safe expert counting (no `torch.bincount` sync), per-row block table, and the real bug: `_indexer_keys` built RoPE positions as `arange(n) + e0`, so at B>1 the rows rotated the compressed pool at positions 4,5,6,7 instead of 4,4,4,4 | **B1 10.84 ms/tok (92 tok/s) -> B2 13.91 (133.8 aggregate) -> B4 17.89 (202.99 aggregate)** = **2.2x throughput**, peak 86.5 GiB/GPU | four IDENTICAL B4 prompts give byte-identical 128-token streams with graphs on; layer-2 attention row diff 0 at pos 9 with pool_c/pool_r/ring byte-equal; B4-captured vs eager logits max KL 0.016-0.024, mean 0.0008-0.0015 (fp-order only) |
+| 3 | **Multi-stream decode (continuous batching)** -- captured B>1 path and corrected compressed-pool RoPE positions | historical **B1 10.84 ms/tok (92 tok/s) -> B2 13.91 (133.8 aggregate) -> B4 17.89 (202.99 aggregate)**, peak 86.5 GiB/GPU | two identical prompt rows in one B4 batch matched; captured vs eager token equality was observed for a B4/50-token run. Diverse-prompt batch correctness remains unresolved; throughput is not correctness validation |
 | 1 | **Capture the decode attention core** (piecewise segments + cross-block graph merge) | plain **13.15 -> 10.97 ms/tok** | tokens byte-identical, 4 prompts x 128 tokens x 2 ranks. Root cause of every earlier failure: `b1_prep` required `q_head_norm=True` while `_batch_ok_b1` required `False`, so the capture never ran |
 | 2 | **Kill the local-memory load in `gemv_tile`** (the `r0_ok ? A2[...] : hzero` conditional took the address of a per-thread const) | MoE **67.31 -> 65.76 us/call @bsz1 (1.024x)**, 1.018x @bsz6 | bitwise identical; ncu had shown A at 1,290,240 local load sectors vs 1,317,141 global (~49%), B 765,250 vs 1,188,536 (~57%) |
 | 3b | **Prefetch hoist (C1) + PDL launch of kernel B (C5)** from the external review kit | **62.54 us/call (1.076x)** @bsz1, 1.052x @bsz6; in-model 10.97/11.02/10.98 -> 10.80/10.91/10.85 | bitwise identical; mixed-K header regenerates byte-identically from the patched base header |
-| 5 | **`COMM=hybrid` for prefill (the real win); arena is a P2P-only lever** | prefill 32768/chunk 8192: p2p+256 KiB 4137.2 -> **hybrid 4819.1 (+16.5%)**, verified 4704.9 on main. Arena size affects **P2P mode only**: 256 KiB 4137.2 -> 2 MiB 4357.4 -> 4 MiB 4369.0 -> 8 MiB 4358.9; launches 204,881 -> 25,681 -> 12,881 -> 6,481 with AR self-CUDA flattening at ~2.51-2.54 s from 2 MiB (transfer-bound). **Hybrid is arena-insensitive** — proven by order reversal: 4 MiB first 4808.8 then 256 KiB 4800.4, versus 256 KiB first 4819.1 then 4 MiB 4751.0, so drift dominated and there is no hybrid gain. Compiled default kept at 4 MiB for P2P-mode runs; 2 MiB would capture the same with half the memory | decode unchanged: byte-identical tokens at 256 KiB vs 4 MiB, 10.84/10.86/10.86 vs 10.88/10.91/10.84; B4 ~205 aggregate |
+| 5 | **`COMM=hybrid` for prefill; arena is a P2P-only lever** | prefill 32768/chunk 8192: p2p+256 KiB 4137.2 -> **hybrid 4819.1 (+16.5%)**, verified 4704.9 on main. P2P 256 KiB 4137.2 -> 2 MiB 4357.4 -> 4 MiB 4369.0 -> 8 MiB 4358.9; hybrid 4 MiB 4808.8 vs 256 KiB 4800.4 in one order, 256 KiB 4819.1 vs 4 MiB 4751.0 in the other. No hybrid arena gain was resolved amid drift; this does not negate hybrid's measured gain over P2P. | decode tokens matched at 256 KiB vs 4 MiB in the measured run |
 
 | 11 | **Prefill chunk and auto sizing** -- `MAX_CHUNK` 8192 (4778 tok/s @32K prompt); `MAX_CHUNK=auto` sizes the chunk from the measured peak table against the `CTX_TOKENS` KV budget, so 1M context costs one chunk step (8192 -> 4096) | prefill 3.9k -> 4.78k | 2 reps per size, sampled device peak |
 | 9 | **Speculative policy: always speculate**; one DFlash block forward per round at every K; round cost ~flat in K | K choice worth <=8% | matched config; `DSPARK_POLICY=always` |
@@ -178,7 +145,7 @@ body and B4 measures 39 ms/token instead of 17.89. This is the *second* time a c
 | 9 | **Speculative policy: always speculate.** One DFlash block forward per round at every K; round cost ~flat in K (19.7/20.7/21.3/22.1 ms for K=2/3/4/5); K=5 beat plain on all six bench prompts | K choice worth <=8% | matched config; `DSPARK_POLICY=always` default. Two earlier claims of mine ("K<5 dominated", "prose loses") came from unmatched configs and are retracted |
 
 | **Whole-step graph / host gap (item 1b) — CLOSED, ~0.3% on main, 2.4% at B4; merged as opt-in `EXL3_PW_TPCOLLECT` (default off, commit `d774e65b`)** | main verification: 10.75/10.81/10.79 (on) vs 10.77/10.84/10.83 (off) ms/tok; earlier capturing the TP collective and merging block pairs (`EXL3_PW_TPCOLLECT`) cuts launches 43 -> 29, `cudaGraphLaunch` CPU 2.03 -> 1.78 ms, `_foreach_copy_` 2.15 -> 1.31 ms, and the instrumented inter-replay gap 3.36 -> 0.72 ms, yet decode only moves 11.45 -> 11.30 ms/tok (~1%), tokens byte-identical. The single-stream step is GPU-bound; the "3 ms host gap" was mostly profiler instrumentation. A whole-step graph is not worth the refactor |
-| **Narrower tile (`MOE_COOP_WNT=1`) — impossible** | the 2-bpw path derives its load count from WNT/2 and the decoder packs two 16-column tiles per 32-lane load, so a 16-column tile needs a new load/lane layout, not a macro override |
+| **Narrower tile (`MOE_COOP_WNT=1`) — not a macro-only change** | the 2-bpw path derives its load count from WNT/2 and the decoder packs two 16-column tiles per 32-lane load; a 16-column tile needs a new load/lane layout |
 | **More warps per block (`WK=16`, 512 threads) — LOSES** | back-to-back: B1 63.19 -> 81.00 us/call (+28%, A 39.45 -> 45.90, B 26.97 -> 38.57), B6 200.21 -> 234.81 (+17%). Outputs also differ by 4.6e-4 relative (different K-split reduction). With wide tiles also 29% slower, the 32-column / 8-warp / 256-thread geometry is locally optimal |
 | **Expert grouping at B>1 — nothing to win at B4, real headroom from B8** | with distinct prompts: B4 = 24 slots / 22.48 distinct (94%, no sharing), B6 = 36 / 32.19 (89%), **B8 = 48 slots / 31.76 distinct -> 34% of slots share an expert with another slot**. So grouping saves ~nothing at B4, but from B8 up a shared read could serve 2-3 rows. Note the dispatch split: B<=8 uses the coop path which executes every row-expert slot separately, while above B8 dispatch can use the sorted, expert-grouped fused `exl3_moe` path — which may explain why B16+ scales better. **Best next experiment: B8 coop vs the grouped path, matched diverse prompts, uninstrumented timing** |
 | **Expert-grouped decode path at B<=8 — LOSES** | `EXL3_MOE_GROUPED_DECODE=1` vs the coop default, short distinct prompts, two reps back-to-back: **B6 coop 247.5 / 246.4 tok/s aggregate vs grouped 138.7 / 138.7**; **B8 coop 213.3 / 216.6 vs grouped 141.3 / 139.3**. Tokens are not identical either (first divergence pos 43 at B6, pos 11 at B8). The coop path wins despite the 34% slot duplication at B8 — grouping costs more in sorting/scatter than it saves in reads. Default unchanged (opt-in) |
@@ -212,33 +179,15 @@ is a **narrower** tile (COLS 32 -> 16, 1008 blocks, and no reduction because the
 ksplit variants that lost). Needs a rebuild and must keep 263 kernel tests green; the 8 bpw staging assumes COLS=32 so
 check `tile_wn`/`STAGE_WORDS` assumptions first.
 
-## C. LEFT TO DO — reordered for the owner's real workload (20k-100k prompts)
+## C. CURRENT PRIORITIES — owner's 20k–100k workload
 
-| # | change | why | evidence / next step |
-|---|---|---|---|
-| 16 | **Captured decode past 1K tokens** | decode at 24k-60k is **16.58-16.88 ms/tok vs 10.77-10.84 short**; the whole gap is the eager fallback because the captured body has no top-k indexer selection | `_batch_ok_b1` requires the dense regime (`ec <= index_topk=512`, m=2, so pos <= 1023). Implement device-side top-k selection in the captured body, or make the gate per-row. IN PROGRESS |
-| 17 | **Prefix caching at 20k-100k** | the owner's agent loops resend a long context every turn; verified 16x at 8k but unmeasured at their sizes | measure cold vs full vs partial hit at 20k/60k, and the growing-suffix case (turn N -> N+1); report the hit ratio and the memory a 60k entry pins (~195 MB of pages). IN PROGRESS |
-| 18 | **Batching for long prompts** | blocked by the same gate: a batch with any long row drops to eager (81.6 vs 31.7 ms/token at B8), so all batching numbers are short-prompt only | follows from #16; then re-measure B4/B8 at 20k+ prompts |
-| 4 | **Prefill rate** | 4624-4756 tok/s at 24k-60k, i.e. ~21 s TTFT for 100k cold | AR is transfer-bound (194 us/call, 34% of prefill CUDA) so only faster transfer helps; the remaining levers are chunk size at long lengths and #17 |
-| 19 | **MoE per-slot cost** | geometry exhausted (wide -29%, narrow unbuildable, WK=16 -28%, grouped -44%) | needs a new kernel design, not a parameter |
-| 12 | **K=7 drafter** | +30-40% on code per the reference | BLOCKED on weights (non-causal 5-slot block) |
-| 6 | **FP8 KV** | -33% pool, quality fine | blocked on packed-pool capture correctness |
-| 5 | **8-bit prefill AR** | +6.5% prefill | fails the coherence gate |
+1. **Establish correctness first:** investigate diverse-prompt batching discrepancies and plain-versus-spec token divergences; do not infer general correctness from identical-prompt or cross-rank checks. Validate the combined graph path at long context, including rank agreement and outputs.
+2. **Long-context decode:** reduce measured eager-path launch/synchronization costs; investigate capture-safe candidate selection with exact tie semantics rather than assuming capture is impossible. Re-measure at 20k–100k on representative prompts.
+3. **Prefix-cache and cold prefill:** long-context hits are measured and default-on, not an unimplemented item. Validate on real growing conversations and measure cold prefill with matched collective and cache settings.
+4. **Concurrency:** after correctness is established, measure long/mixed-context batching and dynamic admission with staggered requests; current short-prompt throughput numbers do not establish correctness.
+5. **Other measured constraints:** FP8 KV needs packed-pool capture correctness; 8-bit prefill reduction failed the coherence gate; K=7 needs suitable trained weights. Grouped MoE and whole-step graph attempts were measured above and are not current retry priorities without new evidence.
 
-Batching is DONE and shipped; these are what remains.
-
-| # | change | why it is worth it | evidence / next step |
-|---|---|---|---|
-| 14 | **Batch scaling** — per-stream 10.84 / 13.91 / 17.89 / 31.67 / 49.56 / 68.71 / 81.70 ms and decode-only aggregate **92 / 133.8 / 203.0 / 231.5 / 266.6 / 349.3 / 391.7 tok/s** at B1/2/4/8/16/24/32 (peak VRAM 86.3-87.1 GiB) | aggregate keeps climbing past the `MAX_BSZN=8` fused cap, but each doubling now buys only ~+15% while per-user latency degrades sharply (B16 = 20 tok/s per user). So the throughput/latency frontier is: B2-B4 for interactive, B8-B16 for batch |  cause: MoE cost is linear in *distinct expert slots*, and rows do not amortise it (8 rows x top-6 = 48 slot reads vs 24 at B4). Next: (a) confirm where the aggregate curve actually turns (B32?), (b) reduce per-slot cost (the `MOE_COOP_WNT=1` experiment below), (c) check whether rows routed to the *same* expert are already grouped so a slot can serve several rows |
-| 15 | **Dynamic admission for real concurrency** — our runner enqueues all slots at once and they finish together | real serving has sequences arriving/leaving at different times; a fixed BATCH means idle slots when fewer than B are active, and the batch width should track the number of live streams | needs the generator's admit/evict loop exercised with staggered job lengths; measure aggregate tok/s with 8 slots and 3/5/8 live streams |
-| 1b | **Whole-step graph** — collective in-graph, 1-4 replays/step instead of 40 | 10.84 ms/tok with ~9 ms CUDA busy: 1.5-2 ms/step of host work, of which `cudaGraphLaunch` ~0.67 ms and `_foreach_copy_` into static buffers ~0.65 ms (PROFILE=1) | external plan steps 3-4; P2P is graph-capturable, so put `tp_collect` inside the segment and merge block pairs. ~10-12% |
-| 1c | **Narrower MoE tile** (`MOE_COOP_WNT=1`, COLS 32->16 -> 1008 blocks, no reduction) | the kernel is **parallelism-limited, not coalescing-limited**: the wide tile reads perfect 128 B sectors and is 29% SLOWER (A 51.65 vs 39.92 us) because it halves the block count, and ncu shows 3 blocks/SM resident against only 2.68 available | branch `tp2/moe-wnt1` prepared (macro made overridable); needs one build + 263 tests. Attacks both B1 latency and the B8 wall |
-| 4 | **Prefill** — 4778 tok/s at chunk 8192 against an 8000 target | MoE is 30.6% of prefill at 19.5% DRAM, 33% warps, 0.98 waves, 128 regs; the tile sweep (M16/32/48/64) is FLAT within 1.8%, so tile choice is not the lever | **first resolve the 15% discrepancy**: the sweep measured 4045-4070 tok/s under the lock against the earlier 4778 — needs one GPU-idle repeat. Then profile the non-MoE 70% (AR is 22%, never profiled at prefill). Note the arithmetic: making the MoE FREE gives 6883 tok/s, so 8000 needs the other 70% to improve ~15% |
-| 3b | **Spec + batching do not compose — measured negative** | B2 K5: 30.31/24.79 ms per stream, 63.27 tok/s; B2 K3: 27.80/23.88 ms, 68.78 tok/s; B4 K2: 49.91/41.79/47.86/49.91 ms, 76.45 tok/s. No clock capture, so absolute values carry a thermal/power-state caveat. Historical plain B4: 203 tok/s; B1 K5: 111–215 tok/s. | B4 + DSpark K=3 hit an illegal memory access reported at the `dsa_attn` combine launch (`dsa_triton.py:1105`); CUDA errors are asynchronous, so the originating kernel is not established. Reproduction was not attempted, so intermittent versus deterministic is unknown; shape logging is inconclusive. Treat verify width S=4 at B=4 as unsafe until buffer sizes are instrumented. Full traceback: `/home/treadall/recipe-artifacts/2x-rtx-tp2/tp2logs/specgrid_1027_1793136692_b4k3_rank0.log`. |
-| 8 | **Prefix caching** | unmeasured by us; diffbot's agentic 224 tok/s rests on it (sybil: 16K prompt 16 s -> 1 s on a hit) | implement warm-prefix replay, measure TTFT on a repeated 8K/32K prefix |
-| 7 | **Replay trim in multi-chunk prefill** | diffbot 3.7-4.6% at 34K-130K | late layers only need the last rows; check prefix-cache/ring semantics first |
-| 6 | **FP8 KV, retry** | -33% pool for -2% decode once a packed-aware captured attention exists | blocked on packed-pool capture correctness; the quality gate already passed |
-| 12 | **K=7 drafter — TRIED, blocked by training, not code** | the block is `[seed] + (block_size-1)` noise tokens (`dspark.py:200`), so no weight has dim 5 — but `dspark.py:20` says block queries attend **NON-CAUSALLY**, so block length is baked into *training*. Measured prompt 0: block5/K5 AL 3.086 acc 0.716 7.86 ms/tok; block7/K5 AL 2.357 acc 0.606 14.76 (a longer block alone degrades the first 5 slots); block7/K7 AL 4.103 acc 0.738 9.37 (draft 1.87 -> 6.3-10.1 ms, ~quadratic in block) -> net -19% | needs a 7-slot-trained drafter pack |
+Historical candidate lists and results below are retained for context, not as an ordered work queue.
 
 ### Appendix: prefill chunk measurements (2 reps each, sampled device peak)
 | prompt | chunk | TTFT ms | tok/s | peak (smi) | headroom |
@@ -248,8 +197,7 @@ Batching is DONE and shipped; these are what remains.
 | 32768 | 32768 | OOM (36 MiB free) | — | 97.2 GiB | 663 MiB |
 | 2048 | 2048 | 573.9 / 573.9 | 3569 / 3569 | 90.9 GiB | 7021 MiB |
 | 2048 | 4096 | 573.8 / 570.1 | 3569 / 3592 | 94.7 GiB | 3222 MiB |
-**`PREFILL_CHUNK` default = 8192.** 16384 buys +1.2% for 3.2 GiB, so it is not worth shipping. Remaining gap to the
-8000 tok/s target is the MoE (30.6% of prefill) — see the tile/occupancy item.
+**Historical chunk sweep:** 16384 bought little throughput for much less headroom than 8192. The 30.6% MoE share came from a different workload and cannot establish the remaining 8000 tok/s gap; see the diagnostic below.
 
 ### Prefill diagnostic: collective modes and rank-0 kernel profile
 
@@ -321,8 +269,8 @@ ncu on those: A 43.4 us at 42.2% DRAM, B 28.2 us at 32.5% DRAM, 80 regs/thread, 
 43.8% occupancy, long-scoreboard 44% -> latency-bound, not bandwidth-bound. Levers in order: occupancy (force fewer
 regs / more warps), memory-level parallelism, then layout.
 
-### New data (2026-10-27, multi-stream measured)
-- **Batching works once the B>1 core is captured**: plain per-stream 14.62 ms/tok at B2 (**126 tok/s aggregate**) and
+### Historical data (2026-10-27, multi-stream measured; correctness caveat above)
+- **Captured B>1 throughput**: plain per-stream 14.62 ms/tok at B2 (**126 tok/s aggregate**) and
   19.51 ms/tok at B4 (**189 tok/s aggregate**), i.e. ~2.1x wall-clock throughput at 1.8x per-stream latency. Peak VRAM
   86.6 GiB (B4 plain) — batching costs almost nothing in memory at these widths.
 - **Spec + batching is a substitution, not a product**: DS K=5 at B4 gives 96.8 tok/s aggregate, *below* B1 spec and far
@@ -333,7 +281,7 @@ regs / more warps), memory-level parallelism, then layout.
   captured B>1 path is not yet numerics-safe (same class as the earlier B4-vs-B1 divergence). Also fixed: the graph
   capture failure was `torch.bincount` (a CPU sync) inside the captured MLP — replaced with a CUDA scatter-add count.
 
-### New data (2026-10-27, later)
+### Historical data (2026-10-27, later; superseded by measured results above)
 - **Prefill chunk size matters a lot**: 2048 → 3666 tok/s, 4096 → 4324, **16384 → 5056 (+17% over 4096)**.
   Larger chunks amortize weight reads. Testing 32768/65536 next. This is now a high-priority prefill dial.
 - **8-bit (e4m3) prefill all-reduce**: +6.5% at 2048, +6.4% at 4096, +6.9% at 16384 — but a plain global cast
@@ -352,7 +300,7 @@ Measured-and-rejected (with numbers in the per-workstream notes): cp.async smem 
 min-blocks=2 (spills), lowering the fused row threshold, fp32→bf16 prefill wire (0.6%), x-fan fusion (−3% but changes
 tokens from position 55), event-based sampler sync, index-math hoisting (<0.15 ms/tok ceiling).
 
-### Warm prefix reuse (2026-10-27, TP2 P2P, B1)
+### Historical warm prefix reuse (2026-10-27, TP2 P2P, B1; 1024-token checkpoint configuration)
 
 `pcbench20261027a`, 1024-token chunks, 32 greedy output tokens, two repetitions;
 rank 0 shown (rank 1 agrees within 0.11 ms and all comparisons match). Effective
@@ -384,7 +332,4 @@ space is required using the tree policy: empty pages first, then oldest leaves,
 preserving referenced and protected chains as long as possible; checkpoint
 storage has a separate host-memory LRU budget.
 
-Runner dials: `EXL3_PREFIX_CACHE=1`, `EXL3_PREFIX_CACHE_CAPACITY` (default
-4294967296 host bytes), `EXL3_PREFIX_CACHE_MIN_MATCH` (256 tokens), and
-`EXL3_PREFIX_CACHE_INTERVAL` (1024 tokens). The interval caps prefill chunks;
-shorter chunks and checkpoint copies add cold-prefill cost.
+Historical runner configuration used `EXL3_PREFIX_CACHE_INTERVAL=1024`, which capped prefill chunks; the later chunk-boundary checkpoint configuration and default-on cache are described above.
