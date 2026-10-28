@@ -44,6 +44,29 @@ def call_rope(q, out_q, inv_freq, k = None, out_k = None, position = 0, position
              norm_eps, norm_bias, l4_beta, l4_orig, rotate_dims, rotate_offset)
 
 
+@pytest.mark.parametrize("norm_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1, 1, 28, 512, 64), (2, 3, 13, 256, 64), (1, 40, 32, 128, 64)])
+@pytest.mark.parametrize("position_mode", ["scalar", "positions", "ids"])
+@torch.inference_mode()
+def test_rope_fused_key_norm_bitwise(device, norm_dtype, shape, position_mode):
+    b, s, h, hd, rd = shape
+    torch.manual_seed(47)
+    q = torch.randn(b, s, h, hd, dtype = torch.half, device = device)
+    k = torch.randn(b, s, 1, hd, dtype = torch.half, device = device)
+    q_ref, k_ref = q.clone(), k.clone()
+    weight = torch.randn(hd, dtype = norm_dtype, device = device)
+    inv = default_inv_freq(rd, device)
+    pos = {"position": 123} if position_mode == "scalar" else (
+        {"positions": torch.arange(b, dtype = torch.int32, device = device) + 123}
+        if position_mode == "positions" else
+        {"position_ids": torch.arange(b * s, dtype = torch.int32, device = device).view(b, s) + 123})
+    call_rope(q_ref[..., -rd:], q_ref[..., -rd:], inv, mode = GPTJ, **pos)
+    call_rope(k_ref, k_ref, inv, mode = GPTJ, q_norm = weight, rotate_offset = hd - rd, **pos)
+    call_rope(q, q, inv, k, k, mode = GPTJ, k_norm = weight, rotate_offset = hd - rd, **pos)
+    assert torch.equal(q.view(torch.int16), q_ref.view(torch.int16))
+    assert torch.equal(k.view(torch.int16), k_ref.view(torch.int16))
+
+
 def ref_positions(bsz, seq, position, positions, position_ids, rotate_dims):
     """(bsz, seq, rotate_dims) int64 positions per token and rotate span"""
     if position_ids is not None:
@@ -508,8 +531,7 @@ def _invalid_cases(device):
         "out_q_smaller": dict(out_q = z(1, 2, 1, 64)),
         "k_inner_strided": dict(k = z(1, 2, 1, 128)[..., ::2], out_k = z(1, 2, 1, 128)[..., ::2]),
         "out_k_layout": dict(k = z(1, 2, 1, 64), out_k = z(1, 2, 1, 80)[..., :64]),
-        "q_norm_without_k_norm": dict(k = z(1, 2, 1, 64), out_k = z(1, 2, 1, 64), q_norm = z(64)),
-        "k_norm_without_q_norm": dict(k = z(1, 2, 1, 64), out_k = z(1, 2, 1, 64), k_norm = z(64)),
+        "k_norm_without_k": dict(k_norm = z(64)),
         "k_norm_size": dict(k = z(1, 2, 1, 64), out_k = z(1, 2, 1, 64), q_norm = z(64), k_norm = z(32)),
         "head_dim_over_2048": dict(q = z(1, 1, 1, 2050), out_q = z(1, 1, 1, 2050)),
         "inv_freq_table_2d_bsz2": dict(q = z(2, 2, 2, 64), out_q = z(2, 2, 2, 64),
@@ -526,7 +548,7 @@ INVALID_CASES = [
     "rotate_offset_overflow", "positions_and_ids", "positions_int64", "positions_shape", "positions_rank2",
     "position_ids_shape", "position_ids_rank3_mismatch", "position_ids_noncontig", "q_norm_size",
     "norm_dtype_mismatch", "norm_fp32", "mode_none", "k_without_out_k", "out_k_without_k", "out_q_fp32",
-    "out_q_smaller", "k_inner_strided", "out_k_layout", "q_norm_without_k_norm", "k_norm_without_q_norm",
+    "out_q_smaller", "k_inner_strided", "out_k_layout", "k_norm_without_k",
     "k_norm_size", "head_dim_over_2048", "inv_freq_table_2d_bsz2", "inv_freq_table_3d_bsz2", "inv_freq_noncontig",
 ]
 
@@ -580,7 +602,7 @@ def test_rope_empty_head_dim_with_norm_rejected(device):
     q = torch.empty(1, 4, 8, 0, dtype = torch.half, device = device)
     w = torch.empty(0, dtype = torch.half, device = device)
     with pytest.raises(RuntimeError, match = "q/k norm over an empty head_dim"):
-        call_rope(q, q, default_inv_freq(0, device), q_norm = w, k_norm = w)
+        call_rope(q, q, default_inv_freq(0, device), q_norm = w)
     # An odd head_dim has an unpaired element (the kernel moves heads in half2 pairs)
     q = torch.randn(1, 2, 2, 66, dtype = torch.half, device = device)[..., :65]
     with pytest.raises(RuntimeError, match = "head_dim must be even"):
