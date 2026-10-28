@@ -8,6 +8,19 @@ Targets: **300 tok/s decode**, **8000 tok/s prefill**.
 Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 tok/s @2K, 362.9 aggregate @4 streams,
 11.2k prefill @40K, fp8 KV.
 
+### Long-context capture past 1K: NOT FEASIBLE without redesigning candidate use (established 2026-10-27)
+Three independent walls, each verified:
+1. **`nonzero()` synchronises the host.** Eager `_indexer_topk` (`dsv4.py` ~1349-1353) does CUDA `nonzero()` plus a
+   data-dependent boolean index (`ent[ent < ec]`), producing a dynamic shape. Neither is graph-capturable, and the
+   sync-per-layer is what the capture exists to remove.
+2. **A fixed-capacity `torch.topk` cannot reproduce eager's tie order.** Proven on CPU: `torch.ones(3).topk(1)` returns
+   index 0, while padding one `-inf` and taking topk(1) returns index 1 — masking changes the algorithm's ordering, so a
+   sentinel cannot fix it. Eager's width is `ec//8+1` (W ~ 3022 at 24k, ~12500 at 100k) selecting **2048 blocks**, and
+   reproducing that exactly by hand is a research project.
+3. **Doing selection outside the graph** would preserve correctness but reintroduces the per-layer host sync.
+Therefore decode past ~1024 positions stays eager. The remaining lever is to make the **eager path** cheaper, which needs
+the cost breakdown (target forward vs attention at 24k vs indexer/candidate selection vs host) rather than capture work.
+
 ### Long-context: what helps and what hurts (measured 2026-10-27)
 - **Speculative decoding at long context: OPEN, not decided.** One measurement exists and it is not sufficient to rule
   anything out: prompt 0 + repeated-sentence filler at 24,167 tokens, `MAX_CHUNK=2048` (forced by a drafter OOM at chunk
