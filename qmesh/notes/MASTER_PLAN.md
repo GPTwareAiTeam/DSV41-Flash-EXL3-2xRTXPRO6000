@@ -101,7 +101,18 @@ is a **narrower** tile (COLS 32 -> 16, 1008 blocks, and no reduction because the
 ksplit variants that lost). Needs a rebuild and must keep 263 kernel tests green; the 8 bpw staging assumes COLS=32 so
 check `tile_wn`/`STAGE_WORDS` assumptions first.
 
-## C. LEFT TO DO (ordered by measured headroom)
+## C. LEFT TO DO — reordered for the owner's real workload (20k-100k prompts)
+
+| # | change | why | evidence / next step |
+|---|---|---|---|
+| 16 | **Captured decode past 1K tokens** | decode at 24k-60k is **16.58-16.88 ms/tok vs 10.77-10.84 short**; the whole gap is the eager fallback because the captured body has no top-k indexer selection | `_batch_ok_b1` requires the dense regime (`ec <= index_topk=512`, m=2, so pos <= 1023). Implement device-side top-k selection in the captured body, or make the gate per-row. IN PROGRESS |
+| 17 | **Prefix caching at 20k-100k** | the owner's agent loops resend a long context every turn; verified 16x at 8k but unmeasured at their sizes | measure cold vs full vs partial hit at 20k/60k, and the growing-suffix case (turn N -> N+1); report the hit ratio and the memory a 60k entry pins (~195 MB of pages). IN PROGRESS |
+| 18 | **Batching for long prompts** | blocked by the same gate: a batch with any long row drops to eager (81.6 vs 31.7 ms/token at B8), so all batching numbers are short-prompt only | follows from #16; then re-measure B4/B8 at 20k+ prompts |
+| 4 | **Prefill rate** | 4624-4756 tok/s at 24k-60k, i.e. ~21 s TTFT for 100k cold | AR is transfer-bound (194 us/call, 34% of prefill CUDA) so only faster transfer helps; the remaining levers are chunk size at long lengths and #17 |
+| 19 | **MoE per-slot cost** | geometry exhausted (wide -29%, narrow unbuildable, WK=16 -28%, grouped -44%) | needs a new kernel design, not a parameter |
+| 12 | **K=7 drafter** | +30-40% on code per the reference | BLOCKED on weights (non-causal 5-slot block) |
+| 6 | **FP8 KV** | -33% pool, quality fine | blocked on packed-pool capture correctness |
+| 5 | **8-bit prefill AR** | +6.5% prefill | fails the coherence gate |
 
 Batching is DONE and shipped; these are what remains.
 
