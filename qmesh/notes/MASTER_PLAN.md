@@ -72,6 +72,12 @@ the cost breakdown (target forward vs attention at 24k vs indexer/candidate sele
 - **The auto-chunker does not reserve the drafter**: with `DSPARK=1` at 24k the default chunk 8192 OOMs (needs ~640 MiB
   more), so long-context spec runs need `MAX_CHUNK=2048` today.
 
+### Prefix caching is default-on and free at short context (verified)
+Short-context decode with `EXL3_PREFIX_CACHE=1` (the new default) vs off: **10.83/10.86/10.84 vs 10.77/10.84/10.83 ms/tok**,
+tokens byte-identical on both ranks. So enabling it costs nothing where it cannot help, and buys 55-130x TTFT where it can.
+Its only cost is host RAM: 268 MB per rank per 60k-token context (8 checkpoints at 8192-token boundaries), plus
+183 MiB of GPU KV for that context.
+
 ## LONG-CONTEXT BASELINE (the owner's real workload: 20k-100k prompts)
 Measured in the runner (end-to-end, `COMM=hybrid`, chunk 8192, graphs on, `EXL3_DSV4_B1_BATCH=1`):
 | prompt tokens | TTFT | prefill tok/s | decode ms/tok |
