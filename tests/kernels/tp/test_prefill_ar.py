@@ -27,7 +27,9 @@ def _rank(rank, root):
     dist.init_process_group('nccl', init_method='file://' + root + '/store', rank=rank, world_size=2)
     p2p = TPBackendP2P(P2PComm(rank, rendezvous_path=root + '/p2p', device=rank))
     os.environ['P2P_RDV'] = root + '/p2p'
-    ar = wrap_prefill_ar(TPBackendHybrid(TPBackendNCCL(), p2p), p2p)
+    hybrid = TPBackendHybrid(TPBackendNCCL(), p2p)
+    hybrid.prefill = True
+    ar = wrap_prefill_ar(hybrid, p2p)
     try:
         # Literal ragged sizes exercise fallback; aligned neighbors exercise the kernel.
         sizes = (TILE - 1, TILE + 1, TILE * 3 // 2, 3 * TILE + 7,
