@@ -25,6 +25,15 @@ void dsa_topk
     int64_t t_seq
 );
 
+// Candidate-block entry compaction: ascending entry ids of the kept blocks (see dsa_topk.cu)
+void dsa_compact_ent
+(
+    const at::Tensor& keep,              // (nb,) bool, device
+    at::Tensor out,                      // (cap,) int32, device, -1 past the count
+    int64_t bs,
+    int64_t ec
+);
+
 void dsa_topk_tile
 (
     const at::Tensor& scores,

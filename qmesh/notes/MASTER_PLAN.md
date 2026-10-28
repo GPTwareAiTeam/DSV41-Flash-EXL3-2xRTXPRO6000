@@ -40,27 +40,19 @@ PyTorch-level ops, not arithmetic. Concrete candidates already identified: merge
 (1 x 40 per step, needs an extension capability and bitwise verification), fuse the attention split/combine pair,
 reduce the six HC mixes per layer, and chain buffers instead of `_foreach_copy_`.
 
-### Long-context capture: tie rate measured at 84% (closes the item quantitatively)
-At 24,166-24,485 positions, candidate-source layer 20, 320 timed decode steps: the 2048th and 2049th candidate scores
-were **exactly equal on 269/320 steps (84.06%)**, identical on both ranks (not independent samples); all 8 warmup steps
-also tied. Evidence: `tp2logs/topk_ties_1028b.csv.rank{0,1}`.
-So ties are the normal case, not an edge case: **no device-side or fixed-capacity selector can reproduce eager's
-`topk` ordering without changing numerics on ~84% of steps.** Capture past 1K is therefore impossible without
-redefining selection, and the remaining lever for long-context decode is the eager path's launch count (631/step).
-This also explains why an FP8-KV packed-capture attempt diverged so quickly earlier in the project.
+### Long-context candidate compaction (2026-10-28)
+At 24,166–24,485 positions, source layer 20's 2048th and 2049th candidate scores tied in 269/320 decode steps
+(84.06%; `tp2logs/topk_ties_1028b.csv.rank{0,1}`). Ties alone do not establish different selected sets: on 32 recorded
+rows `torch.topk` and `dsa_topk` selected the same sets (`tp2logs/longdecode_ab_1028B_tiecheck.log`), but this is not a
+general proof. The source layer retains `torch.topk` unchanged.
 
-### Long-context capture past 1K: NOT FEASIBLE without redesigning candidate use (established 2026-10-27)
-Three independent walls, each verified:
-1. **`nonzero()` synchronises the host.** Eager `_indexer_topk` (`dsv4.py` ~1349-1353) does CUDA `nonzero()` plus a
-   data-dependent boolean index (`ent[ent < ec]`), producing a dynamic shape. Neither is graph-capturable, and the
-   sync-per-layer is what the capture exists to remove.
-2. **A fixed-capacity `torch.topk` cannot reproduce eager's tie order.** Proven on CPU: `torch.ones(3).topk(1)` returns
-   index 0, while padding one `-inf` and taking topk(1) returns index 1 — masking changes the algorithm's ordering, so a
-   sentinel cannot fix it. Eager's width is `ec//8+1` (W ~ 3022 at 24k, ~12500 at 100k) selecting **2048 blocks**, and
-   reproducing that exactly by hand is a research project.
-3. **Doing selection outside the graph** would preserve correctness but reintroduces the per-layer host sync.
-Therefore decode past ~1024 positions stays eager. The remaining lever is to make the **eager path** cheaper, which needs
-the cost breakdown (target forward vs attention at 24k vs indexer/candidate selection vs host) rather than capture work.
+For single-row candidate-use slabs, device compaction emits the same ascending entry list as eager nonzero, padded to
+the 2048-block capacity; `dsa_topk` operates on the scores with padded entries masked. Multirow slabs retain the eager
+path because the union of their selected blocks can exceed that capacity. At 24k, `run_tp2.py`, COMM=p2p, chunk=2048,
+cache=65536, PROFILE (15 steps, rank 0), `aten::nonzero` fell from 8 to 0 calls/step and `cudaLaunchKernel` from 585 to
+557 calls/step (`longdecode_ab_1028B_prof_{e,f}_trace`). Both ranks generated identical tokens in two 32-token pairs.
+Timing from that block is invalid because of severe concurrent host load. Long-context full graph capture remains
+unimplemented: the captured attention body has a separate indexer scoring path requiring parity validation.
 
 ### Long-context: what helps and what hurts (measured 2026-10-27)
 - **Long-context speculation is content- and prompt-dependent, not categorically harmful.** P2P, 32 generated tokens,
