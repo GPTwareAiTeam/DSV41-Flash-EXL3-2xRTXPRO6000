@@ -135,6 +135,16 @@ PROMPTS = [
     "Return only a JSON object describing a user with keys name, age, email, and a list field roles of strings. "
     "Use valid JSON with no commentary.",
 ]
+# LONG_PROMPT_TOKENS: append synthetic filler to every prompt so the runner can exercise long-context behaviour
+# (20k-100k prompts) without a real document. The filler is plain English prose; the log prints the true
+# prompt_tokens, so quote that rather than assuming the requested size was hit exactly.
+LONG_PROMPT_TOKENS = int(os.environ.get("LONG_PROMPT_TOKENS", "0"))
+_FILLER_SENTENCE = ("The agent reviewed the archive, reconciled the ledger entries, and recorded each result "
+                    "in the running log before continuing to the next section of the report. ")
+if LONG_PROMPT_TOKENS:
+    # ~24 tokens per sentence; overshoot and let the caller report the actual length
+    _reps = max(1, LONG_PROMPT_TOKENS // 24)
+    PROMPTS = [p + (_FILLER_SENTENCE * _reps) for p in PROMPTS]
 
 
 def log(msg: str):
