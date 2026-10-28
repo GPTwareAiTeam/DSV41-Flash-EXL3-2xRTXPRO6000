@@ -51,10 +51,10 @@ def ranks_running(tag):
 def run_arm(tag, values, long_context, profile, timeout):
     options = dict(zip(DIALS, map(str, values)))
     options.update({'PROMPT_IDS': '0' if long_context else '0,1,2',
-                    'LONG_PROMPT_TOKENS': '24000' if long_context else '0',
+                    'LONG_PROMPT_TOKENS': '20000' if long_context else '0',
                     'CTX_TOKENS': '65536', 'PROFILE': str(int(profile)),
                     'PROFILE_SEQ': '', 'BATCH': '1', 'MAX_NEW': '128',
-                    'IGNORE_EOS': '1', 'TORCH_CUDA_ARCH_LIST': '12.0a'})
+                    'IGNORE_EOS': '1', 'COMM': 'p2p', 'TORCH_CUDA_ARCH_LIST': '12.0a'})
     args = [str(ARTIFACTS / 'run_lm_model.sh'), tag]
     for key, val in options.items():
         args.extend(['-e', f'{key}={val}'])
