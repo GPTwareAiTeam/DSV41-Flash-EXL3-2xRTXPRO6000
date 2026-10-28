@@ -57,6 +57,7 @@
 #include "parallel/gather.cuh"
 #include "parallel/all_reduce.cuh"
 #include "parallel/p2p_oneshot.cuh"
+#include "parallel/prefill_ar.cuh"
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
@@ -173,6 +174,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("p2p_dev_arena_alloc", &p2p_dev_arena_alloc, "p2p_dev_arena_alloc");
     m.def("p2p_dev_arena_handle", &p2p_dev_arena_handle, "p2p_dev_arena_handle");
     m.def("p2p_dev_arena_open", &p2p_dev_arena_open, "p2p_dev_arena_open");
+#if !defined(USE_ROCM)
+    m.def("prefill_ar_layout", &p2p_prefill_ar_layout);
+    m.def("prefill_ar_occupancy", &p2p_prefill_ar_occupancy);
+    m.def("prefill_ar_alloc", &p2p_prefill_ar_alloc);
+    m.def("prefill_ar_launch", &p2p_prefill_ar_launch);
+#endif
     m.def("p2p_all_reduce_f32", &p2p_all_reduce_f32, "p2p_all_reduce_f32", py::arg("x"), py::arg("rank"),
           py::arg("local"), py::arg("peer"), py::arg("nblk"), py::arg("stats") = false);
     m.def("p2p_all_gather_f32", &p2p_all_gather_f32, "p2p_all_gather_f32", py::arg("x"), py::arg("out"),

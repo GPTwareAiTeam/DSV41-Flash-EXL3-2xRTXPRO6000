@@ -50,6 +50,7 @@ def nvcc_has_compress_mode(nvcc: list[str] | None) -> bool:
 # ldmatrix) with no portable form yet. Their bindings are compiled out as well and the extension reports
 # them missing through its HAS_* attributes (bindings.cpp), which the Python side checks before using them
 HIP_EXCLUDED_SOURCES = {
+    "parallel/prefill_ar.cu",  # prefill all-reduce: system-scope PTX and CUDA IPC
     "hgemm_f16acc.cu",      # fp16-accumulator hgemm (hgemm_f16acc): GeForce tensor-core PTX; RDNA uses rocm/wmma_gemm.cu
     # Replaced on ROCm by an implementation of the same interface under rocm/
     "exl3_gemv.cu",         # -> rocm/quant/exl3_gemv_rdna.cu (exl3_gemv.cuh)
