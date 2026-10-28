@@ -51,8 +51,12 @@ the 2048-block capacity; `dsa_topk` operates on the scores with padded entries m
 path because the union of their selected blocks can exceed that capacity. At 24k, `run_tp2.py`, COMM=p2p, chunk=2048,
 cache=65536, PROFILE (15 steps, rank 0), `aten::nonzero` fell from 8 to 0 calls/step and `cudaLaunchKernel` from 585 to
 557 calls/step (`longdecode_ab_1028B_prof_{e,f}_trace`). Both ranks generated identical tokens in two 32-token pairs.
-Timing from that block is invalid because of severe concurrent host load. Long-context full graph capture remains
-unimplemented: the captured attention body has a separate indexer scoring path requiring parity validation.
+Clean back-to-back `longdecode_clean_1028c` runs, `run_tp2.py`, COMM=p2p, chunk=2048, 32 decode tokens: at 24,167
+prompt tokens, cache=65536, rank 0 was 16.42→16.11 and 16.78→15.79 ms/token; at 72,510 prompt tokens, cache=131072,
+16.64→16.09 ms/token. Both ranks' generated tokens were identical in each pair. Host load was 6.59 at start and 8.08 at
+end; GPU0/1 median clocks were 2272/2272 MHz and median power 171.65/192.44 W over the block, including idle periods.
+Long-context full graph capture remains unimplemented: the captured attention body has a separate indexer scoring path
+requiring parity validation.
 
 ### Long-context: what helps and what hurts (measured 2026-10-27)
 - **Long-context speculation is content- and prompt-dependent, not categorically harmful.** P2P, 32 generated tokens,
