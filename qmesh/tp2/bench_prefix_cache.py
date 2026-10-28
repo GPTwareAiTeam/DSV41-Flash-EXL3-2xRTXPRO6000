@@ -67,6 +67,7 @@ def run(generator, ids, label):
                     torch.cuda.synchronize()
                     first = time.perf_counter()
                 tokens.extend(result["token_ids"].reshape(-1).tolist())
+                last = time.perf_counter()
             if result.get("eos"):
                 final = result
     thread.join()
@@ -75,7 +76,7 @@ def run(generator, ids, label):
     rc = generator.recurrent_cache
     rc_bytes = rc.update_total_size() if rc is not None else 0
     print(f"[PREFIX{RANK}] {label} len={ids.shape[-1]} ttft_ms={elapsed * 1000:.2f} "
-          f"effective_prompt_tok_s={ids.shape[-1] / elapsed:.1f} "
+          f"decode_ms_per_tok={(last - first) * 1000 / (len(tokens) - 1):.2f} effective_prompt_tok_s={ids.shape[-1] / elapsed:.1f} "
           f"cached_pages={final['cached_pages']} cached_tokens={final['cached_tokens']} "
           f"recurrent_checkpoint_bytes={rc_bytes} recurrent_checkpoints={len(rc) if rc is not None else 0} "
           f"gpu_telemetry[index,sm_mhz,temp_c,power_w,throttle_active]={telemetry[0]} tokens={tokens}", flush=True)
@@ -106,7 +107,7 @@ def main():
 
     def new_generator():
         generator = Generator(model, cache, tokenizer, max_batch_size=1,
-                              max_chunk_size=min(CHUNK, PREFIX_CACHE_INTERVAL) if PREFIX_CACHE else CHUNK,
+                              max_chunk_size=CHUNK,
                               recurrent_cache_size=PREFIX_CACHE_CAPACITY if PREFIX_CACHE else 0,
                               recurrent_checkpoint_interval=PREFIX_CACHE_INTERVAL,
                               recurrent_checkpoint_interval_pp=PREFIX_CACHE_INTERVAL)
@@ -144,6 +145,21 @@ def main():
             generator.close()
             if partial_cold != partial_hit:
                 raise RuntimeError(f"partial cache token mismatch for len={n} rep={rep}")
+        generator = new_generator()
+        base = make_ids(tokenizer, n, n * 100 + 1)
+        other = make_ids(tokenizer, n, n * 100 + 2)
+        run(generator, base, "alternate_a_cold")
+        run(generator, other, "alternate_b_cold")
+        run(generator, base, "alternate_a_hit")
+        run(generator, other, "alternate_b_hit")
+        generator.close()
+        generator = new_generator()
+        grown = base
+        for turn in range(4):
+            run(generator, grown, f"growth_turn={turn}")
+            suffix = make_ids(tokenizer, 1000, n * 1000 + turn)
+            grown = torch.cat((grown, suffix), dim=1)
+        generator.close()
     dist.barrier()
     dist.destroy_process_group()
 
