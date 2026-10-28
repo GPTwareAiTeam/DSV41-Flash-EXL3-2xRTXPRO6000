@@ -478,20 +478,14 @@ def main():
         p2p = TPBackendP2P(P2PComm(RANK, world = WORLD, rendezvous_path = rdv, device = RANK,
                                    stats = P2P_STATS_OUT is not None))
         backend = p2p if COMM == "p2p" else TPBackendHybrid(TPBackendNCCL(), p2p)
-        vocab_backend = backend
-        from qmesh.tp2.prefill_ar import wrap_prefill_ar
-        backend = wrap_prefill_ar(backend, p2p)
         comm = p2p.comm if hasattr(p2p, "comm") else None
     else:
         comm = None
         backend = TPBackendNCCL()
-        vocab_backend = backend
-        if os.environ.get("PREFILL_AR", "0") != "0":
-            raise ValueError("PREFILL_AR requires COMM=p2p or hybrid")
     if os.environ.get("TP_COLLECTIVE_TRACE") == "1":
         backend = TPBackendTrace(backend)
     n_blocks = set_tp_reduce(model, backend)
-    local_v, full_v = wrap_vocab_split(model, RANK, WORLD, vocab_backend)
+    local_v, full_v = wrap_vocab_split(model, RANK, WORLD, backend)
     load_s = time.time() - t0
     log(f"LOADED {load_s:.1f}s blocks={n_blocks} vocab_local={local_v} vocab_full={full_v} "
         f"max_alloc_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f}")

@@ -772,20 +772,6 @@ prompt resumes from the nearest interval checkpoint (`recurrent_checkpoint_inter
 DeepSeek-V4) instead of the last full page, so it can re-prefill more than 255 tokens (up to the
 whole prompt for prompts shorter than the interval). Set `1` to restore the checkpoint split.
 
-### `PREFILL_AR` (default: `0`; experimental TP2 runner)
-
-Set to `int8` to try the persistent peer-push prefill all-reduce with signed 8-bit
-values and one bf16 scale per 32 elements, or `exact` for its lossless transport.
-Requires `COMM=hybrid` or `p2p` and GPU peer access. Only eligible eager reductions
-of at least 256 rows use it; decode, CUDA graph capture, vocabulary collectives,
-and unsupported shapes retain the original transport. The int8 mode is lossy and
-must remain disabled until its long-context quality and rank identity are validated.
-
-### `PREFILL_AR_CAP` (default: `41943040` elements)
-
-Maximum payload for the experimental prefill peer-push receive buffer. Larger
-reductions use the original transport. Must be a positive multiple of 512.
-
 ### `EXL3_PREFIX_CACHE` (default: `1`; TP2 runner)
 
 Set to `0` to disable recurrent prefix reuse in the TP2 runner. When enabled,

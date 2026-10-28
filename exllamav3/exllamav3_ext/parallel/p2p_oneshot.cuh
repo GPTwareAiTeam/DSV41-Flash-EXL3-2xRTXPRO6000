@@ -58,7 +58,6 @@ int64_t p2p_dev_arena_open(const std::string& hex, int64_t local_device, int64_t
 // Compiled payload capacity in bytes per parity slot.
 int64_t p2p_arena_maxb();
 
-
 // fp32 sum over both ranks, in place: x <- x_rank0 + x_rank1. numel % 4 == 0, bytes <= P2P_MAXB.
 // stats: record per-invocation device diagnostics into the local arena (opt-in; off = original kernel).
 void p2p_all_reduce_f32(torch::Tensor x, int64_t rank, int64_t local, int64_t peer, int64_t nblk, bool stats);
