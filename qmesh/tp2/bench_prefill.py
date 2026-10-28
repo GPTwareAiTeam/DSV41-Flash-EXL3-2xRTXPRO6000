@@ -109,10 +109,16 @@ def main():
     if COMM in ("p2p", "hybrid"):
         p2p = TPBackendP2P(P2PComm(RANK, world = WORLD, rendezvous_path = os.environ["P2P_RDV"], device = RANK))
         backend = p2p if COMM == "p2p" else TPBackendHybrid(TPBackendNCCL(), p2p)
+        vocab_backend = backend
+        from qmesh.tp2.prefill_ar import wrap_prefill_ar
+        backend = wrap_prefill_ar(backend, p2p)
     else:
         backend = TPBackendNCCL()
+        vocab_backend = backend
+        if os.environ.get("PREFILL_AR", "0") != "0":
+            raise ValueError("PREFILL_AR requires COMM=p2p or hybrid")
     set_tp_reduce(model, backend)
-    wrap_vocab_split(model, RANK, WORLD, backend)
+    wrap_vocab_split(model, RANK, WORLD, vocab_backend)
     tokenizer = Tokenizer.from_config(config)
     log(f"LOADED MAX_CHUNK={MAX_CHUNK} CACHE_TOKENS={CACHE_TOKENS} COMM={COMM} {gpu_mem_line()}")
 
