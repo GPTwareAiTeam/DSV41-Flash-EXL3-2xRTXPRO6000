@@ -8,6 +8,23 @@ Targets: **300 tok/s decode**, **8000 tok/s prefill**.
 Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 tok/s @2K, 362.9 aggregate @4 streams,
 11.2k prefill @40K, fp8 KV.
 
+## LONG-CONTEXT BASELINE (the owner's real workload: 20k-100k prompts)
+Measured in the runner (end-to-end, `COMM=hybrid`, chunk 8192, graphs on, `EXL3_DSV4_B1_BATCH=1`):
+| prompt tokens | TTFT | prefill tok/s | decode ms/tok |
+|---|---|---|---|
+| 24167 (cold, no warmup) | 5081 ms | **4756** | **16.58** |
+| 60417 | 13068 ms | **4624** | **16.88** |
+| ~24k with `WARM=1` | 1843 ms | (artefact: native page reuse from the warm pass) | 16.50 |
+Short-context decode for comparison: 10.77-10.84 ms/tok.
+**Two hard limits for this workload:**
+1. **The captured decode path stops at ~1024 positions**: `_batch_ok_b1` requires the compressed pool in its dense regime
+   (`ec = (pos+1)/m <= index_topk = 512`, m=2), and the captured body implements no top-k indexer selection. Beyond that
+   every decode step falls back to eager. That plus KV reads is the 10.8 -> 16.6 ms/tok penalty.
+2. **The same gate breaks batching for long prompts**: a batch containing ANY row past that limit drops the whole batch to
+   eager (measured 81.6 vs 31.7 ms/token at B8). So all the batching numbers above are short-prompt only.
+Prefill is ~4.6-4.8k tok/s at these lengths, i.e. a 100k prompt costs ~21 s TTFT cold; prefix caching is the lever that matters
+(`EXL3_PREFIX_CACHE`, merged into main at `8ec9c9c8`, default off, verified 16x at 8k).
+
 ## 0. MEASUREMENT RULES LEARNED THE HARD WAY (read before trusting any number)
 
 1. **`COMM` depends on the workload.** Measured back-to-back on main, prefill 2048-token prompt / chunk 2048:
