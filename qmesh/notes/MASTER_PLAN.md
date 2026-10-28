@@ -54,13 +54,27 @@ Therefore decode past ~1024 positions stays eager. The remaining lever is to mak
 the cost breakdown (target forward vs attention at 24k vs indexer/candidate selection vs host) rather than capture work.
 
 ### Long-context: what helps and what hurts (measured 2026-10-27)
-- **Speculative decoding at long context: OPEN, not decided.** One measurement exists and it is not sufficient to rule
-  anything out: prompt 0 + repeated-sentence filler at 24,167 tokens, `MAX_CHUNK=2048` (forced by a drafter OOM at chunk
-  8192), DSpark K=5 gave 19.89 ms/tok vs 16.58 plain with acceptance **0.33 / AL 1.71**. That input is degenerate
-  (the filler is one sentence repeated ~1000 times, so the model loops) and the chunk was not the shipping one.
-  Acceptance 0.33 vs 0.66-0.91 at short context may be the content, the chunk, the eager path, or the drafter's taps at
-  long range - unknown. **Needs a proper sweep**: content type (prose / code fence / JSON / tool-style), context length
-  (0 / 4k / 20k / 60k), K in {2,3,5}, shipping chunk, and acceptance + AL reported per cell, not a blanket rule.
+- **Long-context speculation is content- and prompt-dependent, not categorically harmful.** P2P, 32 generated tokens,
+  prompt IDs 0/1/2, 20k synthetic filler, KV pool 65536, chunk 2048; entries below are in prompt order. Plain and spec
+  arms were run back-to-back. Short rows use no filler. Acceptance and AL are the runner's reported values.
+
+  | Content / K | Plain ms/tok | Spec ms/tok | Acceptance | AL (tokens/round) | Example draft / target / wall ms |
+  |---|---|---|---|---|---|
+  | Short / 5 | 10.87 / 10.83 / 10.79 | 10.22 / 10.33 / 10.81 | .8077 / .5000 / .6500 | 4.000 / 2.333 / 2.182 | not recorded |
+  | Code 20k / 5 | 16.84 / 17.05 / 16.91 | 18.51 / 8.99 / 11.16 | .4231 / .4545 / .7391 | 2.100 / 2.667 / 2.545 | 1.548 / 43.028 / 46.618 |
+  | Code 20k / 3 | 16.86 / 17.27 / 16.88 | 15.51 / 9.90 / 11.88 | .5789 / .5294 / .6957 | 2.100 / 2.500 / 2.333 | 2.207 / 20.428 / 25.671 |
+  | Mixed 20k / 5 | 17.19 / 16.68 / 17.11 | 13.49 / 8.80 / 9.66 | .7826 / .4878 / .6429 | 3.250 / 2.818 / 2.800 | 1.658 / 43.143 / 47.040 |
+  | Mixed 20k / 3 | 16.88 / 17.11 / 16.80 | 16.42 / 8.77 / 9.49 | .5789 / .6897 / .6786 | 2.375 / 2.818 / 2.727 | 1.600 / 20.799 / 24.549 |
+  | JSON 20k / 5 | 16.87 / 17.40 / 17.02 | 13.34 / 13.18 / 9.21 | .6818 / .3673 / .6333 | 3.500 / 2.385 / 2.583 | 1.604 / 43.124 / 47.014 |
+
+  Round splits are individual instrumented iterations, not matched-width averages; verify width and other work vary by round,
+  so they do not establish a causal K comparison. At long context the target forward dominates the round, so speculation
+  amortises it; value tracks acceptance and accepted tokens per round, which are content-dependent. Acceptance alone is
+  not a reliable threshold: mixed prompt 1 wins at .4878. Synthetic fillers repeat the same content and can induce loops;
+  these results are not a substitute for real agent transcripts or measurements at 60k–100k. A prior repeated-prose run
+  gave 19.89 vs 16.58 ms/tok at 24,167 tokens, acceptance .33 / AL 1.71; it does not support a blanket rule.
+  A hybrid speculative arm hung once; its cause is unconfirmed. A P2P prose retest completed. The measured K=5 arms
+  ended before a separate capture run, and K=3/JSON arms started after it ended; no overlap required reruns.
 - **Prefix caching is the big lever for agent loops**: 20k full hit **126 ms vs 6.9 s cold (55x)**; 60k **154 ms vs 21 s (~130x)**;
   two alternating 60k contexts both hit at 155/154 ms; a 60k context growing ~1k per turn keeps **98.2-98.3% cached**
   (TTFT 496-529 ms, with one unexplained 5175 ms outlier at a checkpoint boundary).
