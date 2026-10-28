@@ -1176,6 +1176,10 @@ use P2P and broadcasts use NCCL in hybrid mode. The all-reduce threshold is
 `HYBRID_NCCL_MIN_BYTES` (default `65536` bytes); payloads at or above it use NCCL. Hybrid may
 differ numerically from other modes when its collective routes differ. Both ranks must use the
 same settings. Hybrid and P2P require `P2P_RDV` to name a fresh shared rendezvous directory.
+The TP2 runner rejects `DSPARK=1` with `COMM=hybrid` because of an unresolved
+post-generation collective hang; use `COMM=p2p` for speculation. `TP_COLLECTIVE_TRACE=1`
+logs rank, generator iteration, sequence, operation, shape, byte size, route and CUDA
+capture status, plus draft confidence windows. Graph replays do not produce host calls.
 
 ### `P2P_ARENA_MAXB` (default: `4194304`, 4 MiB)
 

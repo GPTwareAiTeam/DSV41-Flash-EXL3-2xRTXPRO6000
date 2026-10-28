@@ -373,6 +373,9 @@ class DeepseekV4MTPModel(Model):
         keep = cs >= self.draft_conf_threshold
         lens = torch.cumprod(keep.to(torch.int32), dim = 1).sum(dim = 1)
         params["draft_confidence_len"] = int(lens.max().item())
+        backend = params.get("backend")
+        if getattr(backend, "trace_draft_window", False):
+            backend.trace_window(params["draft_confidence_len"])
         return out
 
 
