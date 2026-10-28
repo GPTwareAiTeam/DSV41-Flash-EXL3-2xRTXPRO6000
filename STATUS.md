@@ -46,10 +46,10 @@ Tags `invariance_block_20261028_ref_g{0,1}_all` (B1, prompts 0-7) vs `..._b{2,4,
   margin 0.0625, max-abs delta 1.875), B8 pos 11 (671 -> 666, ref margin 0.15625, delta 2.594). Per prompt g0: p1 pos 20,
   p2 pos 34 (B4), p3 pos 34 (B4/B8, delta 4.13), p5 pos 43, p6 pos 47 (B4) / 74 (B8); p7 identical at B2/B4. Same
   positions for `same`/`distinct`/`mix` and across repeats; g1 stream 0 flips at pos 55 (B4) / 70 (B8).
-- Every flip is a reference near-tie (ref margins 0.03-0.78) and the bsz1-vs-batch full-vocab delta is already
-  0.82 / 1.22 / 1.17 max at steps 0 / 1 / 69 with no jump at any flip ⇒ bsz-keyed kernel geometry
-  (`exl3_moe_coop.cu:197-199` `wide_b = bsz > 1`, M=1 GEMV vs M>1 GEMM), not a logic bug. Geometry-pinning bisect arms
-  are queued as `invariance_bisect_isolated_20261028_{wb0,wb1}_b{1,2,8}`, `attn_b{2,8}`, `rep_b2`.
+- The observed flips have reference margins 0.03–0.78; the bsz1-vs-batch full-vocab delta was already
+  0.82 / 1.22 / 1.17 max at steps 0 / 1 / 69. The cause remains unresolved: bsz-keyed kernel geometry is a hypothesis,
+  not evidence excluding a logic bug. Geometry-pinning bisect arms are queued as
+  `invariance_bisect_isolated_20261028_{wb0,wb1}_b{1,2,8}`, `attn_b{2,8}`, `rep_b2`.
 
 Round anatomy (DSpark K=5, measured with CUDA events): draft **1.9 ms**, target+verify **21.5 ms**, host ~3 ms; exactly ONE drafter forward per round (DFlash block path). These measurements do not establish a DRAM floor or generalize to every workload.
 
