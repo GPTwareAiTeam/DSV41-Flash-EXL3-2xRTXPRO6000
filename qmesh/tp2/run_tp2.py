@@ -42,11 +42,6 @@ import content_seed  # noqa: E402
 
 OVERLAY = os.environ.get("OVERLAY", "/artifacts/tp2-overlay")
 DSPARK = os.environ.get("DSPARK", "0") == "1"
-DSPARK_HEAD = os.environ.get("DSPARK_HEAD", "ours")
-if DSPARK_HEAD not in ("ours", "diffbot"):
-    raise ValueError("DSPARK_HEAD must be ours or diffbot")
-if DSPARK and DSPARK_HEAD == "diffbot":
-    OVERLAY = os.environ.get("DSPARK_DIFFBOT_OVERLAY", "/work/k7db_overlay")
 DSPARK_DYNAMIC = os.environ.get("DSPARK_DYNAMIC", "0") == "1"
 DSPARK_TARGET_ACC = float(os.environ.get("DSPARK_TARGET_ACC", "0.7"))
 DSPARK_POLICY = os.environ.get("DSPARK_POLICY", "always")
@@ -179,11 +174,7 @@ if LONG_PROMPT_STYLE == "mixed":
     _tokens_per_unit = sum(_FILLERS[k][1] for k in ("prose", "code", "json"))
 else:
     _unit, _tokens_per_unit = _FILLERS[LONG_PROMPT_STYLE]
-if os.environ.get("LONG_PROMPT_FILE"):
-    with open(os.environ["LONG_PROMPT_FILE"], encoding="utf-8") as f:
-        transcript = f.read()
-    PROMPTS = [p + "\n\n" + transcript for p in PROMPTS]
-elif LONG_PROMPT_TOKENS:
+if LONG_PROMPT_TOKENS:
     _reps = max(1, LONG_PROMPT_TOKENS // _tokens_per_unit)
     PROMPTS = [p + (_unit * _reps) for p in PROMPTS]
 
