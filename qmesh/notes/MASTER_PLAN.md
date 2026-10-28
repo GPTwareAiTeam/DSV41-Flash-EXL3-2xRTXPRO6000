@@ -150,6 +150,7 @@ prefix cache being on by default is free at short context.
    `_batch_ok_b1` disagreeing on `q_head_norm`, and a merge that restored the `B==1` restriction so `BATCH>1`
    fell back to eager. Whenever `BATCH>1`, verify `EXL3_DSV4_B1_BATCH=1` **and** that replay counters are non-zero.
 
+| 20 | **Three fused launch merges, now default-on** (`EXL3_DSV41_FUSED_ROPE`, `EXL3_DSV41_FUSED_POOL_SCATTER`, `EXL3_DSV4_FUSED_INDEXER_ROPE`, each `=0` to disable) | verified on main, both ranks, tokens byte-identical: **short 10.78/10.86/10.79 -> 10.67/10.74/10.67 ms/tok (-1.0%)**, **24k 16.55 -> 16.32/16.34 (-1.4%)**, launches/step at 24k **630.8 -> 585.0** | identity matrix passed per dial and combined; focused tests 18 + 9, MoE suite 263. The hg-session A/B saw 16.96 -> 16.34 (-3.7%); absolute baselines differ across sessions, so quote pairings within one session |
 ## A. SHIPPED AND VERIFIED (on `recipe/2x-rtxpro6000-tp2`)
 | 8 | **Prefix caching** (`EXL3_PREFIX_CACHE`) -- commit `036f32da` | **8192-token prompt TTFT 3178 -> 196 ms (16x)**, 2048 -> 936 -> 195 ms (4.8x); partial hits ~1.9x (2048: 921 -> 534, 8192: 3178 -> 1655); effective throughput 2578 -> 41,732 tok/s on a full 8K hit | all 8 full/partial comparisons token-identical on BOTH ranks; KV cost 3200 B/token/GPU from a preallocated pool (no extra allocation); reuse stops at the last page-aligned recurrent checkpoint, so `k*256+1` prompt lengths maximise hits |
 
