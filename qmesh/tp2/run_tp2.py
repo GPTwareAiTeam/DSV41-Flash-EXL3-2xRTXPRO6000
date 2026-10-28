@@ -393,6 +393,9 @@ def set_tp_reduce(model: Model, backend: TPBackendNCCL) -> int:
                 params = {}
             params["backend"] = backend
             hybrid = backend.backend if isinstance(backend, TPBackendTrace) else backend
+            from qmesh.tp2.prefill_ar import PrefillAR
+            if isinstance(hybrid, PrefillAR):
+                hybrid = hybrid.inner
             if not isinstance(hybrid, TPBackendHybrid):
                 return fn(input_ids, params)
             previous = hybrid.prefill
