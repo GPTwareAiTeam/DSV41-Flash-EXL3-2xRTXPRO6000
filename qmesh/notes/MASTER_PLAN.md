@@ -43,6 +43,22 @@ Ties make eager ordering an important correctness constraint, not a proof that d
 ### Long-context capture past 1K: current implementation limitations (2026-10-27)
 The eager candidate path uses CUDA `nonzero()` and data-dependent indexing, which synchronize or produce dynamic shapes unsuitable for graph capture. Padding can change `torch.topk` tie order: on CPU `torch.ones(3).topk(1)` and the same input padded with `-inf` choose different indices. This example rules out naive padding, not every fixed-capacity selector. Selection outside the graph retains the per-layer host synchronization. The current capture gate therefore falls back to eager past roughly 1024 positions; a capture-safe candidate implementation needs correctness validation.
 
+### Long-context candidate compaction (2026-10-28)
+Ties alone do not establish different selected sets: on 32 recorded rows `torch.topk` and `dsa_topk` selected the same
+sets (`tp2logs/longdecode_ab_1028B_tiecheck.log`), but this is not a general proof. The source layer retains `torch.topk`
+unchanged.
+For single-row candidate-use slabs, device compaction emits the same ascending entry list as eager nonzero, padded to
+the 2048-block capacity; `dsa_topk` operates on the scores with padded entries masked. Multirow slabs retain the eager
+path because the union of their selected blocks can exceed that capacity. At 24k, `run_tp2.py`, COMM=p2p, chunk=2048,
+cache=65536, PROFILE (15 steps, rank 0), `aten::nonzero` fell from 8 to 0 calls/step and `cudaLaunchKernel` from 585 to
+557 calls/step (`longdecode_ab_1028B_prof_{e,f}_trace`). Both ranks generated identical tokens in two 32-token pairs.
+Clean back-to-back `longdecode_clean_1028c` runs, `run_tp2.py`, COMM=p2p, chunk=2048, 32 decode tokens: at 24,167
+prompt tokens, cache=65536, rank 0 was 16.42→16.11 and 16.78→15.79 ms/token; at 72,510 prompt tokens, cache=131072,
+16.64→16.09 ms/token. Both ranks' generated tokens were identical in each pair. Host load was 6.59 at start and 8.08 at
+end; GPU0/1 median clocks were 2272/2272 MHz and median power 171.65/192.44 W over the block, including idle periods.
+Long-context full graph capture remains unimplemented: the captured attention body has a separate indexer scoring path
+requiring parity validation.
+
 ### Long-context: what helps and what hurts (measured 2026-10-27)
 - **Long-context speculation is content- and prompt-dependent, not categorically harmful.** P2P, 32 generated tokens,
   prompt IDs 0/1/2, 20k synthetic filler, KV pool 65536, chunk 2048; entries below are in prompt order. Plain and spec

@@ -30,6 +30,11 @@ dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
 # piecewise segment). OFF by default: measured ~2.3 ms/token SLOWER than the eager core and not
 # token-exact yet, so it stays experimental (EXL3_DSV4_B1_BATCH=1 to test it)
 dsv4_b1_batch = os.environ.get("EXL3_DSV4_B1_BATCH", "0") != "0"
+# Candidate pre-filter with a fixed-capacity device-side entry list instead of the eager
+# nonzero() + boolean index (which costs a host sync per reading layer and cannot be captured).
+# Same entry set, same order, same dsa_topk call, so the selection is bitwise identical;
+# EXL3_DSV4_CAND_FIXED=0 restores the nonzero path (A/B only)
+dsv4_cand_fixed = os.environ.get("EXL3_DSV4_CAND_FIXED", "1") != "0"
 from ..constants import PAGE_SIZE
 
 # Reference: transformers models/deepseek_v4 (paper §2)
@@ -1353,12 +1358,32 @@ class DSV4Attention(Module):
             if mode == "use":
                 # A row selects inside its candidate blocks: score only the blocks any row of the slab kept
                 drop = shared["cand"][r0:r1]
+                vis = (pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate
+                if dsv4_cand_fixed and r1 - r0 == 1:
+                    # Device-side compaction into a fixed-capacity entry list: the same ascending
+                    # entry ids as the nonzero path below, -1 padded, so every shape here is static
+                    # (capturable) and no host sync is taken
+                    cap = self.candidate_topk_blocks * bs
+                    ent = g_tensor_cache.get(x.device, (cap,), torch.int32, "dsv4_cand_ent")
+                    ext.dsa_compact_ent((~drop).any(dim = 0), ent, bs, ec)
+                    entc = ent.clamp(min = 0)
+                    rows = entc if block_table is None else block_table.reshape(-1)[entc // epp].long() * epp + entc % epp
+                    # The score backing is a per-call allocation as in the eager path (its width
+                    # must equal cap so the kernel writes every column and S_stride is a single
+                    # Triton compile at any context length)
+                    scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool[rows],
+                                                cap * self.compress_rate, self.compress_rate, cap)
+                    scores.masked_fill_(drop[:, entc // bs], ninf)
+                    scores.masked_fill_(ent >= vis[:, None], ninf)
+                    scores.masked_fill_((ent < 0).unsqueeze(0), ninf)
+                    ext.dsa_topk(scores, sel, min(k, cap), None, 0)
+                    sel.copy_(torch.where(sel < 0, sel, ent[sel.clamp(min = 0)]))
+                    return
                 ent = ((~drop).any(dim = 0).nonzero() * bs + torch.arange(bs, device = x.device)).flatten()
                 ent = ent[ent < ec]
                 rows = ent if block_table is None else block_table.reshape(-1)[ent // epp].long() * epp + ent % epp
                 scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool[rows], ent.numel() * self.compress_rate,
                                             self.compress_rate, ent.numel())
-                vis = (pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate
                 scores.masked_fill_(drop[:, ent // bs], ninf)
                 scores.masked_fill_(ent >= vis[:, None], ninf)
                 ext.dsa_topk(scores, sel, min(k, ent.numel()), None, 0)
