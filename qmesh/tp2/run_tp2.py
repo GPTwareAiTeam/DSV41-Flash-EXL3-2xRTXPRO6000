@@ -146,15 +146,29 @@ PROMPTS = [
     "Use valid JSON with no commentary.",
 ]
 # LONG_PROMPT_TOKENS: append synthetic filler to every prompt so the runner can exercise long-context behaviour
-# (20k-100k prompts) without a real document. The filler is plain English prose; the log prints the true
-# prompt_tokens, so quote that rather than assuming the requested size was hit exactly.
+# (20k-100k prompts) without a real document. The log prints the true prompt_tokens, so quote that rather than
+# assuming the requested size was hit exactly.
+# LONG_PROMPT_STYLE picks the filler content, because draft acceptance depends on the text: 'prose' is narrative,
+# 'code' is a fenced Python listing with identifiers and braces, 'json' is a repeated structured record, and 'mixed'
+# interleaves all three (closest to an OMP/Hermes transcript of tool output plus code plus commentary).
 LONG_PROMPT_TOKENS = int(os.environ.get("LONG_PROMPT_TOKENS", "0"))
-_FILLER_SENTENCE = ("The agent reviewed the archive, reconciled the ledger entries, and recorded each result "
-                    "in the running log before continuing to the next section of the report. ")
+LONG_PROMPT_STYLE = os.environ.get("LONG_PROMPT_STYLE", "prose")
+_FILLERS = {
+    "prose": ("The agent reviewed the archive, reconciled the ledger entries, and recorded each result "
+              "in the running log before continuing to the next section of the report. ", 24),
+    "code": ("def reconcile(ledger, entries):\n    totals = {}\n    for key, value in entries.items():\n"
+             "        totals[key] = totals.get(key, 0) + value\n    return {k: v for k, v in totals.items() if v}\n", 62),
+    "json": ('{"id": 4417, "status": "ok", "fields": {"name": "archive", "tags": ["ledger", "review"], '
+             '"count": 12}, "ok": true}\n', 30),
+}
+if LONG_PROMPT_STYLE == "mixed":
+    _unit = "".join([_FILLERS[k][0] for k in ("prose", "code", "json")])
+    _tokens_per_unit = sum(_FILLERS[k][1] for k in ("prose", "code", "json"))
+else:
+    _unit, _tokens_per_unit = _FILLERS[LONG_PROMPT_STYLE]
 if LONG_PROMPT_TOKENS:
-    # ~24 tokens per sentence; overshoot and let the caller report the actual length
-    _reps = max(1, LONG_PROMPT_TOKENS // 24)
-    PROMPTS = [p + (_FILLER_SENTENCE * _reps) for p in PROMPTS]
+    _reps = max(1, LONG_PROMPT_TOKENS // _tokens_per_unit)
+    PROMPTS = [p + (_unit * _reps) for p in PROMPTS]
 
 
 def log(msg: str):
