@@ -8,6 +8,21 @@ Targets: **300 tok/s decode**, **8000 tok/s prefill**.
 Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 tok/s @2K, 362.9 aggregate @4 streams,
 11.2k prefill @40K, fp8 KV.
 
+### Long-context: what helps and what hurts (measured 2026-10-27)
+- **Speculative decoding HURTS at long context**: at 24k tokens, DSpark K=5 gives **19.89 ms/tok vs 16.58 plain**
+  (acceptance 0.33, AL 1.71). The drafter is cheap at long context but the verify rows are not, and the whole path is
+  eager there. Do not enable spec for long-context serving until capture works past 1K; re-measure then.
+- **Prefix caching is the big lever for agent loops**: 20k full hit **126 ms vs 6.9 s cold (55x)**; 60k **154 ms vs 21 s (~130x)**;
+  two alternating 60k contexts both hit at 155/154 ms; a 60k context growing ~1k per turn keeps **98.2-98.3% cached**
+  (TTFT 496-529 ms, with one unexplained 5175 ms outlier at a checkpoint boundary).
+- **Its cost is real**: the cache currently forces prefill chunk 1024, so cold runs are ~35% slower than the 8192-chunk
+  baseline (20k cold 6851-6904 ms vs 5081 ms at chunk 8192 for 24k tokens). Fixing that decoupling is the prerequisite
+  for making it default-on.
+- **Memory per long context online**: ~1.98 GB of *system RAM* for recurrent checkpoints (59 of them) plus **183 MiB of
+  GPU KV** for a 60k context; the 4 GiB `EXL3_PREFIX_CACHE_CAPACITY` is the host checkpoint budget, not GPU memory.
+- **The auto-chunker does not reserve the drafter**: with `DSPARK=1` at 24k the default chunk 8192 OOMs (needs ~640 MiB
+  more), so long-context spec runs need `MAX_CHUNK=2048` today.
+
 ## LONG-CONTEXT BASELINE (the owner's real workload: 20k-100k prompts)
 Measured in the runner (end-to-end, `COMM=hybrid`, chunk 8192, graphs on, `EXL3_DSV4_B1_BATCH=1`):
 | prompt tokens | TTFT | prefill tok/s | decode ms/tok |
