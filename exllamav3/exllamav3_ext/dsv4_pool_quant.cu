@@ -163,3 +163,50 @@ void dsv4_pool_quant_scatter
     dsv4_pool_quant_scatter_gr(stage, pool_q, pool_s, pool_r, pool_bt, position, position_tensor,
                                m, seq, pool_epp, nullptr);
 }
+
+__global__ void dsv4_pool_scatter_kernel(
+    const int64_t* rows, const half* keys, const half* stage,
+    half* pool_idx, half* pool_c, half* pool_r, int di, int dc, int dr)
+{
+    const int i = blockIdx.x;
+    const size_t row = rows[i];
+    for (int c = threadIdx.x; c < di; c += blockDim.x)
+        pool_idx[row * di + c] = keys[(size_t) i * di + c];
+    for (int c = threadIdx.x; c < dc; c += blockDim.x)
+        pool_c[row * dc + c] = stage[(size_t) i * (dc + dr) + c];
+    for (int c = threadIdx.x; c < dr; c += blockDim.x)
+        pool_r[row * dr + c] = stage[(size_t) i * (dc + dr) + dc + c];
+}
+
+void dsv4_pool_scatter(
+    const at::Tensor& rows, const at::Tensor& keys, const at::Tensor& stage,
+    at::Tensor pool_idx, at::Tensor pool_c, at::Tensor pool_r)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(stage.device());
+    TORCH_CHECK_DTYPE(rows, kLong);
+    TORCH_CHECK_DTYPE(keys, kHalf);
+    TORCH_CHECK_DTYPE(stage, kHalf);
+    TORCH_CHECK_DTYPE(pool_idx, kHalf);
+    TORCH_CHECK_DTYPE(pool_c, kHalf);
+    TORCH_CHECK_DTYPE(pool_r, kHalf);
+    TORCH_CHECK(rows.dim() == 1 && keys.dim() == 2 && stage.dim() == 2 &&
+                pool_idx.dim() == 2 && pool_c.dim() == 2 && pool_r.dim() == 2,
+                "dsv4_pool_scatter: invalid dimensions");
+    TORCH_CHECK(rows.is_contiguous() && keys.is_contiguous() && stage.is_contiguous() &&
+                pool_idx.is_contiguous() && pool_c.is_contiguous() && pool_r.is_contiguous(),
+                "dsv4_pool_scatter: non-contiguous tensor");
+    TORCH_CHECK(rows.device() == stage.device() && keys.device() == stage.device() &&
+                pool_idx.device() == stage.device() && pool_c.device() == stage.device() &&
+                pool_r.device() == stage.device(), "dsv4_pool_scatter: device mismatch");
+    TORCH_CHECK(keys.size(0) == rows.size(0) && stage.size(0) == rows.size(0) &&
+                keys.size(1) == pool_idx.size(1) &&
+                stage.size(1) == pool_c.size(1) + pool_r.size(1) &&
+                pool_idx.size(0) == pool_c.size(0) && pool_c.size(0) == pool_r.size(0),
+                "dsv4_pool_scatter: incompatible shapes");
+    if (!rows.numel()) return;
+    dsv4_pool_scatter_kernel<<<rows.numel(), 256, 0, at::cuda::getCurrentCUDAStream().stream()>>>(
+        (const int64_t*) rows.data_ptr(), (const half*) keys.data_ptr(), (const half*) stage.data_ptr(),
+        (half*) pool_idx.data_ptr(), (half*) pool_c.data_ptr(), (half*) pool_r.data_ptr(),
+        (int) keys.size(1), (int) pool_c.size(1), (int) pool_r.size(1));
+    cuda_check(cudaPeekAtLastError());
+}

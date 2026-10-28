@@ -40,3 +40,9 @@ void dsv4_pool_quant_scatter
     int seq,
     int pool_epp
 );
+
+// Copy staged fp16 latent rows and their index keys into the paged pools.
+void dsv4_pool_scatter(
+    const at::Tensor& rows, const at::Tensor& keys, const at::Tensor& stage,
+    at::Tensor pool_idx, at::Tensor pool_c, at::Tensor pool_r
+);

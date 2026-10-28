@@ -201,6 +201,7 @@ void rope_kernel
         // RMS Norm
         auto apply_norm = [&] ()
         {
+            const bool norm_active = active && norm_weight;
             half2 *tptr = (half2*)(sh_head + t * 2);
             int lane_id = threadIdx.x % 32;
             int warp_id = threadIdx.x / 32;
@@ -212,7 +213,7 @@ void rope_kernel
             float v1 = 0.0f;
             float v2 = 0.0f;
             float sum = 0.0f;
-            if (active)
+            if (norm_active)
             {
                 v = *tptr;
                 v1 = __low2float(v);
@@ -223,7 +224,7 @@ void rope_kernel
             }
             __syncthreads();
 
-            if (active)
+            if (norm_active)
             {
                 sum = sums[warps * t_head];
                 for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
@@ -236,7 +237,7 @@ void rope_kernel
 
             // Downcast, apply weight and store. Lanes past head_dim / 2 (block rounded up to whole warps)
             // hold padding and must not read the weight
-            if (active && t * 2 < head_dim)
+            if (norm_active && t * 2 < head_dim)
             {
                 if constexpr (norm_bf16)
                 {
@@ -277,7 +278,7 @@ void rope_kernel
 
         // Do the things
         load_head();
-        if (q_norm) apply_norm();
+        if (q_norm || k_norm) apply_norm();
         apply_rope();
         if (l4_scaling != 1.0f) apply_l4_scaling(head_idx < num_heads_q ? l4_scaling : 1.0f);
         store_head();
@@ -298,8 +299,8 @@ Apply position embeddings, works in-place
 - position_ids: tensor of shape (bsz, seq_len), int, optional
 - rope_mode: ROPESTYLE_NEOX
 - attn_factor: scale for sin/cos factors
-- q_norm: optional RMS norm weight, must be supplied with k_norm
-- k_norm: optional RMS norm weight, must be supplied with q_norm
+- q_norm: optional query RMS norm weight
+- k_norm: optional key RMS norm weight
 - norm_eps
 - norm_constant_bias
 
@@ -416,17 +417,16 @@ void rope_gr
     void* k_norm_ptr = (void*) OPTPTR(k_norm);
     bool norm_fp16 = true;
     bool norm_bf16 = false;
-    // The kernel normalizes k heads only when q heads are, and then reads k_norm unguarded
-    TORCH_CHECK(q_norm.has_value() || !k_norm.has_value(), "rope: k_norm requires q_norm");
-    TORCH_CHECK(!q_norm.has_value() || !k.has_value() || k_norm.has_value(), "rope: q_norm with k requires k_norm");
-    if (q_norm.has_value())
+    TORCH_CHECK(!k_norm.has_value() || k.has_value(), "rope: k_norm requires k");
+    if (q_norm.has_value() || k_norm.has_value())
     {
         TORCH_CHECK(head_dim > 0, "rope: q/k norm over an empty head_dim");
-        TORCH_CHECK_DIM(q_norm.value(), 1);
-        TORCH_CHECK(q_norm.value().size(0) == head_dim, "q_norm is incorrect size");
-        norm_bf16 = q_norm.value().dtype() == at::kBFloat16;
-        norm_fp16 = q_norm.value().dtype() == at::kHalf;
-        if (k_norm.has_value())
+        const auto& norm = q_norm.has_value() ? q_norm.value() : k_norm.value();
+        TORCH_CHECK_DIM(norm, 1);
+        TORCH_CHECK(norm.size(0) == head_dim, "rope: norm is incorrect size");
+        norm_bf16 = norm.dtype() == at::kBFloat16;
+        norm_fp16 = norm.dtype() == at::kHalf;
+        if (q_norm.has_value() && k_norm.has_value())
         {
             TORCH_CHECK(k_norm.value().dtype() == q_norm.value().dtype(), "q_norm and k_norm must be same dtype");
             TORCH_CHECK(k_norm.value().dim() == 1 && k_norm.value().size(0) == head_dim, "k_norm is incorrect size");

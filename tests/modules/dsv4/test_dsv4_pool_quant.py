@@ -67,6 +67,25 @@ def test_scatter(device, i, bits, D_c, D_r, m, seq, pos_list):
         "scatter wrote outside the addressed entries"
 
 
+@pytest.mark.parametrize("n, dc, dr, di", [(0, 32, 16, 24), (1, 448, 64, 128), (9, 33, 17, 21)])
+def test_fp16_pool_scatter_bitwise(device, n, dc, dr, di):
+    # Arbitrary half bit patterns include signed zero, infinities and NaN payloads.
+    def bits(shape):
+        return torch.randint(-32768, 32768, shape, dtype = torch.int16, device = device).view(torch.half)
+
+    rows = torch.randperm(16, device = device)[:n]
+    stage = bits((n, dc + dr))
+    keys = bits((n, di))
+    pools = [bits((16, width)) for width in (di, dc, dr)]
+    ref = [p.clone() for p in pools]
+    ref[0][rows] = keys
+    ref[1][rows] = stage[:, :dc]
+    ref[2][rows] = stage[:, dc:]
+    ext.dsv4_pool_scatter(rows, keys, stage, *pools)
+    for actual, expected in zip(pools, ref):
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.fixture(scope = "module")
 def model_caches(tmp_path_factory, device):
     from exllamav3.cache import Cache, CacheLayer_quant
