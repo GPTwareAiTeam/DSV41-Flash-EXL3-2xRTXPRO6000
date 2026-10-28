@@ -53,13 +53,12 @@ def run_arm(tag, dial, value, long_context, profile, timeout):
         args.extend(['-e', f'{key}={val}'])
     telemetry = None
     try:
-        if profile:
-            gpu_file = open(LOGS / f'{tag}_gpu.csv', 'x')
-            try:
-                telemetry = subprocess.Popen(['nvidia-smi', '--query-gpu=timestamp,index,memory.used,utilization.gpu,clocks.sm,power.draw,clocks_throttle_reasons.active',
-                                              '--format=csv,noheader', '-l', '1'], stdout=gpu_file, stderr=subprocess.STDOUT)
-            finally:
-                gpu_file.close()
+        gpu_file = open(LOGS / f'{tag}_gpu.csv', 'x')
+        try:
+            telemetry = subprocess.Popen(['nvidia-smi', '--query-gpu=timestamp,index,memory.used,utilization.gpu,clocks.sm,power.draw,clocks_throttle_reasons.active',
+                                          '--format=csv,noheader', '-l', '1'], stdout=gpu_file, stderr=subprocess.STDOUT)
+        finally:
+            gpu_file.close()
         print(f'Launching {tag}: {options}', flush=True)
         deadline = time.monotonic() + timeout
         with open(LOGS / f'{tag}_launcher.log', 'x') as log:
