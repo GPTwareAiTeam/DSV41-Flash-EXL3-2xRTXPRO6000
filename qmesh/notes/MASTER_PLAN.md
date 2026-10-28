@@ -9,9 +9,13 @@ Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 t
 11.2k prefill @40K, fp8 KV.
 
 ### Long-context: what helps and what hurts (measured 2026-10-27)
-- **Speculative decoding HURTS at long context**: at 24k tokens, DSpark K=5 gives **19.89 ms/tok vs 16.58 plain**
-  (acceptance 0.33, AL 1.71). The drafter is cheap at long context but the verify rows are not, and the whole path is
-  eager there. Do not enable spec for long-context serving until capture works past 1K; re-measure then.
+- **Speculative decoding at long context: OPEN, not decided.** One measurement exists and it is not sufficient to rule
+  anything out: prompt 0 + repeated-sentence filler at 24,167 tokens, `MAX_CHUNK=2048` (forced by a drafter OOM at chunk
+  8192), DSpark K=5 gave 19.89 ms/tok vs 16.58 plain with acceptance **0.33 / AL 1.71**. That input is degenerate
+  (the filler is one sentence repeated ~1000 times, so the model loops) and the chunk was not the shipping one.
+  Acceptance 0.33 vs 0.66-0.91 at short context may be the content, the chunk, the eager path, or the drafter's taps at
+  long range - unknown. **Needs a proper sweep**: content type (prose / code fence / JSON / tool-style), context length
+  (0 / 4k / 20k / 60k), K in {2,3,5}, shipping chunk, and acceptance + AL reported per cell, not a blanket rule.
 - **Prefix caching is the big lever for agent loops**: 20k full hit **126 ms vs 6.9 s cold (55x)**; 60k **154 ms vs 21 s (~130x)**;
   two alternating 60k contexts both hit at 155/154 ms; a 60k context growing ~1k per turn keeps **98.2-98.3% cached**
   (TTFT 496-529 ms, with one unexplained 5175 ms outlier at a checkpoint boundary).
