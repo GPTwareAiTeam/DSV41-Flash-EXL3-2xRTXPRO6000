@@ -119,6 +119,17 @@ Short-context decode for comparison: 10.77-10.84 ms/tok.
 Prefill is ~4.6-4.8k tok/s at these lengths, i.e. a 100k prompt costs ~21 s TTFT cold; prefix caching is the lever that matters
 (`EXL3_PREFIX_CACHE`, merged into main at `8ec9c9c8`, default off, verified 16x at 8k).
 
+### Captured-NCCL hang: root-caused and fixed (commit `10e820fe`, note `qmesh/notes/SpecCollectiveHang.md`)
+`COMM=hybrid` routes an all-reduce to NCCL once the payload is >= 64 KB. A speculative verify step at 4 rows stages
+4 x 5120 x 4 = **81,920 B**, so under graph capture it issued **NCCL inside a captured region** - which cannot be replayed
+and hangs the box. Traced evidence: `step 54 seq 3849 shape (1,4,5120) 81920 bytes transport=nccl capture=True`, with
+both ranks' collective sequences *matching* (so it was never a rank-divergence problem), followed by the exact original
+symptom: generation completes, then both ranks block at the final barrier.
+Fix (three layers): `_pick` returns **P2P whenever the stream is capturing**; NCCL capture guards; and a startup
+rejection `DSPARK=1 with COMM=hybrid is unsafe: use COMM=p2p`. Verified afterwards: decode 10.78/10.86/10.79 ms/tok
+(unchanged) and hybrid prefill 4760 tok/s (unchanged), so the guard is free.
+**Rule for the repo: NCCL must never be inside a captured region; with hybrid, any captured collective over 64 KB hangs.**
+
 ### Post-merge verification (2026-10-27, after prefix-cache + collective-capture + 4 MiB arena)
 Short-context decode **10.83/10.86/10.84 ms/tok** (was 10.77/10.84/10.83) and **B4 17.94 ms/tok per stream /
 206.02 tok/s aggregate** (was 17.89 / 203.0), tokens byte-identical. So the four merges cost nothing and the
