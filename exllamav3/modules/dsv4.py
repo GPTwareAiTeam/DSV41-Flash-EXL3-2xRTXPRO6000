@@ -1010,7 +1010,7 @@ class DSV4Attention(Module):
 
     def _rope_qkv(self, q, kv, position, positions = None):
         rd = self.rope_head_dim
-        if self.q_head_norm or os.environ.get("EXL3_DSV41_FUSED_ROPE", "0") != "0":
+        if os.environ.get("EXL3_DSV41_FUSED_ROPE", "1") != "0":
             ext.rope(
                 q, q, kv, kv, self._rope_type(), position, positions, None,
                 int(RopeStyle.GPTJ), 1.0, self.q_ones if self.q_head_norm else None,
@@ -1300,7 +1300,7 @@ class DSV4Attention(Module):
         k = self.idx_k_norm.forward(self.idx_wk.forward(lat.unsqueeze(0), params), params, out_dtype = torch.half)
         positions = e0 if isinstance(e0, torch.Tensor) else torch.arange(n, dtype = torch.int, device = lat.device) + e0
         pos = (positions * self.compress_rate).unsqueeze(0)
-        if os.environ.get("EXL3_DSV4_FUSED_INDEXER_ROPE", "0") != "0":
+        if os.environ.get("EXL3_DSV4_FUSED_INDEXER_ROPE", "1") != "0":
             kr = k.view(1, n, 1, -1)[..., -self.rope_head_dim:]
             lr = lat.view(1, n, 1, -1)[..., -self.rope_head_dim:]
             ext.rope(
@@ -2051,7 +2051,7 @@ class DSV4Attention(Module):
                 rows = torch.arange(e0, ec, device = device)
                 rows = bt_row[0, rows // epp].long() * epp + rows % epp
                 keys = self._indexer_keys(stage[:ec - e0], params, e0)
-                if not kl.quant and os.environ.get("EXL3_DSV41_FUSED_POOL_SCATTER", "0") != "0":
+                if not kl.quant and os.environ.get("EXL3_DSV41_FUSED_POOL_SCATTER", "1") != "0":
                     ext.dsv4_pool_scatter(rows, keys, stage[:ec - e0],
                                           kl.pool_idx.view(-1, kl.D_i), kl.pool_c.view(-1, kl.D_c), pool_r_flat)
                 else:
