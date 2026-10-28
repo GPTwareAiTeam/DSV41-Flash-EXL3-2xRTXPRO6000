@@ -8,6 +8,19 @@ Targets: **300 tok/s decode**, **8000 tok/s prefill**.
 Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 tok/s @2K, 362.9 aggregate @4 streams,
 11.2k prefill @40K, fp8 KV.
 
+### Where the long-context 16.55 ms/tok actually goes (profile at 24,167 tokens, `PROFILE=1`)
+- **CUDA total 205.2 ms over 32 tokens = 6.4 ms/token**; wall is 16.55 ms/token. **~10 ms/token is host/gap.**
+- **296 kernel launches per token** (`cudaLaunchKernel` 9,462 calls / 32 tokens, 35.8 ms of CPU) and
+  **120 `aten::nonzero` calls** (0.79 ms of GPU time but each one synchronises the host) - that is the eager attention
+  path, which the 1K-position gate forces us into.
+- Top GPU consumers by op: `aten::matmul` 6.8 ms / 204 calls, `aten::mm` 6.8 ms / 189, `aten::index` 2.6 ms / 399,
+  `aten::_foreach_copy_` 2.0 ms / 645, `aten::copy_` 1.5 ms / 1449.
+- **Conclusion: long-context decode is HOST-bound, not KV-bound.** The lever is fewer launches and fewer syncs in the
+  eager attention path - not a bigger capture and not KV bandwidth. Concretely: capture the attention body for the
+  top-k regime is blocked (see above), but the *launch count* of the eager path can be attacked directly, and the
+  `nonzero` syncs can be replaced with a device-side count + fixed-capacity gather for the parts that do not need
+  exact tie semantics.
+
 ### Long-context capture past 1K: NOT FEASIBLE without redesigning candidate use (established 2026-10-27)
 Three independent walls, each verified:
 1. **`nonzero()` synchronises the host.** Eager `_indexer_topk` (`dsv4.py` ~1349-1353) does CUDA `nonzero()` plus a
