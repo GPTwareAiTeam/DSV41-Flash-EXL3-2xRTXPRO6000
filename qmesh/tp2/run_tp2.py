@@ -99,6 +99,9 @@ CHUNK_MIN = int(os.environ.get("PREFILL_CHUNK_MIN", "512"))
 CHUNK_PEAK_TABLE_RAW = os.environ.get("CHUNK_PEAK_TABLE", "2048=87600,4096=90600,8192=94000,16384=97100")
 CHUNK_PEAK_REF_TOKENS = int(os.environ.get("CHUNK_PEAK_REF_TOKENS", "33536"))
 VRAM_RESERVE_MIB = float(os.environ.get("VRAM_RESERVE_MIB", "2048"))  # graphs, workspaces, allocator slack
+# Measured long-context DSpark with an 8192-row chunk exceeded the device by
+# about 640 MiB; reserve additional space for drafter weights and graphs.
+DSPARK_RESERVE_MIB = float(os.environ.get("DSPARK_RESERVE_MIB", "2048"))
 KV_BYTES_PER_TOKEN = float(os.environ.get("KV_BYTES_PER_TOKEN", "2150" if KV_BITS == 8 else "3200"))  # per rank, pool only
 CHUNK_PEAK_TABLE = sorted((int(rows), float(mib)) for rows, mib in
                           (pair.split("=") for pair in CHUNK_PEAK_TABLE_RAW.split(",") if pair.strip()))
@@ -125,7 +128,7 @@ def resolve_max_chunk(device):
     total_mib = total / (1024 * 1024)
     kv_mib = CACHE_TOKENS * KV_BYTES_PER_TOKEN / (1024 * 1024)
     kv_ref_mib = CHUNK_PEAK_REF_TOKENS * KV_BYTES_PER_TOKEN / (1024 * 1024)
-    limit = total_mib - VRAM_RESERVE_MIB - (kv_mib - kv_ref_mib)
+    limit = total_mib - VRAM_RESERVE_MIB - (DSPARK_RESERVE_MIB if DSPARK else 0) - (kv_mib - kv_ref_mib)
     fits = [c for c in sorted(CHUNK_CANDIDATES, reverse = True) if _peak_mib(c) <= limit]
     chunk = fits[0] if fits else CHUNK_MIN
     return chunk, dict(total_mib = total_mib, kv_mib = kv_mib, kv_ref_mib = kv_ref_mib, limit_mib = limit,
@@ -144,7 +147,12 @@ PROMPTS = [
     # index 5: structured JSON (keys, braces, schema-shaped output)
     "Return only a JSON object describing a user with keys name, age, email, and a list field roles of strings. "
     "Use valid JSON with no commentary.",
+    "Explain why the sky appears blue.",
+    "Give a short recipe for tomato soup.",
+    "Name three planets in our solar system.",
 ]
+if os.environ.get("SHORT_PROMPTS") == "1":
+    PROMPTS[3] = "Describe a peaceful morning in one sentence."
 # LONG_PROMPT_TOKENS: append synthetic filler to every prompt so the runner can exercise long-context behaviour
 # (20k-100k prompts) without a real document. The log prints the true prompt_tokens, so quote that rather than
 # assuming the requested size was hit exactly.
@@ -173,6 +181,15 @@ if LONG_PROMPT_TOKENS:
 
 def log(msg: str):
     print(f"[{TAG}] {msg}", flush=True)
+
+
+
+class RankAgreedGreedySampler(GreedySampler):
+    """Keep verification acceptance and policy state identical on both ranks."""
+    def forward(self, *args, **kwargs):
+        token = super().forward(*args, **kwargs)
+        dist.broadcast(token, src = 0)
+        return token
 
 
 class TPBackendNCCL:
@@ -276,18 +293,36 @@ HYBRID_NCCL_MIN_BYTES = int(os.environ.get("HYBRID_NCCL_MIN_BYTES", 64 * 1024))
 
 
 class TPBackendHybrid:
-    """P2PComm for small payloads (decode), NCCL for large ones (prefill rows). The choice depends only on
-    numel and dtype, so both ranks issue the same collective sequence."""
+    """Use NCCL for large prefill reductions and P2P for every decode reduction.
+
+    Decode transport must not depend on local graph-capture state: ranks can be
+    capturing and replaying at different times, but must issue the same collective.
+    """
 
     def __init__(self, nccl: "TPBackendNCCL", p2p: "TPBackendP2P"):
         self.nccl = nccl
         self.p2p = p2p
+        self.prefill = False
+
+    @property
+    def piecewise_p2p_capture(self):
+        return not self.prefill
+
+    @property
+    def disable_piecewise_capture(self):
+        return self.prefill
+
+    def sync_draft_ids(self, ids):
+        shared = ids.contiguous()
+        dist.broadcast(shared, src = 0)
+        ids.copy_(shared)
+
 
     def fwd_barrier(self):
         self.p2p.fwd_barrier()
 
     def _pick(self, tensor: torch.Tensor):
-        if torch.cuda.is_current_stream_capturing():
+        if not self.prefill:
             return self.p2p
         return self.nccl if tensor.numel() * tensor.element_size() >= HYBRID_NCCL_MIN_BYTES else self.p2p
 
@@ -352,16 +387,25 @@ def set_tp_reduce(model: Model, backend: TPBackendNCCL) -> int:
             m.mlp.tp_reduce = True
             n += 1
 
-    def with_backend(fn):
+    def with_backend(fn, is_prefill):
         def wrapped(input_ids, params = None):
             if params is None:
                 params = {}
             params["backend"] = backend
-            return fn(input_ids, params)
+            hybrid = backend.backend if isinstance(backend, TPBackendTrace) else backend
+            if not isinstance(hybrid, TPBackendHybrid):
+                return fn(input_ids, params)
+            previous = hybrid.prefill
+            # MTP prompt processing uses forward to export final-layer states.
+            hybrid.prefill = is_prefill or bool(params.get("last_tokens_only"))
+            try:
+                return fn(input_ids, params)
+            finally:
+                hybrid.prefill = previous
         return wrapped
 
-    model.prefill = with_backend(model.prefill)
-    model.forward = with_backend(model.forward)
+    model.prefill = with_backend(model.prefill, True)
+    model.forward = with_backend(model.forward, False)
     return n
 
 
@@ -397,8 +441,6 @@ def wrap_vocab_split(model: Model, rank: int, world: int, backend: TPBackendNCCL
 
 
 def main():
-    if DSPARK and COMM == "hybrid":
-        raise ValueError("DSPARK=1 with COMM=hybrid is unsafe: use COMM=p2p")
     if DSPARK_POLICY not in ("always", "auto"):
         raise ValueError("DSPARK_POLICY must be always or auto")
     if DSPARK_POLICY == "auto" and (not DSPARK or BATCH != 1 or DSPARK_DYNAMIC):
@@ -415,12 +457,16 @@ def main():
         f"checkpoint tp_size/tp_rank {config.tp_size}/{config.tp_rank} != launch {WORLD}/{RANK}"
     model = Model.from_config(config)
     max_chunk, chunk_info = resolve_max_chunk(device)
+    # Both ranks must process identical shapes even if their local budgets differ.
+    agreed_chunk = torch.tensor(max_chunk, dtype = torch.int32, device = device)
+    dist.all_reduce(agreed_chunk, op = dist.ReduceOp.MIN)
+    max_chunk = int(agreed_chunk.item())
     if chunk_info is None:
         log(f"PREFILL_CHUNK fixed at {max_chunk} rows (MAX_CHUNK={MAX_CHUNK_RAW}), CTX_TOKENS={CACHE_TOKENS}")
     else:
         log(f"PREFILL_CHUNK auto -> {max_chunk} rows | total={chunk_info['total_mib']:.0f} MiB "
             f"kv={chunk_info['kv_mib']:.0f} MiB (ref {chunk_info['kv_ref_mib']:.0f}) "
-            f"reserve={VRAM_RESERVE_MIB:.0f} MiB limit={chunk_info['limit_mib']:.0f} MiB "
+            f"reserve={VRAM_RESERVE_MIB + (DSPARK_RESERVE_MIB if DSPARK else 0):.0f} MiB limit={chunk_info['limit_mib']:.0f} MiB "
             f"predicted_peak={chunk_info['peak_mib']:.0f} MiB free_now={chunk_info['free_mib']:.0f} MiB "
             f"CTX_TOKENS={CACHE_TOKENS}")
     cache = Cache(model, max_num_tokens = CACHE_TOKENS, max_history = MAX_HISTORY, max_batch_size = BATCH, **KV_CACHE_KWARGS)
@@ -453,6 +499,20 @@ def main():
         draft_model.load(device = device, progressbar = False)
         n_draft = set_tp_reduce(draft_model, backend)
         log(f"DRAFT_LOADED blocks={n_draft} free_GiB={torch.cuda.mem_get_info(device)[0] / 2**30:.2f}")
+        # Replicated confidence heads can differ numerically between ranks.
+        # Agree on draft IDs and the confidence gate before verification.
+        sample_from_state = draft_model.sample_from_state
+        def synchronized_draft_sample(state, params):
+            ids = sample_from_state(state, params)
+            dist.broadcast(ids, src = 0)
+            if "draft_confidence_len" in params:
+                length = torch.tensor(params["draft_confidence_len"], dtype = torch.int32, device = device)
+                dist.broadcast(length, src = 0)
+                params["draft_confidence_len"] = int(length.item())
+            if "draft_conf" in params:
+                dist.broadcast(params["draft_conf"], src = 0)
+            return ids
+        draft_model.sample_from_state = synchronized_draft_sample
     # DSPARK_DYNAMIC=1: the generator's confidence calibrator sizes each round's window against DSPARK_TARGET_ACC
     # (drafter must export draft_conf; run with EXL3_DSPARK_CONF=0 so the static gate does not also cut)
     generator = Generator(model, cache, tokenizer, max_batch_size = BATCH,
@@ -521,10 +581,11 @@ def main():
     # Warm pass: one short job so graph capture and allocator warmup stay out of the timed prompts
     _warm_text = encode_messages([{"role": "user", "content": PROMPTS[PROMPT_IDS[0]]}], thinking_mode = "chat")
     _warm_ids = tokenizer.encode(_warm_text, add_bos = False, encode_special_tokens = True)
-    for _ in range(BATCH):
-        _warm = Job(input_ids = _warm_ids, max_new_tokens = WARM_TOKENS, min_new_tokens = WARM_TOKENS,
-                    sampler = GreedySampler(), stop_conditions = [])
-        generator.enqueue(_warm)
+    if WARM_TOKENS:
+        for _ in range(BATCH):
+            _warm = Job(input_ids = _warm_ids, max_new_tokens = WARM_TOKENS, min_new_tokens = WARM_TOKENS,
+                        sampler = RankAgreedGreedySampler(), stop_conditions = [])
+            generator.enqueue(_warm)
     while generator.num_remaining_jobs():
         for _ in generator.iterate():
             pass
@@ -541,11 +602,12 @@ def main():
             text_in = encode_messages([{"role": "user", "content": PROMPTS[idx]}], thinking_mode = "chat")
             ids = tokenizer.encode(text_in, add_bos = False, encode_special_tokens = True)
             job = Job(input_ids = ids, max_new_tokens = MAX_NEW,
-                      min_new_tokens = MAX_NEW if IGNORE_EOS else 0, sampler = GreedySampler(),
-                      stop_conditions = [] if IGNORE_EOS else [tokenizer.eos_token_id])
+                      min_new_tokens = MAX_NEW if IGNORE_EOS else 0, sampler = RankAgreedGreedySampler(),
+                      stop_conditions = [] if IGNORE_EOS else [tokenizer.eos_token_id],
+                      return_logits = bool(LOGITS_OUT))
             jobs.append(job)
             streams.append({"key": f"{idx}.{slot}", "idx": idx, "serial": None, "tokens": [], "marks": [],
-                            "eos": None, "prompt_tokens": ids.shape[-1]})
+                            "logits": [], "eos": None, "prompt_tokens": ids.shape[-1]})
             generator.enqueue(job)
         by_serial = {j.serial_number: s for j, s in zip(jobs, streams)}
         t1 = time.time()
@@ -559,6 +621,8 @@ def main():
                 if "token_ids" in result:
                     s["tokens"] += result["token_ids"][0].tolist()
                     s["marks"].append(time.time() - t1)
+                if "logits" in result and LOGITS_OUT:
+                    s["logits"].append(result["logits"].float().cpu())
                 if result.get("eos"):
                     s["eos"] = result.get("eos_reason")
         wall = time.time() - t1
@@ -569,6 +633,12 @@ def main():
             first = s["marks"][0] if s["marks"] else float("nan")
             decode = (s["marks"][-1] - first) / max(n - 1, 1) if n > 1 else float("nan")
             out[s["key"]] = s["tokens"]
+            if LOGITS_OUT and s["logits"]:
+                rows = torch.cat([row.reshape(-1, row.shape[-1]) for row in s["logits"]])
+                if os.environ.get("LOGITS_FULL") == "1":
+                    torch.save(rows, f"{LOGITS_OUT}.{s['key']}.rank{RANK}.pt")
+                values, indices = torch.topk(rows, 5, dim = -1)
+                logit_out[s["key"]] = {"values": values.tolist(), "indices": indices.tolist()}
             log(f"STREAM {s['key']} prompt_tokens={s['prompt_tokens']} new_tokens={n} first_token_ms={first * 1e3:.1f} "
                 f"decode_ms_per_tok={decode * 1e3:.2f} eos={s['eos']}")
             log(f"TOKENS {s['key']} {s['tokens']}")
@@ -585,7 +655,7 @@ def main():
             input_ids = ids,
             max_new_tokens = MAX_NEW,
             min_new_tokens = MAX_NEW if IGNORE_EOS else 0,
-            sampler = GreedySampler(),
+            sampler = RankAgreedGreedySampler(),
             stop_conditions = [] if IGNORE_EOS else [tokenizer.eos_token_id],
             return_logits = bool(LOGITS_OUT),
         )
@@ -635,6 +705,9 @@ def main():
         decode = (total - first) / max(len(marks) - 1, 1) if len(marks) > 1 else float("nan")
         out[str(idx)] = tokens
         if LOGITS_OUT and logit_rows:
+            if os.environ.get("LOGITS_FULL") == "1":
+                torch.save(torch.cat([row.reshape(-1, row.shape[-1]) for row in logit_rows]),
+                           f"{LOGITS_OUT}.{idx}.rank{RANK}.pt")
             top = []
             for row in logit_rows:
                 v, i = torch.topk(row.reshape(-1, row.shape[-1]), 2, dim = -1)
@@ -673,7 +746,7 @@ def main():
                                 add_bos = False, encode_special_tokens = True)
         for n in PROBE:
             pj = Job(input_ids = torch.cat([ids0, torch.tensor([out["0"][:n]], dtype = ids0.dtype)], dim = -1),
-                     max_new_tokens = 1, min_new_tokens = 1, sampler = GreedySampler(), stop_conditions = [],
+                     max_new_tokens = 1, min_new_tokens = 1, sampler = RankAgreedGreedySampler(), stop_conditions = [],
                      return_logits = True)
             generator.enqueue(pj)
             got = None
@@ -725,7 +798,7 @@ def main():
                 p.stop()
         model.forward = _filtered_forward
         job = Job(input_ids = last_ids, max_new_tokens = 64, min_new_tokens = 64,
-                  sampler = GreedySampler(), stop_conditions = [])
+                  sampler = RankAgreedGreedySampler(), stop_conditions = [])
         generator.enqueue(job)
         while generator.num_remaining_jobs():
             for result in generator.iterate():
@@ -743,7 +816,7 @@ def main():
         # Profiling starts after the first emitted token, so prefill is excluded: decode steps only.
         prof = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA])
         job = Job(input_ids = last_ids, max_new_tokens = 16, min_new_tokens = 16,
-                  sampler = GreedySampler(), stop_conditions = [])
+                  sampler = RankAgreedGreedySampler(), stop_conditions = [])
         generator.enqueue(job)
         started, steps, t_dec, wall_ms = False, 0, None, float("nan")
         while generator.num_remaining_jobs():

@@ -7,3 +7,17 @@ Both ranks issued matching traced host-side collective sequences, including at s
 At 65,536 context, 20,000 requested prose filler, 24,167 actual prompt tokens, `MAX_CHUNK=2048`, `MAX_NEW=64`, `IGNORE_EOS=1`, batch 1, tracing enabled and graphs off, three hybrid K=5 runs each had 5,320 matching traced calls (1,900 NCCL, 3,420 P2P) and 42 matching confidence windows; one K=3 run had 4,620 matching calls (2,337 NCCL, 2,283 P2P) and 35 matching windows. No rank divergence appeared. A shorter graphs-off K=5 run stopped at EOS after 8 tokens, with 1,620 matching calls and 5 matching windows. The graph-on run used the same long-context settings and K=5. These deterministic repeats cannot bound all workloads or races. Rank-local confidence decisions can still differ; a 3-row fp32 reduction is 61,440 bytes (P2P), versus 4 rows at 81,920 bytes (NCCL). A mismatch can therefore split transports, and even a fixed transport alone cannot repair differing collective shapes or counts.
 
 Runs used `TORCH_CUDA_ARCH_LIST=12.0a` and `EXL3_DSV4_B1_BATCH=1`. Logged host collective counts omit graph replays. The requested p2p/nccl by K=3/5 matrix and a raised-threshold control were not run; the post-fix guard and routing change have not been validated on hardware. Retain the incident logs under `/home/treadall/recipe-artifacts/2x-rtx-tp2/tp2logs/` for comparison.
+
+2026-10-28: hybrid now routes by prefill/decode phase, disables piecewise capture during
+hybrid prefill, and synchronizes draft and greedy target decisions across ranks. Short prompt
+`combined_graph_fix_1028` generated 32 tokens with 368 segment replays and 21 accepted drafts
+in 7 verification rounds; rank token files matched.
+`combined_long_retry_1028` used a 65,536-token KV budget, automatic 4096-row chunk,
+dynamic speculation, and 32 generated tokens; rank token files matched, 828 segment
+replays occurred, and both runner processes exited. The 18 verification windows all
+remained length 5, so adaptive window changes were not exercised.
+
+Cold hybrid comparison at 24,167 prompt tokens, chunk 4096, 32 generated tokens:
+`combined_cold_1028` (DSpark) TTFT 7010.2 ms and 18.79 ms/decode token versus
+`combined_cold_plain_1028` TTFT 6936.5 ms and 18.47 ms/decode token. The outputs agree
+for 19 tokens then diverge; correctness equivalence is not established. One run per arm.

@@ -195,7 +195,8 @@ class TransformerBlock(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
         pending = params.pop("pw_pending", None)
-        if _PIECEWISE and 1 <= x.shape[1] <= _PIECEWISE_MAXSEQ and self.attn_hc is not None and self.mlp_hc is not None:
+        if (_PIECEWISE and 1 <= x.shape[1] <= _PIECEWISE_MAXSEQ and self.attn_hc is not None and
+            self.mlp_hc is not None and not getattr(params.get("backend"), "disable_piecewise_capture", False)):
             return self._forward_piecewise(x, params, out_dtype, pending)
         assert pending is None, "deferred piecewise MLP half reached a non-piecewise block"
 

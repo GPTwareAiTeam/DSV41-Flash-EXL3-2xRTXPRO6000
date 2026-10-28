@@ -1192,10 +1192,15 @@ use P2P and broadcasts use NCCL in hybrid mode. The all-reduce threshold is
 `HYBRID_NCCL_MIN_BYTES` (default `65536` bytes); payloads at or above it use NCCL. Hybrid may
 differ numerically from other modes when its collective routes differ. Both ranks must use the
 same settings. Hybrid and P2P require `P2P_RDV` to name a fresh shared rendezvous directory.
-The TP2 runner rejects `DSPARK=1` with `COMM=hybrid` because of an unresolved
-post-generation collective hang; use `COMM=p2p` for speculation. `TP_COLLECTIVE_TRACE=1`
-logs rank, generator iteration, sequence, operation, shape, byte size, route and CUDA
-capture status, plus draft confidence windows. Graph replays do not produce host calls.
+Hybrid routes prefill reductions by payload size and all decode reductions through P2P;
+rank-zero draft and greedy target decisions are broadcast to keep speculative control flow
+aligned. The combined graph path is experimental and has not yet been validated at long context.
+`TP_COLLECTIVE_TRACE=1` logs rank, iteration, sequence, operation, shape, bytes, route and
+CUDA capture status, plus draft confidence windows. Graph replays do not produce host calls.
+
+With automatic prefill chunk sizing, `DSPARK_RESERVE_MIB` (default `2048`) adds an
+empirical drafter allowance to `VRAM_RESERVE_MIB`. This is not a guaranteed fit for
+every context or allocator state; explicitly reduce `MAX_CHUNK` if needed.
 
 ### `P2P_ARENA_MAXB` (default: `4194304`, 4 MiB)
 

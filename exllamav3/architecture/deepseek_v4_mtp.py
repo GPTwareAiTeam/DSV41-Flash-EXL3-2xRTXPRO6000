@@ -354,6 +354,9 @@ class DeepseekV4MTPModel(Model):
                 bias = params["backend"].all_gather(bias, tp)
             logits[:, i] += bias[:, 0]
             out[:, i + 1] = torch.argmax(logits[:, i], dim = -1)
+            sync_ids = getattr(params.get("backend"), "sync_draft_ids", None)
+            if sync_ids is not None:
+                sync_ids(out[:, i + 1])
 
         # Confidence-capped draft length: proj(cat([pre-norm hidden, markov emb])) per
         # position; the generator clamps its window to the longest all-confident prefix
