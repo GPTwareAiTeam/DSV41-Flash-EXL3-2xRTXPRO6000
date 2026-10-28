@@ -9,10 +9,12 @@ Reference, identical hardware (diffbot, 2x RTX PRO 6000 TP2, EXL3 3bpw): 156.9 t
 11.2k prefill @40K, fp8 KV.
 
 ### Where the long-context 16.55 ms/tok actually goes (profile at 24,167 tokens, `PROFILE=1`)
-- **CUDA total 205.2 ms over 32 tokens = 6.4 ms/token**; wall is 16.55 ms/token. **~10 ms/token is host/gap.**
-- **296 kernel launches per token** (`cudaLaunchKernel` 9,462 calls / 32 tokens, 35.8 ms of CPU) and
-  **120 `aten::nonzero` calls** (0.79 ms of GPU time but each one synchronises the host) - that is the eager attention
-  path, which the 1K-position gate forces us into.
+- The profile covers **15 decode steps**. Per step: **CUDA 13.68 ms**, **631 kernel launches**, **8 `aten::nonzero`
+  syncs**. The timed unprofiled run for the same configuration is **16.55 ms/tok** (PROFILE changes kernel/collective
+  time and overlap, so 16.55 - 13.68 must NOT be read as "host time"; the two are reported separately).
+- 631 launches per step is ~16 per layer, which is the eager attention path the 1K-position gate forces us into.
+  `aten::matmul`/`aten::mm` in the op table are nested and not additive, and graph nodes hide some launches, so treat
+  the per-phase split as a source enumeration, not a profiler readout.
 - Top GPU consumers by op: `aten::matmul` 6.8 ms / 204 calls, `aten::mm` 6.8 ms / 189, `aten::index` 2.6 ms / 399,
   `aten::_foreach_copy_` 2.0 ms / 645, `aten::copy_` 1.5 ms / 1449.
 - **Conclusion: long-context decode is HOST-bound, not KV-bound.** The lever is fewer launches and fewer syncs in the
