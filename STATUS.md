@@ -35,21 +35,50 @@ Historical decode recipe (not a reproduction of the prefill figures): `cd /home/
 | multi-stream plain B2 / B4 (branch tp2/batch) | 14.62 / 19.51 per stream | 126 / 189 aggregate | historical branch result |
 | multi-stream DS K=5 B4 | 38.26-38.97 per stream | 96.8 aggregate | historical result; spec and batching performed poorly in this run |
 
-## 2026-10-28 — batch invariance measured (greedy, 128 tokens, SHORT_PROMPTS=1, EXL3_WHOLE_GRAPH=0, EXL3_DSV4_B1_BATCH=1, both ranks)
-Tags `invariance_block_20261028_ref_g{0,1}_all` (B1, prompts 0-7) vs `..._b{2,4,8}_{same,distinct,mix}_g{0,1}`
-(`LOGITS_FULL=1`, per-stream token files and per-position full logits). Container `exl3-batchinv`, own extension cache.
-- **Invariant across streams**: rows of one batch with identical prompts are token- and logit-bitwise identical; stream 0
-  of `b2_same`/`b2_distinct`/`b2_mix`/`b4_*`/`b2_same_g1` is bitwise identical (max-abs logit delta 0 over 70 steps),
-  so a row's result does not depend on the other slots' contents. The earlier "two identical B4 rows diverge at pos 11"
-  claim is retracted.
-- **Not invariant across batch width**: first B1-vs-batch divergence, g0 stream 0: B2/B4 pos 70 (13849 -> 1261, ref
-  margin 0.0625, max-abs delta 1.875), B8 pos 11 (671 -> 666, ref margin 0.15625, delta 2.594). Per prompt g0: p1 pos 20,
-  p2 pos 34 (B4), p3 pos 34 (B4/B8, delta 4.13), p5 pos 43, p6 pos 47 (B4) / 74 (B8); p7 identical at B2/B4. Same
-  positions for `same`/`distinct`/`mix` and across repeats; g1 stream 0 flips at pos 55 (B4) / 70 (B8).
-- The observed flips have reference margins 0.03–0.78; the bsz1-vs-batch full-vocab delta was already
-  0.82 / 1.22 / 1.17 max at steps 0 / 1 / 69. The cause remains unresolved: bsz-keyed kernel geometry is a hypothesis,
-  not evidence excluding a logic bug. Geometry-pinning bisect arms are queued as
-  `invariance_bisect_isolated_20261028_{wb0,wb1}_b{1,2,8}`, `attn_b{2,8}`, `rep_b2`.
+## 2026-10-28 — batch invariance measured
+Greedy, 128 tokens, SHORT_PROMPTS=1, EXL3_DSV4_B1_BATCH=1, both ranks; tags `invariance_block_20261028_ref_g{0,1}_all`
+(B1, prompts 0-7) vs `..._b{2,4,8}_{same,distinct,mix}_g{0,1}` (LOGITS_FULL=1, per-stream tokens and per-position full
+logits), with `g0`/`g1` = `EXL3_WHOLE_GRAPH=0`/`1`. Container `exl3-batchinv`, own extension cache.
+- **Invariant across streams and neighbours, bitwise**: in every multi-stream arm (B2/B4/B8, both graph settings) all
+  rows of one batch are token- and logit-bitwise identical (max-abs logit delta across streams exactly 0 over 128
+  steps), and at fixed width stream 0 is bitwise identical across the same/distinct/mix neighbour sets (all 36 arm
+  pairs checked). A row's result does not depend on what else is in the batch. The earlier "two identical B4 rows
+  diverge at pos 11" claim is **retracted**.
+- **Not invariant across batch width, and not monotone in bsz**: with graphs on, **B2 ≡ B4 bitwise** over all 128 steps
+  (delta 0.0), while B8 is a third path — differs from B2/B4 from step 0 (max-abs 0.102, mean 0.017; <= 1.42 through
+  step 9), prompt 0 flipping at 11 on a 0.156 reference margin. B1 is separate again: vs B2/B4, 0.82 at step 0, 1.22
+  at step 1, up to 2.66 in steps 0-69 (reference logit absmax 49.0), prompt 0 flipping at 70. With graphs off each
+  width is its own path (b2-vs-b4 flip 55, b2-vs-b8 72, b4-vs-b8 55). Graph on vs off is itself a numeric path:
+  bitwise identical at B1 (8/8 prompts), token-equal with <= 0.164 logits at B2, flips at 55 (B4) and 11 (B8).
+- **Decision-relevant deltas <= 0.94**: over same-prefix steps the top-1 logit moves <= 0.875 (B2/B4) / <= 0.891 (B8),
+  top-2 <= 0.828 / <= 1.219, top-2 margin <= 0.9375 / <= 0.781. Every flip sits on a reference near-tie (margins
+  0.03-0.78, below the perturbation); the 0.8-2.9 whole-vocabulary max-abs figures come from tail tokens (e.g.
+  rank-1787 token 8.17 vs 5.27 at B8 step 10) and are not decision-relevant. Drift is smooth from step 0 with no
+  discontinuity at any flip: kernel-path numerics, not a routing/logic bug.
+- **Mechanism**: `wide_b = bsz > 1` is ruled out as the whole cause (on for B2/B4/B8 alike yet B2 ≡ B4 and B8
+  differs). The measured switch is at 8 rows / 48 MoE slots, on top of the separate bsz-1 body; the coop kernel's
+  k-split is 1 at every width (`base_a` 1728/864/432 vs 188 SMs, `slots_max/slots` 4/2/1), so what is left is the
+  per-`(B,S)` batched projection/attention geometry. No fix ships — the effect is bounded and only reaches near-ties
+  (a flip needs a reference margin below 0.94).
+- Raw data `tp2logs/invariance_block_20261028_*`, checker `multistream/verify_matrix.py`, analysis
+  `tp2logs/invariance_matrix_analysis_20261028.txt`. The pinned-geometry bisect (`multistream/bisect2_20261028.sh`)
+  was cancelled unexecuted.
+
+Per-prompt first divergence vs the B1 reference of the same graph arm (`s`/`d`/`m` = same/distinct/mix neighbour sets,
+identical unless noted):
+
+| prompt | B2 g0 | B4 g0 | B8 g0 | B2 g1 | B4 g1 | B8 g1 |
+|---|---|---|---|---|---|---|
+| p0 | 70 (13849->1261, d1.875) | 70 | 11 (671->666, d2.594) | 70 | 55 (0->201, d2.016) | 70 (d1.344) |
+| p1 | — | 20 (7662->44360, d1.262) | 97 | — | 11 (538->1660, d0.871) | 11 |
+| p2 | — | 34 (2038->3586, d1.473) | 109 | — | 14 (3605->433, d1.445) | 91 (d1.396) |
+| p3 | — | 34 (d4.135) | 34 (d3.806) | — | 34 (d3.405) | 34 |
+| p4 | — | — | 86 (88346<->76231 tie, d0.336) | — | — | identical |
+| p5 | — | 43* (397->1173, d1.438) | 8 (d0.379) | — | 43* (d3.119) | 43 (d1.555) |
+| p6 | — | 47* (d1.727) | 74 (d0.969) | — | 117 (4586->53330, d1.469) | identical |
+| p7 | identical | identical (mix + distinct sets) | identical | identical | 11 (`m` only, 73018->42743, d1.366) | identical |
+
+`*` = position seen in the mixed prompt set. Ranks agree everywhere.
 
 Round anatomy (DSpark K=5, measured with CUDA events): draft **1.9 ms**, target+verify **21.5 ms**, host ~3 ms; exactly ONE drafter forward per round (DFlash block path). These measurements do not establish a DRAM floor or generalize to every workload.
 
