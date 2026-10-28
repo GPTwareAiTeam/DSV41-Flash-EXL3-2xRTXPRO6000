@@ -182,16 +182,22 @@ class TPBackendNCCL:
         dist.barrier()
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("NCCL all_reduce during CUDA graph capture is unsafe; use COMM=p2p")
         # A non-contributing rank reduces a zero stand-in so the collective stays aligned
         if not contribution:
             tensor.zero_()
         dist.all_reduce(tensor, op = dist.ReduceOp.SUM)
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("NCCL broadcast during CUDA graph capture is unsafe; use COMM=p2p")
         dist.broadcast(tensor, src = src_device)
 
     def all_gather(self, t: torch.Tensor, world: int) -> torch.Tensor:
         """Concatenate the per-rank t along the last dim, in rank order, on both ranks (== cat(parts, -1))."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("NCCL all_gather during CUDA graph capture is unsafe; use COMM=p2p")
         assert world == 2
         parts = [torch.empty_like(t) for _ in range(world)]
         dist.all_gather(parts, t.contiguous())
@@ -281,6 +287,8 @@ class TPBackendHybrid:
         self.p2p.fwd_barrier()
 
     def _pick(self, tensor: torch.Tensor):
+        if torch.cuda.is_current_stream_capturing():
+            return self.p2p
         return self.nccl if tensor.numel() * tensor.element_size() >= HYBRID_NCCL_MIN_BYTES else self.p2p
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
@@ -298,6 +306,41 @@ class TPBackendHybrid:
     def end_cpu_reduce_jobs(self):
         pass
 
+
+class TPBackendTrace:
+    """Opt-in host-side collective sequence trace; graph replays are not host calls."""
+    trace_draft_window = True
+
+    def trace_window(self, length):
+        print(f"DRAFT_WINDOW rank={RANK} step={self.step} seq={self.sequence} length={length}", flush=True)
+
+    def __init__(self, backend):
+        self.backend = backend
+        self.step = 0
+        self.sequence = 0
+
+    def __getattr__(self, name):
+        return getattr(self.backend, name)
+
+    def _trace(self, op, tensor, transport):
+        self.sequence += 1
+        print(f"COLLECTIVE rank={RANK} step={self.step} seq={self.sequence} op={op} "
+              f"shape={tuple(tensor.shape)} dtype={tensor.dtype} bytes={tensor.numel() * tensor.element_size()} "
+              f"transport={transport} capture={torch.cuda.is_current_stream_capturing()}", flush=True)
+
+    def all_reduce(self, tensor, contribution=True):
+        backend = self.backend
+        transport = ("nccl" if backend._pick(tensor) is backend.nccl else "p2p") if isinstance(backend, TPBackendHybrid) else COMM
+        self._trace("all_reduce", tensor, transport)
+        return backend.all_reduce(tensor, contribution)
+
+    def all_gather(self, tensor, world):
+        self._trace("all_gather", tensor, "p2p" if COMM == "hybrid" else COMM)
+        return self.backend.all_gather(tensor, world)
+
+    def broadcast(self, tensor, src_device):
+        self._trace("broadcast", tensor, "nccl" if COMM == "hybrid" else COMM)
+        return self.backend.broadcast(tensor, src_device)
 
 def set_tp_reduce(model: Model, backend: TPBackendNCCL) -> int:
     """Enable the attention/MoE partial-sum collectives on every TP-local block, and hand the backend to
@@ -346,11 +389,7 @@ def wrap_vocab_split(model: Model, rank: int, world: int, backend: TPBackendNCCL
 
     def head_fwd(x, params, out_dtype = None):
         y = orig_head(x, params, out_dtype)
-        if isinstance(backend, (TPBackendP2P, TPBackendHybrid)):
-            return backend.all_gather(y.contiguous(), world)
-        parts = [torch.empty_like(y) for _ in range(world)]
-        dist.all_gather(parts, y.contiguous())
-        return torch.cat(parts, dim = -1)
+        return backend.all_gather(y.contiguous(), world)
 
     emb.forward = embed_fwd
     head.forward = head_fwd
@@ -358,6 +397,8 @@ def wrap_vocab_split(model: Model, rank: int, world: int, backend: TPBackendNCCL
 
 
 def main():
+    if DSPARK and COMM == "hybrid":
+        raise ValueError("DSPARK=1 with COMM=hybrid is unsafe: use COMM=p2p")
     if DSPARK_POLICY not in ("always", "auto"):
         raise ValueError("DSPARK_POLICY must be always or auto")
     if DSPARK_POLICY == "auto" and (not DSPARK or BATCH != 1 or DSPARK_DYNAMIC):
@@ -395,6 +436,8 @@ def main():
     else:
         comm = None
         backend = TPBackendNCCL()
+    if os.environ.get("TP_COLLECTIVE_TRACE") == "1":
+        backend = TPBackendTrace(backend)
     n_blocks = set_tp_reduce(model, backend)
     local_v, full_v = wrap_vocab_split(model, RANK, WORLD, backend)
     load_s = time.time() - t0
@@ -422,6 +465,13 @@ def main():
                           dynamic_draft_tokens = DSPARK and DSPARK_DYNAMIC,
                           draft_confidence = DSPARK_TARGET_ACC,
                           record_draft_stats = DSPARK and (DSPARK_DYNAMIC or DSPARK_POLICY == "auto"))
+    if isinstance(backend, TPBackendTrace):
+        original_trace_iterate = generator.iterate
+        def trace_iterate(*args, **kwargs):
+            backend.step += 1
+            log(f"COLLECTIVE_STEP rank={RANK} step={backend.step} sequence={backend.sequence}")
+            return original_trace_iterate(*args, **kwargs)
+        generator.iterate = trace_iterate
     generator.prefix_cache_min_match = PREFIX_CACHE_MIN_MATCH if PREFIX_CACHE else None
     generator.observe_draft_confidence = DSPARK_POLICY == "auto"
     generator.count_draft_forwards = DSPARK_COUNT_FORWARDS
