@@ -1,6 +1,12 @@
 # STATUS
 
-This file preserves historical measurements below, not a current runbook. For current priorities and long-context results see `qmesh/notes/MASTER_PLAN.md`. Batch correctness remains unresolved for diverse prompts; identical-prompt checks alone do not establish general correctness.
+This file preserves historical measurements below, not a current runbook. For current priorities and long-context results see `qmesh/notes/MASTER_PLAN.md`. Batching is batch-invariant across streams (identical rows and neighbour-independence are bitwise); it is not bitwise equal to B1 — see "batch invariance" below.
+
+## 2026-10-28 — long-context compaction integration
+Tested tree `e781583f` (merge `1a3d9648`) exported to `/artifacts/merged_src` in container `exl3-tp2`, extension cache `/artifacts/ext_integrator`; baseline `388a0da9` ran from `/src/exllamav3` with the shared extension cache. Harness: `integrator_postmerge_1028.sh` and `integrator_premerge_1028.sh` under `/home/treadall/recipe-artifacts/2x-rtx-tp2`. Both use `COMM=p2p`, `EXL3_WHOLE_GRAPH=1`, `EXL3_DSV4_B1_BATCH=1`, `WARM=1`, `IGNORE_EOS=1`.
+- Short prompts 0/1/2, 128 tokens: baseline **10.74 / 10.82 / 10.76**, merged **10.70 / 10.80 / 10.74 ms/token** (both ranks); all generated tokens match across trees and ranks. DSpark K=5 on the merged tree: rank 0 **7.87 / 6.79 / 8.95**, rank 1 **7.86 / 6.79 / 8.95 ms/token**.
+- Long prompt 0, 24,167 tokens (`LONG_PROMPT_TOKENS=20000`, chunk 2048, cache 65536), 32 generated tokens: merged **15.99 / 15.98 ms/token** rank 0/1. A separate baseline run generated identical tokens on both ranks, but measured 54.60 / 54.46 ms/token at high host load. A back-to-back pair (`integrator_24kpair_1028.sh`) again had identical tokens but unstable timings: baseline 18.86 / 18.84, merged 70.64 / 70.88 ms/token. These runs do not support a speed comparison; prior controlled comparisons are in the master plan. The historical `longdecode_clean_1028c_24k_f1` tokens differed from the integration run at token index 12 on both ranks; its settings/provenance were not identical.
+- Post-merge block host load averages (1/5/15 min) were 38.18/23.99/23.08 at start and 10.15/18.33/21.19 at end. The pair ran at 33.40/39.55/33.54 initially, 27.22/37.62/33.06 between arms and 32.69/27.80/28.97 at end. `pytest tests/kernels/moe tests/kernels/dsa/test_dsa_compact_ent.py -q`: **273 passed**.
 
 ## 2026-10-27 (historical) — spec on the captured path
 Measurements used `COMM=p2p`, graphs, `EXL3_DSV4_B1_BATCH=1`, WARM:
@@ -26,8 +32,24 @@ Historical decode recipe (not a reproduction of the prefill figures): `cd /home/
 | prefill 2048-token prompt, chunk 2048 | 3856 tok/s | | 32K-prompt sweep, per-chunk table in PrefillPerf.md |
 | prefill 32K prompt, chunk 8192 | 4790 tok/s | | 90.2 GiB peak, safe default |
 | prefill 32K prompt, chunk 16384 | 4941 tok/s | | 93.7 GiB peak, too tight to ship |
-| multi-stream plain B2 / B4 (branch tp2/batch) | 14.62 / 19.51 per stream | 126 / 189 aggregate | historical branch result; numerics bug was open |
+| multi-stream plain B2 / B4 (branch tp2/batch) | 14.62 / 19.51 per stream | 126 / 189 aggregate | historical branch result |
 | multi-stream DS K=5 B4 | 38.26-38.97 per stream | 96.8 aggregate | historical result; spec and batching performed poorly in this run |
+
+## 2026-10-28 — batch invariance measured (greedy, 128 tokens, SHORT_PROMPTS=1, EXL3_WHOLE_GRAPH=0, EXL3_DSV4_B1_BATCH=1, both ranks)
+Tags `invariance_block_20261028_ref_g{0,1}_all` (B1, prompts 0-7) vs `..._b{2,4,8}_{same,distinct,mix}_g{0,1}`
+(`LOGITS_FULL=1`, per-stream token files and per-position full logits). Container `exl3-batchinv`, own extension cache.
+- **Invariant across streams**: rows of one batch with identical prompts are token- and logit-bitwise identical; stream 0
+  of `b2_same`/`b2_distinct`/`b2_mix`/`b4_*`/`b2_same_g1` is bitwise identical (max-abs logit delta 0 over 70 steps),
+  so a row's result does not depend on the other slots' contents. The earlier "two identical B4 rows diverge at pos 11"
+  claim is retracted.
+- **Not invariant across batch width**: first B1-vs-batch divergence, g0 stream 0: B2/B4 pos 70 (13849 -> 1261, ref
+  margin 0.0625, max-abs delta 1.875), B8 pos 11 (671 -> 666, ref margin 0.15625, delta 2.594). Per prompt g0: p1 pos 20,
+  p2 pos 34 (B4), p3 pos 34 (B4/B8, delta 4.13), p5 pos 43, p6 pos 47 (B4) / 74 (B8); p7 identical at B2/B4. Same
+  positions for `same`/`distinct`/`mix` and across repeats; g1 stream 0 flips at pos 55 (B4) / 70 (B8).
+- Every flip is a reference near-tie (ref margins 0.03-0.78) and the bsz1-vs-batch full-vocab delta is already
+  0.82 / 1.22 / 1.17 max at steps 0 / 1 / 69 with no jump at any flip ⇒ bsz-keyed kernel geometry
+  (`exl3_moe_coop.cu:197-199` `wide_b = bsz > 1`, M=1 GEMV vs M>1 GEMM), not a logic bug. Geometry-pinning bisect arms
+  are queued as `invariance_bisect_isolated_20261028_{wb0,wb1}_b{1,2,8}`, `attn_b{2,8}`, `rep_b2`.
 
 Round anatomy (DSpark K=5, measured with CUDA events): draft **1.9 ms**, target+verify **21.5 ms**, host ~3 ms; exactly ONE drafter forward per round (DFlash block path). These measurements do not establish a DRAM floor or generalize to every workload.
 
