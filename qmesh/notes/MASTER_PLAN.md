@@ -110,6 +110,11 @@ Short-context decode for comparison: 10.77-10.84 ms/tok.
 Prefill is ~4.6-4.8k tok/s at these lengths, i.e. a 100k prompt costs ~21 s TTFT cold; prefix caching is the lever that matters
 (`EXL3_PREFIX_CACHE`, merged into main at `8ec9c9c8`, default off, verified 16x at 8k).
 
+### Post-merge verification (2026-10-27, after prefix-cache + collective-capture + 4 MiB arena)
+Short-context decode **10.83/10.86/10.84 ms/tok** (was 10.77/10.84/10.83) and **B4 17.94 ms/tok per stream /
+206.02 tok/s aggregate** (was 17.89 / 203.0), tokens byte-identical. So the four merges cost nothing and the
+prefix cache being on by default is free at short context.
+
 ## 0. MEASUREMENT RULES LEARNED THE HARD WAY (read before trusting any number)
 
 1. **`COMM` depends on the workload.** Measured back-to-back on main, prefill 2048-token prompt / chunk 2048:
