@@ -40,6 +40,15 @@ PyTorch-level ops, not arithmetic. Concrete candidates already identified: merge
 (1 x 40 per step, needs an extension capability and bitwise verification), fuse the attention split/combine pair,
 reduce the six HC mixes per layer, and chain buffers instead of `_foreach_copy_`.
 
+### Long-context capture: tie rate measured at 84% (closes the item quantitatively)
+At 24,166-24,485 positions, candidate-source layer 20, 320 timed decode steps: the 2048th and 2049th candidate scores
+were **exactly equal on 269/320 steps (84.06%)**, identical on both ranks (not independent samples); all 8 warmup steps
+also tied. Evidence: `tp2logs/topk_ties_1028b.csv.rank{0,1}`.
+So ties are the normal case, not an edge case: **no device-side or fixed-capacity selector can reproduce eager's
+`topk` ordering without changing numerics on ~84% of steps.** Capture past 1K is therefore impossible without
+redefining selection, and the remaining lever for long-context decode is the eager path's launch count (631/step).
+This also explains why an FP8-KV packed-capture attempt diverged so quickly earlier in the project.
+
 ### Long-context capture past 1K: NOT FEASIBLE without redesigning candidate use (established 2026-10-27)
 Three independent walls, each verified:
 1. **`nonzero()` synchronises the host.** Eager `_indexer_topk` (`dsv4.py` ~1349-1353) does CUDA `nonzero()` plus a
