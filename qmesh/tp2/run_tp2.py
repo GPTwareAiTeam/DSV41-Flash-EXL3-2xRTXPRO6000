@@ -61,7 +61,7 @@ CACHE_TOKENS_PER_SEQ = int(os.environ.get("CACHE_TOKENS_PER_SEQ", "4096"))  # KV
 CTX_TOKENS = int(os.environ.get("CTX_TOKENS", "0"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", str(CTX_TOKENS if CTX_TOKENS else BATCH * CACHE_TOKENS_PER_SEQ)))
 KV_BITS = int(os.environ.get("KV_BITS", "16"))
-PREFIX_CACHE = os.environ.get("EXL3_PREFIX_CACHE", "0") == "1"
+PREFIX_CACHE = os.environ.get("EXL3_PREFIX_CACHE", "1") == "1"
 PREFIX_CACHE_CAPACITY = int(os.environ.get("EXL3_PREFIX_CACHE_CAPACITY", str(4 * 1024**3)))
 PREFIX_CACHE_MIN_MATCH = int(os.environ.get("EXL3_PREFIX_CACHE_MIN_MATCH", "256"))
 PREFIX_CACHE_INTERVAL = int(os.environ.get("EXL3_PREFIX_CACHE_INTERVAL", "1024"))
@@ -399,7 +399,7 @@ def main():
     # DSPARK_DYNAMIC=1: the generator's confidence calibrator sizes each round's window against DSPARK_TARGET_ACC
     # (drafter must export draft_conf; run with EXL3_DSPARK_CONF=0 so the static gate does not also cut)
     generator = Generator(model, cache, tokenizer, max_batch_size = BATCH,
-                          max_chunk_size = min(max_chunk, PREFIX_CACHE_INTERVAL) if PREFIX_CACHE else max_chunk,
+                          max_chunk_size = max_chunk,
                           draft_model = draft_model, draft_cache = draft_cache,
                           recurrent_cache_size = PREFIX_CACHE_CAPACITY if PREFIX_CACHE else 0,
                           recurrent_checkpoint_interval = PREFIX_CACHE_INTERVAL if PREFIX_CACHE else None,
