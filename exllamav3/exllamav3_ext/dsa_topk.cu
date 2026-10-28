@@ -982,3 +982,108 @@ void dsa_topk
 {
     dsa_topk_gr(scores, indices, (int) k, nullptr, t_ptr, (int) t_seq);
 }
+
+/*
+Candidate-block entry compaction for the DSA indexer's candidate pre-filter.
+
+The eager path builds the entry list of the kept blocks with a CUDA nonzero() plus a
+data-dependent boolean index, which are both a host sync and uncapturable. This kernel produces
+the same list, ascending, in a fixed-capacity buffer (-1 padded), so the caller's shapes are
+static. Block b contributes entries b*bs .. b*bs+min(bs, ec - b*bs) when keep[b] is set, which is
+exactly `((~drop).any(0).nonzero() * bs + arange(bs)).flatten()[< ec]`.
+*/
+
+#define COMPACT_THREADS 1024
+
+__global__ __launch_bounds__(COMPACT_THREADS)
+void dsa_compact_ent_kernel
+(
+    const uint8_t* __restrict__ keep,   // (nb,) nonzero = block kept
+    int* __restrict__ out,              // (cap,) int32 entries, -1 past the count
+    const int nb,
+    const int bs,
+    const int ec,
+    const int cap
+)
+{
+    constexpr int NW = COMPACT_THREADS / 32;
+    __shared__ int wcnt[NW];
+    __shared__ int woff[NW];
+    __shared__ int tile_total;
+    int t = threadIdx.x;
+    int lane = t % 32;
+    int warp = t / 32;
+    int base = 0;
+    for (int b0 = 0; b0 < nb; b0 += COMPACT_THREADS)
+    {
+        int b = b0 + t;
+        int cnt = 0;
+        int first = 0;
+        if (b < nb && keep[b])
+        {
+            first = b * bs;
+            cnt = max(0, min(bs, ec - first));
+        }
+        int incl = cnt;
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1)
+        {
+            int n = __shfl_up_sync(0xffffffffu, incl, o);
+            if (lane >= o) incl += n;
+        }
+        if (lane == 31) wcnt[warp] = incl;
+        __syncthreads();
+        if (warp == 0)
+        {
+            int wc = lane < NW ? wcnt[lane] : 0;
+            int wincl = wc;
+            #pragma unroll
+            for (int o = 1; o < 32; o <<= 1)
+            {
+                int n = __shfl_up_sync(0xffffffffu, wincl, o);
+                if (lane >= o) wincl += n;
+            }
+            if (lane < NW) woff[lane] = wincl - wc;
+            if (lane == 31) tile_total = wincl;
+        }
+        __syncthreads();
+        int pos = base + woff[warp] + (incl - cnt);
+        for (int j = 0; j < cnt && pos + j < cap; ++j) out[pos + j] = first + j;
+        base += tile_total;
+        __syncthreads();   // wcnt/woff/tile_total are reused by the next tile
+        if (base >= cap) break;
+    }
+    for (int i = base + t; i < cap; i += COMPACT_THREADS) out[i] = -1;
+}
+
+void dsa_compact_ent
+(
+    const at::Tensor& keep,
+    at::Tensor out,
+    int64_t bs,
+    int64_t ec
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(keep.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(keep.dim() == 1, "dsa_compact_ent: keep must be 1-D");
+    TORCH_CHECK(keep.scalar_type() == at::kBool || keep.scalar_type() == at::kByte,
+                "dsa_compact_ent: keep must be bool/uint8");
+    TORCH_CHECK(out.dim() == 1 && out.scalar_type() == at::kInt, "dsa_compact_ent: bad out");
+    TORCH_CHECK(bs > 0 && ec >= 0, "dsa_compact_ent: bad bounds");
+    int nb = (int) keep.size(0);
+    int cap = (int) out.size(0);
+    if (!nb || !cap)
+    {
+        if (cap)
+            cuda_check(cudaMemsetAsync(out.data_ptr(), 0xff, cap * sizeof(int), stream));
+        return;
+    }
+    dsa_compact_ent_kernel<<<1, COMPACT_THREADS, 0, stream>>>
+    (
+        (const uint8_t*) keep.data_ptr(), (int*) out.data_ptr(),
+        nb, (int) bs, (int) ec, cap
+    );
+    cuda_check(cudaPeekAtLastError());
+}
