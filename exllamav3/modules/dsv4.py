@@ -1008,31 +1008,30 @@ class DSV4Attention(Module):
     def _rope_type_neg(self):
         return self.inv_freq_main_neg if self.layer_type == "sliding" else self.inv_freq_compress_neg
 
-
-    def _project_qkv(self, x, params, position, positions = None):
-        """Shared front: q_a/q_norm/q_b and wkv, then ONE in-place ext.rope call that also
-        applies both head norms (unweighted per-head q norm via a ones weight, weighted
-        kv_norm) before rotating the trailing rope slice (rotate_offset)."""
-        bsz, seq, _ = x.shape
+    def _rope_qkv(self, q, kv, position, positions = None):
         rd = self.rope_head_dim
-        q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
-        q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
-        kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
-        if not self.q_head_norm:
+        if self.q_head_norm or os.environ.get("EXL3_DSV41_FUSED_ROPE", "0") != "0":
+            ext.rope(
+                q, q, kv, kv, self._rope_type(), position, positions, None,
+                int(RopeStyle.GPTJ), 1.0, self.q_ones if self.q_head_norm else None,
+                self.kv_norm_w, self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
+            )
+        else:
             _ext_rope(q[..., -rd:], self._rope_type(), position, positions = positions)
             ext.rope(
-                kv, kv, None, None,
-                self._rope_type(), position, positions, None,
+                kv, kv, None, None, self._rope_type(), position, positions, None,
                 int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
                 self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
             )
-            return q_res, q, kv.view(bsz, seq, self.head_dim)
-        ext.rope(
-            q, q, kv, kv,
-            self._rope_type(), position, positions, None,
-            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
-        )
+
+
+    def _project_qkv(self, x, params, position, positions = None):
+        """Project queries and keys, then apply their head norms and trailing RoPE."""
+        bsz, seq, _ = x.shape
+        q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
+        q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
+        kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
+        self._rope_qkv(q, kv, position, positions)
         return q_res, q, kv.view(bsz, seq, self.head_dim)
 
 
@@ -1301,8 +1300,16 @@ class DSV4Attention(Module):
         k = self.idx_k_norm.forward(self.idx_wk.forward(lat.unsqueeze(0), params), params, out_dtype = torch.half)
         positions = e0 if isinstance(e0, torch.Tensor) else torch.arange(n, dtype = torch.int, device = lat.device) + e0
         pos = (positions * self.compress_rate).unsqueeze(0)
-        for t in (k, lat):
-            _ext_rope(t.view(1, n, 1, -1)[..., -self.rope_head_dim:], self.inv_freq_compress, position_ids = pos)
+        if os.environ.get("EXL3_DSV4_FUSED_INDEXER_ROPE", "0") != "0":
+            kr = k.view(1, n, 1, -1)[..., -self.rope_head_dim:]
+            lr = lat.view(1, n, 1, -1)[..., -self.rope_head_dim:]
+            ext.rope(
+                kr, kr, lr, lr, self.inv_freq_compress, 0, None, pos,
+                int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0,
+            )
+        else:
+            for t in (k, lat):
+                _ext_rope(t.view(1, n, 1, -1)[..., -self.rope_head_dim:], self.inv_freq_compress, position_ids = pos)
         return k[0]
 
 
@@ -1873,25 +1880,7 @@ class DSV4Attention(Module):
         positions = a_pos if a_pos is not None else \
             torch.tensor([rs.position for rs in rsg[:B]], dtype = torch.int32,
                          device = x.device)
-        if self.q_head_norm:
-            ext.rope(
-                q, q, kv, kv,
-                self._rope_type(), 0, positions, None,
-                int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-                self.rms_norm_eps, 0.0, 0.0, 0, 1,
-                self.head_dim - self.rope_head_dim,
-            )
-        else:
-            # V4.1 no-head-norm split (mirrors _forward_cached_one): rope the trailing q slice per row, then kv via the norm rope
-            rd = self.rope_head_dim
-            ext.rope(q[..., -rd:], q[..., -rd:], None, None, self._rope_type(), 0, positions, None,
-                     int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0)
-            ext.rope(
-                kv, kv, None, None,
-                self._rope_type(), 0, positions, None,
-                int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
-                self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
-            )
+        self._rope_qkv(q, kv, 0, positions)
         return q_res, q, kv, comp_kv, comp_gate, idx_kv, idx_gate, q_idx
 
 
@@ -1994,24 +1983,7 @@ class DSV4Attention(Module):
             else:
                 q = self.q_b.forward(q_res, params).view(1, seq, self.num_q_heads, self.head_dim)
 
-            if self.q_head_norm:
-                ext.rope(
-                    q, q, kv, kv,
-                    self._rope_type(), pos0, None, None,
-                    int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-                    self.rms_norm_eps, 0.0, 0.0, 0, 1,
-                    self.head_dim - self.rope_head_dim,
-                )
-            else:
-                # Same split as _project_qkv's no-head-norm branch: rope the trailing q slice, kv via the norm rope
-                rd = self.rope_head_dim
-                _ext_rope(q[..., -rd:], self._rope_type(), pos0)
-                ext.rope(
-                    kv, kv, None, None,
-                    self._rope_type(), pos0, None, None,
-                    int(RopeStyle.GPTJ), 1.0, self.kv_norm_w, None,
-                    self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
-                )
+            self._rope_qkv(q, kv, pos0)
             kv = kv.view(1, seq, self.head_dim)
         else:
             q_res, q, kv = self._project_qkv(x, params, pos0)
@@ -2078,10 +2050,15 @@ class DSV4Attention(Module):
                 e0 = pos0 // m
                 rows = torch.arange(e0, ec, device = device)
                 rows = bt_row[0, rows // epp].long() * epp + rows % epp
-                kl.pool_idx.view(-1, kl.D_i)[rows] = self._indexer_keys(stage[:ec - e0], params, e0)
-                if not kl.quant:
-                    kl.pool_c.view(-1, kl.D_c)[rows] = stage[:ec - e0, :kl.D_c]
-                    pool_r_flat[rows] = stage[:ec - e0, kl.D_c:]
+                keys = self._indexer_keys(stage[:ec - e0], params, e0)
+                if not kl.quant and os.environ.get("EXL3_DSV41_FUSED_POOL_SCATTER", "0") != "0":
+                    ext.dsv4_pool_scatter(rows, keys, stage[:ec - e0],
+                                          kl.pool_idx.view(-1, kl.D_i), kl.pool_c.view(-1, kl.D_c), pool_r_flat)
+                else:
+                    kl.pool_idx.view(-1, kl.D_i)[rows] = keys
+                    if not kl.quant:
+                        kl.pool_c.view(-1, kl.D_c)[rows] = stage[:ec - e0, :kl.D_c]
+                        pool_r_flat[rows] = stage[:ec - e0, kl.D_c:]
             if kl.quant:
                 ext.dsv4_pool_quant_scatter(
                     stage, kl.pool_c_view(), kl.pool_s.view(-1, kl.G), pool_r_flat,
