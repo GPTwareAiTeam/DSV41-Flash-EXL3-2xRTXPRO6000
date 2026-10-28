@@ -75,14 +75,15 @@ the cost breakdown (target forward vs attention at 24k vs indexer/candidate sele
   gave 19.89 vs 16.58 ms/tok at 24,167 tokens, acceptance .33 / AL 1.71; it does not support a blanket rule.
   A hybrid speculative arm hung once; its cause is unconfirmed. A P2P prose retest completed. The measured K=5 arms
   ended before a separate capture run, and K=3/JSON arms started after it ended; no overlap required reruns.
-- **Prefix caching is the big lever for agent loops**: 20k full hit **126 ms vs 6.9 s cold (55x)**; 60k **154 ms vs 21 s (~130x)**;
-  two alternating 60k contexts both hit at 155/154 ms; a 60k context growing ~1k per turn keeps **98.2-98.3% cached**
-  (TTFT 496-529 ms, with one unexplained 5175 ms outlier at a checkpoint boundary).
-- **Its cost is real**: the cache currently forces prefill chunk 1024, so cold runs are ~35% slower than the 8192-chunk
-  baseline (20k cold 6851-6904 ms vs 5081 ms at chunk 8192 for 24k tokens). Fixing that decoupling is the prerequisite
-  for making it default-on.
-- **Memory per long context online**: ~1.98 GB of *system RAM* for recurrent checkpoints (59 of them) plus **183 MiB of
-  GPU KV** for a 60k context; the 4 GiB `EXL3_PREFIX_CACHE_CAPACITY` is the host checkpoint budget, not GPU memory.
+- **Prefix caching is the big lever for agent loops, and it is now the default** (`EXL3_PREFIX_CACHE=1`). Final numbers,
+  checkpoints at 8192-token chunk boundaries: 20k zero-hit **4269-4288 ms** -> full hit **108-117 ms (55x)**; 60k
+  **13253-13436 ms** -> **153-154 ms (~130x)**; two alternating distinct 60k contexts both hit; a 60k context growing
+  ~1k per turn keeps **98%+ cached** (61k/62k/63k TTFT **524/513/491 ms**). Verified cost-free where it cannot help:
+  short-context decode 10.83/10.86/10.84 with the cache on vs 10.77/10.84/10.83 off, tokens byte-identical.
+- **Superseded figures**: an earlier configuration capped the prefill chunk at 1024, costing ~35% on cold runs and needing
+  59 checkpoints (~1.98 GB of host RAM) per 60k context. Both are fixed by checkpointing at chunk boundaries - cold is now
+  level with the no-cache baseline, and a 60k context costs **268 MB of host RAM per rank** (8 checkpoints) plus
+  **183 MiB of GPU KV**. The 4 GiB `EXL3_PREFIX_CACHE_CAPACITY` is the host checkpoint budget, not GPU memory.
 - **The auto-chunker does not reserve the drafter**: with `DSPARK=1` at 24k the default chunk 8192 OOMs (needs ~640 MiB
   more), so long-context spec runs need `MAX_CHUNK=2048` today.
 
