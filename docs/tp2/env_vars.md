@@ -115,5 +115,9 @@ Defaults shown are the compiled-in defaults; the shipped recipe sets the first t
 | `EXL3_MOE_SPLIT_FUSED` | `1` (runner forces `0`) | Fused split path; the TP=2 runner disables it. |
 | `EXL3_MOE_CPU_SWAP` | `1` (runner forces `0`) | CPU-swapped expert path; off in TP=2 because every expert is resident. |
 | `EXL3_DSPARK_CONF` | `0.5` | Drafter confidence gate. Set `0` when running `DSPARK_DYNAMIC` so the two gates do not compound. |
+| `EXL3_DSPARK_GATE` | `auto` | How each round's verify width is chosen. `auto`: confidence gate whose cutoff drops to `EXL3_DSPARK_AUTO_LO` on low-acceptance text (+0.6% tok/s over 19 prompts, best +3.0%, worst −0.9%). `thr`: fixed `EXL3_DSPARK_CONF`. `ev`: expected-value width, opt-in (losses up to −12% tok/s on some prompts). Details in [doc/env_vars.md](../../doc/env_vars.md). |
+| `EXL3_DSPARK_AUTO_LO`, `EXL3_DSPARK_AUTO_SWITCH`, `EXL3_DSPARK_AUTO_HL` | `0.35`, `1.5`, `32` | `auto` gate: low cutoff, accepted-drafts-per-round switch point, and half-life in rounds of its running average. |
+| `EXL3_DSPARK_EV_SCALE`, `_EV_GAMMA`, `_EV_COST`, `_EV_KMIN` | see doc/env_vars.md | `ev` gate calibration. |
+| `EXL3_ROUTER_INT8` | `0` | `1` opts into the int8 multi-row router projection; the default fp16 router is the tested path. |
 | `EXL3_DSPARK_TAP_SCALE` | `1.0` | Scale on the drafter's input taps. |
 | `EXL3_PREFILL_RC_SPLIT` | `0` (implied `1` by the prefix cache) | Split prefill at recurrent-checkpoint boundaries so a partial prefill can still be cached. |

@@ -1,43 +1,101 @@
-<p align="center"><b>QMesh</b> — a tensor-parallel runtime for very large EXL3 models on two consumer-class GPUs</p>
+<p align="center"><b>QMesh</b> — a tensor-parallel runtime for very large EXL3 models on two workstation GPUs</p>
 
 # QMesh EXL3 Runtime
 
-This repository is a downstream fork of [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (MIT) that turns it
-into a **true TP=2 serving runtime** for one very large mixture-of-experts model: a 2.565-bits-per-weight EXL3
-quantisation of **DeepSeek-V4.1-Flash-1017**, mixed across experts so that it fits, resident and fully on-GPU, in
-**2 × 96 GB** while running the same weights split across both cards with per-block collectives.
+A downstream fork of [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (MIT) that runs one very large
+mixture-of-experts model as a **true TP=2 runtime** on **2 × 96 GB GPUs**: a mixed-bitrate EXL3 quantisation of
+**DeepSeek-V4.1-Flash-1017** (2.565 bpw average — frequently used experts at higher precision, rarely used ones
+at lower), fully resident on-GPU, with speculative decoding always on.
 
-It is not a general-purpose fork: upstream remains intact (`exllamav3/`, `examples/`, `tests/`, `util/`,
-`doc/`), the TP=2 work lives in `qmesh/` and is documented in `docs/tp2/`, and upstream's own README is preserved
-as [README.exllamav3.md](README.exllamav3.md).
+Upstream remains intact (`exllamav3/`, `examples/`, `tests/`, `util/`, `doc/`); the TP=2 work lives in `qmesh/`
+and is documented in `docs/tp2/`. Upstream's own README is preserved as [README.exllamav3.md](README.exllamav3.md).
 
-Status: **v1.0.0** — measured, working, with the limitations listed below stated plainly.
+Status: **v1.0.0**.
 
-## What it does
+## Performance
 
-| | Measured | Conditions |
-|---|---|---|
-| Single-stream decode | **93.7 tok/s** (10.67 ms/token) | greedy, 128 tokens, `COMM=p2p`, whole-step graphs |
-| Speculative decode | **111–215 tok/s** (K=5, AL 2.6–5.3) | short prompts, acceptance .66–.91 |
-| Concurrent streams | **203–206 tok/s** aggregate at B4 | short prompts, captured batched path, 86.5 GiB/GPU |
-| Prefill | **4.82k tok/s** (`COMM=hybrid`), 4.74–4.78k on NCCL | 32k prompt, chunk 8192 |
-| Long context | 16.1–16.6 ms/token at 24k, 16.9 at 60k | `COMM=hybrid`, eager path; the 60k figure predates compaction |
-| Prefix cache | **36–40×** TTFT at 20k, **86–88×** at 60k | full hit on a previously seen prefix |
-| Footprint | 86.9 GiB resident per rank after load, 90.7 GiB peak at 32k prefill, ~6 GiB free | 2.565 bpw, fp16 KV, 8192 chunk |
+Measured on 2 × RTX PRO 6000 Blackwell Max-Q (PCIe, power-capped), greedy decoding, speculative decoding on
+(DSpark, K=5, adaptive confidence cutoff), CPU-pinned ranks. Full tables, configurations and logs:
+[docs/tp2/RESULTS.md](docs/tp2/RESULTS.md).
 
-Every figure, its configuration, and the run it came from are in [docs/tp2/RESULTS.md](docs/tp2/RESULTS.md).
-Read the "how to read these tables" note there before comparing anything: these cards are power-capped and
-drift, so only back-to-back A/B numbers are comparable.
+**Single-user decode, 24k-token context** (512 generated tokens):
+
+| Content | tok/s |
+|---|---|
+| Math | 189 |
+| Code | 177 |
+| Structured data (JSON) | 169 |
+| Agentic coding, 24k (private sessions, not distributed) | 142 |
+| Multilingual (zh + en) | 100 |
+| Prose | 97 |
+
+**Long context, single user** (decode tok/s): 72k agentic 128, 72k code 128, 128k agentic 124.
+
+**4 concurrent users** (12k-token prompts, 16k KV each): 189 tok/s total, 58 tok/s per user.
+
+**Cold prefill** (no prefix cache): 2,614 tok/s at 24k, 2,782 at 72k, 2,746 at 128k (128k prompt → first token
+in 48 s). Repeat prompts hit the prefix cache instead: a 128k prompt seen before answers in under 0.1 s.
+
+The agentic prompts are the owner's own coding-assistant sessions; they are private and not included in this
+repository. To reproduce those rows, use your own agentic transcripts.
+
+Read the note in RESULTS.md before comparing numbers: these cards are power-capped and drift, so only
+back-to-back interleaved A/B numbers are comparable.
+
+## Quality
+
+Perplexity on the two published DeepSeek-V4.1-Flash-1017 panels (199 conversations each; 237,457 and 254,846
+scored assistant positions, the same positions the published packs were scored on), measured through this
+runtime's production prefill path:
+
+| Build | Expert bpw | 1017 panel (native 1017 replies) | sudoingx panel |
+|---|---|---|---|
+| DeepSeek-V4.1-Flash-1017, original weights | — | 1.5720 | 1.6005 |
+| sudoingx v2.0 | 2.80 | 1.5869 | 1.6117 |
+| HeNryous | 2.75 | 1.5871 | 1.6119 |
+| object-oriented-architects | 2.7 | 1.5931 | 1.6146 |
+| sudoingx v1.2 | 2.70 | 1.5946 | 1.6159 |
+| LibertAIDAI | 2.9 | 1.6040 | 1.6155 |
+| **This release (abliterated base)** | **2.565** | **1.6886** | **1.7041** |
+
+Read this table with two caveats:
+
+- The other rows were scored by their authors' harness on DGX Spark; this row is scored by
+  `qmesh/tp2/panel_ppl.py` through the TP=2 runtime. Same panels and positions, different code path.
+- The base checkpoint is [dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8),
+  an abliterated (refusal-removed) fine-tune. Every other quantised row is built from the original
+  `deepseek-ai/DeepSeek-V4.1-Flash-1017` (per their model cards), and the panels hold the original model's replies.
+  This row's gap to the original therefore includes the abliteration edit as well as quantisation; the split
+  between the two has not been measured.
+
+Prefill-chunk invariance: the same text scores the same at 256-, 2048- and 4096-row prefill chunks (8k-token
+WikiText-2 windows: 2.1820 / 2.1827 / 2.1827, ±0.025).
+
+## What is in v1
+
+- **True TP=2.** Attention heads, KV heads, vocab embedding/head and the MoE intermediate dimension are split two
+  ways; each rank is a single-device ExLlamaV3 model (`tp_size=2`). Partial sums are combined by a one-shot
+  CUDA-IPC all-reduce over PCIe. Design: [docs/tp2/DESIGN.md](docs/tp2/DESIGN.md).
+- **Captured decode.** Each decode step and each speculative verify step replays CUDA graphs instead of
+  ~1,600 kernel launches — including long-context steps and the multi-token verify.
+- **Speculative decoding, always on, adaptive.** The DSpark drafter head proposes 5 tokens per round, captured
+  as GPU graphs. Its confidence head decides each round how many drafts to verify; the confidence cutoff adapts
+  to content (bolder on low-acceptance text such as prose and multilingual) on the GPU, with no host cost
+  (`EXL3_DSPARK_GATE`).
+- **Correctness by construction for captured graphs.** Every graph is sized from fixed capacities, not from the
+  current request, so alternating short and long requests never re-captures a graph against stale memory.
+  Repeated requests are token-identical; both ranks are token-identical.
+- **Exact routing.** The multi-row expert router is bitwise identical to single-token decode.
+- **OpenAI-compatible server** (`qmesh/tp2/serve_tp2.sh start|stop|status`): chat and completions, streaming,
+  tool calls, prompt-cache reuse with cached-token usage, API key, clean shutdown. See
+  [docs/tp2/SERVER.md](docs/tp2/SERVER.md).
+- **Prompt cache** with recurrent-state checkpoints, so multi-turn agentic sessions skip the re-prefill.
 
 ## Hardware and software
 
-- 2 × NVIDIA RTX PRO 6000 Blackwell (96 GB), PCIe peer-to-peer between them, both on one NUMA node.
-  The runtime needs `sm_120a`; other Blackwell parts should work if they fit the weights.
-- Python ≥ 3.10, a PyTorch build with CUDA 12.8+ and `sm_120a` support, the CUDA toolkit, `ninja`, `gcc`.
-- `torch.distributed` (NCCL) for rendezvous; a one-shot P2P all-reduce kernel compiled at first import for the
-  fast path.
-- ~87 GiB of GPU memory per rank for the reference checkpoint resident, plus ~1 GiB per rank of KV for a
-  32k-token context (the exact cost scales with context, batch and the graph pool).
+- 2 × NVIDIA RTX PRO 6000 Blackwell (96 GB), PCIe peer-to-peer, one NUMA node. Needs `sm_120a`.
+- Python ≥ 3.10, PyTorch with CUDA 12.8+ and `sm_120a`, the CUDA toolkit, `ninja`, `gcc`.
+- About 87–91 GiB per GPU for weights, drafter and graphs; the rest is KV cache (16-bit KV by default).
 
 Install the way you install upstream — the extension builds on first import:
 
@@ -45,122 +103,66 @@ Install the way you install upstream — the extension builds on first import:
 git clone https://github.com/GPTwareAiTeam/QMesh-EXL3-Runtime.git qmesh
 cd qmesh
 pip install -e .
-TORCH_CUDA_ARCH_LIST=12.0a python -c "import exllamav3"   # JIT-builds the extension, ~2 min
+TORCH_CUDA_ARCH_LIST=12.0a python -c "import exllamav3"   # JIT-builds the extension
 ```
 
-Set `TORCH_EXTENSIONS_DIR` to a persistent path or every restart rebuilds. No container image ships with this
-tree: the runtime builds in a plain PyTorch image with the CUDA toolkit and `ninja`, provided
-`TORCH_CUDA_ARCH_LIST` includes `12.0`; `scripts/bench_v1.sh` assumes you already have such a container
-running on both GPUs.
+Set `TORCH_EXTENSIONS_DIR` to a persistent path, or every restart rebuilds.
 
 ## Getting the checkpoint
 
-You need a TP=2 sharded EXL3 checkpoint. `qmesh/tp2/shard_tool.py` produces one from a full checkpoint on a
-CPU-only host; the expert-mix rationale, the tensor split rules and a three-step reproduction are in
-[docs/tp2/RECIPE.md](docs/tp2/RECIPE.md) and [docs/tp2/SHARD_SPEC.md](docs/tp2/SHARD_SPEC.md). The output
-directory holds `rank0/` and `rank1/`, each a self-describing EXL3 checkpoint with `tp_size=2, tp_rank=r`.
+Download the pre-sharded checkpoint from Hugging Face (link on release), or build one: `qmesh/tp2/shard_tool.py`
+produces `rank0/` and `rank1/` from a full EXL3 checkpoint; see [docs/tp2/RECIPE.md](docs/tp2/RECIPE.md) and
+[docs/tp2/SHARD_SPEC.md](docs/tp2/SHARD_SPEC.md).
 
 ## Running it
 
-One process per GPU. `scripts/bench_v1.sh` is the reference invocation: it launches both ranks, waits, and
-reports ms/token plus a rank-to-rank token comparison.
+Server (recommended):
 
 ```sh
-export EXL3_ARTIFACTS=$PWD/artifacts        # host side; mounted at /artifacts in the container
-export CONTAINER=qmesh-tp2                  # container name
-export COMM=p2p                             # decode fast path
-# OVERLAY is the directory that holds rank0/ and rank1/
-TAG=first_run scripts/bench_v1.sh \
-  -e OVERLAY=/artifacts/tp2-overlay \
-  -e EXL3_WHOLE_GRAPH=1 -e EXL3_DSV4_B1_BATCH=1
+OVERLAY=/path/to/checkpoint qmesh/tp2/serve_tp2.sh start      # OpenAI-compatible API on port 8000
+qmesh/tp2/serve_tp2.sh status
+qmesh/tp2/serve_tp2.sh stop
 ```
 
-For a long-context or multi-stream run, add `-e CTX_TOKENS=131072`, `-e BATCH=4`, or
-`-e LONG_PROMPT_TOKENS=24000`. `DSPARK=1` (the script default) enables speculative decoding; use
-`DSPARK=0` for a plain baseline. `COMM=hybrid` routes prefill through NCCL and decode through P2P and is the
-right default once you care about TTFT more than decode latency.
-
-The launcher is plain `docker exec`; without a container, run the same command twice by hand:
+Direct runner, one process per GPU (`qmesh/tp2/launch_tp2.sh` does this, with CPU pinning):
 
 ```sh
-rm -rf /tmp/rdv && mkdir -p /tmp/rdv/rendezvous /tmp/rdv/p2p
 for r in 0 1; do
   RANK=$r WORLD_SIZE=2 INIT_METHOD=file:///tmp/rdv/rendezvous P2P_RDV=/tmp/rdv/p2p \
-  TORCH_CUDA_ARCH_LIST=12.0a EXL3_WHOLE_GRAPH=1 EXL3_DSV4_B1_BATCH=1 \
+  TORCH_CUDA_ARCH_LIST=12.0a EXL3_WHOLE_GRAPH=1 EXL3_DSV4_B1_BATCH=1 DSPARK=1 \
   python -m qmesh.tp2.run_tp2 > /tmp/rdv/rank$r.log 2>&1 &
-done
-wait
+done; wait
 ```
 
-Every dial is documented in [docs/tp2/env_vars.md](docs/tp2/env_vars.md); the engine-level switches (capture,
-fusion, kernel selection) are in [doc/env_vars.md](doc/env_vars.md).
+Add `CTX_TOKENS=131072` for long context or `BATCH=4` for concurrent streams. Every dial is documented in
+[docs/tp2/env_vars.md](docs/tp2/env_vars.md) and [doc/env_vars.md](doc/env_vars.md).
 
-## How it works
+## Opt-in settings (lossy or experimental)
 
-- **Sharding.** Attention heads, KV heads, the vocab embedding, the output head and the MoE expert
-  intermediate dimension are split two ways; the router, the shared experts' input projection and the norms
-  are replicated. Each rank builds a *single-device* ExLlamaV3 model with `tp_size=2, tp_rank=r`, which keeps
-  the upstream loader, cache and sampler untouched. Design and memory budget: [docs/tp2/DESIGN.md](docs/tp2/DESIGN.md).
-- **Collectives.** Partial sums from attention and MoE are combined by a one-shot CUDA-IPC all-reduce over
-  PCIe: 4.93 µs per call on decode-sized payloads versus 11.84 µs for NCCL. Prefill payloads are large, so
-  `COMM=hybrid` switches to NCCL above a byte threshold — that is worth +16.5% prefill. The vocab head is
-  all-gathered so greedy sampling is bit-identical on both ranks.
-- **Piecewise CUDA graphs.** The decode step is captured as one graph segment per transformer block and
-  merged across blocks; the first step of a run is the capture. This is the single largest decode win
-  (13.35 → 10.97 ms/token, then 10.67 with the fused launch merges) and it is why capture *eligibility* is
-  checked and logged rather than assumed.
-- **Speculative decoding (DSpark).** A DFlash drafter head runs sharded on both ranks; rank 0 decides the
-  accepted prefix and broadcasts it, so both ranks verify the same width. The drafter is a separate EXL3
-  checkpoint; `TORCH_EXTENSIONS_DIR` and the overlay both need room for it.
-- **Prefix cache.** Recurrent layers make exact KV reuse non-trivial, so the cache stores recurrent-state
-  checkpoints at chunk boundaries and replays from the last page-aligned one. Costs host RAM (~268 MB per rank
-  per 60k context), not VRAM.
-- **Prefill chunking.** `MAX_CHUNK=auto` sizes the prefill chunk from a measured device-peak table against
-  whatever KV budget you gave it, so a 1M-token context costs one step (8192 → 4096) instead of an OOM.
-
-## Repository layout
-
-```
-qmesh/tp2/        runner, sharding tools, TP=2 benchmarks, launchers
-qmesh/p2p/        P2P all-reduce benchmark
-qmesh/*.py        standalone MoE / attention / all-reduce benches
-docs/tp2/         design, recipe, results, env dials, shard spec, raw working notes
-scripts/          bench_v1.sh (reference run)
-exllamav3/        upstream library, plus the TP=2 backend (tp2/) and the P2P kernel
-                  (exllamav3_ext/parallel/p2p_oneshot.cu); other changes are additive hooks
-doc/, examples/, tests/, util/, science/   upstream, unchanged
-```
+- `PREFILL_AR=int8` — 8-bit prefill all-reduce, ~+13% prefill; changes outputs slightly.
+- `KV_BITS=8` — 8-bit KV cache, ~1.5× context capacity; fails our quality gate at long context, so off by default.
+- `DSPARK_HEAD=diffbot` — diffbot's drafter head (MIT, credited); ours is faster on every content type we tested.
+- `EXL3_DSPARK_GATE=ev` — per-round expected-value draft width; larger wins on some content, larger losses on
+  others.
 
 ## Known limitations
 
-These are measured, not speculative:
-
-- **Capture stops at ~1024 positions.** The captured decode body has no top-k indexer selection, so past that
-  the runtime falls back to eager attention: 16.1 ms/token at 24k versus 10.7 at short context. Compaction cut
-  `aten::nonzero` from 8 to 0 and launches from 585 to 557 per step but did not remove the gate.
-- **One long row drops the whole batch to eager** — a B8 batch containing a 1.1k-token prompt measured 81.6
-  ms/token against 31.7 for all-short prompts. Fast batching numbers are short-prompt numbers.
-- **Batching is invariant across streams, not across batch width.** Rows are bitwise independent of their
-  neighbours, but B1/B2/B4/B8 are different arithmetic paths and can diverge on near-ties. Verified in detail
-  in [RESULTS.md](docs/tp2/RESULTS.md#6-concurrency).
-- **Speculation and batching are substitutes**: at B4, drafting costs more than it saves.
-- **FP8 KV** cuts the KV pool by a third (3200 → 2150 bytes/token/rank) with no measurable quality loss, but
-  packed pools break capture and the bypassed capture is numerically wrong; `KV_BITS=16` is the default and
-  the supported setting.
-- 8-bit prefill all-reduce gains 6–7% but fails the coherence gate (a prompt-3 token flip at step 11); it is
-  not shipped.
-- The 1M-token path exists and sizes correctly, but the eager long-context path is slow (~3.5 min cold prefill
-  at that rate). Long-context workloads in the 20k–100k range are the tested ones.
-
-## Roadmap
-
-In the order the measurements justify: capture-safe candidate selection with exact tie order (that is the
-long-context gap), per-row capture eligibility so mixed batches do not fall back, then real-transcript
-validation of speculative acceptance and of diverse-prompt batching. Details and rejected ideas (so they do
-not get retried) are in [docs/tp2/notes/master-plan.md](docs/tp2/notes/master-plan.md).
+- Cold prefill is ~2.6–2.8k tokens/s; a 128k prompt takes ~48 s to its first token. Repeated prefixes hit the
+  prefix cache and skip that.
+- Multi-user throughput scales weakly: with several users, decode attention still runs one user at a time (only
+  the expert and dense layers are batched). 4 users reach 189 tok/s total. A whole-batch attention graph is the
+  planned fix.
+- 8 concurrent users with speculation do not run: out of memory at 16k KV per user, and a drafter graph-capture
+  failure at 8k per user. 8 users without speculation run.
+- Little VRAM is spare. At the default 4096-row prefill chunk (1 user, 32k context, speculation on) a 24k prompt
+  still runs with 0.75 GiB per GPU taken by another process and fails at 1.25 GiB. With `MAX_CHUNK=2048` it runs
+  with 2.25 GiB taken (the most tested), at a cost in prefill speed.
+- K=7 speculation needs a block-7 drafter head (only diffbot's exists) and does not beat K=5 on our test set;
+  parked for v2 (see `docs/tp2/notes/`).
 
 ## Credits and licence
 
-This runtime is a small delta on a lot of other people's work — see [CREDITS.md](CREDITS.md). Upstream ExLlamaV3
-is MIT-licensed by Turboderp; the licence text is unchanged in [LICENSE](LICENSE). The checkpoint and the
-sharding tools are ours.
+This runtime is a delta on a lot of other people's work — see [CREDITS.md](CREDITS.md): turboderp (ExLlamaV3,
+MIT), DeepSeek (model, MIT), dealignai (base checkpoint, MIT), the external MoE-kernel candidates kit (two
+kernel changes compiled in), and diffbot (optional drafter head, MIT). The code is MIT; the licence text is
+unchanged in [LICENSE](LICENSE).

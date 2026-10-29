@@ -44,13 +44,13 @@ the captured sampling graph (no host cost, no re-capture).
 - `auto`: the threshold gate with a content-adaptive threshold. An exponential average of accepted drafts per
   verify round (half-life `EXL3_DSPARK_AUTO_HL`, default `32` rounds) selects `EXL3_DSPARK_AUTO_LO` (default
   `0.35`) while it is below `EXL3_DSPARK_AUTO_SWITCH` (default `1.5`) — low-acceptance text such as prose and
-  multilingual — and `EXL3_DSPARK_CONF` otherwise. Measured on 7 prompts at 512 tokens: −0.9% ms/token overall,
-  multilingual −3.8%, worst case +1.0%. The estimate resets when a new job starts. The threshold is a
+  multilingual — and `EXL3_DSPARK_CONF` otherwise. Measured on 19 prompts (2k–72k context): +0.6% tok/s overall,
+  best +3.0% (multilingual 2k), worst −0.9%. The estimate resets when a new job starts. The threshold is a
   persistent device tensor the captured graph reads, so switching levels never re-captures.
 - `ev`: per-round expected-value width, `argmax_k E[k] / cost(k + 1)` with `E[k] = 1 + sum_{i<=k} prod_{j<=i}
   min(1, EXL3_DSPARK_EV_SCALE * c_j ** EXL3_DSPARK_EV_GAMMA)` and the relative round cost per verify-row count
   from `EXL3_DSPARK_EV_COST` (`rows:cost,...`, interpolated). `EXL3_DSPARK_EV_KMIN` bounds the width from below.
-  Measured on 19 prompts: −1.7% ms/token overall but up to +13.5% on some long agentic/math prompts, so it is
+  Measured on 19 prompts: +1.7% tok/s overall but up to −12% tok/s on some long agentic/math prompts, so it is
   opt-in only.
 
 ### `EXL3_DSPARK_NOISE_CACHE` (default: `1`)
