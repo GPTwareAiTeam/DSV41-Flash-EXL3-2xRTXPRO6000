@@ -602,9 +602,10 @@ void BC_BlockSparseMLP::run_single_expert_dq
         had_r_128_dual(y, yh1, gates[expert_idx]->suh, c10::nullopt,
                        y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
 
-        reconstruct(dq_temp_up, gates[expert_idx]->trellis, gate_K, gate_mcg, gate_mul1);
+        // Each expert's own rate: mixed-K layers carry a placeholder in gate_K / up_K / down_K
+        reconstruct(dq_temp_up, gates[expert_idx]->trellis, gates[expert_idx]->K, gate_mcg, gate_mul1);
         hgemm_recon(yh1, dq_temp_up, interm1);
-        reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+        reconstruct(dq_temp_up, ups[expert_idx]->trellis, ups[expert_idx]->K, up_mcg, up_mul1);
         hgemm_recon(yh2, dq_temp_up, interm2);
 
         had_r_128_dual(interm1, interm1, c10::nullopt, gates[expert_idx]->svh,
@@ -613,7 +614,7 @@ void BC_BlockSparseMLP::run_single_expert_dq
     else
     {
         had_r_128(y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
-        reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
+        reconstruct(dq_temp_up, ups[expert_idx]->trellis, ups[expert_idx]->K, up_mcg, up_mul1);
         hgemm_recon(yh2, dq_temp_up, interm2);
         had_r_128(interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
     }
@@ -630,7 +631,7 @@ void BC_BlockSparseMLP::run_single_expert_dq
         relu2_mul(interm1, interm2, interm_a, act_limit);
 
     had_r_128(interm_a, interm_a, downs[expert_idx]->suh, c10::nullopt, 1.0);
-    reconstruct(dq_temp_down, downs[expert_idx]->trellis, down_K, down_mcg, down_mul1);
+    reconstruct(dq_temp_down, downs[expert_idx]->trellis, downs[expert_idx]->K, down_mcg, down_mul1);
     hgemm_recon(interm_a, dq_temp_down, out);
     had_r_128(out, out, c10::nullopt, downs[expert_idx]->svh, 1.0);
 }
