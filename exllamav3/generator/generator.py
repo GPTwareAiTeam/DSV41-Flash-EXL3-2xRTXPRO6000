@@ -16,6 +16,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .disk_cache import DiskPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+from . import roundprof as rprof
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -28,8 +29,26 @@ from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
 # Test hook: True forces the per-position serial speculative-window readback instead of the batched
-# (launch-all-samplers, one pinned stage, one synchronize) path
-_NO_BATCH_READBACK = False
+# (launch-all-samplers, one pinned stage, one synchronize) path; EXL3_SD_BATCH_READBACK=0 sets it
+_NO_BATCH_READBACK = __import__("os").environ.get("EXL3_SD_BATCH_READBACK", "1") == "0"
+# One rank-agreement collective for the whole verify window instead of one per position: a sampler that
+# implements agree_window() gets its per-call broadcast deferred into that single collective
+_BATCH_AGREE = __import__("os").environ.get("EXL3_SD_BATCH_AGREE", "1") != "0"
+# One readback per drafting round: a drafter that gates its own length on device (the captured Markov
+# chain) leaves the width on the GPU, so the draft ids and that width are staged together and settled by
+# one synchronize. EXL3_SD_DEFER_DRAFT_CONF=0 restores the separate host-side readback, for A/B only
+_DEFER_DRAFT_CONF = __import__("os").environ.get("EXL3_SD_DEFER_DRAFT_CONF", "1") != "0"
+# One launch per verify window instead of one per position: a sampler that declares window_batch_safe
+# (a greedy stack, whose token is the row-wise argmax) samples all W positions at once.
+# EXL3_SD_WINDOW_BATCH=0 restores the per-position launches, for A/B measurement only
+_SD_WINDOW_BATCH = __import__("os").environ.get("EXL3_SD_WINDOW_BATCH", "1") != "0"
+_DSPARK_PROBE = bool(int(__import__("os").environ.get("DSPARK_PROBE", "0")))
+_DSPARK_ORACLE = None
+# EXL3_DRAFT_HIST=1: count verify rounds by accepted draft count (index = drafts accepted, 0..K), printed by the runner
+_DRAFT_HIST = [0] * 16 if __import__("os").environ.get("EXL3_DRAFT_HIST", "0") != "0" else None
+if __import__("os").environ.get("DSPARK_ORACLE"):
+    import json as _json
+    _DSPARK_ORACLE = _json.load(open(__import__("os").environ["DSPARK_ORACLE"]))
 
 class Generator:
 
@@ -249,6 +268,8 @@ class Generator:
         # Draft model
         self.draft_model = draft_model
         self.draft_cache = draft_cache
+        # Widest window the drafter can physically produce (caps-driven; None = no block limit)
+        self.max_draft_size = None
         if draft_model:
             assert not ngram_match_min, \
                 "Cannot use both draft model and n-gram draft."
@@ -266,6 +287,15 @@ class Generator:
                 self.num_draft_tokens = num_draft_tokens
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
+            # A drafter that drafts a fixed block per forward (DSpark: one forward over dspark_block_size
+            # tokens) cannot produce positions past that block; asking for more would either index outside
+            # the noise block or silently reuse rows. Clamp, and say so loudly at startup
+            self.max_draft_size = draft_model.caps.get("max_draft_size")
+            if self.max_draft_size is not None and self.num_draft_tokens > self.max_draft_size:
+                print(f" !! num_draft_tokens = {self.num_draft_tokens} exceeds the drafter's block size "
+                      f"({self.max_draft_size}); CLAMPED to {self.max_draft_size}. The drafter drafts one "
+                      f"block per forward, so longer windows cannot be produced", flush=True)
+                self.num_draft_tokens = self.max_draft_size
             depths = draft_model.caps.get("mtp_depths")
             if depths is not None and self.num_draft_tokens > depths:
                 print(f" !! Warning: the MTP head has {depths} depth-specialized layers; draft positions past "
@@ -741,6 +771,7 @@ class Generator:
             }
         """
 
+        rprof.new_round()
         assert self.cache.initialized, \
             "Cache tensors were never allocated. Construct the Cache BEFORE calling model.load()"
         owner_serial = getattr(self.cache, "owner_serial", None)
@@ -823,6 +854,7 @@ class Generator:
                 draft_tokens, self.row_limited(self.hybrid_draft_tokens)
             )
 
+        rprof.mark("draft_dispatch_end")
         self.iterate_gen(results, draft_tokens)
         if round_start is not None and draft_tokens is not None:
             # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
@@ -838,6 +870,7 @@ class Generator:
             self.write_behind()
 
         # Finished iteration
+        rprof.mark("r_end")
         return results
 
 
@@ -1293,6 +1326,8 @@ class Generator:
 
         self._draft_conf_round = None
 
+        rprof.mark("d0")
+
         # Get shape of active batch
         batch_size = 0
         max_seq_len = 0
@@ -1366,23 +1401,52 @@ class Generator:
             params["recurrent_states"] = [job.recurrent_state.draft for job in self.active_jobs if job.is_prefill_done()]
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
+        # One readback for the whole draft output: the drafter that can gate its length on device
+        # (EXL3_DSPARK_MARKOV_GRAPH) leaves the width there, so the ids and the width travel in one
+        # pinned copy and one synchronize below instead of a host .item() plus a separate D2H
+        defer_conf = _DEFER_DRAFT_CONF and self.draft_calibrator is None
+        if defer_conf:
+            params["defer_draft_confidence_len"] = True
         params["sparse_head"] = self._sparse_flag
+        if getattr(self, "count_draft_forwards", False):
+            self.draft_forward_count += 1
+        rprof.mark("d_prep_end")
         out_state = self.draft_model.forward(
             input_ids = batch_ids,
             params = params,
         )
+        rprof.mark("d_fwd_end")
         new_ids = self.draft_model.sample_from_state(out_state, params)
+        rprof.mark("d_sample_end")
 
         # Draft models with a confidence head cap the usable draft length per round;
         # 0 means no draft position cleared the threshold, so skip drafting entirely
         conf_len = params.get("draft_confidence_len")
+        conf_len_dev = params.get("draft_confidence_len_device")
+        if conf_len_dev is not None:
+            # Ids for the whole drafted block and the drafter's own width in one pinned row,
+            # copied on the stream and settled by the single synchronize below
+            width_cap = new_ids.shape[1] - 1
+            pinned_d = self.draft_ids_pinned
+            if pinned_d.shape[1] <= width_cap:
+                self.draft_ids_pinned = pinned_d = torch.empty(
+                    (pinned_d.shape[0], width_cap + 1), dtype = torch.long, pin_memory = True
+                )
+            pinned_d[:batch_size, :width_cap].copy_(new_ids[:batch_size, 1:width_cap + 1], non_blocking = True)
+            pinned_d[0, width_cap:width_cap + 1].copy_(
+                conf_len_dev.reshape(-1)[:1].to(torch.long), non_blocking = True
+            )
+            torch.cuda.synchronize(new_ids.device)
+            new_ids = pinned_d[:batch_size, :width_cap]
+            conf_len = int(pinned_d[0, width_cap])
         if conf_len is not None:
             if conf_len == 0:
                 return None
             window = min(window, conf_len)
 
         # Crop out the first token after sampling to keep batch contiguous for lm_head
-        new_ids = new_ids[:, 1:]
+        if conf_len_dev is None:
+            new_ids = new_ids[:, 1:]
 
         # Confidence-calibrated truncation: cut the batch window at the first position whose
         # drafter confidence falls below the calibrated threshold, taking the longest cut across
@@ -1403,7 +1467,9 @@ class Generator:
                 return None
             window = w_used
 
-        self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        if conf_len_dev is None:
+            self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        rprof.mark("d_ids_end")
         return self.draft_ids_pinned[:, :window]
 
 
@@ -1627,6 +1693,7 @@ class Generator:
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
+        rprof.mark("v0")
         # Get shape of active batch
         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
         # determines how many cache pages the temporary block table needs for this iteration.
@@ -1744,12 +1811,14 @@ class Generator:
             "pinned_staging": True,
         }
         self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
+        rprof.mark("v_prep_end")
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = params,
         )
+        rprof.mark("v_fwd_end")
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.
@@ -1888,31 +1957,78 @@ class Generator:
                     and b - a == 1
                     and job.checkpoint is None
                     and job.forced_ids is None
-                    and job.new_tokens >= job.min_new_tokens
+                    # The min_new_tokens mask (stop tokens blocked while new_tokens < min_new_tokens) is a
+                    # function of new_tokens only, so it is identical for every position of the window whenever
+                    # the window ends inside it: batching is exact there too, and that is the whole IGNORE_EOS run
+                    and (job.new_tokens >= job.min_new_tokens or
+                         (0 <= job.new_tokens and job.new_tokens + W <= job.min_new_tokens))
                     and not any(f.is_active or f.trigger_token is not None for f in job.filters)
                     and not job.sampler.reqs_past_ids
                 )
                 staged = None
+                device_accepted = None
                 if batchable:
                     rng_state = job.rng.getstate()
                     staged = []
                     any_cuda = False
-                    for i in range(W):
-                        token_logits = job_logits[:, i:i + 1, :]
-                        sampled = job.receive_logits(token_logits)
-                        is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
-                        staged.append((sampled, is_cuda))
-                        any_cuda |= is_cuda
+                    agree = getattr(job.sampler, "agree_window", None) if _BATCH_AGREE else None
+                    if agree is not None:
+                        job.sampler.defer_agree = True
+                    # A greedy sampler is a row-wise pure function of the logits, so the whole window
+                    # samples in one launch (one call, one pinned copy) instead of one per position:
+                    # same token per position, and the RNG replay below restores the serial stream
+                    window_sampled = None
+                    if (_SD_WINDOW_BATCH and W > 1 and getattr(job.sampler, "window_batch_safe", False)
+                            and job.device_logit_mask is None
+                            and not job.return_probs and not job.return_top_tokens):
+                        sampled_window = job.receive_logits(job_logits)
+                        if sampled_window[0].is_cuda and sampled_window[0].numel() == W:
+                            window_sampled = sampled_window[0].reshape(1, W)
+                            staged = [((window_sampled[:, i:i + 1].view(1, 1),) + sampled_window[1:], True)
+                                      for i in range(W)]
+                            any_cuda = True
+                    if window_sampled is None:
+                        for i in range(W):
+                            token_logits = job_logits[:, i:i + 1, :]
+                            sampled = job.receive_logits(token_logits)
+                            is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
+                            staged.append((sampled, is_cuda))
+                            any_cuda |= is_cuda
+                    if agree is not None:
+                        job.sampler.defer_agree = False
+                        agreed = agree([s[0] for s, _ in staged])
+                        staged = [((tok,) + s[1:], c) for (s, c), tok in zip(staged, agreed)]
+                        rprof.mark("s_agree_end")
                     if any_cuda:
                         pinned_w = getattr(self, "draft_sample_pinned", None)
-                        if pinned_w is None or pinned_w.shape[1] < W:
-                            pinned_w = torch.empty((1, max(W, 8)), dtype = torch.long, pin_memory = True)
+                        if pinned_w is None or pinned_w.shape[1] < W + 1:
+                            pinned_w = torch.empty((1, max(W + 1, 8)), dtype = torch.long, pin_memory = True)
                             self.draft_sample_pinned = pinned_w
-                        for i, (sampled, is_cuda) in enumerate(staged):
-                            if is_cuda:
-                                pinned_w[0:1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
-                                staged[i] = ((pinned_w[0:1, i:i + 1],) + sampled[1:], False)
+                        if (draft_tokens is not None and all(c for _, c in staged) and
+                                __import__("os").environ.get("EXL3_SD_DEVICE_ACCEPT", "0") == "1"):
+                            tokens_dev = window_sampled.view(W) if window_sampled is not None else \
+                                torch.cat([s[0].reshape(1) for s, _ in staged])
+                            drafts_dev = draft_tokens[j, :W - 1].to(tokens_dev.device, non_blocking = True)
+                            matched = (tokens_dev[:W - 1] == drafts_dev).long().cumprod(0).sum().view(1)
+                            packed = torch.cat((tokens_dev, matched))
+                            pinned_w[0, :W + 1].copy_(packed, non_blocking = True)
+                            staged = [((pinned_w[0:1, i:i + 1],) + s[1:], False)
+                                      for i, (s, _) in enumerate(staged)]
+                            device_accepted = pinned_w[0, W:W + 1]
+                        elif window_sampled is not None:
+                            pinned_w[0:1, :W].copy_(window_sampled, non_blocking = True)
+                            staged = [((pinned_w[0:1, i:i + 1],) + s[1:], False)
+                                      for i, (s, _) in enumerate(staged)]
+                        else:
+                            for i, (sampled, is_cuda) in enumerate(staged):
+                                if is_cuda:
+                                    pinned_w[0:1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
+                                    staged[i] = ((pinned_w[0:1, i:i + 1],) + sampled[1:], False)
+                        rprof.mark("s_launch_end")
                         torch.cuda.synchronize(batch_logits.device)
+                        if device_accepted is not None:
+                            device_accepted = device_accepted.item()
+                        rprof.mark("s_sync_end")
 
                 for i in range(W):
                     positions_used = i + 1
@@ -1977,7 +2093,9 @@ class Generator:
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+                        matches = i < device_accepted if device_accepted is not None else \
+                                  draft_tokens[j, i].item() == sampled_token.item()
+                        if not matches or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
 
@@ -2023,12 +2141,17 @@ class Generator:
                             draft_tokens.shape[-1],
                             accepted_length - 1,
                         ))
+                    # Content-adaptive gate (EXL3_DSPARK_GATE=auto): one rank-agreed integer per round
+                    observe = getattr(self.draft_model, "observe_accepted", None)
+                    if observe is not None:
+                        observe(accepted_length - 1)
 
                 # The last sampled token leads the next forward
                 self.model.prefetch_tokens([sampled_token.item()])
 
                 accepted_lengths.append(accepted_length)
                 j += 1
+        rprof.mark("accept_end")
 
         if self.sparse_head is not None:
             self._sparse_head_update(batch_jobs, accepted_lengths)
@@ -2094,6 +2217,7 @@ class Generator:
                 lengths = lengths,
                 params = update_params,
             )
+        rprof.mark("kv_end")
 
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
@@ -2222,6 +2346,12 @@ class Generator:
                 self.pending_jobs.remove(job)
                 self.active_jobs.append(job)
                 job.activate()
+                # A new job starts with no content estimate for the adaptive gate. Single-stream state: with
+                # several active jobs the estimate is shared (the gate decides one width per batch anyway).
+                if len(self.active_jobs) == 1:
+                    reset = getattr(self.draft_model, "reset_adaptive", None)
+                    if reset is not None:
+                        reset()
 
                 # Allocate pages for job
                 try:
