@@ -77,10 +77,14 @@ class DSparkAttention(DSV4Attention):
         device = x.device
         cache = params["cache"]
         kl = cache.layers[(self.layer_idx, params.get("layer_instance", 0))]
-        block_table = get_for_device(params, "block_table", self.device)
+        block_table = params.get("dspark_graph_block_table")
+        if block_table is None:
+            block_table = get_for_device(params, "block_table", self.device)
         seqlens = params["cache_seqlens"]                       # host values
         H, D, rd = self.num_q_heads, self.head_dim, self.rope_head_dim
-        positions = get_for_device(params, "cache_seqlens", device)
+        positions = params.get("dspark_graph_positions")
+        if positions is None:
+            positions = get_for_device(params, "cache_seqlens", device)
 
         # Projections + fused unweighted q head norm / weighted kv norm / partial rope
         _, q, kv = self._project_qkv(x, params, 0, positions)
@@ -95,7 +99,7 @@ class DSparkAttention(DSV4Attention):
 
         # TODO: Batched DSpark-attn fwd
         for r in range(bsz):
-            p0 = int(seqlens[r])
+            p0 = 0 if params.get("dspark_graph_positions") is not None else int(seqlens[r])
             hist = min(self.sliding_window, p0)
             outs.append(dsa_attn(
                 q[r].half().contiguous(),
@@ -115,6 +119,8 @@ class DSparkAttention(DSV4Attention):
                 groups = self.o_groups,
                 page_size = 256,
                 nc_block = True,
+                nc_device_pos = positions[r : r + 1] if params.get("dspark_graph_positions") is not None else None,
+                nc_window = self.sliding_window,
                 out = torch.empty((self.o_groups, s, hpg * D), dtype = torch.half, device = device),
             ))
         o = torch.stack(outs, dim = 0).permute(0, 2, 1, 3)      # (bsz, s, G, hpg * D)
@@ -178,6 +184,10 @@ class DSparkInputLayer(Module):
         self.register_submodule(self.main_norm)
         self.attached_model = None
         self.own_embed = None   # set by attach when the target is TP (embedding not borrowable)
+        # The block's noise tokens are all the same id, so their embedding is one row replicated. Caching it
+        # keeps the (CPU-resident, x_cpu) embedding cost flat in the drafter block instead of growing with it.
+        self.noise_cache = os.environ.get("EXL3_DSPARK_NOISE_CACHE", "1") == "1"
+        self._noise_row = None
         self.caps.update({"x_cpu": True})
 
 
@@ -198,8 +208,20 @@ class DSparkInputLayer(Module):
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):
         bsz, seqlen = x.shape
         noise = torch.full((bsz, self.block_size - 1), self.noise_token_id, dtype = torch.long)
-        x = torch.cat((x.cpu(), noise), dim = -1)
+        # The block ids stay in params exactly as before (consumers may read them), but only the seed row has to
+        # go through the embedding table: rows 1..block-1 are the same noise id and come from the cached row.
+        x = x.cpu()
+        ids = torch.cat((x, noise), dim = -1)
+        params.setdefault("input_ids", ids)
         embed = self.own_embed if self.own_embed is not None else self.attached_model().modules[0]
-        x = embed.forward(x, params)
+        if not self.noise_cache or self.block_size < 2:
+            x = embed.forward(ids, params)
+        else:
+            x = embed.forward(x, params)
+            if self._noise_row is None or self._noise_row.dtype != x.dtype:
+                nparams = dict(params)
+                nparams["input_ids"] = torch.full((1, 1), self.noise_token_id, dtype = torch.long)
+                self._noise_row = embed.forward(nparams["input_ids"], nparams).detach()
+            x = torch.cat((x, self._noise_row.expand(bsz, self.block_size - 1, -1)), dim = 1)
         # mHC stream stack: broadcast copies of the embedding, fp32
         return x.float().unsqueeze(2).repeat(1, 1, self.hc_mult, 1)

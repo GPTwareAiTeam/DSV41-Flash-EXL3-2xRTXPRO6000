@@ -12,10 +12,17 @@ from ..modules.arch_specific.dspark import DSparkAttention, DSparkInputLayer, to
 from ..modules.attn import prepare_for_attn
 from ..util.device_copy import to_device
 from ..util.tensor import get_for_device
+from ..util.segment import Segment
+from ..modules.hyperconnections import hc_flush
+import os
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .deepseek_v4 import DeepseekV4Config
+
+# Capture the drafter's sampling chain (trunk head + sequential Markov loop + confidence
+# head and its length gate) as one graph replay.
+_MARKOV_GRAPH = os.environ.get("EXL3_DSPARK_MARKOV_GRAPH", "1") == "1"
 
 # DeepSeek-V4 MTP component = the DSPARK block drafter, stored under the mtp.* namespace:
 # n_mtp_layers full transformer blocks (compressor-less DSA attention, 256-expert noaux MoE
@@ -285,7 +292,33 @@ class DeepseekV4MTPModel(Model):
             x = m.prepare_for_device(x, params)
             if i == self.fwd_end_idx - 1:
                 params["dspark_prenorm"] = x.clone()    # confidence input is PRE-norm
-            x = m.forward(x, params)
+            if (os.environ.get("EXL3_DSPARK_BLOCK_GRAPH", "1") == "1" and isinstance(m, TransformerBlock)
+                    and x.shape[0] == 1 and getattr(params.get("backend"), "piecewise_p2p_capture", False)):
+                positions = get_for_device(params, "cache_seqlens", m.device)
+                block_table = get_for_device(params, "block_table", m.device)
+                if not hasattr(m, "_dspark_full_segments"):
+                    m._dspark_full_segments = {}
+                key = (tuple(x.shape), x.dtype, tuple(block_table.shape), id(params["cache"]))
+                seg = m._dspark_full_segments.get(key)
+                if seg is None:
+                    def block_body(x, positions, block_table, p, block = m):
+                        p["dspark_graph_positions"] = positions
+                        p["dspark_graph_block_table"] = block_table
+                        post, comb, y = block._piece_a(x, p)
+                        y = block.attn.forward(y, p)
+                        p.pop("dspark_graph_positions")
+                        p.pop("dspark_graph_block_table")
+                        result, = block._piece_b(x, post, comb, y, p)
+                        hc_flush(p)
+                        return result
+                    seg = m._dspark_full_segments[key] = Segment(block_body, carry = ("hc_pre",))
+                x, = seg(x, positions, block_table, params)
+                rp = getattr(seg, "replays", 0)
+                if rp in (1, 100) and getattr(self.config, "tp_rank", 0) == 0:
+                    print(f"DSPARK_BLOCK_GRAPH key={key} graph={'yes' if seg.graph is not None else 'no'} "
+                          f"replays={rp}", flush = True)
+            else:
+                x = m.forward(x, params)
         return x
 
 
@@ -314,10 +347,101 @@ class DeepseekV4MTPModel(Model):
             attn.update_kv_rows(mx, params)
 
 
+    def _markov_body(self, state: torch.Tensor, seed: torch.Tensor, prenorm: torch.Tensor, p: dict):
+        """Device-only form of sample_from_state, captured as one graph: trunk head over the whole
+        block, the sequential markov chain (7 tiny steps, one collective each), the confidence head
+        and the length gate. Returns (ids, conf_logits, conf_len); nothing is read back on the host.
+
+        Every per-round value enters through a static tensor (state, seed, prenorm) and every
+        per-round result leaves as a static output, so the captured body never depends on host state
+        that changes between replays. `p` is the capture-time params copy."""
+        import torch.nn.functional as F
+        if self.own_head is not None:
+            lm = self.own_head
+        else:
+            am = self.attached_model()
+            lm = am.modules[am.logit_layer_idx]
+        logits = lm.forward(lm.prepare_for_device(state, p), p).float()
+        b, s, V = logits.shape
+        dev = self.markov_w2.device
+        logits = to_dev(logits, dev)
+        seed = to_dev(seed, dev)
+        if getattr(self, "_markov_w1_dev", None) is None:
+            self._markov_w1_dev = to_dev(self.markov_w1.embedding.weight.data, dev)
+        w2 = self.markov_w2
+        tp = self.config.tp_size
+        out = torch.empty((b, s + 1), dtype = torch.long, device = dev)
+        out[:, 0] = seed[:, -1]
+        embs = []
+        for i in range(s):
+            if tp > 1:
+                local_ids = out[:, i] - self.config.tp_rank * self.markov_w1.vocab_size
+                mask = (local_ids >= 0) & (local_ids < self.markov_w1.vocab_size)
+                emb = F.embedding(torch.where(mask, local_ids, torch.zeros_like(local_ids)), self._markov_w1_dev).float()
+                emb = emb * mask.unsqueeze(-1).float()
+                p["backend"].all_reduce(emb)
+                emb = emb.half()
+            else:
+                emb = F.embedding(out[:, i], self._markov_w1_dev).half()
+            embs.append(emb)
+            bias = w2.forward(emb.unsqueeze(1), p).float()
+            if tp > 1:
+                bias = p["backend"].all_gather(bias, tp)
+            logits[:, i] += bias[:, 0]
+            out[:, i + 1] = torch.argmax(logits[:, i], dim = -1)
+
+        # Confidence head and the length gate, all device side: column 0 is the (unused) seed
+        # position, the generator crops it
+        cdev = self.confidence.device
+        xpre = to_dev(prenorm, cdev).half()
+        me = to_dev(torch.stack(embs, dim = 1), cdev).half()
+        logit = self.confidence.forward(torch.cat((xpre, me), dim = -1), p).float().squeeze(-1)
+        cs = torch.sigmoid(logit)
+        conf_out = torch.cat((torch.zeros_like(logit[:, :1]), logit), dim = 1)
+        keep = cs >= self.draft_conf_threshold
+        lens = torch.cumprod(keep.to(torch.int32), dim = 1).sum(dim = 1)
+        return out, conf_out, lens
+
+
+    def _sample_graphed(self, state: torch.Tensor, params: dict) -> torch.Tensor:
+        """Captured sample_from_state: one graph replay for head + markov chain + confidence instead
+        of ~50 host launches. The two host values the generator needs (draft length, and the ids it
+        stages for the verifier) are read once afterwards, as before."""
+        dev = self.markov_w2.device
+        seed = to_dev(params["dspark_seed_ids"], dev)
+        prenorm = params["dspark_prenorm"]
+        if not hasattr(self, "_sample_segments"):
+            self._sample_segments = {}
+        key = (tuple(state.shape), state.dtype, tuple(prenorm.shape), prenorm.dtype, self.draft_conf_threshold)
+        seg = self._sample_segments.get(key)
+        if seg is None:
+            # The gemms inside the body keep their own recorded sub-graphs (exllamav3_ext/graph.cu):
+            # one eager call only flips them to record-on-next-call, which the outer capture would
+            # then trigger on a second stream. Two eager calls settle them before we capture.
+            self._markov_body(state, seed, prenorm, params)
+            self._markov_body(state, seed, prenorm, params)
+            seg = self._sample_segments[key] = Segment(self._markov_body)
+        out, conf, lens = seg(state, seed, prenorm, params)
+        rp = getattr(seg, "replays", 0)
+        if rp in (1, 100) and self.config.tp_rank == 0:
+            print(f"MARKOV_GRAPH key={key} graph={'yes' if seg.graph is not None else 'no'} replays={rp}", flush = True)
+        if params.get("export_draft_conf"):
+            params["draft_conf"] = conf
+        params["draft_confidence_len"] = int(lens.max().item())
+        if self._conf_stats is not None:
+            self._conf_stats.append(torch.sigmoid(conf[0, 1:].float()).tolist())
+        backend = params.get("backend")
+        if getattr(backend, "trace_draft_window", False):
+            backend.trace_window(params["draft_confidence_len"])
+        return out
+
+
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
         """Trunk head over all block positions at once, then the sequential greedy loop
         with the markov bigram bias. Returns (bsz, block + 1) ids [seed, drafts...]; the
         generator crops the seed."""
+        if _MARKOV_GRAPH and "dspark_prenorm" in params:
+            return self._sample_graphed(state, params)
         import torch.nn.functional as F
         if self.own_head is not None:
             lm = self.own_head
