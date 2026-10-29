@@ -231,6 +231,8 @@ class Cache:
 
         rl = model.get_recurrent_layers()
         for module in rl:
+            getattr(module, "_bc_dsa", {}).clear()
+            getattr(module, "_bc_dsa_batch", {}).clear()
             for instance in self.model.get_layer_instances(module.layer_idx):
                 layer = self.recurrent_layers[instance]
                 module.recurrent_layers.remove(layer)
