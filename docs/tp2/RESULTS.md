@@ -216,19 +216,40 @@ Numbers above are only reported for runs that passed these:
   silently halves throughput and produces plausible-looking numbers (this happened twice).
 - **Batch invariance as measured in §6**, including the retraction.
 - **Prefix-cache hit correctness**: 8 full-hit and 8 partial-hit comparisons, token-identical on both ranks.
+- **Prefill-chunk invariance** (added for v1.0.0, after it caught the mixed-rate prefill bug): the same text
+  must score the same perplexity at 256-, 2048- and 4096-row prefill chunks (8k-token WikiText-2 windows:
+  2.1820 / 2.1827 / 2.1827, ±0.025). Self-consistency checks — identical repeats and identical ranks — cannot
+  catch an error that is the same on every run; this one can.
 
-## 9. What this is and is not
+## 9. v1.0.0 final measurements (fixed build)
+
+Measured on the release tree after the mixed-rate prefill fix, default settings (speculation on, adaptive
+cutoff, `COMM=p2p`, 4096-row prefill chunk), interleaved A/B blocks, logs under `<artifacts>/final/logs/`:
+
+| Measurement | Result |
+|---|---|
+| Decode, 24k context, single user | agentic 142, code 177, math 189, structured 169, prose 97, multilingual 100 tok/s |
+| Decode, long-file tails (72k) | agentic 127, code 118, prose 109, math 136, structured 153, multilingual 86 tok/s |
+| Decode, 2k prompts | agentic 128, code 164, prose 109, math 154, structured 155, multilingual 88 tok/s |
+| Decode, long context | 72k agentic 128, 72k code 128, 128k agentic 124 tok/s |
+| Adaptive cutoff vs fixed (19 prompts) | +0.6% tok/s overall; best +3.0%, worst −0.9%; every repeat token-identical |
+| 4 users, 12k prompt / 16k KV each | 189 tok/s total, 58 per user |
+| Cold prefill (no prefix cache) | 2,614 tok/s at 24k, 2,782 at 72k, 2,746 at 128k |
+
+Earlier sections record the development history on earlier trees; where they disagree with this table, this
+table is the release build.
+
+## 10. What this is and is not
 
 - **Is:** a true TP=2 runtime for a 2.565 bpw mixed-bitrate EXL3 checkpoint of a 100B-class MoE model, fitting
-  two 96 GB cards with ~6 GiB free at a 32k prefill, at 93.7 tok/s single-stream and 203–206 tok/s aggregate at
-  B4 on short prompts, 4.75k tok/s prefill, with 36–88× TTFT reduction from prefix caching on 20k–60k contexts.
+  two 96 GB cards with speculative decoding always on, at 97–189 tok/s single-user decode at 24k context
+  depending on content, 124 tok/s at 128k, and prefix caching for repeated long prompts.
 - **Is not:** a claim to beat every other runtime. As a reference point published by a third party on the same
   hardware class for a *different* checkpoint and configuration (diffbot, EXL3 3 bpw, fp8 KV, their own
   drafter): 156.9 tok/s single-stream at 2k context, 362.9 tok/s aggregate with 4 streams at 46k, and
   11.2–11.5k tok/s fresh 40k prefill warm ([public-number survey](notes/EXL3_SPEED_SURVEY.md)). Different
-  checkpoint, different KV precision, different batching policy — the gap is real and worth closing, and the
-  honest summary is that this runtime wins on memory footprint (2.565 bpw, fp16 KV, everything resident) and on
-  long-context TTFT (prefix cache), and does not yet win on raw decode throughput or prefill.
-- **Known limits**, all measured: capture falls back to eager past ~1024 positions; a batch containing any long
-  row drops the *whole* batch to eager (81.6 / 83.1 vs 31.7 ms/token at B8); 1M context costs one chunk step
-  (8192 → 4096); FP8 KV breaks capture; the 8-bit prefill all-reduce is +6% but fails the coherence gate.
+  checkpoint, different KV precision, different batching policy. This runtime does not win on multi-user
+  throughput or prefill.
+- **Known limits**, all measured: decode attention runs per user when several users are active (weak
+  multi-user scaling); 8 users with speculation do not run; FP8 KV breaks capture; the 8-bit prefill all-reduce
+  fails the coherence gate.

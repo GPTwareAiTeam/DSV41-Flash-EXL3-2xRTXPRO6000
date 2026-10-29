@@ -20,11 +20,15 @@ below is documented with its conditions in [docs/tp2/RESULTS.md](docs/tp2/RESULT
   32k prompt while keeping the decode path. `COMM=nccl` and `COMM=p2p` still selectable.
 - **Piecewise CUDA graph capture and cross-block merge** for the decode step, with explicit capture-eligibility
   checks that log the fallback instead of silently degrading.
-- **Batched capture path** (`EXL3_DSV4_B1_BATCH`) enabling 2–8 concurrent streams: 93.7 tok/s at B1 (same
-  kernel path, one row) to 203–206 tok/s aggregate at B4.
+- **Batched capture path** (`EXL3_DSV4_B1_BATCH`) for 2–8 concurrent streams; on short prompts without
+  speculation, 203–206 tok/s total at 4 streams.
 - **Speculative decoding (DSpark)**: sharded drafter head, one block forward per round, rank-0 decisions
-  broadcast so both ranks verify the same width. `DSPARK`, `NUM_DRAFT`, `DSPARK_POLICY`, `DSPARK_DYNAMIC`,
+  broadcast so both ranks verify the same width. Captured drafter graphs keyed by the cache's full page table,
+  so jobs of different lengths never re-capture. `DSPARK`, `NUM_DRAFT`, `DSPARK_POLICY`, `DSPARK_DYNAMIC`,
   `DSPARK_TARGET_ACC`.
+- **Adaptive speculation gate** (`EXL3_DSPARK_GATE=auto`, default): the drafter-confidence cutoff drops on
+  low-acceptance text and resets per job. +0.6% tok/s over 19 prompts (best +3.0% multilingual 2k, worst −0.9%),
+  every repeat token-identical. The target still verifies every token; only the verify width changes.
 - **Prefix cache** (`EXL3_PREFIX_CACHE`, default on): recurrent-state checkpoints at chunk boundaries,
   36–40× TTFT at 20k and 86–88× at 60k on a full hit, ~268 MB host RAM per rank per 60k context.
 - **Auto prefill chunk sizing** (`MAX_CHUNK=auto`) from a measured device-peak table against the KV budget, so
@@ -45,23 +49,39 @@ below is documented with its conditions in [docs/tp2/RESULTS.md](docs/tp2/RESULT
 
 ### Performance, relative to the pre-release tree on the same hardware
 
-- Decode: 13.35 → **10.67 ms/token** (75 → 93.7 tok/s) from capturing the decode attention core, a MoE
-  prefetch/PDL hoist, and three fused launch merges; launches per step 630.8 → 585.0 at 24k context.
-- Decode MoE kernel: 67.31 → **62.54 µs/call** at bsz1 (1.076×) from removing a local-memory load and hoisting
-  the trellis prefetch ring.
-- Prefill: 3.9k → **4.78k tok/s** at 32k from chunk sizing; +16.5% from `COMM=hybrid`.
-- Long context: `aten::nonzero` 8 → **0** and launches 585 → **557** per step at 24k from device compaction;
-  16.4 → **16.1 ms/token**.
-- Batching: 92 → **203–206 tok/s** aggregate at B4.
+All single-user figures are decode speed with speculation on (default settings), 512 generated tokens.
+
+- Decode at 24k context: **142 tok/s** agentic, 177 code, 189 math, 169 structured, 97 prose, 100 multilingual
+  (pre-release: 62 tok/s at 24k without speculation).
+- Long context: **128 tok/s** at 72k, **124 tok/s** at 128k (agentic).
+- Decode MoE kernel: 1.076× faster per call at bsz1 from removing a local-memory load and hoisting the trellis
+  prefetch ring.
+- Cold prefill (no prefix cache): 2,614 tok/s at 24k, 2,782 at 72k, 2,746 at 128k.
+- 4 concurrent users at 12k context: **189 tok/s** total.
+
+### Fixed
+
+- **Mixed-rate MoE prefill decoded experts at the wrong bitrate.** In a prefill chunk, experts with more than
+  32 routed rows go through the batched reconstruct tier, which decoded every expert of a group at one K. On
+  mixed-rate packs (2 / 2.5 / 3 / 3.5 / 4 bpw experts) those experts were reconstructed wrong, so long prompts
+  were read inaccurately and the result depended on the prefill chunk size. Groups are now planned per rate and
+  decoded at their members' own K; the per-expert DQ path also uses each expert's own K. Covered by a mixed-rate
+  parity test against the per-expert path.
 
 ### Known issues
 
-- The captured decode path stops at roughly 1024 positions; long context runs eager (16.1 ms/token at 24k).
-- A batch containing any long row drops the whole batch to eager.
+- **Multi-user throughput scales weakly.** With several users, decode attention runs one user at a time
+  (per-user graph replays, `exllamav3/modules/dsv4.py` `_forward_cached`); only the MoE and dense layers are
+  batched. Measured at 12k context per user: 4 users 189 tok/s total with speculation; without speculation
+  (pre-fix build) 4 users 91 and 8 users 93 tok/s total. A whole-batch attention graph is the planned fix.
+- **8 concurrent users with speculation fail.** At 16k KV per user they run out of memory; at 8k per user the
+  drafter's graph capture fails (`Cannot copy between CPU and CUDA tensors during CUDA graph capture`).
+  8 users without speculation run.
+- **Little VRAM is spare.** At the default 4096-row prefill chunk (1 user, 32k context, speculation on), a 24k
+  prompt fails once more than ~1 GiB per GPU is taken; `MAX_CHUNK=2048` leaves room for at least 2.25 GiB.
 - Batching is bitwise invariant across streams and neighbours but not across batch width; near-ties can flip.
 - FP8 KV breaks capture and is numerically wrong when capture is bypassed — `KV_BITS=16` only.
-- 8-bit prefill all-reduce is +6% but fails the coherence gate (prompt-3 token flip at step 11); not shipped.
-- Speculative decoding loses to plain decode at B4; the two are substitutes at these widths.
+- 8-bit prefill all-reduce is faster but fails the coherence gate (prompt-3 token flip at step 11); opt-in only.
 
 ### Notes
 
