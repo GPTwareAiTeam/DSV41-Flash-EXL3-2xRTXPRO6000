@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "exllamav3"
 description = "Inference library for running local LLMs on modern consumer GPUs"
 dynamic = ["version"]
-readme = "README.md"
+readme = "README.exllamav3.md"
 requires-python = ">=3.10.11"
 license = "MIT"
 authors = [{ name = "turboderp" }]
