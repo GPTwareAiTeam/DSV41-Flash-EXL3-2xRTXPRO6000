@@ -18,7 +18,44 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
 | `EXL3_MOE_BATCH_RECON` | `1` | `0` | same |
 | `EXL3_MOE_MTILE` | `1` | `0` | same (no 32 / 64-row instances of the RDNA kernel) |
 
+`EXL3_ROUTER_INT8` (default: `0`): set to `1` to opt into the deterministic int8 multi-row router projection where supported; otherwise routing uses the fp16 gate.
+
 ## Attention
+
+### `EXL3_DSPARK_BLOCK_GRAPH` (default: `1`)
+
+Captures the batch-one DSpark transformer block with device-driven attention positions on capture-capable P2P backends; set to `0` to disable.
+
+### `EXL3_DSPARK_MARKOV_GRAPH` (default: `1`)
+
+Captures the DSpark logits head, Markov loop, confidence head and device-side length gate; set to `0` to disable. Capture failures propagate.
+
+### `EXL3_DSPARK_CONF` (default: `0.5`)
+
+Confidence threshold of the DSpark length gate: each round the drafter's confidence head scores every drafted
+position, and the target verifies the leading run of positions whose confidence is at or above this value.
+
+### `EXL3_DSPARK_GATE` (default: `auto`)
+
+How each round's verified width is chosen from the drafter's per-position confidences. Computed on device inside
+the captured sampling graph (no host cost, no re-capture).
+
+- `thr`: the threshold gate above, fixed `EXL3_DSPARK_CONF`.
+- `auto`: the threshold gate with a content-adaptive threshold. An exponential average of accepted drafts per
+  verify round (half-life `EXL3_DSPARK_AUTO_HL`, default `32` rounds) selects `EXL3_DSPARK_AUTO_LO` (default
+  `0.35`) while it is below `EXL3_DSPARK_AUTO_SWITCH` (default `1.5`) — low-acceptance text such as prose and
+  multilingual — and `EXL3_DSPARK_CONF` otherwise. Measured on 7 prompts at 512 tokens: −0.9% ms/token overall,
+  multilingual −3.8%, worst case +1.0%. The estimate resets when a new job starts. The threshold is a
+  persistent device tensor the captured graph reads, so switching levels never re-captures.
+- `ev`: per-round expected-value width, `argmax_k E[k] / cost(k + 1)` with `E[k] = 1 + sum_{i<=k} prod_{j<=i}
+  min(1, EXL3_DSPARK_EV_SCALE * c_j ** EXL3_DSPARK_EV_GAMMA)` and the relative round cost per verify-row count
+  from `EXL3_DSPARK_EV_COST` (`rows:cost,...`, interpolated). `EXL3_DSPARK_EV_KMIN` bounds the width from below.
+  Measured on 19 prompts: −1.7% ms/token overall but up to +13.5% on some long agentic/math prompts, so it is
+  opt-in only.
+
+### `EXL3_DSPARK_NOISE_CACHE` (default: `1`)
+
+Embeds only the drafter block's seed row and replicates a cached noise-token row into the remaining block positions, so the (CPU-resident) drafter embedding cost stays flat in the block size; set to `0` to embed the whole `[seed, noise x (block - 1)]` block in one call.
 
 ### `EXL3_PW_TPCOLLECT` (default: `0`)
 
@@ -393,6 +430,45 @@ their Gumbel noise by token id rather than sorted position, so individual seeds 
 samples from the same distribution. Stacks the collapse does not recognize fall back to the
 step-by-step path by design. Set to `0` to disable collapsing entirely, e.g. for A/B validation
 against the reference implementation.
+
+### `EXL3_SD_WINDOW_BATCH` (default: `1`)
+
+Speculative verify rounds sample a whole draft window in one sampler call when the job's stack is
+row-wise pure (a greedy/argmax stack, or a fused greedy tail) and no per-position host mask applies.
+One fused-kernel launch and one pinned copy replace one launch per window position, with identical tokens. It
+does not move wall clock on GPU-bound rounds (the host work sits behind the verify forward), but it is strictly
+less host work. Stochastic stacks keep the
+per-position path (each position draws its own Gumbel stream); set to `0` to force the per-position
+launches for A/B.
+
+### `EXL3_SD_BATCH_READBACK` (default: `1`)
+
+Read a speculative window's sampled tokens through one pinned buffer and one `synchronize` instead of
+one blocking readback per position. Constrained or filter-bearing jobs (checkpointing, forced ids,
+active filters, pending injections) always take the per-position path, because a token inside the
+window can change the mask for the positions after it. Set to `0` for the serial readback (A/B only).
+
+### `EXL3_SD_BATCH_AGREE` (default: `1`)
+
+Collapse the per-position rank agreement of a speculative window into one collective over the whole
+window (`agree_window`). The ranks' verified tokens must agree before the accept walk, since the
+replicated indexer can ULP-diverge on near ties; this is the safety net, and it costs one blocking
+broadcast per round. Set to `0` to agree per position instead (A/B only).
+
+### `EXL3_SD_DEFER_DRAFT_CONF` (default: `1`)
+
+Let a drafter that gates its confidence length on device (see `EXL3_DSPARK_MARKOV_GRAPH`) hand the
+width back in the same pinned copy as the drafted ids, so the round does one readback and one
+`synchronize` instead of a host `.item()` plus a second copy. Set to `0` to restore the separate
+host-side readback (A/B only).
+
+### `EXL3_SD_DEVICE_ACCEPT` (default: `0`)
+
+Compute the speculative accept prefix on device (compare the sampled window against the drafted ids,
+cumulative product into a matched-length scalar) and read back the token row and match length in one
+pinned copy, instead of walking the accept on the host one position at a time. Left off by default: on
+a GPU-bound round the host walk is already hidden, and the device path has not been gated on the
+transcript workload, so measure before enabling.
 
 ## CPU MoE offload
 
@@ -1241,6 +1317,32 @@ position therefore do not acquire different rotations merely because they occupy
 
 KV pool tokens per concurrent stream. `CACHE_TOKENS` defaults to `BATCH * CACHE_TOKENS_PER_SEQ`, so every stream
 has room for its prompt plus `MAX_NEW` tokens without sharing pages with another stream's shortfall.
+
+### `NUM_DRAFT` (default: `5`)
+
+Fixed speculative window for the DSpark drafter: how many draft tokens are verified per round. The drafter
+produces one whole block per forward, so the window cannot exceed the checkpoint's `dspark_block_size`. A larger
+`NUM_DRAFT` is **clamped** to the block size, with a loud startup warning from the `Generator`
+(`!! num_draft_tokens = … exceeds the drafter's block size … CLAMPED to …`) and a runner line
+`DRAFT_K requested=… effective=… block=… clamped=yes|no`.
+
+The standard 2×RTX-PRO-6000 TP=2 overlay (`/artifacts/tp2-overlay`) carries the checkpoint's declared
+`dspark_block_size = 5`, so K=3 and K=5 are native and K=5 is the widest fixed window there. A `NUM_DRAFT=7` run
+against it logs `clamped=yes` and measures K=5, so any K=7 number or token set must state the overlay it was taken
+with.
+
+The block size is a declarative value in the drafter config, not a weight shape: no drafter tensor depends on it
+(the block positions share one transformer stack and differ only in RoPE offset, and the Markov head loops over
+`state.shape[1]`), so a config with `dspark_block_size = 7` loads the same weights and drafts 8 positions
+(seed + 7) without a clamp. The reference config in `/artifacts/k7cfg/b7` is exactly that — a symlink farm over
+`/artifacts/tp2-overlay` whose only difference is `rank{0,1}/config.json` — and it exists to measure the code path,
+not as a re-exported head: the checkpoint was exported at block size 5, so depths past 5 are outside what the head
+was calibrated for. Use a head exported (or retrained) at 7 positions if K=7 has to be a default.
+
+On this checkpoint K=5 stays the default: K=3 accepts more often per position but carries fewer tokens per round,
+and K=7 (with the block-7 config) accepts more tokens per round than K=5 but not enough to pay for its wider verify
+row, so it measured slower. V1 optimizes the fixed K=3/5/7 configurations; adaptive K (`DSPARK_DYNAMIC=1`) is
+separate work.
 
 ### `DSPARK_DYNAMIC` (default: `0`)
 
