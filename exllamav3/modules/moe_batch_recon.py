@@ -67,10 +67,17 @@ _ACT_CALLS_GATELESS = {"relu2": ext.relu_mul}
 _ACT_IDX = {0: "silu", 1: "gelu", 2: "relu2", 3: "swiglu_oai"}
 
 
-def plan_groups(experts, count_of, batch_max = None):
+def plan_groups(experts, count_of, batch_max = None, rate_of = None):
     """Split `experts` (ids) into groups for run_group, largest first, so each group's padding
-    stays small. count_of: id -> row count."""
+    stays small. count_of: id -> row count. rate_of: id -> hashable per-expert rate key (mixed-K
+    layers); a group never mixes rates, since one reconstruct launch decodes every member at one K."""
     batch_max = batch_max or RECON_BATCH
+    if rate_of is not None:
+        by_rate = {}
+        for e in experts:
+            by_rate.setdefault(rate_of(e), []).append(e)
+        if len(by_rate) > 1:
+            return [g for es in by_rate.values() for g in plan_groups(es, count_of, batch_max)]
     order = sorted(experts, key = lambda e: -count_of(e))
     groups, cur, cmax, real = [], [], 0, 0
     for e in order:
@@ -151,10 +158,13 @@ class BatchReconLayer:
     differ between GPU-resident and streamed experts)."""
 
     def __init__(self, dims_g, dims_u, dims_d, cb_g, cb_u, cb_d, activation, act_limit, device,
-                 scales, folded = None, interm_fp32 = False):
+                 scales, folded = None, interm_fp32 = False, rates = None):
         # dims: (k, n, K); cb: (mcg, mul1); scales: per projection ("g", "u", "d") a pair of
         # lists of per-expert suh (k) and svh (n) half tensors, stacked here into [E, dim]
-        # tables
+        # tables. rates: mixed-K layers, per projection ("g", "u", "d") a host list of each
+        # expert's K; dims' K is then a placeholder and every group decodes at its members' rate
+        # (plan_groups with rate_of = self.rate_key keeps a group to one rate per projection)
+        self.rates = rates
         self.gated = dims_g is not None
         self.dims_g, self.dims_u, self.dims_d = dims_g, dims_u, dims_d
         self.cb_g, self.cb_u, self.cb_d = cb_g, cb_u, cb_d
@@ -221,6 +231,19 @@ class BatchReconLayer:
         """Resident experts: [E] int64 device tensors of trellis addresses per projection"""
         self.ptr_tables = (ptrs_g, ptrs_u, ptrs_d)
 
+    def rate_key(self, e):
+        """Grouping key for plan_groups: the expert's (g, u, d) rates on mixed-K layers"""
+        return tuple(self.rates[p][e] if self.rates.get(p) is not None else None for p in ("g", "u", "d"))
+
+    def _rate(self, p, ids, K):
+        """K for projection p of a group: the uniform K, or the members' common mixed-K rate"""
+        r = self.rates.get(p) if self.rates is not None else None
+        if r is None:
+            return K
+        k = r[ids[0]]
+        assert all(r[e] == k for e in ids), "batched reconstruct group mixes EXL3 rates"
+        return k
+
     def run_group(
         self,
         y_ext: torch.Tensor,       # (rows + 1, k_in) half; last row zero, k_in == dims_u[0]
@@ -243,6 +266,7 @@ class BatchReconLayer:
         dev = y_ext.device
         ku, nu, Ku = self.dims_u
         kd, nd, Kd = self.dims_d
+        Ku, Kd = self._rate("u", ids, Ku), self._rate("d", ids, Kd)
 
         # One host->device copy per group: [ids | starts | counts | ptr_g | ptr_u | ptr_d]. The
         # source is a fresh pageable tensor: CUDA stages those immediately without waiting on
@@ -284,7 +308,7 @@ class BatchReconLayer:
         u = self._linear(x, Wu, "u", ids_d, nu, out_dtype = idt)
         del Wu
         if self.gated:
-            Kg = self.dims_g[2]
+            Kg = self._rate("g", ids, self.dims_g[2])
             Wg = scratch1[:B * kg * ng].view(B, kg, ng)
             self._recon(Wg, ptr_g, "g", ids_d, Kg, self.cb_g)
             g = self._linear(x, Wg, "g", ids_d, ng, out_dtype = idt)

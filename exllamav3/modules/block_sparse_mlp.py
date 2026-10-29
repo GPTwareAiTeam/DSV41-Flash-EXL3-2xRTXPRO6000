@@ -982,13 +982,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
             scales = {p: ([l.inner.suh for l in m.linears], [l.inner.svh for l in m.linears])
                       for p, m in (("g", mg), ("u", mu), ("d", md)) if m is not None}
+            # Mixed-K layers: each expert decodes at its own rate, so groups are planned per rate
+            rates = {p: [l.inner.K for l in m.linears]
+                     for p, m in (("g", mg), ("u", mu), ("d", md)) if m is not None and m.mixed_k} or None
             self.batch_recon = BatchReconLayer(
                 (mg.in_features, mg.out_features, mg.K) if mg is not None else None,
                 (mu.in_features, mu.out_features, mu.K),
                 (md.in_features, md.out_features, md.K),
                 mg.q_cb() if mg is not None else None, mu.q_cb(), md.q_cb(),
                 self.activation_fn, self.act_limit, self.device, scales,
-                interm_fp32 = self.interm_dtype != torch.half)
+                interm_fp32 = self.interm_dtype != torch.half, rates = rates)
             self.batch_recon.set_static_pointers(
                 mg.ptrs_trellis if mg is not None else None, mu.ptrs_trellis, md.ptrs_trellis)
         return self.batch_recon
@@ -1307,7 +1310,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
                         if heavy:
                             from .moe_batch_recon import plan_groups
-                            groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap)
+                            groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap,
+                                                 rate_of = recon.rate_key if recon.rates else None)
 
                 # Deterministic accumulation (FUSED_DET): every assignment of the fused and
                 # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,

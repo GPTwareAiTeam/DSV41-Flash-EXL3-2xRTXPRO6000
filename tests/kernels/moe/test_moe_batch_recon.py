@@ -58,6 +58,12 @@ def test_plan_groups():
     flat = [e for g in groups for e in g]
     assert sorted(flat) == sorted(counts)
     assert all(counts[g[0]] >= counts[g[-1]] for g in groups)
+    # Mixed-K layer: no group may mix rates, even where the row counts alone would batch them
+    rate = {0: 2, 1: 3, 2: 2, 3: 4, 4: 2, 5: 2.5, 6: 2}
+    mixed = plan_groups(list(counts), lambda e: counts[e], batch_max = 3, rate_of = lambda e: rate[e])
+    assert all(len({rate[e] for e in g}) == 1 for g in mixed), mixed
+    assert sorted(e for g in mixed for e in g) == sorted(counts)
+    assert [0, 1] not in mixed     # 600 + 590 batch together uniformly, but are 2 and 3 bpw
 
 
 @pytest.mark.parametrize("dtype", [torch.half, torch.float])
@@ -92,15 +98,24 @@ def test_reconstruct_batch(device, K):
     assert torch.equal(out, ref)
 
 
+# Per-expert EXL3 rates: uniform, or a mixed-K layer (the shipped DSV4 packs mix 2 / 2.5 / 3 / 3.5 / 4 bpw
+# experts). A batched group decodes every member at one K, so mixed layers must be grouped by rate
+RATES = {"uniform": [4] * 6, "mixed": [2, 3, 4, 2.5, 3, 2]}
+
+
+@pytest.mark.parametrize("rates", list(RATES))
 @pytest.mark.parametrize("interm_fp32", [False, True])
 @pytest.mark.parametrize("static", [True, False])
 @pytest.mark.parametrize("folded", [False, True])
 @pytest.mark.parametrize("gated", [True, False])
-def test_batch_recon_layer_matches_per_expert(device, gated, folded, static, interm_fp32):
+def test_batch_recon_layer_matches_per_expert(device, gated, folded, static, interm_fp32, rates):
     gen = torch.Generator().manual_seed(7)
-    k, n, K = 256, 384, 4
+    k, n = 256, 384
     E, rows = 6, 200
-    trell = {p: [rand_trellis(k if p != "d" else n, n if p != "d" else k, K, gen, device) for _ in range(E)]
+    Ks = RATES[rates]
+    mixed = len(set(Ks)) > 1
+    K = Ks[0]   # layer-level K: the real one when uniform, a placeholder when mixed
+    trell = {p: [rand_trellis(k if p != "d" else n, n if p != "d" else k, Ks[e], gen, device) for e in range(E)]
              for p in (("g", "u", "d") if gated else ("u", "d"))}
     suh = {p: [rand_scale(k if p != "d" else n, gen, device) for _ in range(E)] for p in trell}
     svh = {p: [rand_scale(n if p != "d" else k, gen, device) for _ in range(E)] for p in trell}
@@ -124,14 +139,18 @@ def test_batch_recon_layer_matches_per_expert(device, gated, folded, static, int
     # hgemm_batched picks the fp16-accumulator kernel or cuBLAS from that padded shape; the
     # per-expert reference pads the same way so hgemm_recon makes the same choice per expert
     # (the grouping is deterministic, computed here exactly as the loop below does)
-    groups = plan_groups(list(range(E)), lambda e: counts[e], batch_max = 4)
+    layer_rates = {p: list(Ks) for p in trell} if mixed else None
+    groups = plan_groups(list(range(E)), lambda e: counts[e], batch_max = 4,
+                         rate_of = (lambda e: Ks[e]) if mixed else None)
+    if mixed:
+        assert all(len({Ks[e] for e in grp}) == 1 for grp in groups), groups
     cmax_of = {e: max(counts[g] for g in grp) for grp in groups for e in grp}
 
     def lin(p, e, x, out_dtype = torch.half):
         # The per-expert reconstruct path (BC_BlockSparseMLP::run_single_expert_dq):
         # had(x * suh) @ W_hat -> had -> * svh, fp32 output for the down projection
         W = torch.empty((trell[p][e].shape[0] * 16, trell[p][e].shape[1] * 16), dtype = torch.half, device = device)
-        ext.reconstruct(W, trell[p][e], K, False, True)
+        ext.reconstruct(W, trell[p][e], Ks[e], False, True)
         xh = torch.empty_like(x)
         ext.had_r_128(x, xh, suh[p][e], None, 1.0)
         rows = cmax_of[e]
@@ -161,7 +180,8 @@ def test_batch_recon_layer_matches_per_expert(device, gated, folded, static, int
     scales = {p: (suh[p], svh[p]) for p in trell}
     layer = BatchReconLayer((k, n, K) if gated else None, (k, n, K), (n, k, K),
                             (False, True), (False, True), (False, True),
-                            "silu" if gated else "relu2", 0.0, device, scales, folded = folded, interm_fp32 = interm_fp32)
+                            "silu" if gated else "relu2", 0.0, device, scales, folded = folded, interm_fp32 = interm_fp32,
+                            rates = layer_rates)
     y_ext = torch.cat([y, torch.zeros((1, k), dtype = torch.half, device = device)])
     out_ext = torch.zeros((rows + 1, k), dtype = torch.float, device = device)
     tok_ext = torch.cat([tok, torch.full((1,), rows, dtype = tok.dtype, device = device)])
