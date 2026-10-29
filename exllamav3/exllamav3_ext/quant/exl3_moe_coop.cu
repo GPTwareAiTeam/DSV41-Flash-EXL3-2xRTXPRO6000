@@ -17,6 +17,40 @@
 #define EXL3_MOE_COOP_DEFINE_ROT
 #include "exl3_moe_coop_kernel.cuh"
 
+// Copy half weights as raw bits, including NaN payloads, and append exact half 1.0.
+__global__ void exl3_moe_fold_stage_kernel(
+    const int64_t* sel, const uint16_t* rw, int64_t* out_sel, uint16_t* out_rw,
+    int rows, int topk, int expert, int64_t sel_s0, int64_t sel_s1,
+    int64_t rw_s0, int64_t rw_s1)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int width = topk + 1;
+    if (i >= rows * width) return;
+    int row = i / width, col = i % width;
+    if (col == topk)
+    {
+        out_sel[i] = expert;
+        out_rw[i] = 0x3c00;
+    }
+    else
+    {
+        out_sel[i] = sel[row * sel_s0 + col * sel_s1];
+        out_rw[i] = rw[row * rw_s0 + col * rw_s1];
+    }
+}
+
+void exl3_moe_fold_stage(const at::Tensor& sel, const at::Tensor& rw,
+                         at::Tensor& fold_sel, at::Tensor& fold_rw, int rows, int topk, int expert)
+{
+    const int n = rows * (topk + 1);
+    if (!n) return;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    exl3_moe_fold_stage_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        (const int64_t*) sel.data_ptr(), (const uint16_t*) rw.data_ptr(),
+        (int64_t*) fold_sel.data_ptr(), (uint16_t*) fold_rw.data_ptr(),
+        rows, topk, expert, sel.stride(0), sel.stride(1), rw.stride(0), rw.stride(1));
+}
+
 // Output rows of a launch without routed slots (top-k 0): the empty sum, plus the shared-expert term
 // when there is one. One warp per (row, 128-column chunk)
 __global__ __launch_bounds__(32)

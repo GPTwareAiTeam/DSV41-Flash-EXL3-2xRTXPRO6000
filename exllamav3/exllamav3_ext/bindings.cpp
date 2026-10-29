@@ -136,6 +136,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("dsa_compact_ent", &dsa_compact_ent, "dsa_compact_ent");
+    m.def("dsa_compact_ent_rows", &dsa_compact_ent_rows, "dsa_compact_ent_rows");
+    m.def("dsa_compact_ent_rows_map", &dsa_compact_ent_rows_map, "dsa_compact_ent_rows_map");
     m.def("hc_mix", &hc_mix, "hc_mix");
     m.def("hc_mix_carry", &hc_mix_carry, "hc_mix_carry");
     m.def("ple_gate", &ple_gate, "ple_gate");

@@ -18,6 +18,9 @@ _PIECEWISE_MAXSEQ = int(os.environ.get("EXL3_WHOLE_GRAPH_MAXSEQ", "8"))
 _PW_MERGE = os.environ.get("EXL3_PW_MERGE", "1") != "0"
 _PW_TPCOLLECT = os.environ.get("EXL3_PW_TPCOLLECT", "0") == "1"
 _PW_PAIR = os.environ.get("EXL3_PW_PAIR", "0") == "1"
+_B1_EAGER_DIAG = os.environ.get("EXL3_DSV4_B1_EAGER_DIAG", "0") == "1"
+_B1_MULTIROW = os.environ.get("EXL3_DSV4_B1_MULTIROW", "1") == "1"
+_B1_PDUMP = os.environ.get("EXL3_DSV4_PDUMP", "") != ""
 
 # DSpark tap export. EXL3_DSPARK_TAP_SCALE: power-of-two scale applied before the fp16 cast. The drafter's only
 # consumer is main_proj (no bias) -> main_norm (RMSNorm, scale-invariant up to eps), so the scale is absorbed.
@@ -306,8 +309,9 @@ class TransformerBlock(Module):
         Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply. A block whose graph B is
         deferred (pending = the previous block's (block, x, post, comb, y_attn)) runs that graph B inside its own
         graph A. Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs."""
-        if x.shape[1] == 1 and self.attn is not None and hasattr(self.attn, "b1_prep"):
-            b1 = self.attn.b1_prep(params)
+        if (x.shape[1] == 1 or (_B1_MULTIROW and x.shape[0] == 1 and x.shape[1] <= 8)) and \
+           self.attn is not None and hasattr(self.attn, "b1_prep"):
+            b1 = self.attn.b1_prep(params, x.shape[1])
             if b1 is not None:
                 pair = params.get("pw_pair")
                 if (_PW_PAIR and _PW_MERGE and _PW_TPCOLLECT and pair and
@@ -319,7 +323,7 @@ class TransformerBlock(Module):
                         nxt.attn is not None and hasattr(nxt.attn, "b1_prep") and
                         self.attn.tp_owner is None and nxt.attn.tp_owner is None and
                         nxt.layer_idx != self.layer_idx):
-                        b1_next = nxt.attn.b1_prep(params)
+                        b1_next = nxt.attn.b1_prep(params, x.shape[1])
                         if b1_next is not None:
                             return self._forward_piecewise_pair(x, params, pending, b1, nxt, b1_next, after)
                 return self._forward_piecewise_b1(x, params, out_dtype, pending, b1)
@@ -369,7 +373,9 @@ class TransformerBlock(Module):
         prev = None if pending is None else pending[0]
         capture_collect = (_PW_TPCOLLECT and self.attn.tp_owner is None and
                            getattr(params.get("backend"), "piecewise_p2p_capture", False))
-        key = ("b1", tuple(x.shape), x.dtype, out_dtype, id(ctx[0]), id(ctx[1]),
+        # ctx[5] is the indexer selection regime and ctx[6] the step's new-entry run length: a step that
+        # changes either must capture a body of its own (the run's base entry stays device-driven)
+        key = ("b1", tuple(x.shape), x.dtype, out_dtype, id(ctx[0]), id(ctx[1]), ctx[5], ctx[6],
                None if prev is None else id(prev), capture_collect)
         if not hasattr(self, "_segments"):
             self._segments = {}
@@ -380,10 +386,16 @@ class TransformerBlock(Module):
             self._segments[key] = segs
         seg_a, seg_b = segs
         if pending is None:
-            x, post, comb, y = seg_a(x, arr, bt_st, params)
+            x, post, comb, y = (self._piece_b1(ctx, prev, capture_collect, x, arr, bt_st, params)
+                                if _B1_EAGER_DIAG else seg_a(x, arr, bt_st, params))
         else:
             _, x_b, post_b, comb_b, y_b = pending
-            x, post, comb, y = seg_a(x_b, post_b, comb_b, y_b, arr, bt_st, params)
+            x, post, comb, y = (self._piece_b1(ctx, prev, capture_collect, x_b, post_b, comb_b, y_b, arr, bt_st, params)
+                                if _B1_EAGER_DIAG else seg_a(x_b, post_b, comb_b, y_b, arr, bt_st, params))
+        if _B1_PDUMP:
+            # Parity dump of the captured body's selection buffers, taken from the host after the step
+            from .dsv4 import _pdup_host
+            _pdup_host(self.layer_idx, params, x.shape[1] if x.dim() > 1 else x.shape[0])
         if self.attn.tp_reduce and not capture_collect:
             self.attn.tp_collect(params["backend"], y)
         if self._pw_defer(x, params, out_dtype):
@@ -402,8 +414,9 @@ class TransformerBlock(Module):
         ctx, arr, bt = b1
         next_ctx, next_arr, next_bt = b1_next
         prev = None if pending is None else pending[0]
-        key = ("pair", id(nxt), tuple(x.shape), x.dtype, id(ctx[0]), id(ctx[1]),
-               id(next_ctx[0]), id(next_ctx[1]), id(bt), id(next_bt), None if prev is None else id(prev))
+        key = ("pair", id(nxt), tuple(x.shape), x.dtype, id(ctx[0]), id(ctx[1]), ctx[5], ctx[6],
+               id(next_ctx[0]), id(next_ctx[1]), next_ctx[5], next_ctx[6], id(bt), id(next_bt),
+               None if prev is None else id(prev))
         if not hasattr(self, "_segments"):
             self._segments = {}
         segs = self._segments.get(key)
@@ -423,6 +436,13 @@ class TransformerBlock(Module):
         else:
             _, x_b, post_b, comb_b, y_b = pending
             x, post, comb, y = seg(x_b, post_b, comb_b, y_b, arr, bt, next_arr, next_bt, params)
+        if _B1_PDUMP:
+            # Both blocks' attention bodies ran inside this one replay: dump each layer's registered
+            # buffers before the next segment reuses them
+            from .dsv4 import _pdup_host
+            _pw = x.shape[1] if x.dim() > 1 else x.shape[0]
+            _pdup_host(self.layer_idx, params, _pw)
+            _pdup_host(nxt.layer_idx, params, _pw)
         params["pw_skip_next"] = True
         if defer:
             params["pw_pending"] = (nxt, x, post, comb, y)
@@ -449,8 +469,9 @@ class TransformerBlock(Module):
             x_b, post_b, comb_b, y_b, arr, bt_st, params = a
             x, = prev._piece_b(x_b, post_b, comb_b, y_b, params)
         post, comb, y = self._piece_a(x, params)
-        rsl, kl, m, w, kp = ctx
-        y_attn = self.attn._batch_body(y, arr, y.shape[0], 1, y.shape[0], rsl, kl, bt_st, m, w, kp, params, None)
+        rsl, kl, m, w, kp, cand_regime, nnew = ctx
+        y_attn = self.attn._batch_body(y, arr, y.shape[0], y.shape[1], y.shape[0] * y.shape[1], rsl, kl, bt_st, m, w, kp,
+                                       params, None, cand_regime = cand_regime, nnew = nnew)
         if capture_collect and self.attn.tp_reduce:
             self.attn.tp_collect(params["backend"], y_attn)
         return x, post, comb, y_attn

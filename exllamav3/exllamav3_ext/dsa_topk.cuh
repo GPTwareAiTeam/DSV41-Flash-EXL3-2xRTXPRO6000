@@ -34,6 +34,32 @@ void dsa_compact_ent
     int64_t ec
 );
 
+// Multi-row compaction (MTP verify slab): row s keeps its own blocks and its own entry bound
+// min((pos_base + s) / cr, ec_max); same ascending order and -1 padding as dsa_compact_ent
+void dsa_compact_ent_rows
+(
+    const at::Tensor& keep,              // (rows, nb) bool, device, contiguous
+    at::Tensor out,                      // (rows, cap) int32, device, -1 past each row's count
+    int64_t bs,
+    int64_t ec_max,
+    int64_t pos_base,                    // pos0 + 1 + r0
+    int64_t cr                           // compress_rate
+);
+
+// Same, plus the pool row of each kept entry: out_rows[t] = pages[out[t] / epp] * epp + out[t] % epp
+void dsa_compact_ent_rows_map
+(
+    const at::Tensor& keep,              // (rows, nb) bool, device, contiguous
+    at::Tensor out,                      // (rows, cap) int32, device, -1 past each row's count
+    at::Tensor out_rows,                 // (rows, cap) int32, device, -1 padded, pool rows
+    const at::Tensor& pages,             // (np,) int32, device, block table
+    int64_t epp,                         // pool entries per page
+    int64_t bs,
+    int64_t ec_max,
+    int64_t pos_base,
+    int64_t cr
+);
+
 void dsa_topk_tile
 (
     const at::Tensor& scores,

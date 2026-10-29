@@ -1189,6 +1189,13 @@ class CustomSampler(Sampler):
                         self.steps.append(prep_step())
                 self.steps.append(step)
 
+        # True when every step is a row-wise pure function of the logits (a greedy stack): the verify path
+        # may then sample the whole verification window in one launch, since each position's token is the
+        # argmax of its own row and no step reads the RNG or the job's past ids
+        self.window_batch_safe = (
+            (fused_tail is not None and fused_tail.mode == SS_Fused.MODE_GREEDY)
+            or (not self.fused_only and all(type(s) is SS_Argmax for s in self.steps))
+        )
 
     @override
     @torch.inference_mode

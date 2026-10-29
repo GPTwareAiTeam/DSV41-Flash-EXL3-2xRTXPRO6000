@@ -126,6 +126,10 @@ MoeCoopParams exl3_moe_coop_prepare
     float& K_gu, float& K_d, int& cb
 );
 
+// Stage routed selections and weights with the shared expert appended to each row.
+void exl3_moe_fold_stage(const at::Tensor& sel, const at::Tensor& rw,
+                         at::Tensor& fold_sel, at::Tensor& fold_rw, int rows, int topk, int expert);
+
 // Per-call part: input rows, routing, optional shared-expert output (bsz rows, width H), launch
 void exl3_moe_coop_run
 (

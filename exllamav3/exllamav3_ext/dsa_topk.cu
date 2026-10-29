@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include <climits>
+#include <cstdlib>
 #include "dsa_topk.cuh"
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -995,11 +996,24 @@ exactly `((~drop).any(0).nonzero() * bs + arange(bs)).flatten()[< ec]`.
 
 #define COMPACT_THREADS 1024
 
-__global__ __launch_bounds__(COMPACT_THREADS)
-void dsa_compact_ent_kernel
+// One row of the candidate compaction: ascending entry ids of the kept blocks into `out`, -1 past
+// the count. Every thread of the block takes part, so this must be called by the whole block.
+// When `out_rows` is set, the pool row of each entry is emitted alongside, mapped through the
+// block table: pages[e / epp] * epp + e % epp, i.e. the same arithmetic the caller used to do with
+// one aten gather plus a dtype promotion per row.
+// BPT = blocks per thread. 4 is the shipped setting: a thread's run loads as one aligned 4-byte word
+// and the tile loop needs a quarter of the iterations (and barriers), which is what this kernel's
+// cost is made of at the DSV4 candidate widths. Adjacent kept blocks contribute adjacent entry
+// ranges, so a thread's run is one ascending range and the emitted list is byte-identical to the
+// one-block-per-thread scan (BPT = 1, kept as the EXL3_COMPACT_BPT=1 A/B baseline)
+template <int BPT>
+__device__ void dsa_compact_row_impl
 (
     const uint8_t* __restrict__ keep,   // (nb,) nonzero = block kept
     int* __restrict__ out,              // (cap,) int32 entries, -1 past the count
+    int* __restrict__ out_rows,         // (cap,) int32 pool rows, -1 past the count, or null
+    const int* __restrict__ pages,      // block table (page ids), when out_rows is set
+    const int epp,                      // pool entries per page
     const int nb,
     const int bs,
     const int ec,
@@ -1014,17 +1028,40 @@ void dsa_compact_ent_kernel
     int lane = t % 32;
     int warp = t / 32;
     int base = 0;
-    for (int b0 = 0; b0 < nb; b0 += COMPACT_THREADS)
+    const bool aligned = (((size_t) keep) & 3) == 0;
+    for (int b0 = 0; b0 < nb; b0 += COMPACT_THREADS * BPT)
     {
-        int b = b0 + t;
-        int cnt = 0;
-        int first = 0;
-        if (b < nb && keep[b])
+        int b = b0 + t * BPT;
+        int cnt[BPT];
+        int first[BPT];
+        int total = 0;
+        if (BPT == 4 && aligned && b + 4 <= nb)
         {
-            first = b * bs;
-            cnt = max(0, min(bs, ec - first));
+            uint32_t k4 = *reinterpret_cast<const uint32_t*>(keep + b);
+            #pragma unroll
+            for (int q = 0; q < BPT; ++q)
+            {
+                int f = (b + q) * bs;
+                int c = ((k4 >> (8 * q)) & 0xFFu) ? max(0, min(bs, ec - f)) : 0;
+                first[q] = f;
+                cnt[q] = c;
+                total += c;
+            }
         }
-        int incl = cnt;
+        else
+        {
+            #pragma unroll
+            for (int q = 0; q < BPT; ++q)
+            {
+                int bb = b + q;
+                int f = bb * bs;
+                int c = (bb < nb && keep[bb]) ? max(0, min(bs, ec - f)) : 0;
+                first[q] = f;
+                cnt[q] = c;
+                total += c;
+            }
+        }
+        int incl = total;
         #pragma unroll
         for (int o = 1; o < 32; o <<= 1)
         {
@@ -1047,13 +1084,113 @@ void dsa_compact_ent_kernel
             if (lane == 31) tile_total = wincl;
         }
         __syncthreads();
-        int pos = base + woff[warp] + (incl - cnt);
-        for (int j = 0; j < cnt && pos + j < cap; ++j) out[pos + j] = first + j;
+        int pos = base + woff[warp] + (incl - total);
+        #pragma unroll
+        for (int q = 0; q < BPT; ++q)
+        {
+            for (int j = 0; j < cnt[q] && pos + j < cap; ++j)
+            {
+                int e = first[q] + j;
+                out[pos + j] = e;
+                if (out_rows)
+                {
+                    int p = e / epp;
+                    out_rows[pos + j] = pages[p] * epp + (e - p * epp);
+                }
+            }
+            pos += cnt[q];
+        }
         base += tile_total;
         __syncthreads();   // wcnt/woff/tile_total are reused by the next tile
         if (base >= cap) break;
     }
-    for (int i = base + t; i < cap; i += COMPACT_THREADS) out[i] = -1;
+    for (int i = base + t; i < cap; i += COMPACT_THREADS)
+    {
+        out[i] = -1;
+        if (out_rows) out_rows[i] = -1;
+    }
+}
+
+// EXL3_COMPACT_BPT=1 selects the one-block-per-thread scan (A/B baseline); anything else the 4-wide one.
+// Both emit the same list, so this is a timing knob only
+__device__ void dsa_compact_row
+(
+    const uint8_t* __restrict__ keep,
+    int* __restrict__ out,
+    int* __restrict__ out_rows,
+    const int* __restrict__ pages,
+    const int epp,
+    const int nb,
+    const int bs,
+    const int ec,
+    const int cap,
+    const int bpt
+)
+{
+    if (bpt == 1)
+        dsa_compact_row_impl<1>(keep, out, out_rows, pages, epp, nb, bs, ec, cap);
+    else
+        dsa_compact_row_impl<4>(keep, out, out_rows, pages, epp, nb, bs, ec, cap);
+}
+
+__global__ __launch_bounds__(COMPACT_THREADS)
+void dsa_compact_ent_kernel
+(
+    const uint8_t* __restrict__ keep,   // (nb,) nonzero = block kept
+    int* __restrict__ out,              // (cap,) int32 entries, -1 past the count
+    const int nb,
+    const int bs,
+    const int ec,
+    const int cap,
+    const int bpt
+)
+{
+    dsa_compact_row(keep, out, nullptr, nullptr, 0, nb, bs, ec, cap, bpt);
+}
+
+/*
+Multi-row (MTP verify slab) compaction: one block per row, each row keeping its own blocks and
+having its own causal entry bound min((pos_base + s) / cr, ec_max), where pos_base is
+pos0 + 1 + r0 so that row s stands for query position pos0 + r0 + s. Order and padding are those of
+the single-row kernel, so a row's list is exactly what `((~drop[s]).nonzero() * bs +
+arange(bs)).flatten()[< ec_s]` yields.
+*/
+__global__ __launch_bounds__(COMPACT_THREADS)
+void dsa_compact_ent_rows_kernel
+(
+    const uint8_t* __restrict__ keep,   // (rows, nb) nonzero = block kept
+    int* __restrict__ out,              // (rows, cap) int32 entries, -1 past each row's count
+    int* __restrict__ out_rows,         // (rows, cap) int32 pool rows, or null
+    const int* __restrict__ pages,      // block table, when out_rows is set
+    const int epp,                      // pool entries per page
+    const int rows,
+    const int nb,
+    const int bs,
+    const int ec_max,                   // valid pool entries (clamp)
+    const int pos_base,
+    const int cr,                       // compress_rate
+    const int cap,
+    const int bpt
+)
+{
+    int s = blockIdx.x;
+    if (s >= rows) return;
+    int ec = min((pos_base + s) / max(cr, 1), ec_max);
+    long long off = (long long) s * cap;
+    dsa_compact_row(keep + (long long) s * nb, out + off, out_rows ? out_rows + off : nullptr,
+                    pages, epp, nb, bs, ec, cap, bpt);
+}
+
+// Blocks per thread for the candidate compaction scan (EXL3_COMPACT_BPT=1 -> the one-block-per-thread
+// baseline). Both settings emit the same list; the knob exists for A/B measurement
+static int compact_bpt()
+{
+    static const int bpt = []() {
+        const char* e = std::getenv("EXL3_COMPACT_BPT");
+        int v = e ? atoi(e) : 4;
+        return v == 1 ? 1 : 4;
+    }();
+    return bpt;
 }
 
 void dsa_compact_ent
@@ -1083,7 +1220,97 @@ void dsa_compact_ent
     dsa_compact_ent_kernel<<<1, COMPACT_THREADS, 0, stream>>>
     (
         (const uint8_t*) keep.data_ptr(), (int*) out.data_ptr(),
-        nb, (int) bs, (int) ec, cap
+        nb, (int) bs, (int) ec, cap, compact_bpt()
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+void dsa_compact_ent_rows
+(
+    const at::Tensor& keep,
+    at::Tensor out,
+    int64_t bs,
+    int64_t ec_max,
+    int64_t pos_base,
+    int64_t cr
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(keep.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(keep.dim() == 2, "dsa_compact_ent_rows: keep must be 2-D");
+    TORCH_CHECK(keep.is_contiguous(), "dsa_compact_ent_rows: keep must be contiguous");
+    TORCH_CHECK(keep.scalar_type() == at::kBool || keep.scalar_type() == at::kByte,
+                "dsa_compact_ent_rows: keep must be bool/uint8");
+    TORCH_CHECK(out.dim() == 2 && out.is_contiguous() && out.scalar_type() == at::kInt,
+                "dsa_compact_ent_rows: bad out");
+    TORCH_CHECK(out.size(0) == keep.size(0), "dsa_compact_ent_rows: row count mismatch");
+    TORCH_CHECK(bs > 0 && ec_max >= 0 && cr > 0, "dsa_compact_ent_rows: bad bounds");
+    int rows = (int) keep.size(0);
+    int nb = (int) keep.size(1);
+    int cap = (int) out.size(1);
+    if (!rows || !cap || !nb)
+    {
+        if (rows && cap)
+            cuda_check(cudaMemsetAsync(out.data_ptr(), 0xff, (long long) rows * cap * sizeof(int), stream));
+        return;
+    }
+    dsa_compact_ent_rows_kernel<<<rows, COMPACT_THREADS, 0, stream>>>
+    (
+        (const uint8_t*) keep.data_ptr(), (int*) out.data_ptr(), nullptr, nullptr, 0,
+        rows, nb, (int) bs, (int) ec_max, (int) pos_base, (int) cr, cap, compact_bpt()
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+// dsa_compact_ent_rows plus the pool-row mapping of every kept entry, so the caller does no
+// gather/promotion per row: rows[t] = pages[ent[t] / epp] * epp + ent[t] % epp, -1 padded.
+void dsa_compact_ent_rows_map
+(
+    const at::Tensor& keep,
+    at::Tensor out,
+    at::Tensor out_rows,
+    const at::Tensor& pages,
+    int64_t epp,
+    int64_t bs,
+    int64_t ec_max,
+    int64_t pos_base,
+    int64_t cr
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(keep.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK(keep.dim() == 2, "dsa_compact_ent_rows_map: keep must be 2-D");
+    TORCH_CHECK(keep.is_contiguous(), "dsa_compact_ent_rows_map: keep must be contiguous");
+    TORCH_CHECK(keep.scalar_type() == at::kBool || keep.scalar_type() == at::kByte,
+                "dsa_compact_ent_rows_map: keep must be bool/uint8");
+    TORCH_CHECK(out.dim() == 2 && out.is_contiguous() && out.scalar_type() == at::kInt,
+                "dsa_compact_ent_rows_map: bad out");
+    TORCH_CHECK(out_rows.sizes() == out.sizes() && out_rows.is_contiguous() &&
+                out_rows.scalar_type() == at::kInt, "dsa_compact_ent_rows_map: bad out_rows");
+    TORCH_CHECK(out.size(0) == keep.size(0), "dsa_compact_ent_rows_map: row count mismatch");
+    TORCH_CHECK(pages.dim() == 1 && pages.is_contiguous() && pages.scalar_type() == at::kInt,
+                "dsa_compact_ent_rows_map: bad pages");
+    TORCH_CHECK(bs > 0 && ec_max >= 0 && cr > 0 && epp > 0, "dsa_compact_ent_rows_map: bad bounds");
+    TORCH_CHECK((ec_max + epp - 1) / epp <= pages.size(0), "dsa_compact_ent_rows_map: pages too short");
+    int rows = (int) keep.size(0);
+    int nb = (int) keep.size(1);
+    int cap = (int) out.size(1);
+    if (!rows || !cap || !nb)
+    {
+        if (rows && cap)
+        {
+            cuda_check(cudaMemsetAsync(out.data_ptr(), 0xff, (long long) rows * cap * sizeof(int), stream));
+            cuda_check(cudaMemsetAsync(out_rows.data_ptr(), 0xff, (long long) rows * cap * sizeof(int), stream));
+        }
+        return;
+    }
+    dsa_compact_ent_rows_kernel<<<rows, COMPACT_THREADS, 0, stream>>>
+    (
+        (const uint8_t*) keep.data_ptr(), (int*) out.data_ptr(), (int*) out_rows.data_ptr(),
+        (const int*) pages.data_ptr(), (int) epp,
+        rows, nb, (int) bs, (int) ec_max, (int) pos_base, (int) cr, cap, compact_bpt()
     );
     cuda_check(cudaPeekAtLastError());
 }
