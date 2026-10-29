@@ -5,6 +5,8 @@ import torch
 import weakref
 
 from ..cache import Cache
+from ..cache.dsa import DSparkState
+from ..constants import PAGE_SIZE
 from ..model.model import Model
 from ..modules import RMSNorm, Linear, Embedding, GatedMLP, BlockSparseMLP, TransformerBlock, \
     HyperConnection, HyperHead
@@ -58,8 +60,7 @@ _EV_COST_RAW = _os.environ.get("EXL3_DSPARK_EV_COST", "1:16.35,2:18.9,3:20.7,4:2
 #         lives in a device tensor the captured sampling graph reads, so switching never re-captures.
 # Defaults retuned for the 2.499-bpw TP=2 checkpoint (7 prompts, 256 tokens, ABBA: 143.3/144.7 -> 153.4/154.0 tok/s
 # vs 0.35 / 1.5; 5 of 7 prompts faster, two short ones -2..-7%). It changes the verify width, and a different verify
-# width is a different numeric path (batch-width non-invariance), so greedy output can differ on near-tied tokens.
-# The hybrid pair keeps them as a starting point; Phase E measures them against fixed K on this checkpoint
+# width is a different numeric path (batch-width non-invariance), so greedy output can differ on near-tied tokens
 _AUTO_LO = float(_os.environ.get("EXL3_DSPARK_AUTO_LO", "0.25"))
 _AUTO_SWITCH = float(_os.environ.get("EXL3_DSPARK_AUTO_SWITCH", "2.0"))
 _AUTO_HL = float(_os.environ.get("EXL3_DSPARK_AUTO_HL", "32"))
@@ -363,7 +364,10 @@ class DeepseekV4MTPModel(Model):
             # One forward per draft call covers exactly dspark_block_size positions; a longer window is
             # unproduceable (the Generator clamps num_draft_tokens to this with a startup warning)
             "max_draft_size": config.dspark_block_size,
+            # Main-kv rows live in per-sequence window rings (DSparkLayerState), checkpointed with the target
+            "recurrent_states": True,
         })
+        self.recurrent_state_cls = DSparkState
         self.attached_model = None
         # Private trunk embedding/head instances, loaded lazily by attach_to when the
         # target is tensor-parallel (its own embedding and head then live in the rank
@@ -468,22 +472,62 @@ class DeepseekV4MTPModel(Model):
         params: dict,
         lengths: list[int] = None,
     ):
-        """Write main-kv rows for freshly accepted/prefilled target positions: concat the
-        trunk tap states, project through main_proj/main_norm once, then per block derive
-        and store that block's kv rows (paged, aligned with the target block tables)."""
-        if lengths is not None:
-            max_length = max(lengths)
-            target_hidden = [t[:, :max_length] for t in target_hidden]
+        """Write main-kv rows for freshly accepted/prefilled target positions into the drafter's window
+        rings: concat the trunk tap states, project through main_proj/main_norm once, then per block
+        derive and store that block's kv rows.
+
+        params carries cache_seqlens (the rows' first positions) and recurrent_states (one DSparkState
+        per batch row, at that position); lengths[i] is how many of row i's rows are real (default: all).
+        A row longer than the ring only writes its tail: earlier rows would be overwritten before any
+        draft could read them. Rows past a row's length are written too (one batched write) but land
+        above its position, where the next write overwrites them before the drafter reads them; a row
+        of length 0 writes into the trash page."""
+        rsg = params["recurrent_states"]
+        seqlens = params["cache_seqlens"]
+        seqlens = seqlens.tolist() if torch.is_tensor(seqlens) else list(seqlens)
+        bsz = len(rsg)
+        T = target_hidden[0].shape[1]
+        if lengths is None:
+            lengths = [T] * bsz
+        n = max(lengths)
+        if n == 0:
+            return
+        ring_rows = rsg[0].ring_rows
+        window = rsg[0].window
+        # Rows that the drafter can still read: the last ring_rows of the row. Only a single-row write (prefill)
+        # can be longer than the ring; a batched write's padding rows (past a row's length) must stay clear of
+        # that row's window, which they do while they fit in the ring's slack above it
+        skip = max(0, n - ring_rows)
+        assert skip == 0 or all(ln == n for ln in lengths), "DSpark ring: a long write must not be padded"
+        assert all(ln == 0 or n - ln <= ring_rows - window for ln in lengths), \
+            "DSpark ring: padding rows of a batched write would overwrite a row's window"
+        width = -(-(max(seqlens) + n) // PAGE_SIZE) + 1
+        tables = []
+        pos0 = []
+        for st, p, ln in zip(rsg, seqlens, lengths):
+            if ln > 0:
+                assert st.position == p, f"DSpark ring state at {st.position}, rows start at {p}"
+                tables.append(st.block_table(width))
+            else:
+                tables.append(st.trash_table(width))
+            pos0.append(p + skip)
+        target_hidden = [t[:, skip:n] for t in target_hidden]
         device = self.input_layer.main_proj.device
         for i in range(len(target_hidden)):
             target_hidden[i] = to_device(target_hidden[i], device)
         th = torch.cat(target_hidden, dim = -1)
-        params = dict(params)
-        params["cache"] = cache
-        params["dspark_main_x"] = self.input_layer.project_taps(th, {})
+        p = {
+            "cache": cache,
+            "block_table": torch.cat(tables, dim = 0),
+            "cache_seqlens": torch.tensor(pos0, dtype = torch.int32),
+            "dspark_main_x": self.input_layer.project_taps(th, {}),
+        }
         for attn in self.attn_modules:
-            mx = get_for_device(params, "dspark_main_x", attn.device)
-            attn.update_kv_rows(mx, params)
+            mx = get_for_device(p, "dspark_main_x", attn.device)
+            attn.update_kv_rows(mx, p)
+        for st, q, ln in zip(rsg, seqlens, lengths):
+            if ln > 0:
+                st.wrote(q, ln, n)
 
 
     def _markov_body(self, state: torch.Tensor, seed: torch.Tensor, prenorm: torch.Tensor, p: dict):
