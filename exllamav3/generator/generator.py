@@ -1333,6 +1333,12 @@ class Generator:
         # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
         # pageable copies; the draft's own buffers, since the target's are still in flight
         max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        # The drafter's captured block graph is keyed by this table's shape. Size it from the cache capacity, not
+        # the current job's length, so one capture serves every prompt length: a second capture made for a job of
+        # another length corrupted the next job's target state (NaN logits, later an illegal memory access).
+        # Rows past a sequence's own pages stay zero and are never read (attention is bounded by its positions).
+        cap_pages = (self.pagetable.max_pages + 15) // 16 * 16
+        max_pages_batch = max(max_pages_batch, cap_pages)
         block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
         block_index.zero_()
         cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
