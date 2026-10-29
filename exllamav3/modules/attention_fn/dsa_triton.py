@@ -100,6 +100,8 @@ def _dsa_attn_kernel(
                                    # of NC_HIST history rows from the ring; win_len is
                                    # the scan length (NC_HIST - 1 + R), top = chunk end
     NC_HIST: tl.constexpr = 0,
+    NC_DEVICE_POS: tl.constexpr = 0, # NC_BLOCK: q_pos0 points to current sequence length
+    NC_WINDOW: tl.constexpr = 0,
     Q_SPLIT: tl.constexpr = 0,     # GLM-5.2 absorbed queries: q is the HEAD-MAJOR latent
                                    # (H, R, D_c) and the (unused, windowless) ring slot
                                    # carries the token-major rope queries (R, H, D_r)
@@ -117,6 +119,11 @@ def _dsa_attn_kernel(
     h_blocks = tl.cdiv(H, BLOCK_H)
     row = pid // h_blocks
     h_block = pid % h_blocks
+    if NC_DEVICE_POS:
+        q_pos0 = tl.load(q_pos0)
+        hist = tl.minimum(q_pos0, NC_WINDOW)
+        win_floor = q_pos0 - hist
+        win_len = hist + R
 
     offs_h = h_block * BLOCK_H + tl.arange(0, BLOCK_H)
     valid_h = offs_h < H
@@ -905,6 +912,8 @@ def dsa_attn(
     page_size = 256,         # pool entries per block-table page (PAGE_SIZE // m for the
                              # paged pools; 256 with an identity table for contiguous pools)
     nc_block = False,        # DSpark draft mode: non-causal chunk + paged window history
+    nc_device_pos = None,    # device int32 sequence length, graph-safe NC_BLOCK positions
+    nc_window = 0,
                              # (single job per call; forces the one-shot kernel)
     nc_chunk = False,        # non-causal image chunk (DeepSeek-V4 vision): every query sees
                              # the whole chunk (bidirectional) plus its own win_len-wide
@@ -1019,6 +1028,7 @@ def dsa_attn(
     else:
         dbg_pages = 0
     if nc_block:
+        assert nc_device_pos is None or nc_window >= 0
         n_splits = 1
     nc_hist = 0
     if nc_chunk:
@@ -1118,7 +1128,8 @@ def dsa_attn(
     m_args = (
         q, ring, kv_chunk, pc_arg, (pool_r.reshape(-1, D_r) if D_r > 0 else pool_r.reshape(-1)),
         block_table, indices, sinks_t, derot_t, out,
-        k_len, win_len, pool_len, npr, q_pos0, R, win_floor, ring_beg, pool_s, h32_t,
+        k_len, win_len, pool_len, npr, nc_device_pos if nc_device_pos is not None else q_pos0,
+        R, win_floor, ring_beg, pool_s, h32_t,
     )
     def m_consts(cfg):
         bh, bn, _ = cfg
@@ -1134,6 +1145,7 @@ def dsa_attn(
             BLOCK_H = bh, BLOCK_N = bn, BLOCK_W = 16,
             DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
             NC_BLOCK = 1 if nc_block else 0,
+            NC_DEVICE_POS = nc_device_pos is not None, NC_WINDOW = nc_window,
             NC_CHUNK = 1 if nc_chunk else 0, NC_HIST = nc_hist,
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
             QC = qc_bits,
@@ -1159,7 +1171,8 @@ def dsa_attn(
                     ladder.append((bh, bn, ns))
     with torch.cuda.device(q.device):   # layer split: launch on the tensor's device
         pick_key = (H, D_c, D_r, K_pad, has_window, has_sinks, dense_pool, derotate, hpg, dbg,
-                    bool(nc_block), bool(nc_chunk), nc_hist, bool(q_split), bool(out_latent), qc_bits,
+                    bool(nc_block), bool(nc_device_pos is not None), nc_window, bool(nc_chunk), nc_hist,
+                    bool(q_split), bool(out_latent), qc_bits,
                     num_warps, ladder[0])
         block_h, block_n, num_stages = pick_config(
             q.device, "dsa_attn", pick_key, ladder,
