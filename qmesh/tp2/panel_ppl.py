@@ -53,7 +53,7 @@ SCORE_CHUNK = 64  # logits rows scored per logsumexp block (memory)
 
 
 
-def build_model(ctx: int):
+def build_model(ctx: int, cached: bool):
     torch.cuda.set_device(R.RANK)
     dist.init_process_group(backend = "nccl", rank = R.RANK, world_size = R.WORLD,
                             init_method = os.environ["INIT_METHOD"])
@@ -63,6 +63,9 @@ def build_model(ctx: int):
     assert config.tp_size == R.WORLD and config.tp_rank == R.RANK, \
         f"checkpoint tp_size/tp_rank {config.tp_size}/{config.tp_rank} != launch {R.WORLD}/{R.RANK}"
     model = Model.from_config(config)
+    # The Cache must exist before model.load(): loading is what allocates the tensors of every attached cache
+    cache = Cache(model, max_num_tokens = (ctx + 2 + 255) // 256 * 256, max_history = R.MAX_HISTORY,
+                  max_batch_size = 1, **R.KV_CACHE_KWARGS) if cached else None   # prompt + the one decode row
     model.load(device = device, max_chunk_size = ctx, max_output_size = ctx,
                max_batch_size = 1, progressbar = False)
     backend = R.TPBackendNCCL()
@@ -72,7 +75,7 @@ def build_model(ctx: int):
     R.log(f"LOADED {time.time() - t0:.1f}s blocks={n_blocks} vocab_local={local_v} vocab_full={full_v} "
           f"actual_vocab={tokenizer.actual_vocab_size} ctx={ctx} "
           f"max_alloc_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f}")
-    return model, device, tokenizer, backend
+    return model, device, tokenizer, backend, cache
 
 
 def pack_name() -> str:
@@ -111,28 +114,30 @@ CACHED_GEN = None
 CACHED_CAP: list | None = None   # per-prefill-chunk logits captured from the full-stack forward
 
 
-def _prefill_with_logits(self, input_ids, params = None):
-    """Model.prefill replacement: the same cached forward plus the head over every prompt row."""
-    p = dict(params or {})
-    p.pop("last_tokens_only", None)
-    y = self.forward(input_ids, p)
-    lg = y if torch.is_tensor(y) else (y.get("logits") if isinstance(y, dict) else None)
-    if lg is not None and CACHED_CAP is not None:
-        CACHED_CAP.append(lg)
-    return None
+def _install_prefill_with_logits(model):
+    """Replace model.prefill with the same cached forward plus the head over every prompt row. Set on the
+    instance: set_tp_reduce already wrapped model.prefill / model.forward there, which shadows any class hook.
+    Calls the wrapped model.forward, so the TP backend is still injected into params."""
+    def prefill(input_ids, params = None):
+        p = dict(params or {})
+        p.pop("last_tokens_only", None)
+        y = model.forward(input_ids, p)
+        lg = y if torch.is_tensor(y) else (y.get("logits") if isinstance(y, dict) else None)
+        if lg is not None and CACHED_CAP is not None:
+            CACHED_CAP.append(lg)
+        return None
+    model.prefill = prefill
 
 
-def build_cached_scorer(model, tokenizer, ctx: int, chunk: int):
+def build_cached_scorer(model, cache, tokenizer, chunk: int):
     """Install a prefill hook that returns logits for every prompt row, and the Generator to drive it."""
-    cache = Cache(model, max_num_tokens = ctx + 2, max_history = R.MAX_HISTORY,
-                  max_batch_size = 1, **R.KV_CACHE_KWARGS)   # prompt + the one decode row
     gen = Generator(model, cache, tokenizer, max_batch_size = 1, max_chunk_size = chunk,
                     recurrent_cache_size = 0)   # no prefix cache: 0 avoids the 4 GiB default alloc
     gen.prefix_cache_min_match = None            # read via getattr() by pagetable.py: disables it
     # Model.prefill stops at the last cache-writing module, so it never runs the head (job.prefill
     # ignores its return value). The full forward is the same kernels plus the head over every row --
     # the call shape job.py already uses for MTP drafting, minus `last_tokens_only`.
-    Model.prefill = _prefill_with_logits        # one model per process, so a class hook is enough
+    _install_prefill_with_logits(model)
     return gen
 
 
@@ -145,16 +150,23 @@ def cached_logits(model, device, ids: list[int]):
     gen.enqueue(Job(input_ids = torch.tensor([ids], dtype = torch.long), max_new_tokens = 1,
                     min_new_tokens = 1, sampler = R.RankAgreedGreedySampler(), stop_conditions = [],
                     return_logits = True))
+    # Prefill covers every token but the last; the generator feeds the last one as the first decode step and
+    # returns that row's pre-sampling logits in the result (return_logits)
+    last = []
     while gen.num_remaining_jobs():
         for result in gen.iterate():
             if "error" in result:
                 raise result["error"]
+            if "logits" in result:
+                last.append(result["logits"])
     cap, CACHED_CAP = CACHED_CAP, None
     if R.RANK != 0:
         return torch.zeros((1, 1, 1), dtype = torch.float, device = device)
-    if not cap:
+    if not cap or not last:
         raise RuntimeError("cached prefill captured no logits")
-    lg = torch.cat(cap, dim = 1) if len(cap) > 1 else cap[0]
+    tail = last[0].to(device = cap[0].device).reshape(1, -1, last[0].shape[-1])[:, :1, :]
+    w = min(tail.shape[-1], *(c.shape[-1] for c in cap))   # scoring reads only the first `vocab` columns
+    lg = torch.cat([c[..., :w] for c in cap] + [tail[..., :w].to(cap[0].dtype)], dim = 1)
     assert lg.shape[1] == len(ids), f"captured {lg.shape[1]} logits rows for {len(ids)} tokens"
     return lg
 
@@ -410,12 +422,12 @@ def main():
         if not (2 <= pm <= args.ctx):
             raise ValueError(f"--sweep value {pm} outside [2, ctx]")
 
-    model, device, tokenizer, _backend = build_model(args.ctx)
+    model, device, tokenizer, _backend, cache = build_model(args.ctx, args.attn == "cached")
     vocab = tokenizer.actual_vocab_size
     raw_tok, enc = None, None
     prefill_chunk = args.prefill_chunk or args.ctx
     if args.attn == "cached":
-        CACHED_GEN = build_cached_scorer(model, tokenizer, args.ctx, prefill_chunk)
+        CACHED_GEN = build_cached_scorer(model, cache, tokenizer, prefill_chunk)
         R.log(f"ATTN cached prefill_chunk={prefill_chunk} (production path: full-stack forward + head)")
     else:
         R.log("ATTN nc WARNING: stateless flash_attn_nc is NOT prefix-stable on this build (the same token "
