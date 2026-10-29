@@ -101,6 +101,8 @@ class CacheLayer_dsa(CacheLayer):
         return self.k_bits > 0
 
     def alloc(self, device: torch.device):
+        getattr(self.attention, "_bc_dsa", {}).clear()
+        getattr(self.attention, "_bc_dsa_batch", {}).clear()
         self.device = device
         self.mirrors = {}
         if self.k_bits:
@@ -113,6 +115,8 @@ class CacheLayer_dsa(CacheLayer):
             self.pool_idx = torch.zeros((self.num_pages, self.epp, self.D_i), dtype = torch.half, device = device)
 
     def free(self):
+        getattr(self.attention, "_bc_dsa", {}).clear()
+        getattr(self.attention, "_bc_dsa_batch", {}).clear()
         self.device = None
         self.pool_c = self.pool_q = self.pool_s = self.pool_r = self.pool_idx = None
         self._slot_bt = None
@@ -402,11 +406,15 @@ class DSV4LayerState:
 
 
     def alloc(self, device):
+        getattr(self.module, "_bc_dsa", {}).clear()
+        getattr(self.module, "_bc_dsa_batch", {}).clear()
         self.device = device
         self._set_tensors([torch.zeros_like(t, device = device) for t in self._tensors()])
 
 
     def free(self):
+        getattr(self.module, "_bc_dsa", {}).clear()
+        getattr(self.module, "_bc_dsa_batch", {}).clear()
         self.device = None
         self._set_tensors([torch.zeros_like(t, device = "meta") for t in self._tensors()])
 
