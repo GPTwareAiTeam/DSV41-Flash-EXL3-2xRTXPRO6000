@@ -83,6 +83,8 @@ IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
 COMM = os.environ.get("COMM", "p2p")  # nccl | p2p | hybrid (hybrid: P2P <64KB, NCCL >=64KB)
 P2P_STATS_OUT = os.environ.get("P2P_STATS_OUT")  # p2p only: prefix; enables device spin/timing stats, dumped at run end to <prefix>.rank<r>.json
 PROFILE = os.environ.get("PROFILE", "0") == "1"
+PROFILE_STACK = os.environ.get("PROFILE_STACK", "0") == "1"   # attach python stacks (names the .to()/copy_ call sites)
+PROFILE_SHAPES = os.environ.get("PROFILE_SHAPES", "0") == "1"  # record tensor shapes (names the copied buffers)
 TOKENS_OUT = os.environ.get("TOKENS_OUT")
 LOGITS_OUT = os.environ.get("LOGITS_OUT")
 PROBE = [int(n) for n in os.environ.get("PROBE", "").split(",") if n.strip()]
@@ -179,7 +181,13 @@ if LONG_PROMPT_STYLE == "mixed":
     _tokens_per_unit = sum(_FILLERS[k][1] for k in ("prose", "code", "json"))
 else:
     _unit, _tokens_per_unit = _FILLERS[LONG_PROMPT_STYLE]
-if LONG_PROMPT_TOKENS:
+if os.environ.get("LONG_PROMPT_FILE"):
+    # Real-content long prompt: a captured transcript/fixture appended to every prompt, so the round is
+    # measured on agentic text (acceptance and indexer behaviour differ from synthetic filler).
+    with open(os.environ["LONG_PROMPT_FILE"], encoding = "utf-8") as f:
+        _transcript = f.read()
+    PROMPTS = [p + "\n\n" + _transcript for p in PROMPTS]
+elif LONG_PROMPT_TOKENS:
     _reps = max(1, LONG_PROMPT_TOKENS // _tokens_per_unit)
     PROMPTS = [p + (_unit * _reps) for p in PROMPTS]
 
@@ -191,10 +199,28 @@ def log(msg: str):
 
 class RankAgreedGreedySampler(GreedySampler):
     """Keep verification acceptance and policy state identical on both ranks."""
+
+    # Set by the generator's verify path while it launches a whole window: the per-call broadcast is
+    # then replaced by one agree_window() collective, so a W-position window pays one host-blocking
+    # collective instead of W. Values are unchanged (rank 0 still wins per position).
+    defer_agree = False
+
     def forward(self, *args, **kwargs):
         token = super().forward(*args, **kwargs)
-        dist.broadcast(token, src = 0)
+        if not self.defer_agree:
+            dist.broadcast(token, src = 0)
         return token
+
+    def agree_window(self, tokens: list) -> list:
+        """Rank-0 agreement for one verify window's sampled tokens, in one collective."""
+        dev = [t for t in tokens if t.is_cuda and t.numel() == 1]
+        if not dev or len(dev) != len(tokens) or len({t.dtype for t in dev}) != 1:
+            for t in tokens:
+                dist.broadcast(t, src = 0)
+            return list(tokens)
+        batch = torch.cat([t.reshape(1) for t in dev])
+        dist.broadcast(batch, src = 0)
+        return [v.view(t.shape) for v, t in zip(batch.unbind(), tokens)]
 
 
 class TPBackendNCCL:
@@ -538,7 +564,12 @@ def main():
                           num_draft_tokens = NUM_DRAFT if DSPARK else None,
                           dynamic_draft_tokens = DSPARK and DSPARK_DYNAMIC,
                           draft_confidence = DSPARK_TARGET_ACC,
-                          record_draft_stats = DSPARK and (DSPARK_DYNAMIC or DSPARK_POLICY == "auto"))
+                          record_draft_stats = DSPARK and (DSPARK_DYNAMIC or DSPARK_POLICY == "auto" or os.environ.get("EXL3_DRAFT_POSITION_STATS", "0") == "1"))
+    if DSPARK:
+        # State the effective window explicitly: NUM_DRAFT beyond the drafter's block is clamped, not honoured
+        log(f"DRAFT_K requested={NUM_DRAFT} effective={generator.num_draft_tokens} "
+            f"block={generator.max_draft_size} "
+            f"clamped={'yes' if generator.num_draft_tokens != NUM_DRAFT else 'no'}")
     if isinstance(backend, TPBackendTrace):
         original_trace_iterate = generator.iterate
         def trace_iterate(*args, **kwargs):
@@ -551,37 +582,48 @@ def main():
     generator.count_draft_forwards = DSPARK_COUNT_FORWARDS
     generator.draft_forward_count = 0
     draft_timing_rounds = []
+    DIAG_SPLIT = os.environ.get("EXL3_DIAG_SPLIT", "0") == "1"
+    DIAG_SPLIT_EVERY = int(os.environ.get("EXL3_DIAG_SPLIT_EVERY", "4"))
     if DRAFT_TIMING and DSPARK:
         # Events measure stream elapsed time, including any idle gaps, not kernel-only time.
         current_events = None
+        sample_now = False
+        def wait_total():
+            if not DIAG_SPLIT or comm is None or not getattr(comm, "stats_enabled", False):
+                return 0
+            return sum(b["wait_ns"] for b in comm.stats()["blocks"])
         def timed_forward(original, component):
             def call(*args, **kwargs):
                 if current_events is None:
                     return original(*args, **kwargs)
                 start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                w0 = wait_total() if sample_now else 0
+                h0 = time.perf_counter()
                 start.record()
                 try:
                     return original(*args, **kwargs)
                 finally:
                     end.record()
-                    current_events.append((component, start, end))
+                    w1 = wait_total() if sample_now else 0
+                    current_events.append((component, start, end, w1 - w0, time.perf_counter() - h0))
             return call
         model.forward = timed_forward(model.forward, "target")
         draft_model.forward = timed_forward(draft_model.forward, "draft")
         original_iterate = generator.iterate
         def timed_iterate(*args, **kwargs):
-            nonlocal current_events
+            nonlocal current_events, sample_now
             events = []
             current_events = events
+            sample_now = DIAG_SPLIT and (len(draft_timing_rounds) % DIAG_SPLIT_EVERY == 0)
             start = time.perf_counter()
             try:
                 return original_iterate(*args, **kwargs)
             finally:
                 wall = time.perf_counter() - start
                 current_events = None
-                if any(component == "draft" for component, _, _ in events):
+                sample_now = False
+                if any(component == "draft" for component, *_ in events):
                     draft_timing_rounds.append((wall, events))
-        generator.iterate = timed_iterate
     FORCE_EXPORT = os.environ.get("FORCE_EXPORT", "0") == "1"
     if FORCE_EXPORT and not DSPARK:
         _export_layers = set(config.dspark_target_layer_ids)
@@ -676,11 +718,16 @@ def main():
         policy_class, policy_ema = content_seed.seed_acceptance(prompt)
         policy_off = DSPARK_POLICY == "auto" and policy_ema < content_seed.POLICY_THRESHOLD
         if DSPARK_POLICY == "auto":
-            generator.num_draft_tokens = 0 if policy_off else NUM_DRAFT
+            generator.num_draft_tokens = 0 if policy_off else min(NUM_DRAFT, generator.max_draft_size or NUM_DRAFT)
         draft_forward_start = generator.draft_forward_count
         if DSPARK_POLICY == "auto":
             log(f"POLICY {idx} class={policy_class} seed_al={policy_ema:.3f} speculative={not policy_off}")
         generator.enqueue(job)
+        forced_path = os.environ.get("EXL3_DIAG_FORCE_TOKENS")
+        if forced_path:
+            with open(forced_path) as f:
+                reference_tokens = json.load(f)[str(idx)]
+            job.constrain_output_now(torch.tensor([reference_tokens], dtype = torch.long))
         t1 = time.time()
         marks, text, tokens, eos_info, logit_rows, spec = [], "", [], None, [], None
         while generator.num_remaining_jobs():
@@ -742,6 +789,13 @@ def main():
             tpr = 1 + acc / max(rnd, 1)
             log(f"SPEC {idx} accepted={acc} rejected={rej} acc_rate={acc_rate:.4f} verify_rounds={rnd} "
                 f"tokens_per_round={tpr:.3f} eff_tok_s={len(tokens) / total:.2f}")
+            if os.environ.get("EXL3_DRAFT_POSITION_STATS", "0") == "1" and job.draft_stats:
+                positions = []
+                for pos in range(1, NUM_DRAFT + 1):
+                    attempted = sum(window >= pos and accepted >= pos - 1 for _, window, accepted in job.draft_stats)
+                    accepted = sum(accepted >= pos for _, _, accepted in job.draft_stats)
+                    positions.append((pos, attempted, accepted))
+                log(f"DRAFT_POSITION {idx} (position,attempted,accepted)={positions}")
             if DSPARK_DYNAMIC and job.draft_stats:
                 # draft_stats rows: (position, window, accepted-drafts) per verify round
                 wins = [w for _, w, _ in job.draft_stats]
@@ -773,12 +827,33 @@ def main():
             log(f"PROBE n={n} next_tok={probe_tok} top1={int(i[0])} top2={int(i[1])} gap={float(v[0]-v[1]):.5f}")
     if draft_timing_rounds:
         torch.cuda.synchronize(device)
+        split_rows = []
         for i, (wall, events) in enumerate(draft_timing_rounds):
-            draft = [start.elapsed_time(end) for component, start, end in events if component == "draft"]
-            target = [start.elapsed_time(end) for component, start, end in events if component == "target"]
+            draft = [(start.elapsed_time(end), w, h) for component, start, end, w, h in events if component == "draft"]
+            target = [(start.elapsed_time(end), w, h) for component, start, end, w, h in events if component == "target"]
+            if DIAG_SPLIT:
+                split_rows.append((wall, draft, target))
             log(f"DRAFT_TIMING iteration={i} wall_ms={wall * 1000:.3f} "
-                f"draft_n={len(draft)} draft_ms={sum(draft):.3f} "
-                f"target_n={len(target)} target_ms={sum(target):.3f}")
+                f"draft_n={len(draft)} draft_ms={sum(d for d, _, _ in draft):.3f} "
+                f"target_n={len(target)} target_ms={sum(d for d, _, _ in target):.3f}")
+        if split_rows:
+            # Rounds with sampled p2p-wait snapshots only; the snapshot syncs the device, so these rows
+            # attribute GPU-side collective wait, they are not timing arms.
+            sampled = [(w, d, t) for w, d, t in split_rows if any(x[1] or x[2] for x in d + t)]
+            if sampled:
+                def mean(xs):
+                    return sum(xs) / len(xs) if xs else float("nan")
+                wall_ms = mean([w * 1000 for w, _, _ in sampled])
+                draft_ms = mean([sum(x[0] for x in d) for _, d, _ in sampled])
+                target_ms = mean([sum(x[0] for x in t) for _, _, t in sampled])
+                draft_wait = mean([sum(x[1] for x in d) / 1e6 for _, d, _ in sampled])
+                target_wait = mean([sum(x[1] for x in t) / 1e6 for _, _, t in sampled])
+                draft_host = mean([sum(x[2] for x in d) * 1000 for _, d, _ in sampled])
+                target_host = mean([sum(x[2] for x in t) * 1000 for _, _, t in sampled])
+                log(f"ROUND_SPLIT rounds={len(sampled)} wall_ms={wall_ms:.3f} draft_ms={draft_ms:.3f} "
+                    f"target_ms={target_ms:.3f} host_ms={wall_ms - draft_ms - target_ms:.3f} "
+                    f"draft_wait_ms={draft_wait:.3f} target_wait_ms={target_wait:.3f} "
+                    f"draft_py_ms={draft_host:.3f} target_py_ms={target_host:.3f}")
     log(f"MEM max_alloc_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f}")
     if LOGITS_OUT:
         with open(f"{LOGITS_OUT}.rank{RANK}.json", "w") as f:
@@ -801,7 +876,8 @@ def main():
             if w not in PROFILE_SEQ or w in done_w or widths[w] < 3:
                 return _orig_fwd(input_ids, params = params, **kw)
             done_w.add(w)
-            p = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            p = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        with_stack = PROFILE_STACK, record_shapes = PROFILE_SHAPES)
             profs[w] = p
             torch.cuda.synchronize()
             p.start()
@@ -811,6 +887,25 @@ def main():
                 torch.cuda.synchronize()
                 p.stop()
         model.forward = _filtered_forward
+        _orig_draft_fwd = draft_model.forward if draft_model is not None else None
+        _draft_prof = []
+        _draft_calls = [0]
+        if _orig_draft_fwd is not None and os.environ.get("PROFILE_DRAFT") == "1":
+            def _profile_draft(*args, **kwargs):
+                _draft_calls[0] += 1
+                if _draft_calls[0] != 3:
+                    return _orig_draft_fwd(*args, **kwargs)
+                p = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                            with_stack = PROFILE_STACK, record_shapes = PROFILE_SHAPES)
+                _draft_prof.append(p)
+                torch.cuda.synchronize()
+                p.start()
+                try:
+                    return _orig_draft_fwd(*args, **kwargs)
+                finally:
+                    torch.cuda.synchronize()
+                    p.stop()
+            draft_model.forward = _profile_draft
         job = Job(input_ids = last_ids, max_new_tokens = 64, min_new_tokens = 64,
                   sampler = RankAgreedGreedySampler(), stop_conditions = [])
         generator.enqueue(job)
@@ -818,6 +913,10 @@ def main():
             for result in generator.iterate():
                 if "error" in result: raise result["error"]
         model.forward = _orig_fwd
+        if _orig_draft_fwd is not None:
+            draft_model.forward = _orig_draft_fwd
+        if RANK == 0 and _draft_prof:
+            _draft_prof[0].export_chrome_trace(f"{os.environ.get('PROFILE_TRACE', '/artifacts/tp2logs/profile_trace.json')}.draft.json")
         if RANK == 0:
             log(f"PROFILE_SEQ widths_seen={sorted(widths.items())} recorded={sorted(profs)}")
             for w in sorted(profs):
@@ -828,7 +927,8 @@ def main():
         from torch.profiler import profile, ProfilerActivity
         # both ranks must run the same collective sequence; only rank 0 prints the table.
         # Profiling starts after the first emitted token, so prefill is excluded: decode steps only.
-        prof = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        prof = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        with_stack = PROFILE_STACK, record_shapes = PROFILE_SHAPES)
         job = Job(input_ids = last_ids, max_new_tokens = 16, min_new_tokens = 16,
                   sampler = RankAgreedGreedySampler(), stop_conditions = [])
         generator.enqueue(job)
