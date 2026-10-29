@@ -136,10 +136,21 @@ void BC_BlockSparseMLP::run_bszN
             fold_rw = at::zeros({MAX_BSZN, fold_topk}, at::TensorOptions().dtype(at::kHalf).device(dev));
             fold_prepare(fold_topk * MAX_BSZN, dev);
         }
-        fold_sel.slice(0, 0, num_tokens).slice(1, 0, top_k).copy_(selected_experts);
-        fold_rw.slice(0, 0, num_tokens).slice(1, 0, top_k).copy_(routing_weights);
-        fold_sel.slice(0, 0, num_tokens).select(1, top_k).fill_(fold_E);
-        fold_rw.slice(0, 0, num_tokens).select(1, top_k).fill_(1.0f);
+        // EXL3_MOE_FOLD_STAGE=0 retains the four-op baseline for A/B measurements.
+        static const bool fused_stage = [] { const char* e = std::getenv("EXL3_MOE_FOLD_STAGE"); return !(e && e[0] == '0'); }();
+        if (fused_stage && selected_experts.dim() == 2 && routing_weights.dim() == 2 &&
+            selected_experts.size(0) == num_tokens && routing_weights.size(0) == num_tokens &&
+            routing_weights.size(1) == top_k && selected_experts.scalar_type() == at::kLong &&
+            routing_weights.scalar_type() == at::kHalf && selected_experts.device() == y.device() &&
+            routing_weights.device() == y.device())
+            exl3_moe_fold_stage(selected_experts, routing_weights, fold_sel, fold_rw, num_tokens, top_k, fold_E);
+        else
+        {
+            fold_sel.slice(0, 0, num_tokens).slice(1, 0, top_k).copy_(selected_experts);
+            fold_rw.slice(0, 0, num_tokens).slice(1, 0, top_k).copy_(routing_weights);
+            fold_sel.slice(0, 0, num_tokens).select(1, top_k).fill_(fold_E);
+            fold_rw.slice(0, 0, num_tokens).select(1, top_k).fill_(1.0f);
+        }
         exl3_moe_coop_run(fold_coop_p, fold_K_gu, fold_K_d, fold_cb, y,
                           fold_sel.slice(0, 0, num_tokens).slice(1, 0, top_k + 1),
                           fold_rw.slice(0, 0, num_tokens).slice(1, 0, top_k + 1), c10::nullopt);

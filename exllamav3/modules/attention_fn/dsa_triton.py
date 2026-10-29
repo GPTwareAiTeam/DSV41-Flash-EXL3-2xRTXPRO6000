@@ -609,7 +609,7 @@ def _dsa_attn_combine_kernel(
     tl.store(out + base_h[:, None] + offs_d[None, :], o.to(tl.float16),
              mask = valid_h[:, None] & valid_d[None, :])
 
-@triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max"],
+@triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max", "num_pages_per_row"],
             debug = dsa_debug_bounds)
 def _dsa_indexer_kernel(
     q_idx,               # (R, H_i, D_i) fp16, rope applied
@@ -622,6 +622,7 @@ def _dsa_indexer_kernel(
     bound_max,           # runtime: entry count clamp; bound[r] =
                          #   min((q_pos0 + r + 1) // compress_rate, bound_max)
     block_table,         # EPP > 0: (npr,) i32 page table of the (single) job
+    num_pages_per_row,
     H_i: tl.constexpr,
     D_i: tl.constexpr,
     S_stride: tl.constexpr,
@@ -630,6 +631,8 @@ def _dsa_indexer_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     EPP: tl.constexpr = 0,           # pool entries per page; 0 = contiguous k_idx
+    SEQ: tl.constexpr = 1,
+    MULTIROW: tl.constexpr = 0,
     DEBUG_BOUNDS: tl.constexpr = 0,
     DEBUG_PAGES: tl.constexpr = 0,
 ):
@@ -640,9 +643,19 @@ def _dsa_indexer_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    if MULTIROW:
+        job = tl.program_id(2)
+        loc_m = offs_m
+        offs_m = job * SEQ + loc_m
+        T = tl.load(T + job)
+        q_pos0 = tl.load(q_pos0 + job)
+        bound_max = tl.load(bound_max + job)
+        block_table = block_table + job * num_pages_per_row
+    else:
+        loc_m = offs_m
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D_i)
-    valid_m = offs_m < R
+    valid_m = (loc_m < SEQ) if MULTIROW else (offs_m < R)
     valid_n = offs_n < T
 
     if EPP > 0:
@@ -664,7 +677,7 @@ def _dsa_indexer_kernel(
         acc += tl.maximum(logits, 0.0) * wh[:, None].to(tl.float32)
 
     acc = acc * scale
-    bound = tl.minimum((q_pos0 + offs_m + 1) // compress_rate, bound_max)
+    bound = tl.minimum((q_pos0 + loc_m + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n[None, :] < bound[:, None], acc, -float("inf"))
     tl.store(scores + offs_m[:, None].to(tl.int64) * S_stride + offs_n[None, :], acc.to(tl.float16),
              mask = valid_m[:, None] & valid_n[None, :])
@@ -912,9 +925,9 @@ def dsa_attn(
     page_size = 256,         # pool entries per block-table page (PAGE_SIZE // m for the
                              # paged pools; 256 with an identity table for contiguous pools)
     nc_block = False,        # DSpark draft mode: non-causal chunk + paged window history
+                             # (single job per call; forces the one-shot kernel)
     nc_device_pos = None,    # device int32 sequence length, graph-safe NC_BLOCK positions
     nc_window = 0,
-                             # (single job per call; forces the one-shot kernel)
     nc_chunk = False,        # non-causal image chunk (DeepSeek-V4 vision): every query sees
                              # the whole chunk (bidirectional) plus its own win_len-wide
                              # causal window into the ring history; pool phases unchanged
@@ -1252,7 +1265,7 @@ def dsa_indexer_scores(
             grid = (R, triton.cdiv(max(T, 1), block_n))
             _dsa_indexer_fewq_kernel[grid](*f_args, **f_consts(block_n), num_warps = num_warps, num_stages = num_stages)
         else:
-            t_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt)
+            t_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0)
             def t_consts(cfg):
                 bm, bn = cfg
                 return dict(

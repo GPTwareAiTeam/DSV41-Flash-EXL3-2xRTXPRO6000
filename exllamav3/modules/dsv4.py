@@ -2,7 +2,9 @@ from __future__ import annotations
 from typing_extensions import override
 import math
 import torch
+import hashlib
 import os
+import json
 import torch.nn.functional as F
 from ..model.config import Config
 from ..model.model_tp_alloc import TPAllocation
@@ -35,6 +37,68 @@ dsv4_b1_batch = os.environ.get("EXL3_DSV4_B1_BATCH", "0") != "0"
 # Same entry set, same order, same dsa_topk call, so the selection is bitwise identical;
 # EXL3_DSV4_CAND_FIXED=0 restores the nonzero path (A/B only)
 dsv4_cand_fixed = os.environ.get("EXL3_DSV4_CAND_FIXED", "1") != "0"
+# Batched-step indexer key write: one projection over the step's whole new-entry run, with eager's
+# row count and rope base (the per-entry loop rounds 1-2 fp16 ulps away from the eager keys). The
+# run's BASE entry is read from the per-step device position -- a host base would be baked into the
+# captured graph and replay stale for every later step of the same run length. Strict dump parity
+# (bitwise, all 40 layers x 2 ranks) at consecutive multi-row steps, identical tokens and identical
+# accept/reject counters. EXL3_DSV4_IDX_WK_GROUPED=0 restores the per-entry loop (A/B only)
+dsv4_idx_wk_grouped = os.environ.get("EXL3_DSV4_IDX_WK_GROUPED", "1") != "0"
+# Parity dump for the candidate paths: at one position, save the per-row selected entry ids
+# (sorted, so only the selected set is compared) of every indexer reading layer. Temporary gate
+# instrumentation, off unless EXL3_DSV4_SELDUMP is set
+dsv4_seldump = os.environ.get("EXL3_DSV4_SELDUMP")
+dsv4_seldump_pos = int(os.environ.get("EXL3_DSV4_SELDUMP_POS", "-1"))
+# The dump must come from a decode slab (the multi-row candidate path), not from the prompt's last
+# prefill chunk, which also sits above any position threshold and takes the eager union path
+dsv4_seldump_maxseq = int(os.environ.get("EXL3_DSV4_SELDUMP_MAXSEQ", "17"))
+dsv4_cand_dbg = os.environ.get("EXL3_DSV4_CANDDBG")
+_cand_dbg_seen = set()
+# Cross-rank selection diagnostic (read-only experiment, off by default; both env vars unset means
+# every branch below is skipped). SEL=<pos0>: from the first decode slab at/after <pos0>, both
+# ranks are forced onto rank 0's selected entry list through the params["backend"] all_reduce, so
+# the attention that follows uses one selection instead of two rank-local ones. DBG=1: print
+# md5-of-bytes of this layer's indexer inputs (x, q_idx, wts, pool[:ec]) once per (K, seq, pos0),
+# which decides "ranks' inputs differ" vs "score kernel not rank-deterministic"
+dsv4_xrank_sel = int(os.environ.get("EXL3_DSV4_XRANK_SEL", "-1"))
+dsv4_xrank_dbg = os.environ.get("EXL3_DSV4_XRANK_DBG", "0") != "0"
+_xrank_dbg_seen = set()
+# Long-context selection inside the captured b1 body (single row, B == 1): 1 lets the body serve the
+# top-k regime (ec > index_topk) with its bounded pool-scan top-k, 2 also serves the candidate
+# pre-filter (ec > candidate_topk_blocks * block_size): the source layer refreshes the candidate mask
+# in the captured step and the reading layers select over their compacted entries. 0 keeps the dense
+# regime only (the body stays on the eager path above index_topk)
+dsv4_b1_long = int(os.environ.get("EXL3_DSV4_B1_LONG", "0") or 0)
+# The body's top-k normally runs the launch-time single-block kernel (t_seq = S); EXL3_DSV4_B1_SPLIT=1
+# hands it the device bound instead (t_seq = 0) so a long single-row scan takes the span-split path the
+# eager selection uses above 32768 entries
+dsv4_b1_split = os.environ.get("EXL3_DSV4_B1_SPLIT", "0") == "1"
+
+# The most recent selection over one pool inside one step, keyed by id(cache layer) -- the pool object,
+# so several layers selecting over the same pool (index_source_layer_ids) and its readers all agree on
+# it -- valued (step epoch, indices). Not params["dsv4_b_sel"]: Segment._capture runs the body on a
+# shallow *copy* of params, so a publisher's write into a per-step key never reaches a reader's
+# capture copy; the epoch object is set once per step in b1_prep and is shared by every copy, so a
+# reader can still tell a same-step publish from a stale one.
+_B_SEL = {}
+
+# Opt-in per-round counters (EXL3_ROUND_PROF=1): which core served each step, so an anatomy run can tell
+# graph replays from eager launches without perturbing anything (no-op when the probe is off). Lazy import
+# because this module is loaded while exllamav3.generator is still initializing.
+_rp_on = os.environ.get("EXL3_ROUND_PROF", "0") == "1"
+_rp_note_fn = None
+
+def _rpnote(name, value = 1):
+    global _rp_note_fn
+    if _rp_note_fn is None:
+        try:
+            from ..generator.roundprof import note as _n
+        except Exception:
+            _n = False
+        _rp_note_fn = _n
+    if _rp_note_fn:
+        _rp_note_fn(name, value)
+
 from ..constants import PAGE_SIZE
 
 # Reference: transformers models/deepseek_v4 (paper §2)
@@ -75,6 +139,132 @@ def _dsv4_dump(tag, layer, pos, ec, m, tensors, kl, bt_row):
     import torch.distributed as _dist
     _rk = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
     torch.save(d, f"{_dsv4_dump_dir}/r{_rk}_{tag}_L{layer}_p{pos}.pt")
+
+
+
+# Indexer-selection parity dump (EXL3_DSV4_PDUMP=<dir>, EXL3_DSV4_PDUMP_POS=<pos>,
+# EXL3_DSV4_PDUMP_WIDTH=<width>): the first step at or past that position writes each layer's raw
+# scores / candidate entry list / mask / selected ids and the attention q/kv/out (plus the live pool
+# rows, pool_idx/pool_r), from whichever path ran (eager _indexer_topk or the captured body), for an
+# offline diff. EXL3_DSV4_PDUMP_WIDTH > 0 restricts the dump to steps of exactly that row count (0 =
+# any), so one directory holds one width. Off by default, and never inside a capture (the body's
+# Python only runs in the pre-capture warmup). Each dump is a .pt of row-major tensors plus a
+# <file>.json sidecar recording width / position / rank / layer / tag.
+_pdup_dir = os.environ.get("EXL3_DSV4_PDUMP", "")
+_pdup_pos = int(os.environ.get("EXL3_DSV4_PDUMP_POS", "0") or 0)
+_pdup_width = int(os.environ.get("EXL3_DSV4_PDUMP_WIDTH", "0") or 0)
+# Diagnostic window form: dump EVERY step whose position lies in [POS, POS_END] instead of latching
+# the first one, into a per-position subdirectory (<dir>/s<pos>), so the grader can pair positions
+# one at a time. Off unless POS_END is set; dump-only and capture-safe.
+_pdup_end = int(os.environ.get("EXL3_DSV4_PDUMP_POS_END", "0") or 0)
+_pdup_done = set()
+_pdup_manifest = set()
+
+def _pdup(tag, layer, pos, width, tensors, pool = None, selection = None):
+    if (not _pdup_dir or (_pdup_width and width != _pdup_width) or
+        torch.cuda.is_current_stream_capturing()):
+        return
+    key = (layer, tag, width, pos) if _pdup_end else (layer, tag, width)
+    if key in _pdup_done:
+        return
+    pos = int(pos)
+    if pos < _pdup_pos or (_pdup_end and pos > _pdup_end):
+        return
+    _pdup_done.add(key)
+    out_dir = _pdup_dir if not _pdup_end else f"{_pdup_dir}/s{pos}"
+    os.makedirs(out_dir, exist_ok = True)
+    if _pdup_width and out_dir not in _pdup_manifest:
+        # One width per directory: record the strict filter next to the dumps so a directory's
+        # contents are self-describing (the .pt dicts carry tensors only)
+        _pdup_manifest.add(out_dir)
+        mpath = f"{out_dir}/manifest.json"
+        if not os.path.exists(mpath):
+            with open(mpath, "w") as f:
+                json.dump(dict(width = _pdup_width, position = _pdup_pos), f)
+    d = {k: v.detach().to("cpu", copy = True) for k, v in tensors.items() if v is not None}
+    if selection is not None:
+        # Both paths dump one canonical layout so an offline diff compares values, not storage: the
+        # pool-scan scores are cut at the step's live entry extent and masked past each row's own
+        # causal bound, and the entry-scored (candidate) path gets the same per-row causal mask.
+        # Candidate masks drop the blocks that are not live for any row of this width.
+        rate, block = selection
+        live = (pos + width) // rate
+        vis = (pos + 1 + torch.arange(width)) // rate
+        s = d.get("scores")
+        if s is not None:
+            ent = d.get("ent")
+            if ent is not None and ent.dim() == 1 and s.dim() == 2 and s.shape[0] == 1 \
+                    and ent.numel() == s.shape[1]:
+                # The body stores a single row's entry list flat; eager stores it (1, cap)
+                ent = ent.unsqueeze(0)
+                d["ent"] = ent
+            if ent is not None and ent.dim() == 2 and s.shape[:1] == ent.shape[:1]:
+                s.masked_fill_(ent >= vis.unsqueeze(1), -float("inf"))
+                s.masked_fill_(ent < 0, -float("inf"))
+            elif ent is None:
+                # Pool-scan scores are pool-entry indexed: cut at the live extent, then apply each
+                # row's own causal bound (the b1 kernel may score the tile-padded tail).
+                s = s[:, :live]
+                cols = torch.arange(s.shape[1])
+                s.masked_fill_(cols.unsqueeze(0) >= vis.unsqueeze(1), -float("inf"))
+                d["scores"] = s
+            # A flat entry list over a multi-row score matrix is already masked in entry space
+        krow = d.get("krow")
+        if krow is not None and krow.dim() == 1:
+            d["krow"] = krow.unsqueeze(0)
+        cand = d.get("cand")
+        if cand is not None:
+            nb = min(cand.shape[1], -(-live // block))
+            cand = cand[:, :nb]
+            cols = torch.arange(nb)
+            cand.masked_fill_(cols.unsqueeze(0) * block >= vis.unsqueeze(1), True)
+            d["cand"] = cand
+    if pool is not None:
+        kl, bt, live = pool
+        ids = torch.arange(int(live), device = bt.device)
+        rows = bt.reshape(-1)[ids // kl.epp].long() * kl.epp + ids % kl.epp
+        if kl.pool_idx is not None:
+            d["pool_idx"] = kl.pool_idx.view(-1, kl.D_i)[rows].detach().to("cpu", copy = True)
+        d["pool_r"] = kl.pool_r.view(-1, kl.D_r)[rows].detach().to("cpu", copy = True)
+        if getattr(kl, "pool_c", None) is not None:
+            d["pool_c"] = kl.pool_c.view(-1, kl.D_c)[rows].detach().to("cpu", copy = True)
+    rank = int(os.environ.get("RANK", "0"))
+    path = f"{out_dir}/r{rank}s{pos}_L{layer}_{tag}.pt"
+    torch.save(d, path)
+    with open(path + ".json", "w") as f:
+        json.dump(dict(width = width, position = pos, rank = rank, layer = layer, tag = tag), f)
+
+
+_pdup_last = {}
+
+def _pdup_reg(layer, tag, width, tensors, pool = None, selection = None):
+    """Register static capture buffers, keyed by width to avoid stale graph buffers."""
+    if _pdup_dir and (not _pdup_width or width == _pdup_width):
+        _pdup_last[(layer, tag, width)] = (tensors, pool, selection)
+
+def _pdup_host(layer, params, width):
+    """Dump the buffers belonging to the width just replayed."""
+    if not _pdup_dir or (_pdup_width and width != _pdup_width):
+        return
+    rsg = params.get("recurrent_states") or ()
+    if not rsg:
+        return
+    pos = int(rsg[0].position)
+    for (l, tag, w), (tensors, pool, selection) in list(_pdup_last.items()):
+        if l == layer and w == width:
+            _pdup("cap_" + tag, layer, pos, width, tensors, pool, selection)
+
+
+_arange_cache = {}
+
+def _cached_arange(device, n):
+    """Static int32 [0, n): the captured body must not allocate a column index per step, and the
+    buffer has to be fully written before the capture starts."""
+    key = (str(device), n)
+    t = _arange_cache.get(key)
+    if t is None:
+        _arange_cache[key] = t = torch.arange(n, device = device, dtype = torch.int32)
+    return t
 
 
 class DSV4CompressorState:
@@ -686,6 +876,9 @@ class DSV4Attention(Module):
 
     @override
     def load(self, device: torch.device, **kwargs):
+        # Captured graphs bind weights and cache storage, all of which load may replace.
+        getattr(self, "_bc_dsa", {}).clear()
+        getattr(self, "_bc_dsa_batch", {}).clear()
         super().load(device, **kwargs)
         stc = self.config.stc
         self.sinks = stc.get_tensor(f"{self.key}.attn_sink", device, no_defer = True, arena = False).float().contiguous()
@@ -1161,9 +1354,9 @@ class DSV4Attention(Module):
             mu = self.wo_a_multi
             A = o[:, 0]                                   # (G, seq, hpg * head_dim)
             ah = g_tensor_cache.get(o.device, tuple(A.shape), torch.half, "dsv4_woa_had")
-            C = g_tensor_cache.get(o.device, (G, seq, mu.out_features), torch.half,
-                                   "dsv4_woa_c") if mgemm_out else \
-                torch.empty((G, seq, mu.out_features), dtype = torch.half, device = o.device)
+            # Static out / transposed-out buffers both paths: the kernel writes every element, and
+            # a fresh allocation + a permute().reshape() clone per layer costs 3 launches a layer
+            C = g_tensor_cache.get(o.device, (G, seq, mu.out_features), torch.half, "dsv4_woa_c")
             ext.exl3_mgemm(
                 A, mu.ptrs_trellis, C, mu.ptrs_suh, ah, mu.ptrs_svh,
                 self.woa_indices, None, mu.K, -1, mu.mcg, mu.mul1,
@@ -1171,13 +1364,11 @@ class DSV4Attention(Module):
             )
             if seq == 1:
                 o2 = C.view(1, 1, G * mu.out_features)
-            elif mgemm_out:
+            else:
                 o2 = g_tensor_cache.get(o.device, (seq, G * mu.out_features), torch.half,
                                         "dsv4_woa_t")
                 o2.view(seq, G, mu.out_features).copy_(C.transpose(0, 1))
                 o2 = o2.unsqueeze(0)
-            else:
-                o2 = C.permute(1, 0, 2).reshape(seq, G * mu.out_features).unsqueeze(0)
             if mgemm_out and self.wob_multi is not None and seq <= 32:
                 return self._mgemm1(self.wob_multi, o2.contiguous(),
                                     out_dtype or self.out_dtype,
@@ -1345,6 +1536,11 @@ class DSV4Attention(Module):
         wts = self.idx_weights.forward(x, params)
         bs = self.candidate_block_size
         mode = self.candidate_mode if ec > self.candidate_topk_blocks * bs else None
+        if dsv4_cand_dbg and (self.kv_source, seq, mode) not in _cand_dbg_seen:
+            _cand_dbg_seen.add((self.kv_source, seq, mode))
+            print(f"CANDDBG rank={os.environ.get('RANK','x')} L{self.kv_source} seq={seq} pos0={pos0} "
+                  f"ec={ec} mode={mode} fixed={dsv4_cand_fixed} cap={self.candidate_topk_blocks * bs}",
+                  flush = True)
         if mode == "source":
             shared["cand"] = torch.ones((seq, ec // bs + 1), dtype = torch.bool, device = x.device)
         elif mode == "use":
@@ -1359,25 +1555,61 @@ class DSV4Attention(Module):
                 # A row selects inside its candidate blocks: score only the blocks any row of the slab kept
                 drop = shared["cand"][r0:r1]
                 vis = (pos0 + 1 + torch.arange(r0, r1, device = x.device)) // self.compress_rate
-                if dsv4_cand_fixed and r1 - r0 == 1:
-                    # Device-side compaction into a fixed-capacity entry list: the same ascending
+                S = r1 - r0
+                if dsv4_cand_fixed and S <= 17:
+                    # Device-side compaction into fixed-capacity entry lists: the same ascending
                     # entry ids as the nonzero path below, -1 padded, so every shape here is static
-                    # (capturable) and no host sync is taken
+                    # (capturable) and no host sync is taken. A multi-row slab compacts and scores
+                    # each row's own list -- the eager union list only exists because its width had
+                    # to be shared, and one row's own list is exactly the union restricted to the
+                    # blocks that row kept (fewer columns scored than the union path, which scores
+                    # every union column for every row)
                     cap = self.candidate_topk_blocks * bs
-                    ent = g_tensor_cache.get(x.device, (cap,), torch.int32, "dsv4_cand_ent")
-                    ext.dsa_compact_ent((~drop).any(dim = 0), ent, bs, ec)
-                    entc = ent.clamp(min = 0)
-                    rows = entc if block_table is None else block_table.reshape(-1)[entc // epp].long() * epp + entc % epp
-                    # The score backing is a per-call allocation as in the eager path (its width
-                    # must equal cap so the kernel writes every column and S_stride is a single
-                    # Triton compile at any context length)
-                    scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool[rows],
-                                                cap * self.compress_rate, self.compress_rate, cap)
-                    scores.masked_fill_(drop[:, entc // bs], ninf)
-                    scores.masked_fill_(ent >= vis[:, None], ninf)
-                    scores.masked_fill_((ent < 0).unsqueeze(0), ninf)
+                    rows_max = 17   # widest non-prefill slab (a chunk slab stays on the union path)
+                    ent = g_tensor_cache.get(x.device, (rows_max, cap), torch.int32, "dsv4_cand_ent_rows")[:S]
+                    if block_table is None:
+                        pages = None
+                    else:
+                        # int32 throughout: the block table is int32, and a .long() here makes
+                        # every row's id arithmetic promote (one to + _to_copy + copy_ per row)
+                        pages = block_table.reshape(-1) if block_table.dtype == torch.int32 \
+                            else block_table.reshape(-1).to(torch.int32)
+                    if S == 1:
+                        ext.dsa_compact_ent((~drop).any(dim = 0), ent[0], bs, ec)
+                        entc = ent.clamp(min = 0)
+                        rows_ent = (entc if pages is None
+                                    else pages[entc // epp] * epp + entc % epp)
+                    elif pages is None:
+                        ext.dsa_compact_ent_rows(~drop, ent, bs, ec, pos0 + 1 + r0, self.compress_rate)
+                        rows_ent = ent.clamp(min = 0)
+                    else:
+                        # Row s of the slab is query position pos0 + r0 + s, so its entry bound
+                        # min((pos0 + 1 + r) // compress_rate, ec) is per row, computed in-kernel.
+                        # The same kernel emits each kept entry's pool row through the block table,
+                        # which otherwise costs an aten gather plus an index-dtype promotion per row
+                        rows_ent = g_tensor_cache.get(x.device, (rows_max, cap), torch.int32,
+                                                      "dsv4_cand_rows")[:S]
+                        ext.dsa_compact_ent_rows_map(~drop, ent, rows_ent, pages, epp, bs, ec,
+                                                     pos0 + 1 + r0, self.compress_rate)
+                    # Row-contiguous (S, cap) score backing: cap is the kernel's S_stride, so this is
+                    # a single Triton compile at any context length and the rows are scored in place
+                    scores = g_tensor_cache.get(x.device, (rows_max, cap), torch.half, "dsv4_cand_scores")[:S]
+                    for i in range(S):
+                        s_i = dsa_indexer_scores(q_idx[0, r0 + i:r0 + i + 1], wts[0, r0 + i:r0 + i + 1],
+                                                 idx_pool[rows_ent[i]],
+                                                 cap * self.compress_rate, self.compress_rate, cap,
+                                                 scores = scores[i:i + 1])
+                        s_i.masked_fill_(ent[i] >= vis[i], ninf)
+                        s_i.masked_fill_(ent[i] < 0, ninf)
                     ext.dsa_topk(scores, sel, min(k, cap), None, 0)
-                    sel.copy_(torch.where(sel < 0, sel, ent[sel.clamp(min = 0)]))
+                    sel.copy_(torch.where(sel < 0, sel, ent.gather(1, sel.clamp(min = 0))))
+                    krow = idx_pool[block_table.reshape(-1)[(ec - 1) // epp].long() * epp + (ec - 1) % epp] \
+                        if _pdup_dir and block_table is not None and epp and ec > 0 and \
+                        self.idx_wk is not None and seq == 1 else None
+                    _pdup("eager_use", self.layer_idx, pos0, seq, dict(
+                        scores = scores, sel = sel, ent = ent, cand = drop, q = q_idx[0, r0:r1], w = wts[0, r0:r1],
+                        krow = krow),
+                        selection = (self.compress_rate, bs))
                     return
                 ent = ((~drop).any(dim = 0).nonzero() * bs + torch.arange(bs, device = x.device)).flatten()
                 ent = ent[ent < ec]
@@ -1388,6 +1620,9 @@ class DSV4Attention(Module):
                 scores.masked_fill_(ent >= vis[:, None], ninf)
                 ext.dsa_topk(scores, sel, min(k, ent.numel()), None, 0)
                 sel.copy_(torch.where(sel < 0, sel, ent.int()[sel.clamp(min = 0)]))
+                _pdup("eager_use", self.layer_idx, pos0, seq, dict(
+                    scores = scores, sel = sel, ent = ent, cand = drop, q = q_idx[0, r0:r1], w = wts[0, r0:r1]),
+                    selection = (self.compress_rate, bs))
                 return
             scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool, pos0 + r0, self.compress_rate, ec,
                                         block_table = block_table, epp = epp)
@@ -1400,12 +1635,45 @@ class DSV4Attention(Module):
                 top = blk.scatter_(1, last.unsqueeze(1) // bs, float("inf")).topk(self.candidate_topk_blocks, dim = 1)
                 shared["cand"][r0:r1].scatter_(1, top.indices, top.values == ninf)
             ext.dsa_topk(scores, sel, k, None, 0)
+            krow = None
+            if block_table is not None and epp and ec > 0 and self.idx_wk is not None and seq == 1:
+                # Same single newly compressed key row the captured body's dump carries
+                krow = idx_pool[block_table.reshape(-1)[(ec - 1) // epp].long() * epp + (ec - 1) % epp]
+            _pdup("eager_" + (mode or "none"), self.layer_idx, pos0, seq, dict(
+                scores = scores, sel = sel, cand = shared["cand"][r0:r1] if mode == "source" else None,
+                q = q_idx[0, r0:r1], w = wts[0, r0:r1], krow = krow),
+                selection = (self.compress_rate, bs))
 
         # Row slabs bound the transient score matrix, as in MLAttention._indexer_topk: selection is
         # per row. No slab is left with the few rows that take the decode kernels
         cuts = list(range(0, max(seq - 16, 1), self.SCORE_SLAB))
         for r0, r1 in zip(cuts, cuts[1:] + [seq]):
             slab(r0, r1)
+        if dsv4_xrank_dbg and seq <= 17 and (self.kv_source, seq, pos0) not in _xrank_dbg_seen:
+            _xrank_dbg_seen.add((self.kv_source, seq, pos0))
+            def _sig(t):
+                b = t.detach().to(torch.float32).contiguous().cpu().numpy().tobytes()
+                return hashlib.md5(b).hexdigest()[:12]
+            print(f"XRDBG rank={os.environ.get('RANK', 'x')} L{self.layer_idx} K{self.kv_source} "
+                  f"seq={seq} pos0={pos0} ec={ec} x={_sig(x)} qres={_sig(q_res)} q={_sig(q_idx)} "
+                  f"w={_sig(wts)} pool={_sig(idx_pool[:ec])} sel_sum={int(indices.long().sum())}",
+                  flush = True)
+        if dsv4_xrank_sel >= 0 and seq <= 17 and pos0 >= dsv4_xrank_sel:
+            # Both ranks must issue the same collective sequence: pos0/seq agree by construction
+            rk = int(os.environ.get("RANK", "0"))
+            t = indices.to(torch.float32) if rk == 0 else torch.zeros_like(indices, dtype = torch.float32)
+            params["backend"].all_reduce(t, rk == 0)
+            indices.copy_(t.to(torch.int32))
+
+        if dsv4_seldump and pos0 >= dsv4_seldump_pos and seq <= dsv4_seldump_maxseq:
+            rk = os.environ.get("RANK", "x")
+            # EVERY=1 keeps one file per position (path-local selections step by step), default
+            # keeps the first one only
+            every = os.environ.get("EXL3_DSV4_SELDUMP_EVERY", "0") != "0"
+            name = f"{dsv4_seldump}.{rk}.L{self.layer_idx}.K{self.kv_source}"
+            path = (f"{name}.p{pos0}.pt" if every else f"{name}.pt")
+            if not os.path.exists(path):
+                torch.save({"sel": indices.sort(dim = 1).values.cpu(), "k": k, "ec": ec, "pos0": pos0}, path)
         return indices, k
 
 
@@ -1436,22 +1704,117 @@ class DSV4Attention(Module):
         t = torch.empty((n,), dtype = torch.half, device = self.device)
         del t
 
-    def _batch_ok_b1(self, kl, pos_end):
-        """Layers the batched B=1 body can express at this step: sliding layers, and compressed
-        owners and readers while the pool is in the dense regime (entries <= index_topk, where top-k
-        keeps every causal entry and no indexer/candidate selection runs). Quantized pools, top-k-regime
-        steps and active candidate selection stay on _forward_cached_one (host decision, before any
-        state moves)."""
+    def _cand_regime(self, ec):
+        """True when this layer selects inside its candidate blocks at entry bound `ec` (the eager
+        source/use branch), and the dial lets the body serve it."""
+        return (dsv4_b1_long >= 2 and self.candidate_mode is not None
+                and ec > self.candidate_topk_blocks * self.candidate_block_size)
+
+    def _cand_mask(self, device, kl, rows = 1):
+        """Per-pool, per-query dropped-block mask with capture-stable storage."""
+        bs = self.candidate_block_size
+        shape = (kl.capacity // bs + 2,) if rows == 1 else (rows, kl.capacity // bs + 2)
+        return g_tensor_cache.get(device, shape, torch.bool, f"dsv4_b_cand_{id(kl)}")
+
+    def _cand_source(self, device, kl, scores, a_ec, s_max, a_pos, m):
+        """Publish the eager source selection independently for every query row."""
+        bs, ninf = self.candidate_block_size, -float("inf")
+        R, nf = scores.shape[0], s_max // bs
+        if R == 1:
+            bounds = a_ec
+        else:
+            bounds = (a_pos[0] + 1 + _cached_arange(device, R)) // m
+        scores.masked_fill_(_cached_arange(device, s_max)[None, :] >= bounds[:, None], ninf)
+        blk = scores.view(R, nf, bs).amax(dim = -1)
+        blk.scatter_(1, ((bounds - 1).clamp(min = 0) // bs).view(-1, 1).long(), float("inf"))
+        top = blk.topk(self.candidate_topk_blocks, dim = 1)
+        cand = self._cand_mask(device, kl, R)
+        cand.fill_(True)
+        if R == 1:
+            cand.scatter_(0, top.indices[0], top.values[0] == ninf)
+        else:
+            cand.scatter_(1, top.indices, top.values == ninf)
+
+    def _cand_use(self, device, kl, bt_st, qi, wts, indices, m, a_ec, a_pos):
+        """Compact and score each query's own candidate blocks, then map to pool ids."""
+        from .attention_fn.dsa_triton import dsa_indexer_scores
+        bs, ninf = self.candidate_block_size, -float("inf")
+        cap = self.candidate_topk_blocks * bs
+        R, Hi, Di = qi.shape
+        cand = self._cand_mask(device, kl, R)
+        if R > 1:
+            nb = cand.shape[1]
+            bounds = (a_pos[0] + 1 + _cached_arange(device, R)) // m
+            keep = (~cand) & (_cached_arange(device, nb)[None, :] * bs < bounds[:, None])
+            ent = g_tensor_cache.get(device, (R, cap), torch.int32, "dsv4_b_ent_rows")
+            scores = g_tensor_cache.get(device, (R, cap), torch.half, "dsv4_b_scores_cap")
+            for row in range(R):
+                ext.dsa_compact_ent(keep[row], ent[row], bs, kl.capacity)
+                ent[row].masked_fill_(ent[row] >= bounds[row], -1)
+                entc = ent[row].clamp(min = 0)
+                pool_rows = bt_st[0][(entc // kl.epp).long()].long() * kl.epp + (entc % kl.epp).long()
+                keys = kl.pool_idx.view(-1, Di)[pool_rows]
+                dsa_indexer_scores(qi[row:row + 1], wts[row:row + 1], keys,
+                                   cap * m, m, cap, scores = scores[row:row + 1])
+                scores[row].masked_fill_(ent[row] < 0, ninf)
+            ext.dsa_topk(scores, indices, min(self.index_topk, cap), None, 0)
+            indices.copy_(torch.where(indices < 0, indices, ent.gather(1, indices.clamp(min = 0))))
+            return scores, ent
+        # Entry list bound: the eager compaction is told the live entry count ec (a host int there) and
+        # truncates every kept block to it. Here ec is a device value: drop the blocks that start at or
+        # past it, then send the partial block's entries at and past it back to the -1 padding. The kept
+        # blocks are the ones the mask below leaves, in ascending order, so those entries are the last
+        # real ones and the list, every column of the score matrix and the ent dump match eager's
+        nb = cand.numel()
+        keep = g_tensor_cache.get(device, (nb,), torch.bool, f"dsv4_b_keep_{id(kl)}")
+        torch.lt(_cached_arange(device, nb) * bs, a_ec[0], out = keep)
+        keep.logical_and_(~cand)
+        ent = g_tensor_cache.get(device, (cap,), torch.int32, "dsv4_b_ent")
+        ext.dsa_compact_ent(keep, ent, bs, kl.capacity)
+        ent.masked_fill_(ent >= a_ec[0], -1)
+        entc = ent.clamp(min = 0)
+        rows = bt_st[0][(entc // kl.epp).long()].long() * kl.epp + (entc % kl.epp).long()
+        keys = kl.pool_idx.view(-1, Di)[rows]
+        scores = g_tensor_cache.get(device, (R, cap), torch.half, "dsv4_b_scores_cap")
+        dsa_indexer_scores(qi, wts, keys, cap * m, m, cap, scores = scores)
+        scores.masked_fill_(cand[entc // bs].unsqueeze(0), ninf)
+        scores.masked_fill_((ent >= a_ec[0]).unsqueeze(0), ninf)
+        scores.masked_fill_((ent < 0).unsqueeze(0), ninf)
+        ext.dsa_topk(scores, indices, min(self.index_topk, cap), None, 0)
+        indices.copy_(torch.where(indices < 0, indices, ent[indices.clamp(min = 0)]))
+        return scores, ent
+
+    def _batch_ok_b1(self, kl, pos_end, single = False):
+        """Layers the batched B=1 body can express at this step: sliding layers at any length, and
+        compressed pools only once they are past index_topk -- below that bound the eager path is the
+        exact dense read (indices = None) and the body has no second, indexed regime for the same rows.
+        Above it both select the bounded pool-scan top-k: EXL3_DSV4_B1_LONG >= 1 for a plain layer, >= 2
+        for a candidate layer, whose selection must stay inside its blocks (the eager source/use branch).
+        A pool reader follows its owner, which publishes the selection in the body. Both for a single row
+        only. Quantized pools stay on _forward_cached_one (host decision, before any state moves)."""
         if self.kv_source is None:
             return self.candidate_mode is None
+        if kl.quant:
+            return False
+        if self.kv_owner is not None and not self.kv_owner._batch_ok_b1(kl, pos_end, single):
+            # A pool reader only enters the body together with its owner: the owner publishes the
+            # selection in the body, while an eager owner publishes in params["dsv4_shared"] only
+            return False
         ec = pos_end // self.compress_rate
-        return not kl.quant and ec <= self.index_topk and self.candidate_mode is None
+        if ec <= self.index_topk:
+            return False
+        if self.candidate_mode is not None and ec > self.candidate_topk_blocks * self.candidate_block_size:
+            return single and dsv4_b1_long >= 2
+        return single and dsv4_b1_long >= 1
 
-    def b1_prep(self, params):
-        """Piecewise capture prepass for one bsz-1 decode step (S == 1): the host half of
-        _forward_cached_batch. Resolves the cache and stages the per-job state array and block-table static
-        that the device-driven body reads. Returns ((rsl, kl, m, w, kp), arr, bt_st) when the captured body serves
-        this step, or None with no state touched for the eager path: ring shifts, top-k regime switches, mirrored pools."""
+    def b1_prep(self, params, seq = 1):
+        """Stage host state for the captured decode body, including multi-row verification.
+
+        Return None before touching state when the body cannot serve the whole step. Ring
+        maintenance remains on the eager path; the graph key includes the input shape and regime.
+        """
+        # One epoch object per step, shared by the live params and every Segment capture's copy
+        params.setdefault("dsv4_b_epoch", object())
         if not dsv4_b1_batch or not self.num_q_heads:
             return None
         if params.get("attn_mode") != "flash_attn" or params.get("prefill"):
@@ -1461,10 +1824,12 @@ class DSV4Attention(Module):
             return None
         rs = rsg[0]
         B = len(rsg)
+        if seq > 1 and (B != 1 or not dsv4_cand_fixed):
+            return None
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))
         rsl = self._get_rsl(rs, layer_instance)
         for state in rsg:
-            if self._get_rsl(state, layer_instance) is not rsl or state.position - state.window_beg + 1 > rsl.ring_rows:
+            if self._get_rsl(state, layer_instance) is not rsl or state.position - state.window_beg + seq > rsl.ring_rows:
                 return None
         kl = None
         if self.kv_source is not None:
@@ -1475,11 +1840,22 @@ class DSV4Attention(Module):
                 else rs.cache.layers[(self.kv_source, layer_instance[1])]
             if self.kv_owner is not None and kl.device != self.device:
                 return None
-        if any(not self._batch_ok_b1(kl, state.position + 1) for state in rsg):
+        if any(not self._batch_ok_b1(kl, state.position + seq, B == 1) for state in rsg):
             return None
+        if seq > 1 and self.kv_source is not None:
+            # A single captured branch cannot represent a change of selection regime within
+            # the verification window. Let the eager path handle that boundary.
+            first_ec = (rs.position + 1) // self.compress_rate
+            last_ec = (rs.position + seq) // self.compress_rate
+            if first_ec <= self.index_topk or self._cand_regime(first_ec) != self._cand_regime(last_ec):
+                return None
         m = self.compress_rate if self.kv_source is not None else 1
         w = self.sliding_window
-        kp = -(-self.index_topk // 32) * 32 if self.indexer is not None else 32
+        # Selection width: the padded top-k for layers that own a pool selection (indexer_mode set,
+        # V4.1) or build one from a per-layer indexer compressor (V4 "csa"); window-only layers
+        # never index and keep the one-warp minimum
+        kp = -(-self.index_topk // 32) * 32 \
+            if self.indexer_mode is not None or self.indexer is not None else 32
         gkey = ("b1", id(rsl), id(kl), B)
         st = self._bgraph_state.get(gkey)
         if st is None:
@@ -1495,15 +1871,25 @@ class DSV4Attention(Module):
         st["pin_i"] = (st["pin_i"] + 1) % len(st["pins"])
         pos = [state.position for state in rsg]
         floor = [state.position - min(w - 1, state.position - state.window_beg, state.position) for state in rsg]
-        ec = [(state.position + 1) // m if self.kv_source is not None else 0 for state in rsg]
+        ec = [(state.position + seq) // m if self.kv_source is not None else 0 for state in rsg]
+        # Per-row selection count: a layer below index_topk keeps every causal entry, so its k_len
+        # is the live entry count, not the padded width (the top-k output is -1 padded either way)
         pin.copy_(torch.tensor([pos, floor, [state.window_beg for state in rsg], ec,
-                                [state.slot for state in rsg], [kp] * B], dtype = torch.int32))
+                                [state.slot for state in rsg], [min(kp, e) for e in ec]],
+                               dtype = torch.int32))
         st["arr"].copy_(pin, non_blocking = True)
         if kl is not None:
             bt = get_for_device(params, "block_table", self.device)
             npr = min(bt.shape[1], kl.num_pages)
             st["bt_st"][:, :npr].copy_(bt[:B, :npr])
-        return (rsl, kl, m, w, kp), st["arr"], st["bt_st"]
+        # Host entry window of this step's new compressed entries: the captured body projects them in
+        # one call, the way the eager path does, so `nnew` is part of the graph key (a step whose run
+        # length differs gets its own capture rather than a stale shape).
+        nnew = (ec[0] - pos[0] // m) if kl is not None else 0
+        if os.environ.get("EXL3_DSV4_B1_DBG") and kl is not None:
+            print(f"B1PREP L{self.layer_idx} pos={pos[0]} seq={seq} m={m} ec={ec[0]} "
+                  f"e0={pos[0] // m} n={nnew}", flush=True)
+        return (rsl, kl, m, w, kp, self._cand_regime(ec[0]), nnew), st["arr"], st["bt_st"]
 
 
 
@@ -1547,7 +1933,7 @@ class DSV4Attention(Module):
                     for i in range(bsz):
                         kl.pull(src, pages[i], rsg[i].position // m, (rsg[i].position + x.shape[1]) // m)
         if bsz == 1:
-            if dsv4_b1_batch and x.shape[1] == 1 and self._batch_ok_b1(kl, rsg[0].position + 1):
+            if dsv4_b1_batch and x.shape[1] == 1 and self._batch_ok_b1(kl, rsg[0].position + 1, True):
                 return self._forward_cached_batch(x, params, rsg, layer_instance, out_dtype, kl, bt)
             return self._forward_cached_one(
                 x, params, rsg[0], self._get_rsl(rsg[0], layer_instance), out_dtype,
@@ -1606,7 +1992,8 @@ class DSV4Attention(Module):
                 "batched DSA path requires all jobs in one cache"
         m = self.compress_rate if self.kv_source is not None else 1
         w = self.sliding_window
-        kp = -(-self.index_topk // 32) * 32 if self.indexer is not None else 32
+        kp = -(-self.index_topk // 32) * 32 \
+            if self.indexer_mode is not None or self.indexer is not None else 32
 
         # Host prepass (never captured): ring shifts BEFORE attention (the body then
         # addresses the post-shift ring via the effective ring_beg; appends are in-body,
@@ -1636,8 +2023,10 @@ class DSV4Attention(Module):
         # Whole-batch BC graph (house pattern): all per-job state device-driven through the
         # owner's (6, MAX_B) array and block-table static, the input pointer is the only
         # patched parameter. Declines (no fan / non-exl3 projections) fall through to the
-        # eager batched body below
-        if dsv4_batch_graph and B <= 8 and S <= 16 and R <= 32 and self.q_head_norm:
+        # eager batched body below. The candidate regime keeps out: the BC selection scans the
+        # full pool, which only matches eager while every causal entry is kept
+        cand_regime = R == 1 and self._cand_regime(ec_l[0])
+        if dsv4_batch_graph and B <= 8 and S <= 16 and R <= 32 and self.q_head_norm and not cand_regime:
             if not hasattr(self, "_bc_dsa_batch"):
                 self._bc_dsa_batch = {}
             bcd = self._bc_dsa_batch.get(id(rsl))
@@ -1647,7 +2036,9 @@ class DSV4Attention(Module):
             if bcd:
                 y = bcd.run(x, B, S, pos_l, floor_l, beg_l, ec_l, slot_l, bt)
                 if y is not None:   # None: the graph kernels do not fit this device's shared memory
+                    if _rp_on: _rpnote("batchbc_graph_hit")
                     return y
+                if _rp_on: _rpnote("batchbc_graph_decline")
 
         # Eager batched body (capture reference / fallback): per-job state in a device
         # array, same kernels as the graphs
@@ -1668,20 +2059,25 @@ class DSV4Attention(Module):
             self._bgraph_state[gkey] = st
         pin = st["pins"][st["pin_i"]]
         st["pin_i"] = (st["pin_i"] + 1) % len(st["pins"])
-        pin.copy_(torch.tensor([pos_l, floor_l, beg_l, ec_l, slot_l, [kp] * B],
-                               dtype = torch.int32))
+        pin.copy_(torch.tensor([pos_l, floor_l, beg_l, ec_l, slot_l,
+                                [min(kp, e) for e in ec_l]], dtype = torch.int32))
         st["arr"].copy_(pin, non_blocking = True)
         if kl is not None:
             npr = min(bt.shape[1], kl.num_pages)
             st["bt_st"][:, :npr].copy_(bt[:B, :npr])
+        if _rp_on: _rpnote("batchbody_S%d" % S)
+        # Host entry window for the whole step: the run the eager path projects in one call
+        nnew = (ec_l[0] - pos_l[0] // m) if (kl is not None and B == 1) else None
         return self._batch_body(x, st["arr"], B, S, R, rsl, kl, st["bt_st"], m, w, kp,
-                                params, out_dtype)
+                                params, out_dtype, cand_regime = cand_regime, nnew = nnew)
 
-    def _batch_body(self, x, arr, B, S, R, rsl, kl, bt_st, m, w, kp, params, out_dtype):
+    def _batch_body(self, x, arr, B, S, R, rsl, kl, bt_st, m, w, kp, params, out_dtype,
+                    cand_regime = False, nnew = None):
         """Eager batched step, the capture reference for BC_DSV4BatchAttention: everything
         is device-driven (per-job state from `arr`, slot/block-table indirection
-        in-kernel)."""
-        from .attention_fn.dsa_triton import dsa_attn, _dsa_indexer_fewq_kernel
+        in-kernel). `cand_regime` selects the candidate pre-filter branch of the indexer selection,
+        which the host half (b1_prep) decides for the captured piecewise path."""
+        from .attention_fn.dsa_triton import dsa_attn, _dsa_indexer_fewq_kernel, _dsa_indexer_kernel
         import triton
         device = x.device
         a_pos, a_floor, a_beg, a_ec, a_slots, a_klen = arr.unbind(0)
@@ -1690,6 +2086,8 @@ class DSV4Attention(Module):
             self._project_batch(x, params, None, a_pos = a_pos)
 
         indices = None
+        # Newly compressed indexer key row (single-row step only); set inside the compressor block
+        krow = None
         if self.compressor is not None:
             comp, idx = self.compressor, self.indexer
             if kl.quant:
@@ -1717,60 +2115,158 @@ class DSV4Attention(Module):
                     idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None,
                     0, a_pos, m, a_slots, bt_st, kl.epp, False)
             if self.idx_wk is not None:
-                # Each job uses its own block-table row for the newly compressed entry.
-                e = (a_ec - 1).clamp(min = 0)
-                row = bt_st.gather(1, (e // kl.epp).long().unsqueeze(1)).squeeze(1).long() * kl.epp + (e % kl.epp).long()
-                lat = torch.cat((kl.pool_c.view(-1, kl.D_c)[row], kl.pool_r.view(-1, kl.D_r)[row]), dim = -1)
-                keys = self._indexer_keys(lat, params, e)
-                new = (a_ec > a_pos // m).view(-1, 1)
-                # _indexer_keys ropes the copy's trailing rope slice in place; the eager path
-                # stores that roped slice in the pool (idx owners' compressor rope table is
-                # zero), so write it back for new entries. Non-new steps keep the stored row.
                 pool_r_flat = kl.pool_r.view(-1, kl.D_r)
-                pool_r_flat.index_copy_(0, row, torch.where(new, lat[:, kl.D_c:], pool_r_flat[row]))
                 idx_flat = kl.pool_idx.view(-1, kl.D_i)
-                idx_flat.index_copy_(0, row, torch.where(new, keys, idx_flat[row]))
+                if S == 1:
+                    # Preserve the existing single-row projection and write behavior.
+                    e = (a_ec - 1).clamp(min = 0)
+                    row = bt_st.gather(1, (e // kl.epp).long().unsqueeze(1)).squeeze(1).long() * kl.epp + (e % kl.epp).long()
+                    lat = torch.cat((kl.pool_c.view(-1, kl.D_c)[row], pool_r_flat[row]), dim = -1)
+                    keys = self._indexer_keys(lat, params, e)
+                    new = (a_ec > a_pos // m).view(-1, 1)
+                    pool_r_flat.index_copy_(0, row, torch.where(new, lat[:, kl.D_c:], pool_r_flat[row]))
+                    idx_flat.index_copy_(0, row, torch.where(new, keys, idx_flat[row]))
+                elif dsv4_idx_wk_grouped and nnew and B == 1 and not kl.quant:
+                    # Exact eager write: project the step's whole new-entry run in ONE call. The base
+                    # entry of the run comes from the per-step device position, never from the host:
+                    # a host base baked here would replay stale for every later step sharing this
+                    # graph (same run length), shifting the write window by the position delta. Only
+                    # the run LENGTH is a host value, and it is part of the segment key.
+                    e = _cached_arange(device, nnew) + a_pos[0] // m
+                    safe_e = e.clamp(max = bt_st.shape[1] * kl.epp - 1)
+                    row = bt_st[0].gather(0, (safe_e // kl.epp).long()).long() * kl.epp + (safe_e % kl.epp).long()
+                    lat = torch.cat((kl.pool_c.view(-1, kl.D_c)[row], pool_r_flat[row]), dim = -1)
+                    keys = self._indexer_keys(lat, params, e.to(torch.int))
+                    pool_r_flat.index_copy_(0, row, lat[:, kl.D_c:])
+                    idx_flat.index_copy_(0, row, keys)
+                else:
+                    # Fixed iteration bounds keep the writes graph-capture safe. Process
+                    # each job/window separately so masked padding cannot race a real
+                    # write to the same physical row.
+                    for b in range(B):
+                        for j in range(S // m + 1):
+                            e = a_pos[b:b + 1] // m + j
+                            new = (e < a_ec[b:b + 1]).view(1, 1)
+                            safe_e = e.clamp(max = bt_st.shape[1] * kl.epp - 1)
+                            row = bt_st[b].gather(0, (safe_e // kl.epp).long()).long() * kl.epp + (safe_e % kl.epp).long()
+                            if kl.quant:
+                                # The quantized pool cannot reconstruct the eager latent.
+                                lat = stage[b, j:j + 1].clone()
+                            else:
+                                lat = torch.cat((kl.pool_c.view(-1, kl.D_c)[row], pool_r_flat[row]), dim = -1)
+                            keys = self._indexer_keys(lat, params, e)
+                            pool_r_flat.index_copy_(0, row, torch.where(new, lat[:, kl.D_c:], pool_r_flat[row]))
+                            idx_flat.index_copy_(0, row, torch.where(new, keys, idx_flat[row]))
+                if _pdup_dir:
+                    krow = idx_flat[row]
 
-        if self.compressor is not None and self.layer_type == "csa":
-            if True:
-                # Unified selection for ALL rows: for jobs still under index_topk the
-                # bounded top-k IS the causal identity set (ascending) -- no dense/gathered
-                # regime split
-                Hi, Di = self.index_n_heads, self.index_head_dim
-                qi = q_idx.view(B, S, Hi, Di)
-                ext.rope(
-                    qi[..., -self.rope_head_dim:], qi[..., -self.rope_head_dim:],
-                    None, None, self.inv_freq_compress, 0, a_pos, None,
-                    int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0)
-                wts = g_tensor_cache.get(device, (R, Hi), torch.half, "dsv4_b_wts")
-                self.idx_weights.inner.bc.run(x.view(R, -1), wts)
+        # Pool selection: every layer the eager path scans for (indexer_mode "full": V4.1 layers that
+        # own an indexer head, whether or not they own the pool they index -- index_source_layer_ids
+        # includes readers of an earlier layer's pool, which select for themselves -- plus a V4 "csa"
+        # indexer compressor, whose mode defaults to "full"). Layers that read a selection instead
+        # (indexer_mode "shared") reuse the most recent one over the same pool below
+        # Eager only builds a selection once its pool passes index_topk (dense_pool below); mirror
+        # that in the dumped field set so both paths carry the same keys
+        # Dump field set only: the instrumented positions sit in the top-k regime (ec >> index_topk)
+        # on both paths, and reading a_ec back here would sync inside the captured step
+        sel_live = bool(_pdup_dir)
+        if self.indexer_mode == "full":
+            # Unified selection for ALL rows: for jobs still under index_topk the bounded
+            # top-k IS the causal identity set (ascending) -- no dense/gathered regime split.
+            # Above index_topk the same bounded top-k over the pool scan selects, and in the
+            # candidate regime the source layer refreshes the candidate mask from those block
+            # maxima while the reading layers select over their compacted entries
+            Hi, Di = self.index_n_heads, self.index_head_dim
+            qi = q_idx.view(B, S, Hi, Di)
+            ext.rope(
+                qi[..., -self.rope_head_dim:], qi[..., -self.rope_head_dim:],
+                None, None, self.inv_freq_compress, 0, a_pos, None,
+                int(RopeStyle.GPTJ), 1.0, None, None, 1e-6, 0.0, 0.0, 0, 1, 0)
+            wts = g_tensor_cache.get(device, (R, Hi), torch.half, "dsv4_b_wts")
+            # Same call the eager path's LinearFP16.forward makes for an unquantized head
+            # (cuBLAS matmul into a half out): the BC_LinearFP16 kernel is not bitwise equal to
+            # cuBLAS here and the head weights feed the top-k, so mirror eager exactly
+            iw = self.idx_weights.inner
+            torch.matmul(x.view(R, -1), iw.weight, out = wts)
+            if iw.bias is not None:
+                wts += iw.bias
+            indices = g_tensor_cache.get(device, (R, kp), torch.int32, "dsv4_b_idx")
+            sc, ent = None, None
+
+            if cand_regime and self.candidate_mode == "use":
+                sc, ent = self._cand_use(device, kl, bt_st, qi.view(R, Hi, Di), wts, indices, m, a_ec, a_pos)
+                scores = sc
+            else:
+                bs = self.candidate_block_size
                 # The score stride and the tile alignment both follow the kv tile, which the
                 # ladder may shrink on small-smem devices (smem.py)
                 from .attention_fn.smem import pick_config, shared_bytes, halving_ladder
-                def i_args(bn):
+                tiled = S > 4
+                kernel = _dsa_indexer_kernel if tiled else _dsa_indexer_fewq_kernel
+                def i_args(cfg):
+                    bm, bn = cfg
                     s_max = -(-kl.capacity // bn) * bn
+                    if cand_regime and s_max % bs:
+                        s_max = -(-s_max // bs) * bs
                     scores = g_tensor_cache.get(device, (R, s_max), torch.half, "dsv4_b_scores")
                     args = (qi.view(R, Hi, Di), wts.view(R, Hi), kl.pool_idx.view(-1, Di),
                             scores, a_ec, R, a_pos, a_ec, bt_st, bt_st.stride(0))
                     consts = dict(
-                        H_i = Hi, H_pad = max(triton.next_power_of_2(Hi), 16), D_i = Di,
-                        S_stride = s_max, compress_rate = m,
+                        H_i = Hi, D_i = Di, S_stride = s_max, compress_rate = m,
                         scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = bn,
                         SEQ = S, MULTIROW = 1, EPP = kl.epp,
                         DEBUG_BOUNDS = 1 if dsa_debug_bounds else 0,
                         DEBUG_PAGES = kl.num_pages if dsa_debug_bounds else 0)
+                    if tiled:
+                        consts["BLOCK_M"] = bm
+                    else:
+                        consts["H_pad"] = max(triton.next_power_of_2(Hi), 16)
                     return s_max, scores, args, consts
                 with torch.cuda.device(device):
-                    def probe(bn):
-                        _, _, args, consts = i_args(bn)
-                        return shared_bytes(_dsa_indexer_fewq_kernel, args, **consts, num_warps = 8, num_stages = 2)
-                    idx_bn = pick_config(device, "dsv4_indexer_fewq", (Hi, Di, m, S, kl.epp, kl.capacity), halving_ladder(128), probe)
-                    s_max, scores, args, consts = i_args(idx_bn)
-                    _dsa_indexer_fewq_kernel[(R, triton.cdiv(s_max, idx_bn))](*args, **consts, num_warps = 8, num_stages = 2)
-                indices = g_tensor_cache.get(device, (R, kp), torch.int32, "dsv4_b_idx")
+                    ladder = ([(64, 128)] + [(bm, bn) for bn in halving_ladder(128)
+                              for bm in halving_ladder(64) if (bm, bn) != (64, 128)]) if tiled else \
+                             [(1, bn) for bn in halving_ladder(128)]
+                    def probe(cfg):
+                        _, _, args, consts = i_args(cfg)
+                        return shared_bytes(kernel, args, **consts, num_warps = 8, num_stages = 2)
+                    bm, bn = pick_config(device, "dsv4_indexer_tiled" if tiled else "dsv4_indexer_fewq",
+                                         (Hi, Di, m, S, kl.epp, kl.capacity), ladder, probe)
+                    s_max, scores, args, consts = i_args((bm, bn))
+                    grid = (triton.cdiv(S, bm), triton.cdiv(s_max, bn), B) if tiled else \
+                           (R, triton.cdiv(s_max, bn))
+                    kernel[grid](*args, **consts, num_warps = 8, num_stages = 2)
+                if cand_regime:
+                    self._cand_source(device, kl, scores, a_ec, s_max, a_pos, m)
                 # Per-row scan bound from the state array: each row reads only its own
                 # causal region, so the score buffer needs no -inf backfill
-                ext.dsa_topk(scores, indices, self.index_topk, a_ec, S)
+                ext.dsa_topk(scores, indices, self.index_topk, a_ec,
+                             0 if dsv4_b1_split and R == 1 else S)
+            # Tag by the branch that actually served the step, so the dump pairs with the eager one
+            b1_mode = ("use" if self.candidate_mode == "use" else "source") if cand_regime else "none"
+
+            if _pdup_dir and sel_live:
+                tensors = dict(
+                    scores = scores, sel = indices, ent = ent,
+                    cand = self._cand_mask(device, kl, R) if cand_regime else None,
+                    q = qi.view(R, Hi, Di), w = wts,
+                    krow = krow if (S == 1 and self.idx_wk is not None) else None)
+                # Register static buffers for the host after replay.
+                sel_args = (m, self.candidate_block_size)
+                _pdup_reg(self.layer_idx, b1_mode, S, tensors, selection = sel_args)
+                _pdup("b1_" + b1_mode, self.layer_idx, a_pos[0], S, tensors, selection = sel_args)
+            # Readers of this pool (indexer_mode "shared") take this selection in the same step: the
+            # selector precedes every one of its readers in layer order, and each selector of a pool
+            # overwrites the entry, so a reader picks up the most recent selection -- the same
+            # last-writer-wins rule the eager sh["topk"] follows. No k_len is needed -- a selection
+            # only runs once ec > index_topk, i.e. min(index_topk, ec) == index_topk
+            _B_SEL[id(kl)] = (params.get("dsv4_b_epoch"), indices)
+        elif self.indexer_mode == "shared":
+            epoch, sel = _B_SEL.get(id(kl), (None, None))
+            if sel is None or epoch is not params.get("dsv4_b_epoch"):
+                raise RuntimeError(
+                    f"DSV4Attention: layer {self.layer_idx} reads pool {self.kv_source} before a "
+                    "selector published a selection in this step")
+            indices = sel
 
         # Paged pools: the split kernel reads one block-table row per job from the fixed
         # (B, num_pages) static
@@ -1804,12 +2300,24 @@ class DSV4Attention(Module):
                 k_len = a_klen, slot_ids = a_slots,
                 ring_stride = rsl.ring_rows * self.head_dim, seq = S,
             ),
+            # dsa_attn auto-splits a single row into 16 flash-decoding partials once the scanned
+            # region passes 256 rows, else 8 -- and its multirow branch defaults to 8. The splits
+            # decide how the fp32 partials are combined, so an 8-split body would differ from the
+            # 16-split eager call in the last bits: force the value eager computes for this layer
+            # (indices is None only for the window-only layers, whose eager estimate is win_len)
+            n_splits = 16 if (w if w > 0 else 0) + (self.index_topk if indices is not None else 0) > 256 else 8,
         )
 
         if _dsv4_dump_dir:
             _dsv4_dump("B", self.layer_idx, int(a_pos[0]), int(a_ec[0]), m,
                        {"q": q, "kv": kv, "out": out, "ck": comp_kv, "cg": comp_gate}, kl,
                        bt_st[:1] if bt_st is not None else None)
+        if _pdup_dir:
+            ts = dict(out = out.transpose(0, 1).reshape(R, -1), kv = kv.reshape(R, -1),
+                      q = q.reshape(R, -1), indices = indices if sel_live else None)
+            pool = (kl, bt_st[:1], a_ec[0]) if self.kv_source is not None else None
+            _pdup_reg(self.layer_idx, "attn", S, ts, pool)
+            _pdup("b1_attn", self.layer_idx, a_pos[0], S, ts, pool)
         # Ring appends (shift already applied in the prepass): batched, slot-indexed
         ext.dsv4_ring_append(kv.reshape(R, self.head_dim), rsl.ring, a_pos, a_beg, a_slots)
         return self._project_o_grouped(out.unsqueeze(1), params, out_dtype,
@@ -1826,7 +2334,10 @@ class DSV4Attention(Module):
             self._build_x_fan()
         xf = x.view(1, rows, -1)
         comp_kv = comp_gate = idx_kv = idx_gate = q_idx = None
-        need_q_idx = self.indexer is not None
+        # Layers that run an indexer scan need the indexer query: indexer_mode "full" (V4.1 layers with
+        # their own indexer head -- with idx_wk only if they also own the pool they index -- or a V4
+        # "csa" layer, whose mode defaults to "full"). Readers ("shared") reuse a published selection
+        need_q_idx = self.indexer_mode == "full" and self.idx_wq_b is not None
 
         if self.x_fan is not None and rows <= 32:
             f = self.x_fan
@@ -1870,7 +2381,12 @@ class DSV4Attention(Module):
                     comp_kv, comp_gate = cc[0], cc[1]
                 else:
                     comp_kv = comp.wkv.forward(xf, params)[0]
-                    comp_gate = comp.wgate.forward(xf, params)[0]
+                    # Gateless compressor: compress_ratios == 1 means non-overlapping windows,
+                    # so dsv4_compress's gate softmax runs over a single element and any
+                    # same-shaped tensor yields kv unchanged -- reuse comp_kv (the kernel's
+                    # gate_new is not optional, and the shape check compares it to kv_new)
+                    comp_gate = comp.wgate.forward(xf, params)[0] if comp.wgate is not None \
+                        else comp_kv
             if self.indexer is not None:
                 if not self.indexer.fused_ready:
                     self.indexer._build_fused()
@@ -1940,7 +2456,10 @@ class DSV4Attention(Module):
                 if y is not None:
                     # y is a shared static, overwritten by the next slot's replay; batch
                     # rows are assembled only after all slots have run
+                    if _rp_on: _rpnote("bc_graph_hit")
                     return y.clone() if copy_static else y
+                if _rp_on: _rpnote("bc_graph_decline")
+        if _rp_on: _rpnote("eager_core_S%d" % seq)
         device = x.device
         pos0 = rs.position
         slot = rs.slot
@@ -2071,6 +2590,9 @@ class DSV4Attention(Module):
                         x, params, rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], kl.pool_idx.view(-1, kl.D_i), None, pos0,
                         bt_row, epp)
+            if os.environ.get("EXL3_DSV4_B1_DBG"):
+                print(f"EAGER L{self.layer_idx} pos={pos0} seq={seq} m={m} ec={ec} "
+                      f"e0={pos0 // m} n={ec - pos0 // m}", flush=True)
             if self.idx_wk is not None and ec > pos0 // m:
                 e0 = pos0 // m
                 rows = torch.arange(e0, ec, device = device)
@@ -2136,6 +2658,13 @@ class DSV4Attention(Module):
                        {"q": q, "kv": kv, "out": out, "ck": fouts[2] if fouts is not None else None,
                         "cg": fouts[3] if fouts is not None else None}, kl,
                        bt_row if kl is not None else None)
+        if _pdup_dir:
+            # Second dump stage: identical attention inputs but a different output would put the
+            # divergence in the attn kernel invocation rather than in the selection above
+            _pdup("eager_attn", self.layer_idx, pos0, seq, dict(
+                out = out.transpose(0, 1).reshape(seq, -1), kv = kv.reshape(seq, -1),
+                q = q.reshape(seq, -1), indices = indices if topk_regime else None),
+                (kl, bt_row, pool_len) if self.kv_source is not None else None)
 
         # Ring update after attention: the shift/rebase branches move rows the kernel
         # reads in place (the kernel addresses the PRE-update ring via ring_beg). Keep the
