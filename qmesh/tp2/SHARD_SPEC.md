@@ -75,3 +75,11 @@ norms (`*norm*`), `ffn.gate.*` (incl. `bias_vl`), compressor and indexer (includ
 4. Byte-exact reconstruction (rank0 ⊕ rank1 == source) for ≥64 routed experts (16 per K tier, all layers incl. MTP)
    plus shared experts, wq_b, wo_b, wo_a slices, head, embed, markov, aligner, sinks, and vision fused layers.
    `verify_shards.py` re-derives roles and shapes itself and does not reuse `shard_tool.plan()`.
+
+## External DSpark drafter overlay
+
+`qmesh/tp2/drafter_overlay.py` converts diffbot's MIT-licensed `drafter-code-k7` pack into a separate TP2 overlay without modifying target weights. Pass `--drafter` for the pack directory, `--base` for the existing rank overlay, `--index-root` for the original sharded checkpoint, and `--out` for a new directory. `--block-size 7` sets `dspark_block_size` in the copied rank configs; `--verify` reconstructs mapped drafter tensors from both ranks. The converter retains non-MTP tensors in rewritten shards and symlinks other files, so the base must remain available.
+
+For the runner, `DSPARK_HEAD=ours` (default) uses `OVERLAY`; `DSPARK_HEAD=diffbot` uses `DSPARK_DIFFBOT_OVERLAY` (default `/work/k7db_overlay`). Both rank directories and the symlinked base must remain available. Set `NUM_DRAFT=7` with a block-7 overlay; a block-5 configuration limits the effective draft length to five.
+
+`launch_tp2.sh` pins rank 0 to CPUs `2-5` and rank 1 to `10-13` by default using `taskset`. These are distinct physical cores on NUMA node 0 on the measured host; choose appropriate cores for other hosts using the host environment variables `QMESH_CPUSET_RANK0` and `QMESH_CPUSET_RANK1`. Set either variable to an empty string to disable pinning for that rank. The container must provide `taskset` and allow the selected CPUs.
