@@ -38,6 +38,10 @@ below is documented with its conditions in [docs/tp2/RESULTS.md](docs/tp2/RESULT
 - **Documentation**: [docs/tp2/DESIGN.md](docs/tp2/DESIGN.md), [RECIPE.md](docs/tp2/RECIPE.md),
   [RESULTS.md](docs/tp2/RESULTS.md), [env_vars.md](docs/tp2/env_vars.md),
   [SHARD_SPEC.md](docs/tp2/SHARD_SPEC.md), and the raw working notes in `docs/tp2/notes/`.
+- **OpenAI-compatible HTTP server** (`qmesh/tp2/serve_tp2.py` with the `serve_tp2.sh` launcher,
+  [docs/tp2/SERVER.md](docs/tp2/SERVER.md)): stdlib HTTP/SSE front end that drives both ranks in lockstep from
+  one scheduler, with chat/completions endpoints, tools, streaming usage, prefix-cache reuse and optional bearer
+  auth. Greedy output is token-identical to `run_tp2.py`, checked by `scripts/server_smoke.sh`.
 
 ### Performance, relative to the pre-release tree on the same hardware
 
