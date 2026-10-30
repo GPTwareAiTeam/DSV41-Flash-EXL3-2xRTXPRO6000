@@ -29,6 +29,7 @@ Full `tests/kernels/moe/`: 263 passed (259 baseline + 4 fold cases).
 - B-WIDE at bsz1: B 22.4 (worse than 19.9).
 - A ksplit forced 2/3/4 (EXL3_MOE_COOP_KSPLIT): A 38.3/42.0/44.4, B 26.1/30.4/36.9. Every split slows both. Default ksplit=1 kept.
 - cp.async smem trellis ring (per-warp, RING_NS slots of 128 words, PF=RING_NS-1; sm_75 sync fallback). Same-harness bsz1 / bsz6 (A/B us): HEAD 34.16/19.25, 216.75/97.05. NS=8: 49.43/23.03, 324.71/110.51. NS=4: 38.83/19.65, 206.98/98.68. Worse at bsz1; rejected. Patch kept at `recipe-artifacts/2x-rtx-tp2/ring_ns4.patch` (not committed). Cause: per-slice wait_group + __syncwarp on critical path; occupancy not limited (NS=8: A 4, B 5 blocks/SM).
+- Mixed kernel A at 4 blocks/SM (`__launch_bounds__(256, 4)` on `exl3_moe_coop_a_mixed_kernel` only: 80 -> 64 registers, no spills per ptxas; B unchanged). `bench_moe_tp2.py`, real 2.565 rank-0 slices, folded graph, ABBA, GPU 1: layer 3 bsz 1/6/8 55.9/297.8/388.1 -> 58.8/302.3/394.0 us (+5.1/+1.5/+1.5%); layer 20 +5.3/+1.3/+1.1%; identical output. Less register-level parallelism costs more than the extra resident blocks gain. Rejected. (B at 4 blocks/SM spills: 64 registers, 92-184 bytes spill loads.)
 
 ## Diagnostics
 - Kernel B reduction costs ~1.1 us (DBG=2 skip: 18.8 vs 19.9).
