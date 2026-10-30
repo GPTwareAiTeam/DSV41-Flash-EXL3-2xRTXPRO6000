@@ -47,31 +47,32 @@ from .smem import pick_config, shared_bytes, halving_ladder
 from . import dsa_mqa
 
 @triton.jit
+def _e2m1_to_f32(code):
+    """Exact E2M1 nibble -> fp32: placing the 3 magnitude bits at the top of an fp16 exponent/mantissa
+    (bits 11..9) gives 2^-14 times the E2M1 value for every code, subnormal 0.5 included; the sign goes
+    to bit 15. The 2^14 factor is applied by the caller with the (power-of-two-exact) scale."""
+    h = ((code & 8) << 12) | ((code & 7) << 9)
+    return h.to(tl.int16).to(tl.float16, bitcast = True).to(tl.float32)
+
+@triton.jit
 def _fp4_kv_load(packed, scales, rows, cols, mask, valid):
     b = tl.load(packed + rows[:, None] * 256 + cols[None, :] // 2,
                 mask = mask[:, None] & valid[None, :], other = 0).to(tl.int32)
     code = (b >> ((cols[None, :] % 2) * 4)) & 15
-    mag = code & 7
-    value = tl.where(mag < 4, mag.to(tl.float32) * 0.5,
-                     tl.where(mag == 4, 2., tl.where(mag == 5, 3., tl.where(mag == 6, 4., 6.))))
-    value = tl.where((code & 8) != 0, -value, value)
     sb = tl.load(scales + rows[:, None] * 32 + cols[None, :] // 16,
                  mask = mask[:, None] & valid[None, :], other = 0).to(tl.uint8)
-    scale = sb.to(tl.float8e4nv, bitcast = True).to(tl.float32)
-    return (value * scale).to(tl.float16)
+    scale = sb.to(tl.float8e4nv, bitcast = True).to(tl.float32) * 16384.0
+    return (_e2m1_to_f32(code) * scale).to(tl.float16)
 
 @triton.jit
 def _fp4_idx_load(packed, scales, rows, cols, mask):
     b = tl.load(packed + rows[None, :] * 64 + cols[:, None] // 2,
                 mask = mask[None, :], other = 0).to(tl.int32)
     code = (b >> ((cols[:, None] % 2) * 4)) & 15
-    mag = code & 7
-    value = tl.where(mag < 4, mag.to(tl.float32) * 0.5,
-                     tl.where(mag == 4, 2., tl.where(mag == 5, 3., tl.where(mag == 6, 4., 6.))))
-    value = tl.where((code & 8) != 0, -value, value)
     sb = tl.load(scales + rows[None, :] * 4 + cols[:, None] // 32,
                  mask = mask[None, :], other = 0).to(tl.int32)
-    return (value * (sb << 23).to(tl.float32, bitcast = True)).to(tl.float16)
+    # E8M0 scale 2^(sb-127); times 2^14 is 2^(sb-113), still a power of two (exact)
+    return (_e2m1_to_f32(code) * ((sb + 14) << 23).to(tl.float32, bitcast = True)).to(tl.float16)
 
 @triton.jit(do_not_specialize = [
     "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
@@ -918,16 +919,24 @@ _dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", 
 def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r):
     """Gather the pages holding entries [0, pool_len) of a packed pool and dequantize them into
     a contiguous fp16 pool with an identity block table. Returns (pool_c, pool_r, block_table)
-    for the fp16 kernel path."""
+    for the fp16 kernel path. bits == -1 is DeepSeek FP4 (whole 512-wide rows, rope included):
+    decoded with the exact dsv4_fp4_dequant, so the staged values equal the in-kernel decode."""
     from ...ext import exllamav3_ext as ext
     pool_s, bits = qc
-    G = D_c // 32
     npw = -(-pool_len // page_size)
     pages = block_table[0, :npw].long()
+    n_rows = npw * page_size
+    if bits == -1:
+        rows = ext.dsv4_fp4_dequant(pool_c.reshape(-1, page_size, 256)[pages].view(-1, 256),
+                                    pool_s.reshape(-1, page_size, 32)[pages].view(-1, 32), False)
+        pc = rows[:, :D_c].contiguous().view(npw, page_size, D_c)
+        pr = rows[:, D_c:].contiguous().view(npw, page_size, D_r)
+        bt = torch.arange(npw, dtype = torch.int32, device = pool_c.device).unsqueeze(0)
+        return pc, pr, bt
+    G = D_c // 32
     pool_pages = pool_c.reshape(-1, page_size, G * bits)
     pc = pool_pages[pages]
     ps = pool_s.reshape(-1, page_size, G)[pages]
-    n_rows = npw * page_size
     # pow2: few distinct sizes, but never past the pool itself: the rounding alone would
     # double a 2049-page window to 4096 pages. MLAttention.autosplit_extra_measure stages a
     # window spanning the pool (pools within the staging limit), so its reserve follows the
@@ -1036,7 +1045,7 @@ def dsa_attn(
             assert out.shape == out_shape
 
     dummy_i = block_table  # any valid int32 pointer for unused int args
-    if (qc is not None and qc[1] > 0 and _dsa_qc_stage and multirow is None and not nc_block
+    if (qc is not None and _dsa_qc_stage and multirow is None and not nc_block
             and R >= _dsa_qc_stage_min_r and block_table.shape[0] == 1
             and 0 < pool_len <= _dsa_qc_stage_max_entries):
         pool_c, pool_r, block_table = _stage_packed_pool(
@@ -1271,6 +1280,16 @@ def dsa_indexer_scores(
     R, H_i, D_i = q_idx.shape
     if scale is None:
         scale = D_i ** -0.5 * H_i ** -0.5
+    if idx_scales is not None and R >= _dsa_qc_stage_min_r and block_table is not None and _dsa_qc_stage:
+        # Many queries re-read every key: unpack the job's key pages to fp16 once (exact
+        # dsv4_fp4_dequant, same values as the in-kernel decode) and score through the fp16 kernel
+        from ...ext import exllamav3_ext as ext
+        npw = -(-bound_max // epp)
+        pages = block_table.reshape(-1)[:npw].long()
+        k_idx = ext.dsv4_fp4_dequant(k_idx.view(-1, epp, 64)[pages].view(-1, 64),
+                                     idx_scales.view(-1, epp, 4)[pages].view(-1, 4), True)
+        block_table = torch.arange(npw, dtype = torch.int32, device = q_idx.device)
+        idx_scales = None
     T = bound_max
     if block_table is None:
         T = k_idx.shape[0]
