@@ -1364,7 +1364,7 @@ class Generator:
         # The drafter's captured block graph is keyed by this table's shape. Size it from the cache capacity, not
         # the current job's length, so one capture serves every prompt length: a second capture made for a job of
         # another length corrupted the next job's target state (NaN logits, later an illegal memory access).
-        # Rows past a sequence's own pages stay zero and are never read (attention is bounded by its positions).
+        # Rows past a sequence's own pages are never read (attention is bounded by its positions).
         cap_pages = (self.pagetable.max_pages + 15) // 16 * 16
         max_pages_batch = max(max_pages_batch, cap_pages)
         block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
@@ -1373,9 +1373,17 @@ class Generator:
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
+            ds = job.recurrent_state.draft if self.draft_recurrent and job.recurrent_state is not None else None
             for seq in job.sequences:
-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                if ds is not None and hasattr(ds, "block_table"):
+                    # Window-ring drafter (DSpark): its own per-slot table into the rings, which hold the rows
+                    # below the K/V position
+                    assert ds.position == seq.kv_position, \
+                        f"draft ring at {ds.position}, K/V position {seq.kv_position}"
+                    block_index[batch:batch+1].copy_(ds.block_table(max_pages_batch))
+                else:
+                    seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                    block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
 

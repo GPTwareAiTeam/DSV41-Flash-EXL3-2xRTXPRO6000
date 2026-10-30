@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The drafter's cache is a small per-user window instead of a context-sized copy.** The DSpark drafter only
+  ever reads the last 128 positions, but it kept a 3-layer, 512-wide row for every position of the context:
+  3,072 bytes per token per GPU on top of the 3,200-byte main KV cache. It now keeps a 768-row ring per user
+  per layer (`exllamav3/cache/dsa.py` `DSparkLayerState` / `DSparkState`), checkpointed and rolled back with
+  the target's recurrent state. Measured on the same pinned GEMM tuning: output token-identical to v1.0.0 on
+  both ranks (alternating 24k/short jobs, speed set, prefix-cache turn 2, 2 and 4 users); speed unchanged within
+  noise; 0.19 GiB more free per GPU at a 64k cache and 1.50 GiB at 512k. A 150k-token prompt in a 512k cache now
+  runs (85.5 tok/s decode); v1.0.0 runs out of memory there.
+
+### Fixed
+
+- Token-identity comparisons between two builds must pin the GEMM autotuner's choices
+  (`EXLLAMAV3_TUNE_CACHE` pointing at copies of one tuning file): each container tunes its own kernels, and
+  different picks alone change the numerics enough to flip greedy tokens a few hundred tokens in.
+
 ## v1.0.0 — 2026-10-29
 
 First public release of the TP=2 runtime: ExLlamaV3 (upstream, MIT) plus a tensor-parallel backend, a sharded
@@ -78,7 +97,9 @@ All single-user figures are decode speed with speculation on (default settings),
   drafter's graph capture fails (`Cannot copy between CPU and CUDA tensors during CUDA graph capture`).
   8 users without speculation run.
 - **Little VRAM is spare.** At the default 4096-row prefill chunk (1 user, 32k context, speculation on), a 24k
-  prompt fails once more than ~1 GiB per GPU is taken; `MAX_CHUNK=2048` leaves room for at least 2.25 GiB.
+  prompt still runs with 1.42 GiB per GPU used by another process and fails at 1.92 GiB; `MAX_CHUNK=2048`
+  runs with 2.92 GiB used. (Corrected after release: earlier text gave the requested ballast sizes, 0.75 /
+  1.25 / 2.25 GiB, not the memory actually used.)
 - Batching is bitwise invariant across streams and neighbours but not across batch width; near-ties can flip.
 - FP8 KV breaks capture and is numerically wrong when capture is bypassed — `KV_BITS=16` only.
 - 8-bit prefill all-reduce is faster but fails the coherence gate (prompt-3 token flip at step 11); opt-in only.
