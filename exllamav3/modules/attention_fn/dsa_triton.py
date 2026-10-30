@@ -665,7 +665,7 @@ def _dsa_attn_combine_kernel(
     tl.store(out + base_h[:, None] + offs_d[None, :], o.to(tl.float16),
              mask = valid_h[:, None] & valid_d[None, :])
 
-@triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max"],
+@triton.jit(do_not_specialize = ["T", "R", "q_pos0", "bound_max", "num_pages_per_row"],
             debug = dsa_debug_bounds)
 def _dsa_indexer_kernel(
     q_idx,               # (R, H_i, D_i) fp16, rope applied
@@ -678,6 +678,7 @@ def _dsa_indexer_kernel(
     bound_max,           # runtime: entry count clamp; bound[r] =
                          #   min((q_pos0 + r + 1) // compress_rate, bound_max)
     block_table,         # EPP > 0: (npr,) i32 page table of the (single) job
+    num_pages_per_row,
     H_i: tl.constexpr,
     D_i: tl.constexpr,
     S_stride: tl.constexpr,
@@ -686,6 +687,8 @@ def _dsa_indexer_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     EPP: tl.constexpr = 0,           # pool entries per page; 0 = contiguous k_idx
+    SEQ: tl.constexpr = 1,
+    MULTIROW: tl.constexpr = 0,
     DEBUG_BOUNDS: tl.constexpr = 0,
     DEBUG_PAGES: tl.constexpr = 0,
     idx_scales = None,
@@ -698,9 +701,19 @@ def _dsa_indexer_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    if MULTIROW:
+        job = tl.program_id(2)
+        loc_m = offs_m
+        offs_m = job * SEQ + loc_m
+        T = tl.load(T + job)
+        q_pos0 = tl.load(q_pos0 + job)
+        bound_max = tl.load(bound_max + job)
+        block_table = block_table + job * num_pages_per_row
+    else:
+        loc_m = offs_m
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D_i)
-    valid_m = offs_m < R
+    valid_m = (loc_m < SEQ) if MULTIROW else (offs_m < R)
     valid_n = offs_n < T
 
     if EPP > 0:
@@ -725,7 +738,7 @@ def _dsa_indexer_kernel(
         acc += tl.maximum(logits, 0.0) * wh[:, None].to(tl.float32)
 
     acc = acc * scale
-    bound = tl.minimum((q_pos0 + offs_m + 1) // compress_rate, bound_max)
+    bound = tl.minimum((q_pos0 + loc_m + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n[None, :] < bound[:, None], acc, -float("inf"))
     tl.store(scores + offs_m[:, None].to(tl.int64) * S_stride + offs_n[None, :], acc.to(tl.float16),
              mask = valid_m[:, None] & valid_n[None, :])
@@ -919,6 +932,15 @@ def _dsa_pool_expand_kernel(
 _dsa_qc_stage = os.environ.get("EXL3_DSA_QC_STAGE", "1") != "0"
 _dsa_qc_stage_min_r = int(os.environ.get("EXL3_DSA_QC_STAGE_MIN_R", "64"))
 _dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", str(1 << 20)))
+# FP4 staging decodes this many pool rows per slice (each slice holds a 1 KiB/row fp16 copy briefly)
+_fp4_stage_slice_rows = int(os.environ.get("EXL3_DSA_FP4_STAGE_SLICE", str(1 << 16)))
+# Indexer scoring reads FP4 keys in-kernel even for many-query (prefill) calls instead of unpacking them to fp16 first:
+# same values, no fp16 key copy (128 MiB at a 1M context). 0 = unpack once per call (slightly faster, more memory)
+_dsa_idx_fp4_direct = os.environ.get("EXL3_DSA_IDX_FP4_DIRECT", "1") == "1"
+# Gathered (top-k) FP4 attention decodes the selected entries in-kernel instead of staging the pool window once the
+# window holds more than this many entries (262144 entries = 256 MiB of fp16 staging). Measured, one 2048-row chunk:
+# 131k-entry pool staged 1.0 ms / direct 1.9 ms; 1M-entry pool staged 3.2 ms, 1.23 GiB / direct 2.2 ms, 64 MiB
+_fp4_gather_direct_min = int(os.environ.get("EXL3_DSA_FP4_GATHER_DIRECT_MIN", str(1 << 18)))
 
 
 def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r):
@@ -932,10 +954,19 @@ def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c
     pages = block_table[0, :npw].long()
     n_rows = npw * page_size
     if bits == -1:
-        rows = ext.dsv4_fp4_dequant(pool_c.reshape(-1, page_size, 256)[pages].view(-1, 256),
-                                    pool_s.reshape(-1, page_size, 32)[pages].view(-1, 32), False)
-        pc = rows[:, :D_c].contiguous().view(npw, page_size, D_c)
-        pr = rows[:, D_c:].contiguous().view(npw, page_size, D_r)
+        # Decode into the two fp16 windows a slice of pages at a time: the transient is the windows
+        # (pool_len * 1 KiB) plus one slice, not a full 512-wide copy on top of them
+        pc = torch.empty((npw, page_size, D_c), dtype = torch.half, device = pool_c.device)
+        pr = torch.empty((npw, page_size, D_r), dtype = torch.half, device = pool_c.device)
+        packed = pool_c.reshape(-1, page_size, 256)
+        scales = pool_s.reshape(-1, page_size, 32)
+        step = max(1, _fp4_stage_slice_rows // page_size)
+        for a in range(0, npw, step):
+            b = min(npw, a + step)
+            pg = pages[a:b]
+            rows = ext.dsv4_fp4_dequant(packed[pg].view(-1, 256), scales[pg].view(-1, 32), False)
+            pc[a:b].view(-1, D_c).copy_(rows[:, :D_c])
+            pr[a:b].view(-1, D_r).copy_(rows[:, D_c:])
         bt = torch.arange(npw, dtype = torch.int32, device = pool_c.device).unsqueeze(0)
         return pc, pr, bt
     G = D_c // 32
@@ -986,9 +1017,9 @@ def dsa_attn(
     page_size = 256,         # pool entries per block-table page (PAGE_SIZE // m for the
                              # paged pools; 256 with an identity table for contiguous pools)
     nc_block = False,        # DSpark draft mode: non-causal chunk + paged window history
+                             # (single job per call; forces the one-shot kernel)
     nc_device_pos = None,    # device int32 sequence length, graph-safe NC_BLOCK positions
     nc_window = 0,
-                             # (single job per call; forces the one-shot kernel)
     nc_chunk = False,        # non-causal image chunk (DeepSeek-V4 vision): every query sees
                              # the whole chunk (bidirectional) plus its own win_len-wide
                              # causal window into the ring history; pool phases unchanged
@@ -1050,7 +1081,13 @@ def dsa_attn(
             assert out.shape == out_shape
 
     dummy_i = block_table  # any valid int32 pointer for unused int args
-    if (qc is not None and _dsa_qc_stage and multirow is None and not nc_block
+    # FP4 with a per-row selection (indices): staging unpacks the whole pool window (1 KiB per entry) to read 512
+    # entries per row. Past _fp4_gather_direct_min entries that copy is the largest prefill transient at depth
+    # (1.2 GiB at 1M tokens), and in-kernel decode of just the selected entries is as fast or faster (128-row kv
+    # tile, one stage); below it the staged fp16 kernel is quicker and its window small. Same values either way
+    fp4_gather_direct = (qc is not None and qc[1] == -1 and indices is not None
+                         and pool_len > _fp4_gather_direct_min)
+    if (qc is not None and _dsa_qc_stage and multirow is None and not nc_block and not fp4_gather_direct
             and R >= _dsa_qc_stage_min_r and block_table.shape[0] == 1
             and 0 < pool_len <= _dsa_qc_stage_max_entries):
         pool_c, pool_r, block_table = _stage_packed_pool(
@@ -1240,6 +1277,9 @@ def dsa_attn(
                 )
             return out
 
+    if fp4_gather_direct:
+        # In-kernel FP4 gather: a 128-entry kv tile, one stage, 8 warps (measured fastest, ~1.7x the stock tile)
+        block_n, num_stages, num_warps = 128, 1, 8
     # Head tile, then kv tile, then pipeline depth (smem.py); the stock config leads
     ladder = [(block_h, block_n, num_stages)]
     for ns in range(num_stages, 0, -1):
@@ -1285,7 +1325,8 @@ def dsa_indexer_scores(
     R, H_i, D_i = q_idx.shape
     if scale is None:
         scale = D_i ** -0.5 * H_i ** -0.5
-    if idx_scales is not None and R >= _dsa_qc_stage_min_r and block_table is not None and _dsa_qc_stage:
+    if idx_scales is not None and R >= _dsa_qc_stage_min_r and block_table is not None and _dsa_qc_stage \
+            and not _dsa_idx_fp4_direct:
         # Many queries re-read every key: unpack the job's key pages to fp16 once (exact
         # dsv4_fp4_dequant, same values as the in-kernel decode) and score through the fp16 kernel
         from ...ext import exllamav3_ext as ext
@@ -1344,7 +1385,7 @@ def dsa_indexer_scores(
             grid = (R, triton.cdiv(max(T, 1), block_n))
             _dsa_indexer_fewq_kernel[grid](*f_args, **f_consts(block_n), num_warps = num_warps, num_stages = num_stages)
         else:
-            t_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt)
+            t_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0)
             def t_consts(cfg):
                 bm, bn = cfg
                 return dict(
