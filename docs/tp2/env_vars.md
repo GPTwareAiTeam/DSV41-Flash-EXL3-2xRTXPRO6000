@@ -43,10 +43,11 @@ invocation.
 | `WARM` | `0` | `1` runs every prompt twice and times the second pass, so the graph/allocator warmup is excluded. Also makes ~24k TTFT an artefact of page reuse — do not quote TTFT from a `WARM=1` run. |
 | `WARM_TOKENS` | `8` | Untimed warm pass length. Never 0 when graphs are on: the first step is the capture. |
 | `BATCH` | `1` | Concurrent streams: number of cache slots and `max_batch_size`. B>1 requires `EXL3_DSV4_B1_BATCH=1` or it silently falls back to the eager batched path (2× slower). |
-| `KV_BITS` | `16` | `8` selects `CacheLayer_quant` (3200 → 2150 B/token/rank) but breaks graph capture and is numerically wrong when the capture is bypassed, so 16 is the default. |
+| `KV_BITS` | `16` | `4` stores the compressed main pools in DeepSeek's trained FP4 format (packed E2M1; E4M3 scale per 16 latent values, E8M0 per 32 index-key values): 3200 → ~890 B/token/rank, decode and prefill within 1% of 16-bit. `8` selects `CacheLayer_quant` (3200 → 2150 B/token/rank) but breaks graph capture and is numerically wrong when the capture is bypassed. |
 | `CACHE_TOKENS_PER_SEQ` | `4096` | KV pool tokens per stream when `CTX_TOKENS` is 0. |
 | `CTX_TOKENS` | `0` | Total KV budget in tokens; 0 = `BATCH × CACHE_TOKENS_PER_SEQ`. Set it to the context you actually want to serve (e.g. `1048576`) and the chunk auto-sizer gets whatever VRAM is left. |
-| `KV_BYTES_PER_TOKEN` | `2150` with `KV_BITS=8`, else `3200` | Per-rank pool cost used by the chunk sizing arithmetic. Only change it if you change the cache type. |
+| `KV_BYTES_PER_TOKEN` | `890` with `KV_BITS=4`, `2150` with `KV_BITS=8`, else `3200` | Per-rank pool cost used by the chunk sizing arithmetic. Only change it if you change the cache type. |
+| `MEM_BREAKDOWN` | `0` | `1` logs `MEMB` lines: per-GPU resident GiB by owner (weights, KV cache, recurrent state, statics, generator) after load, device/torch totals, and the peak since load at the end of the run. |
 | `FORCE_EXPORT` | `0` | `1` makes the target model emit `export_state_layers` (drafter input taps) during a plain run. Needed to collect drafter training data, not for serving. |
 
 ## Prefix cache

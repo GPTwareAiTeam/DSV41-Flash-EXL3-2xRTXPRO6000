@@ -82,6 +82,7 @@ if KV_BITS not in (4, 8, 16):
 KV_CACHE_KWARGS = ({"layer_type": CacheLayer_quant, "k_bits": 8, "v_bits": 8} if KV_BITS == 8 else
                    {"kv_format": "fp4"} if KV_BITS == 4 else {})
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
+MEM_BREAKDOWN = os.environ.get("MEM_BREAKDOWN", "0") == "1"  # per-GPU resident GiB by owner after load + peak (MEMB lines)
 COMM = os.environ.get("COMM", "p2p")  # nccl | p2p | hybrid (hybrid: P2P <64KB, NCCL >=64KB)
 P2P_STATS_OUT = os.environ.get("P2P_STATS_OUT")  # p2p only: prefix; enables device spin/timing stats, dumped at run end to <prefix>.rank<r>.json
 PROFILE = os.environ.get("PROFILE", "0") == "1"
@@ -572,6 +573,23 @@ def main():
         log(f"DRAFT_K requested={NUM_DRAFT} effective={generator.num_draft_tokens} "
             f"block={generator.max_draft_size} "
             f"clamped={'yes' if generator.num_draft_tokens != NUM_DRAFT else 'no'}")
+    if MEM_BREAKDOWN:
+        # Resident memory by owner after load (target + drafter + caches + generator statics), before any job
+        from exllamav3.util.memory import vram_accounting
+        g = 2 ** 30
+        for name, m, c in (("target", model, cache), ("drafter", draft_model, draft_cache)):
+            if m is None:
+                continue
+            r = vram_accounting(m, c, generator if name == "target" else None, [device])[0]
+            log(f"MEMB {name} weights={r.weights / g:.3f} kv_cache={r.cache / g:.3f} "
+                f"recurrent={r.recurrent / g:.3f} statics={r.statics / g:.3f} generator={r.generator / g:.3f} "
+                f"other={r.other / g:.3f}")
+        free, total = torch.cuda.mem_get_info(device)
+        log(f"MEMB device total={total / g:.3f} used={(total - free) / g:.3f} "
+            f"torch_reserved={torch.cuda.memory_reserved(device) / g:.3f} "
+            f"torch_allocated={torch.cuda.memory_allocated(device) / g:.3f} "
+            f"non_torch={(total - free - torch.cuda.memory_reserved(device)) / g:.3f}")
+        torch.cuda.reset_peak_memory_stats(device)
     if isinstance(backend, TPBackendTrace):
         original_trace_iterate = generator.iterate
         def trace_iterate(*args, **kwargs):
@@ -857,6 +875,11 @@ def main():
                     f"draft_wait_ms={draft_wait:.3f} target_wait_ms={target_wait:.3f} "
                     f"draft_py_ms={draft_host:.3f} target_py_ms={target_host:.3f}")
     log(f"MEM max_alloc_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f}")
+    if MEM_BREAKDOWN:
+        g = 2 ** 30
+        log(f"MEMB peak_since_load allocated={torch.cuda.max_memory_allocated(device) / g:.3f} "
+            f"reserved={torch.cuda.max_memory_reserved(device) / g:.3f} "
+            f"device_used_now={(torch.cuda.mem_get_info(device)[1] - torch.cuda.mem_get_info(device)[0]) / g:.3f}")
     if LOGITS_OUT:
         with open(f"{LOGITS_OUT}.rank{RANK}.json", "w") as f:
             json.dump(logit_out, f)
