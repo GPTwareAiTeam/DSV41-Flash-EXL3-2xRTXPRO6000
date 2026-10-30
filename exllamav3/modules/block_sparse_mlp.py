@@ -1287,7 +1287,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 expert_count = torch.zeros(E + 1, dtype = torch.int64, device = flat_expert_local.device)
                 expert_count.scatter_add_(0, flat_expert_local,
                                           torch.ones_like(flat_expert_local, dtype = torch.int64))
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                # An expert receives at most one row per token (top-k picks are distinct), so with
+                # num_tokens <= fused_rows every expert fits the fused kernel too. Eager calls in that
+                # range keep the readback (it picks the row tiles); a graph capture cannot read back
+                # (multi-user verify: 8 users x 6 rows x top-6 = 288 > 256 aborted the capture), so
+                # it takes the all-fused launch
+                if self.fused_mode_buffers is not None and (
+                        num_tokens * top_k <= self.fused_rows or
+                        (num_tokens <= self.fused_rows and torch.cuda.is_current_stream_capturing())):
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
