@@ -18,7 +18,7 @@ from ..util.device_copy import to_device
 from .quant.exl3 import LinearEXL3
 from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
 from .multilinear import MultiLinear
-from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds
+from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_indexer_scores_rowmap, dsa_debug_bounds
 from .attention_fn.bc_dsa import bc_dsa_enable, build_bc_dsa, build_bc_dsa_batch
 
 # Multi-job decode via the batched path: one projection pass, one MULTIROW attention
@@ -1620,14 +1620,21 @@ class DSV4Attention(Module):
                     # Row-contiguous (S, cap) score backing: cap is the kernel's S_stride, so this is
                     # a single Triton compile at any context length and the rows are scored in place
                     scores = g_tensor_cache.get(x.device, (rows_max, cap), torch.half, "dsv4_cand_scores")[:S]
-                    for i in range(S):
-                        s_i = dsa_indexer_scores(q_idx[0, r0 + i:r0 + i + 1], wts[0, r0 + i:r0 + i + 1],
-                                                 idx_pool[rows_ent[i]],
-                                                 cap * self.compress_rate, self.compress_rate, cap,
-                                                 idx_scales = idx_scales[rows_ent[i]].contiguous() if idx_scales is not None else None,
-                                                 scores = scores[i:i + 1])
-                        s_i.masked_fill_(ent[i] >= vis[i], ninf)
-                        s_i.masked_fill_(ent[i] < 0, ninf)
+                    if S > 1 and pages is not None:
+                        # One launch for every row: the kernel reads each row's own pool rows through its
+                        # map (-1 past the row's bound -> -inf), the same scores the per-row loop below
+                        # writes, without its S gathers + S launches + 2S fills (host-bound at verify widths)
+                        dsa_indexer_scores_rowmap(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool, rows_ent, scores,
+                                                  idx_scales = idx_scales)
+                    else:
+                        for i in range(S):
+                            s_i = dsa_indexer_scores(q_idx[0, r0 + i:r0 + i + 1], wts[0, r0 + i:r0 + i + 1],
+                                                     idx_pool[rows_ent[i]],
+                                                     cap * self.compress_rate, self.compress_rate, cap,
+                                                     idx_scales = idx_scales[rows_ent[i]].contiguous() if idx_scales is not None else None,
+                                                     scores = scores[i:i + 1])
+                            s_i.masked_fill_(ent[i] >= vis[i], ninf)
+                            s_i.masked_fill_(ent[i] < 0, ninf)
                     ext.dsa_topk(scores, sel, min(k, cap), None, 0)
                     sel.copy_(torch.where(sel < 0, sel, ent.gather(1, sel.clamp(min = 0))))
                     krow = idx_pool[block_table.reshape(-1)[(ec - 1) // epp].long() * epp + (ec - 1) % epp] \

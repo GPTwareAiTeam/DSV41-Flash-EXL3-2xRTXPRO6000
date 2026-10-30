@@ -84,6 +84,33 @@ def test_fp4_indexer(count):
     assert torch.equal(got.topk(8).indices, ref.topk(8).indices)
 
 
+@pytest.mark.parametrize('fp4', [False, True])
+def test_indexer_rowmap_matches_per_row(fp4):
+    """One-launch scoring of several rows over their own pool-row lists equals scoring each row's
+    gathered keys separately (bit for bit), with -inf in every unmapped (-1) column."""
+    from exllamav3.modules.attention_fn.dsa_triton import dsa_indexer_scores, dsa_indexer_scores_rowmap
+    torch.manual_seed(5)
+    R, Hi, Di, cap, pool = 6, 32, 128, 512, 4096
+    keys = torch.randn((pool, Di), device='cuda', dtype=torch.float16)
+    packed, scales = ext.dsv4_fp4_quant(keys, True)
+    k_idx, k_sc = (packed, scales) if fp4 else (keys, None)
+    q = torch.randn((R, Hi, Di), device='cuda', dtype=torch.float16)
+    w = torch.randn((R, Hi), device='cuda', dtype=torch.float16)
+    row_map = torch.full((R, cap), -1, dtype=torch.int32, device='cuda')
+    for r in range(R):
+        n = 300 + 40 * r   # each row its own list length, -1 padded
+        row_map[r, :n] = torch.randperm(pool, device='cuda')[:n].sort().values.int()
+    got = torch.empty((R, cap), dtype=torch.half, device='cuda')
+    dsa_indexer_scores_rowmap(q, w, k_idx, row_map, got, idx_scales=k_sc)
+    for r in range(R):
+        rows = row_map[r].clamp(min=0)
+        ref = torch.empty((1, cap), dtype=torch.half, device='cuda')
+        dsa_indexer_scores(q[r:r + 1], w[r:r + 1], k_idx[rows], cap, 1, cap, scores=ref,
+                           idx_scales=k_sc[rows].contiguous() if fp4 else None)
+        ref.masked_fill_(row_map[r] < 0, -float('inf'))
+        assert torch.equal(got[r], ref[0]), f"row {r}"
+
+
 @pytest.mark.parametrize('count', [1, 8])
 def test_fp4_indexer_cuda_graph_matches_eager(count):
     from exllamav3.modules.attention_fn.dsa_triton import dsa_indexer_scores
