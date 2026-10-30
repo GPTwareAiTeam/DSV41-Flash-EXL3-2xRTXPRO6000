@@ -771,6 +771,8 @@ def _dsa_indexer_fewq_kernel(
     DEBUG_PAGES: tl.constexpr = 0,
     idx_scales = None,
     FP4: tl.constexpr = 0,
+    ROWMAP: tl.constexpr = 0,        # block_table is an (R, num_pages_per_row) i32 map: column n of row r reads
+                                     # pool row map[r, n] (-1 = no entry, scored -inf)
 ):
     """Few-query variant (decode): one program per (query row, key tile) with HEADS as
     the MMA M dim. A single dot replaces the head loop, which is a serial latency chain
@@ -786,6 +788,8 @@ def _dsa_indexer_fewq_kernel(
         block_table = block_table + job * num_pages_per_row
     else:
         loc = r
+    if ROWMAP:
+        block_table = block_table + r * num_pages_per_row
     # In a captured graph the grid is sized for the FULL score buffer (pool capacity)
     # with T patched per replay; tiles past T retire immediately (their region of the
     # scores buffer holds the required -inf from the one-time fill)
@@ -799,7 +803,10 @@ def _dsa_indexer_fewq_kernel(
 
     qh = tl.load(q_idx + (r * H_i + offs_h)[:, None] * D_i + offs_d[None, :],
                  mask = valid_h[:, None], other = 0.0)                     # (H_pad, D)
-    if EPP > 0:
+    if ROWMAP:
+        k_rows = tl.load(block_table + offs_n, mask = valid_n, other = -1)
+        valid_n = valid_n & (k_rows >= 0)
+    elif EPP > 0:
         phys = tl.load(block_table + offs_n // EPP, mask = valid_n, other = 0)
         if DEBUG_BOUNDS:
             tl.device_assert(tl.where(valid_n, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_fewq: pool page OOB")
@@ -817,7 +824,11 @@ def _dsa_indexer_fewq_kernel(
 
     bound = tl.minimum((q_pos0 + loc + 1) // compress_rate, bound_max)
     acc = tl.where(offs_n < bound, acc, -float("inf"))
-    tl.store(scores + r * S_stride + offs_n, acc.to(tl.float16), mask = valid_n)
+    if ROWMAP:
+        acc = tl.where(valid_n, acc, -float("inf"))
+        tl.store(scores + r * S_stride + offs_n, acc.to(tl.float16), mask = offs_n < T)
+    else:
+        tl.store(scores + r * S_stride + offs_n, acc.to(tl.float16), mask = valid_n)
 
 
 @triton.jit(do_not_specialize = ["num_pages_per_row", "append_len"])
@@ -1403,3 +1414,40 @@ def dsa_indexer_scores(
             grid = (triton.cdiv(R, block_m), triton.cdiv(max(T, 1), block_n))
             _dsa_indexer_kernel[grid](*t_args, **t_consts((block_m, block_n)), num_warps = num_warps, num_stages = num_stages)
     return scores[:, :T]
+
+
+def dsa_indexer_scores_rowmap(
+    q_idx,                   # (R, H_i, D_i) fp16, rope applied
+    weights,                 # (R, H_i) fp16 raw head weights
+    k_idx,                   # flat key pool: (rows, D_i) fp16, or (rows, 64) uint8 FP4 with idx_scales
+    row_map,                 # (R, cap) i32 pool row per score column, -1 = no entry
+    scores,                  # (R, cap) fp16 row-contiguous backing
+    idx_scales = None,       # (rows, 4) uint8 E8M0 scales (FP4 keys)
+    block_n = 128,
+    num_warps = 8,
+    num_stages = 2,
+):
+    """Indexer scores of R query rows, each over its own list of pool rows, in one launch:
+    scores[r, n] = the DSA score of query r against pool row row_map[r, n], -inf where it is -1.
+    Same per-column arithmetic as dsa_indexer_scores over one row's gathered keys."""
+    R, H_i, D_i = q_idx.shape
+    cap = row_map.shape[1]
+    assert row_map.dtype == torch.int32 and row_map.is_contiguous() and row_map.shape[0] == R
+    assert scores.shape == (R, cap) and scores.stride(1) == 1 and scores.stride(0) == cap and cap % 8 == 0
+    scale = D_i ** -0.5 * H_i ** -0.5
+    # Causal bound min(q_pos0 + r + 1, bound_max) = cap: every column passes, the map carries the bounds
+    f_args = (q_idx, weights, k_idx, scores, cap, R, cap, cap, row_map, cap)
+    def f_consts(bn):
+        return dict(
+            H_i = H_i, H_pad = max(triton.next_power_of_2(H_i), 16), D_i = D_i,
+            S_stride = cap, compress_rate = 1, scale = scale, BLOCK_N = bn,
+            idx_scales = idx_scales, FP4 = idx_scales is not None, ROWMAP = 1,
+        )
+    with torch.cuda.device(q_idx.device):
+        block_n = pick_config(
+            q_idx.device, "dsa_indexer_fewq_rowmap", (H_i, D_i, cap, idx_scales is not None, num_warps, num_stages, block_n),
+            halving_ladder(block_n),
+            lambda bn: shared_bytes(_dsa_indexer_fewq_kernel, f_args, **f_consts(bn), num_warps = num_warps, num_stages = num_stages))
+        grid = (R, triton.cdiv(cap, block_n))
+        _dsa_indexer_fewq_kernel[grid](*f_args, **f_consts(block_n), num_warps = num_warps, num_stages = num_stages)
+    return scores
