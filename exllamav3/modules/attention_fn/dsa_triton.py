@@ -65,14 +65,32 @@ def _fp4_kv_load(packed, scales, rows, cols, mask, valid):
     return (_e2m1_to_f32(code) * scale).to(tl.float16)
 
 @triton.jit
-def _fp4_idx_load(packed, scales, rows, cols, mask):
-    b = tl.load(packed + rows[None, :] * 64 + cols[:, None] // 2,
-                mask = mask[None, :], other = 0).to(tl.int32)
-    code = (b >> ((cols[:, None] % 2) * 4)) & 15
-    sb = tl.load(scales + rows[None, :] * 4 + cols[:, None] // 32,
-                 mask = mask[None, :], other = 0).to(tl.int32)
-    # E8M0 scale 2^(sb-127); times 2^14 is 2^(sb-113), still a power of two (exact)
-    return (_e2m1_to_f32(code) * ((sb + 14) << 23).to(tl.float32, bitcast = True)).to(tl.float16)
+def _fp4_kv_load_bytes(packed, scales, rows, mask, C0: tl.constexpr, NB: tl.constexpr, NV: tl.constexpr):
+    """Columns [C0, C0 + 2 * NB) of FP4 latent rows: NB consecutive packed bytes per row (one
+    contiguous load), both nibbles decoded, interleaved back to column order. Same exact decode
+    as _fp4_kv_load. Only the first NV bytes are real columns (the rest return 0, padding for a
+    power-of-two tile). C0 is a multiple of 16, so each byte pair shares one scale."""
+    offs_b = tl.arange(0, NB)
+    m = mask[:, None] & (offs_b[None, :] < NV)
+    b = tl.load(packed + rows[:, None] * 256 + C0 // 2 + offs_b[None, :], mask = m, other = 0).to(tl.int32)
+    sb = tl.load(scales + rows[:, None] * 32 + (C0 // 16) + offs_b[None, :] // 8, mask = m, other = 0).to(tl.uint8)
+    scale = sb.to(tl.float8e4nv, bitcast = True).to(tl.float32) * 16384.0
+    lo = (_e2m1_to_f32(b & 15) * scale).to(tl.float16)
+    hi = (_e2m1_to_f32((b >> 4) & 15) * scale).to(tl.float16)
+    return tl.interleave(lo, hi)
+
+@triton.jit
+def _fp4_idx_load_t(packed, scales, rows, mask):
+    """(D_i=128, N) transposed FP4 key tile from row-contiguous loads: 64 packed bytes per key row,
+    both nibbles decoded, interleaved to column order, then transposed in registers. E8M0 scale
+    2^(sb-127) times 2^14 (see _e2m1_to_f32) is 2^(sb-113), still a power of two (exact)."""
+    offs_b = tl.arange(0, 64)
+    b = tl.load(packed + rows[:, None] * 64 + offs_b[None, :], mask = mask[:, None], other = 0).to(tl.int32)
+    sb = tl.load(scales + rows[:, None] * 4 + offs_b[None, :] // 16, mask = mask[:, None], other = 0).to(tl.int32)
+    s = ((sb + 14) << 23).to(tl.float32, bitcast = True)
+    lo = (_e2m1_to_f32(b & 15) * s).to(tl.float16)
+    hi = (_e2m1_to_f32((b >> 4) & 15) * s).to(tl.float16)
+    return tl.trans(tl.interleave(lo, hi))
 
 @triton.jit(do_not_specialize = [
     "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
@@ -510,7 +528,7 @@ def _dsa_attn_split_kernel(
             tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_split: pool page OOB")
         tok = phys * page_size + idx_s % page_size
         if QC == -1:
-            vc = _fp4_kv_load(pool_c, pool_s, tok, offs_c, in_range, valid_c)
+            vc = _fp4_kv_load_bytes(pool_c, pool_s, tok, in_range, 0, D_c_pad // 2, D_c // 2)
         elif QC > 0:
             vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
         else:
@@ -519,7 +537,7 @@ def _dsa_attn_split_kernel(
         scores = tl.dot(qc, tl.trans(vc))
         if D_r > 0:
             if QC == -1:
-                vr = _fp4_kv_load(pool_c, pool_s, tok, D_c + offs_r, in_range, tl.full((D_r,), True, tl.int1))
+                vr = _fp4_kv_load_bytes(pool_c, pool_s, tok, in_range, D_c, D_r // 2, D_r // 2)
             else:
                 vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
                              mask = in_range[:, None], other = 0.0)
@@ -706,7 +724,7 @@ def _dsa_indexer_kernel(
     else:
         k_rows = offs_n
     if FP4:
-        kt = _fp4_idx_load(k_idx, idx_scales, k_rows, offs_d, valid_n)
+        kt = _fp4_idx_load_t(k_idx, idx_scales, k_rows, valid_n)
     else:
         kt = tl.load(k_idx + k_rows[None, :] * D_i + offs_d[:, None],
                      mask = valid_n[None, :], other = 0.0)
@@ -789,7 +807,7 @@ def _dsa_indexer_fewq_kernel(
     else:
         k_rows = offs_n
     if FP4:
-        kt = _fp4_idx_load(k_idx, idx_scales, k_rows, offs_d, valid_n)
+        kt = _fp4_idx_load_t(k_idx, idx_scales, k_rows, valid_n)
     else:
         kt = tl.load(k_idx + k_rows[None, :] * D_i + offs_d[:, None],
                      mask = valid_n[None, :], other = 0.0)
@@ -1316,7 +1334,9 @@ def dsa_indexer_scores(
             and scores.stride(1) == 1 and scores.stride(0) == S_stride, \
             "dsa_indexer_scores: score backing must be a row-contiguous (>= R, >= T rounded to the tile) view"
     with torch.cuda.device(q_idx.device):
-        if R <= 4:
+        # FP4 keys up to a verify width also take the few-query kernel: it decodes each key tile once,
+        # where the query-tiled kernel's head loop re-decodes it per head
+        if R <= 4 or (idx_scales is not None and R <= 8):
             # Few-query (decode) shape: heads as the MMA M dim, one dot per key tile --
             # the query-tiled kernel degenerates to a serial head loop over padding here
             f_args = (q_idx, weights, k_idx, scores, T, R, q_pos0, bound_max, bt, 0)
