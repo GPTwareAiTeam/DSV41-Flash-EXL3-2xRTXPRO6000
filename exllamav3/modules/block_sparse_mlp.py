@@ -1215,9 +1215,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Count how many assignments per expert. With few enough total assignments no
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused.
+                # scatter_add_ rather than torch.bincount: bincount performs an internal device->host
+                # step, which aborts CUDA graph capture (it broke capture whenever the spec verify
+                # width ran at batch > 1). A scatter_add_ over a zeroed int64 buffer is device-only,
+                # synchronous-free and gives identical counts.
+                expert_count = torch.zeros(E + 1, dtype = torch.int64, device = flat_expert_local.device)
+                expert_count.scatter_add_(0, flat_expert_local,
+                                          torch.ones_like(flat_expert_local, dtype = torch.int64))
+                # An expert receives at most one row per token (top-k picks are distinct), so with
+                # num_tokens <= fused_rows every expert fits the fused kernel too. Eager calls in that
+                # range keep the readback (it picks the row tiles); a graph capture cannot read back
+                # (multi-user verify: 8 users x 6 rows x top-6 = 288 > 256 aborted the capture), so
+                # it takes the all-fused launch
+                if self.fused_mode_buffers is not None and (
+                        num_tokens * top_k <= self.fused_rows or
+                        (num_tokens <= self.fused_rows and torch.cuda.is_current_stream_capturing())):
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
