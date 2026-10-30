@@ -273,6 +273,10 @@ Same tree, fp16 vs FP4 main pools, pinned GEMM tuning, logs under `<artifacts>/f
 | Time to first token, same runs | 8.36 s | 8.34 s |
 | Five planted facts at 10–90% depth, 128k prose / code | 5/5, 5/5 | 5/5, 5/5 (also 5/5 in a 1M cache) |
 | Main cache per token per GPU | 3,200 B | ~890 B |
+| 2 users, total tok/s, ABBA (first run of each kind is cold: 63.1 fp16) | 125.4 | 124.0 / 126.2 |
+| 4 users, total tok/s | — | 125.3 |
+| Prefix cache, 25.8k prompt twice, 256 tokens | — | TTFT 9.55 s → 0.19 s, turn 2 = turn 1 |
+| Server (1M cache), chat + streaming | — | responds |
 
 Kernel times, FP4 / fp16, one GPU at model shapes (24k / 128k pools): prefill attention 1.02 / 1.01, prefill
 indexer 1.04 / 1.01, decode attention 1.04 / 1.02, decode indexer 0.90 / 1.00, verify (6 rows) attention
