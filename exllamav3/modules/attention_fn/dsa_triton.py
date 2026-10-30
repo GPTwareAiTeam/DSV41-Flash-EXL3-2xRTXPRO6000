@@ -934,6 +934,9 @@ _dsa_qc_stage_min_r = int(os.environ.get("EXL3_DSA_QC_STAGE_MIN_R", "64"))
 _dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", str(1 << 20)))
 # FP4 staging decodes this many pool rows per slice (each slice holds a 1 KiB/row fp16 copy briefly)
 _fp4_stage_slice_rows = int(os.environ.get("EXL3_DSA_FP4_STAGE_SLICE", str(1 << 16)))
+# Indexer scoring reads FP4 keys in-kernel even for many-query (prefill) calls instead of unpacking them to fp16 first:
+# same values, no fp16 key copy (128 MiB at a 1M context). 0 = unpack once per call (slightly faster, more memory)
+_dsa_idx_fp4_direct = os.environ.get("EXL3_DSA_IDX_FP4_DIRECT", "1") == "1"
 
 
 def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r):
@@ -1309,7 +1312,8 @@ def dsa_indexer_scores(
     R, H_i, D_i = q_idx.shape
     if scale is None:
         scale = D_i ** -0.5 * H_i ** -0.5
-    if idx_scales is not None and R >= _dsa_qc_stage_min_r and block_table is not None and _dsa_qc_stage:
+    if idx_scales is not None and R >= _dsa_qc_stage_min_r and block_table is not None and _dsa_qc_stage \
+            and not _dsa_idx_fp4_direct:
         # Many queries re-read every key: unpack the job's key pages to fp16 once (exact
         # dsv4_fp4_dequant, same values as the in-kernel decode) and score through the fp16 kernel
         from ...ext import exllamav3_ext as ext
