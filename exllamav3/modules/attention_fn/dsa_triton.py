@@ -937,6 +937,10 @@ _fp4_stage_slice_rows = int(os.environ.get("EXL3_DSA_FP4_STAGE_SLICE", str(1 << 
 # Indexer scoring reads FP4 keys in-kernel even for many-query (prefill) calls instead of unpacking them to fp16 first:
 # same values, no fp16 key copy (128 MiB at a 1M context). 0 = unpack once per call (slightly faster, more memory)
 _dsa_idx_fp4_direct = os.environ.get("EXL3_DSA_IDX_FP4_DIRECT", "1") == "1"
+# Gathered (top-k) FP4 attention decodes the selected entries in-kernel instead of staging the pool window once the
+# window holds more than this many entries (262144 entries = 256 MiB of fp16 staging). Measured, one 2048-row chunk:
+# 131k-entry pool staged 1.0 ms / direct 1.9 ms; 1M-entry pool staged 3.2 ms, 1.23 GiB / direct 2.2 ms, 64 MiB
+_fp4_gather_direct_min = int(os.environ.get("EXL3_DSA_FP4_GATHER_DIRECT_MIN", str(1 << 18)))
 
 
 def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r):
@@ -1077,7 +1081,13 @@ def dsa_attn(
             assert out.shape == out_shape
 
     dummy_i = block_table  # any valid int32 pointer for unused int args
-    if (qc is not None and _dsa_qc_stage and multirow is None and not nc_block
+    # FP4 with a per-row selection (indices): staging unpacks the whole pool window (1 KiB per entry) to read 512
+    # entries per row. Past _fp4_gather_direct_min entries that copy is the largest prefill transient at depth
+    # (1.2 GiB at 1M tokens), and in-kernel decode of just the selected entries is as fast or faster (128-row kv
+    # tile, one stage); below it the staged fp16 kernel is quicker and its window small. Same values either way
+    fp4_gather_direct = (qc is not None and qc[1] == -1 and indices is not None
+                         and pool_len > _fp4_gather_direct_min)
+    if (qc is not None and _dsa_qc_stage and multirow is None and not nc_block and not fp4_gather_direct
             and R >= _dsa_qc_stage_min_r and block_table.shape[0] == 1
             and 0 < pool_len <= _dsa_qc_stage_max_entries):
         pool_c, pool_r, block_table = _stage_packed_pool(
@@ -1267,6 +1277,9 @@ def dsa_attn(
                 )
             return out
 
+    if fp4_gather_direct:
+        # In-kernel FP4 gather: a 128-entry kv tile, one stage, 8 warps (measured fastest, ~1.7x the stock tile)
+        block_n, num_stages, num_warps = 128, 1, 8
     # Head tile, then kv tile, then pipeline depth (smem.py); the stock config leads
     ladder = [(block_h, block_n, num_stages)]
     for ns in range(num_stages, 0, -1):

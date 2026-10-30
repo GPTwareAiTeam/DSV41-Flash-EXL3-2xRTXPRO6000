@@ -19,6 +19,34 @@ def test_fp4_attention(splits):
     torch.testing.assert_close(got, ref, atol=0.002, rtol=0.002)
 
 
+@pytest.mark.parametrize('compress_rate', [1, 2])
+@pytest.mark.parametrize('rows', [1, 6, 512])
+def test_fp4_gathered_direct_matches_staged(monkeypatch, compress_rate, rows):
+    """Top-k (gathered) attention over an FP4 pool: in-kernel decode of the selected entries (the deep-context
+    path) and staging of the whole window must both match the fp16 kernel on the dequantized pool."""
+    import exllamav3.modules.attention_fn.dsa_triton as dt
+    torch.manual_seed(7)
+    epp = 256 // compress_rate
+    entries = 4096
+    pool = torch.randn((entries, 512), device='cuda', dtype=torch.float16)
+    packed, scales = ext.dsv4_fp4_quant(pool, False)
+    decoded = ext.dsv4_fp4_dequant(packed, scales, False)
+    bt = torch.arange(entries // epp, device='cuda', dtype=torch.int32).unsqueeze(0)
+    q = torch.randn((rows, 32, 512), device='cuda', dtype=torch.float16) * 0.1
+    q0 = entries * compress_rate - rows
+    bound = (q0 + torch.arange(rows, device='cuda') + 1) // compress_rate
+    idx = torch.stack([torch.randperm(int(b), device='cuda')[:512].sort().values for b in bound.tolist()]).int()
+    kw = dict(indices=idx, k_len=512, pool_len=entries, q_pos0=q0, compress_rate=compress_rate, page_size=epp)
+    ref = dsa_attn(q, decoded[:, :448].contiguous(), decoded[:, 448:].contiguous(), bt, **kw).clone()
+    rope0 = decoded[:1, 448:].contiguous()
+    monkeypatch.setattr(dt, "_fp4_gather_direct_min", 0)
+    direct = dsa_attn(q, packed, rope0, bt, qc=(scales, -1), **kw).clone()
+    monkeypatch.setattr(dt, "_fp4_gather_direct_min", 1 << 40)
+    staged = dsa_attn(q, packed, rope0, bt, qc=(scales, -1), **kw).clone()
+    torch.testing.assert_close(direct, ref, atol=0.002, rtol=0.002)
+    torch.testing.assert_close(staged, ref, atol=0.002, rtol=0.002)
+
+
 @pytest.mark.parametrize('splits', [1, 8])
 def test_fp4_attention_cuda_graph_matches_eager(splits):
     rows = torch.randn((32, 512), device='cuda', dtype=torch.float16)
