@@ -9,6 +9,11 @@ namespace py = pybind11;
 #include "dsv4_compressor.h"
 #include "../triton_kernel.h"
 
+void dsv4_fp4_index_keys(at::Tensor st, at::Tensor keys, at::Tensor positions,
+                         at::Tensor xh, const at::Tensor& pos_dev, int m, int rope_dim,
+                         const std::shared_ptr<BC_LinearEXL3>& wk, at::Tensor norm,
+                         float eps, at::Tensor inv);
+
 // Whole-attention-step graph for DeepSeek-V4 DSA decode (BC_Attention v2 pattern): x staged
 // via one patched copy2d, then q_a -> q_norm -> q_b / wkv -> fused-norm rope -> compressor
 // BC(s) -> [indexer scoring + capture-safe topk, long-ctx regime] -> AOT split/combine
@@ -62,6 +67,10 @@ struct BC_DSV4Attention
     // per-step fp16 staging rows the compressor emits before quantize + scatter
     c10::optional<at::Tensor> pool_s, pool_stage, h32;
     int pool_bits;
+    c10::optional<at::Tensor> idx_scale, idx_stage;
+    std::shared_ptr<BC_LinearEXL3> idx_wk;
+    c10::optional<at::Tensor> idx_k_norm, idx_inv_compress, idx_pos, idx_xh;
+    float idx_k_eps;
     c10::optional<at::Tensor> idx_buf_kv, idx_buf_gate, idx_ovl, pool_idx;
     at::Tensor pool_bt;          // (1, num_pages) int32 per-job static
     at::Tensor pos_dev;          // (1,) int32 -- shared per (device, job slot)
@@ -133,7 +142,12 @@ struct BC_DSV4Attention
         c10::optional<at::Tensor> _fan_svh = {}, c10::optional<at::Tensor> _fan_n = {},
         c10::optional<at::Tensor> _fan_indices = {},
         c10::optional<at::Tensor> _pool_s = {}, c10::optional<at::Tensor> _pool_stage = {},
-        c10::optional<at::Tensor> _h32 = {}, int _pool_bits = 0
+        c10::optional<at::Tensor> _h32 = {}, int _pool_bits = 0,
+        c10::optional<at::Tensor> _idx_scale = {}, c10::optional<at::Tensor> _idx_stage = {},
+        std::shared_ptr<BC_LinearEXL3> _idx_wk = nullptr,
+        c10::optional<at::Tensor> _idx_k_norm = {}, float _idx_k_eps = 0,
+        c10::optional<at::Tensor> _idx_inv_compress = {}, c10::optional<at::Tensor> _idx_pos = {},
+        c10::optional<at::Tensor> _idx_xh = {}
     ) :
         q_a(_q_a), q_b(_q_b), wkv(_wkv), wo_b(_wo_b), idx_wq_b(_idx_wq_b),
         idx_weights_w(std::move(_idx_weights_w)),
@@ -151,6 +165,9 @@ struct BC_DSV4Attention
         pool_c(std::move(_pool_c)), pool_r(std::move(_pool_r)),
         pool_s(std::move(_pool_s)), pool_stage(std::move(_pool_stage)), h32(std::move(_h32)),
         pool_bits(_pool_bits),
+        idx_scale(std::move(_idx_scale)), idx_stage(std::move(_idx_stage)),
+        idx_wk(_idx_wk), idx_k_norm(std::move(_idx_k_norm)), idx_inv_compress(std::move(_idx_inv_compress)),
+        idx_pos(std::move(_idx_pos)), idx_xh(std::move(_idx_xh)), idx_k_eps(_idx_k_eps),
         idx_buf_kv(std::move(_idx_buf_kv)), idx_buf_gate(std::move(_idx_buf_gate)),
         idx_ovl(std::move(_idx_ovl)), pool_idx(std::move(_pool_idx)),
         pool_bt(std::move(_pool_bt)), pos_dev(std::move(_pos_dev)),
@@ -247,6 +264,10 @@ struct BC_DSV4BatchAttention
     // per-step fp16 staging rows the compressor emits before quantize + scatter
     c10::optional<at::Tensor> pool_s, pool_stage, h32;
     int pool_bits;
+    c10::optional<at::Tensor> idx_scale, idx_stage;
+    std::shared_ptr<BC_LinearEXL3> idx_wk;
+    c10::optional<at::Tensor> idx_k_norm, idx_inv_compress, idx_pos, idx_xh;
+    float idx_k_eps;
     c10::optional<at::Tensor> idx_buf_kv, idx_buf_gate, idx_ovl, pool_idx;
     at::Tensor arr;                                 // (6, MAX_B) int32: pos/floor/beg/ec/slot/klen
     at::Tensor bt_st;                               // (MAX_B, num_pages) int32
@@ -311,7 +332,12 @@ struct BC_DSV4BatchAttention
         c10::optional<at::Tensor> _fan2_indices = {},
         int _fan2_k = 0, bool _fan2_mcg = false, bool _fan2_mul1 = false,
         c10::optional<at::Tensor> _pool_s = {}, c10::optional<at::Tensor> _pool_stage = {},
-        c10::optional<at::Tensor> _h32 = {}, int _pool_bits = 0
+        c10::optional<at::Tensor> _h32 = {}, int _pool_bits = 0,
+        c10::optional<at::Tensor> _idx_scale = {}, c10::optional<at::Tensor> _idx_stage = {},
+        std::shared_ptr<BC_LinearEXL3> _idx_wk = nullptr,
+        c10::optional<at::Tensor> _idx_k_norm = {}, float _idx_k_eps = 0,
+        c10::optional<at::Tensor> _idx_inv_compress = {}, c10::optional<at::Tensor> _idx_pos = {},
+        c10::optional<at::Tensor> _idx_xh = {}
     ) :
         q_b(_q_b), wo_b(_wo_b), idx_wq_b(_idx_wq_b),
         idx_weights_w(std::move(_idx_weights_w)),
@@ -337,6 +363,9 @@ struct BC_DSV4BatchAttention
         pool_c(std::move(_pool_c)), pool_r(std::move(_pool_r)),
         pool_s(std::move(_pool_s)), pool_stage(std::move(_pool_stage)), h32(std::move(_h32)),
         pool_bits(_pool_bits),
+        idx_scale(std::move(_idx_scale)), idx_stage(std::move(_idx_stage)),
+        idx_wk(_idx_wk), idx_k_norm(std::move(_idx_k_norm)), idx_inv_compress(std::move(_idx_inv_compress)),
+        idx_pos(std::move(_idx_pos)), idx_xh(std::move(_idx_xh)), idx_k_eps(_idx_k_eps),
         idx_buf_kv(std::move(_idx_buf_kv)), idx_buf_gate(std::move(_idx_buf_gate)),
         idx_ovl(std::move(_idx_ovl)), pool_idx(std::move(_pool_idx)),
         arr(std::move(_arr)), bt_st(std::move(_bt_st)),

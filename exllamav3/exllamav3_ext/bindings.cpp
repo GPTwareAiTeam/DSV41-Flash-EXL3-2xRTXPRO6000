@@ -131,6 +131,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsv4_pool_quant_scatter", &dsv4_pool_quant_scatter, "dsv4_pool_quant_scatter");
     m.def("dsv4_fp4_quant", &dsv4_fp4_quant, "Pack DeepSeek FP4 rows");
     m.def("dsv4_fp4_dequant", &dsv4_fp4_dequant, "Unpack DeepSeek FP4 rows");
+    m.def("dsv4_fp4_scatter", &dsv4_fp4_scatter, "Scatter DeepSeek FP4 rows");
     m.def("dsv4_pool_scatter", &dsv4_pool_scatter, "dsv4_pool_scatter");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");

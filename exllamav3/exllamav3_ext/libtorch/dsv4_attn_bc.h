@@ -1,3 +1,5 @@
+m.def("dsv4_fp4_index_keys", &dsv4_fp4_index_keys);
+
 py::class_<BC_DSV4Attention, std::shared_ptr<BC_DSV4Attention>>(m, "BC_DSV4Attention").def
 (
     py::init<
@@ -16,7 +18,10 @@ py::class_<BC_DSV4Attention, std::shared_ptr<BC_DSV4Attention>>(m, "BC_DSV4Atten
         int, int, int, int, int, int, int, int, int, int, int, int, int, float, float, int, int,
         c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>,
         c10::optional<at::Tensor>, c10::optional<at::Tensor>,
-        c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, int
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, int,
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>,
+        std::shared_ptr<BC_LinearEXL3>, c10::optional<at::Tensor>, float,
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>
     >()
 )
 .def("needs_configure", &BC_DSV4Attention::needs_configure)
@@ -42,7 +47,10 @@ py::class_<BC_DSV4BatchAttention, std::shared_ptr<BC_DSV4BatchAttention>>(m, "BC
         int, int, int, int, int, int, int, int, int, int, int, int, int, float, float, int, int,
         c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>,
         c10::optional<at::Tensor>, c10::optional<at::Tensor>, int, bool, bool,
-        c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, int
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>, int,
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>,
+        std::shared_ptr<BC_LinearEXL3>, c10::optional<at::Tensor>, float,
+        c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>
     >()
 )
 .def("needs_configure", &BC_DSV4BatchAttention::needs_configure)
