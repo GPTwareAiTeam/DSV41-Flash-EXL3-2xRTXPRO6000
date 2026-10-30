@@ -595,8 +595,9 @@ class DSV4Compressor:
 
 class DSV4Attention(Module):
 
-    # Query rows per indexer score slab
-    SCORE_SLAB = 256
+    # Query rows per indexer score slab: the slab's score matrix is rows x context entries, the largest prefill
+    # transient past ~300k tokens. 128 rows: 256 MiB at a 1M context (640 at 256 rows), +1.6% prefill time at 131k
+    SCORE_SLAB = int(os.environ.get("EXL3_DSV4_SCORE_SLAB", "128"))
 
     def __init__(
         self,
