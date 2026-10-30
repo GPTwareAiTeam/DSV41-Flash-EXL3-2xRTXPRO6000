@@ -42,8 +42,8 @@ prompt in a 1M cache peaks at 93.23 GiB of 94.97 per GPU with a 2048-row prefill
 - **Verify steps score every row's candidate entries in one launch.** The candidate-block indexer layers scored
   each verify row in its own Python iteration (key gather, launch, two fills per row); the few-query indexer
   kernel now reads each row's pool rows through the entry map the compaction kernel already builds. Bit-identical
-  scores; scoring at 6 rows 537 → 23 µs (FP4, 8192 entries). Removes most of the GPU idle time measured on those
-  layers in verify; the full-model decode gain is not yet measured.
+  scores; scoring at 6 rows 537 → 23 µs (FP4, 8192 entries). Full model, 26.9k-token prompt, 512 new tokens,
+  3 ABBA pairs: decode 4.57 → 4.44 ms per token (+2.6% tok/s), token-identical in all 12 runs.
 
 ### Fixed
 
