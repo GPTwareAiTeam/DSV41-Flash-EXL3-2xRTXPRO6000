@@ -70,6 +70,12 @@ invocation.
 | `CHUNK_PEAK_REF_TOKENS` | `33536` | KV token count at which the table was sampled; the table is re-based to your KV budget. |
 | `VRAM_RESERVE_MIB` | `2048` | Kept free for graphs, workspaces and allocator slack. |
 | `DSPARK_RESERVE_MIB` | `2048` | Extra reserve when `DSPARK=1`: an 8192-row chunk with a long-context drafter exceeded the device by ~640 MiB. Empirical, not a guarantee. |
+| `PREFILL_ADAPTIVE` | `1` | Before every prefill chunk, read free memory once and solve the peak model below for the largest chunk (whole 256-row pages, at most the planned `MAX_CHUNK`) that leaves `PREFILL_MARGIN_MIB` free on the card; both ranks take the minimum. Only ever shortens a chunk. ~0.57 ms per chunk. `0` = fixed chunks. |
+| `PREFILL_MARGIN_MIB` | `1024` | Card memory left free at the predicted peak. |
+| `PREFILL_ROW_KIB` | `382` | Peak model: activation memory per prefill row (measured, flat in depth). |
+| `PREFILL_DEPTH_BASE_MIB`, `PREFILL_DEPTH_BYTES` | `461`, `1280` | Peak model: the depth term (uncompressed pool layer's fp16 staging window + indexer score slab) is `461 MiB + 1280 B × (chunk end position)` at 2048 rows, and dominates past ~300k tokens. The rise is `max(row term, depth term)`. Fitted to 598 chunks of an 876k-token prefill, FP4 KV. |
+| `PREFILL_FRAG` | `0` | Share of torch's held-but-free memory not counted as usable (expandable segments make it reusable). |
+| `PREFILL_ADAPTIVE_LOG` | `0` | `1` logs each chunk's decision, measured rise vs prediction, and rows/s. |
 
 ## Speculative decoding (DSpark)
 

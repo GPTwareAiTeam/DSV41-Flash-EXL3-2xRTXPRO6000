@@ -12,6 +12,12 @@
   and time to first token 8.34 vs 8.36 s at 24k (4 ABBA pairs); 5/5 planted facts at 128k in prose and code,
   same as 16-bit; repeat- and rank-identical. Output differs from 16-bit (lossy by design).
 - **`MEM_BREAKDOWN=1`** logs per-GPU resident GiB by owner after load and the peak since load.
+- **Adaptive prefill chunk (`PREFILL_ADAPTIVE=1`, default).** Before every prefill chunk the runner reads free
+  memory once and solves a measured peak model (activations per row; a depth term for the uncompressed pool
+  layer's staging window and the indexer score slab) for the largest chunk that leaves 1 GiB free, capped at
+  `MAX_CHUNK`. Only ever shortens a chunk; ~0.57 ms per decision; both ranks agree. An 876k-token prompt with
+  planned 8192-row chunks completes (6,656 → 3,328 rows as depth grows); short prompts keep full chunks and
+  identical output. Larger `MAX_CHUNK` is now safe to request.
 
 With the drafter ring below, both together: 1M-token context fits (cache 0.87 GiB per GPU); a 131k-token
 prompt in a 1M cache peaks at 93.23 GiB of 94.97 per GPU with a 2048-row prefill chunk and 94.34 GiB with 4096.
@@ -32,6 +38,15 @@ prompt in a 1M cache peaks at 93.23 GiB of 94.97 per GPU with a 2048-row prefill
 - Token-identity comparisons between two builds must pin the GEMM autotuner's choices
   (`EXLLAMAV3_TUNE_CACHE` pointing at copies of one tuning file): each container tunes its own kernels, and
   different picks alone change the numerics enough to flip greedy tokens a few hundred tokens in.
+- Prefill-sized staging and attention-output buffers in `DSV4Attention._forward_cached_one` were kept for the life
+  of the process, one copy per distinct chunk size (~200 MiB each): varying chunk sizes ran the card out of memory.
+  They now come from the caching allocator; decode-sized buffers stay kept for graph capture.
+- FP4 prefill staging decodes in slices instead of a full 512-wide copy on top of the fp16 windows.
+
+### Known issues
+
+- With `KV_BITS=4`, output can differ between prefill chunk sizes at near-tied tokens (top-2 logit gap ~0.05);
+  16-bit KV is chunk-invariant.
 
 ## v1.0.0 — 2026-10-29
 

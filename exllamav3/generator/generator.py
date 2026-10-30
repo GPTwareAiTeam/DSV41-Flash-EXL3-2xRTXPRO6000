@@ -338,6 +338,11 @@ class Generator:
         self.shared_chunk_size = shared_chunk_size
         self.prefill_cooldown = prefill_cooldown
         self.prefill_cooldown_left = 0
+        # Optional per-pass chunk limiter: callable(prefill_start: int, chunk: int) -> int (a multiple of the
+        # page size, at most chunk). Called before every prefill forward with the position the chunk starts
+        # at; lets the runtime shrink chunks as the context deepens (memory headroom). Both TP ranks must
+        # return the same value. None keeps fixed chunks
+        self.prefill_chunk_limit = None
         self.prefill_rotation = 0
 
         # Job queues
