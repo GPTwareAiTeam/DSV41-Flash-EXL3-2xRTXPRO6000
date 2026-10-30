@@ -932,6 +932,8 @@ def _dsa_pool_expand_kernel(
 _dsa_qc_stage = os.environ.get("EXL3_DSA_QC_STAGE", "1") != "0"
 _dsa_qc_stage_min_r = int(os.environ.get("EXL3_DSA_QC_STAGE_MIN_R", "64"))
 _dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", str(1 << 20)))
+# FP4 staging decodes this many pool rows per slice (each slice holds a 1 KiB/row fp16 copy briefly)
+_fp4_stage_slice_rows = int(os.environ.get("EXL3_DSA_FP4_STAGE_SLICE", str(1 << 16)))
 
 
 def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r):
@@ -945,10 +947,19 @@ def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c
     pages = block_table[0, :npw].long()
     n_rows = npw * page_size
     if bits == -1:
-        rows = ext.dsv4_fp4_dequant(pool_c.reshape(-1, page_size, 256)[pages].view(-1, 256),
-                                    pool_s.reshape(-1, page_size, 32)[pages].view(-1, 32), False)
-        pc = rows[:, :D_c].contiguous().view(npw, page_size, D_c)
-        pr = rows[:, D_c:].contiguous().view(npw, page_size, D_r)
+        # Decode into the two fp16 windows a slice of pages at a time: the transient is the windows
+        # (pool_len * 1 KiB) plus one slice, not a full 512-wide copy on top of them
+        pc = torch.empty((npw, page_size, D_c), dtype = torch.half, device = pool_c.device)
+        pr = torch.empty((npw, page_size, D_r), dtype = torch.half, device = pool_c.device)
+        packed = pool_c.reshape(-1, page_size, 256)
+        scales = pool_s.reshape(-1, page_size, 32)
+        step = max(1, _fp4_stage_slice_rows // page_size)
+        for a in range(0, npw, step):
+            b = min(npw, a + step)
+            pg = pages[a:b]
+            rows = ext.dsv4_fp4_dequant(packed[pg].view(-1, 256), scales[pg].view(-1, 32), False)
+            pc[a:b].view(-1, D_c).copy_(rows[:, :D_c])
+            pr[a:b].view(-1, D_r).copy_(rows[:, D_c:])
         bt = torch.arange(npw, dtype = torch.int32, device = pool_c.device).unsqueeze(0)
         return pc, pr, bt
     G = D_c // 32

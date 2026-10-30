@@ -2615,12 +2615,15 @@ class DSV4Attention(Module):
             # compress kernels directly
             fp4 = kl.kv_format == "fp4"
             pool_r_flat = None if fp4 else kl.pool_r.view(-1, kl.D_r)
-            idx_stage = (g_tensor_cache.get(device, (seq // m + 1, kl.D_i), torch.half, "dsv4_idx_stage")
-                         if fp4 and self.layer_type == "csa" else None)
+            # Kept (graph-safe) only at decode-class row counts: a prefill-sized entry keyed by its exact shape
+            # would pin one copy per distinct chunk size for the life of the process
+            idx_stage = (g_tensor_cache.get_scratch(device, (seq // m + 1) * kl.D_i, torch.half, "dsv4_idx_stage", seq)
+                         .view(seq // m + 1, kl.D_i) if fp4 and self.layer_type == "csa" else None)
             if kl.quant or fp4 or self.idx_wk is not None:
                 # Packed pool: compress into transient staging rows (this step's entries),
                 # then quantize + scatter through the block table
-                stage = g_tensor_cache.get(device, (seq // m + 1, self.head_dim), torch.half, "dsv4_stage")
+                stage = g_tensor_cache.get_scratch(device, (seq // m + 1) * self.head_dim, torch.half, "dsv4_stage",
+                                                   seq).view(seq // m + 1, self.head_dim)
                 dest_a, dest_b, dbt, depp, rel = stage, None, None, 0, True
             else:
                 dest_a, dest_b, dbt, depp, rel = kl.pool_c.view(-1, kl.D_c), pool_r_flat, bt_row, epp, False
@@ -2720,7 +2723,8 @@ class DSV4Attention(Module):
             compress_rate = dense_m, scale = self.sm_scale,
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
             page_size = epp, qc = qc,
-            out = g_tensor_cache.get(device, (self.o_groups, seq, hpg * self.head_dim), torch.half, "dsv4_attn_out"),
+            out = g_tensor_cache.get_scratch(device, self.o_groups * seq * hpg * self.head_dim, torch.half,
+                                             "dsv4_attn_out", seq).view(self.o_groups, seq, hpg * self.head_dim),
             # Image chunk (vision): bidirectional over the chunk, own window into history
             nc_chunk = bool(params.get("nc_chunk", False)),
         )

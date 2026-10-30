@@ -1452,6 +1452,13 @@ class Job:
             # window above, so a job resuming a cached prompt still walks it at the usual rate
             if chunk_size is not None:
                 prefill_end = min(prefill_end, (prefill_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
+            # Depth-aware limit (memory headroom): it only ever shortens a chunk, to a whole number of pages from
+            # prefill_start (at least one); a chunk already shorter than that (the prompt's tail) is left as is
+            limit = self.generator.prefill_chunk_limit
+            if limit is not None and prefill_end - prefill_start > PAGE_SIZE:
+                allowed = limit(prefill_start, prefill_end - prefill_start)
+                if allowed < prefill_end - prefill_start:
+                    prefill_end = prefill_start + max(PAGE_SIZE, allowed // PAGE_SIZE * PAGE_SIZE)
 
             if prefill_end <= prefill_start:
                 continue
@@ -1677,6 +1684,11 @@ class Job:
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
                     seq.prefill_complete = True
+                    # Prefill's freed chunk buffers stay in torch's general pool, but the decode step's CUDA
+                    # graphs allocate from their own pool and need memory the card still has free
+                    done = getattr(self.generator.prefill_chunk_limit, "prefill_done", None)
+                    if done is not None:
+                        done()
 
                 if recurrent_last_page:
                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)

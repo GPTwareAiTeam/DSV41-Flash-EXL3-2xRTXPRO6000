@@ -33,6 +33,7 @@ from encoding import encode_messages  # noqa: E402
 
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer  # noqa: E402
 from exllamav3 import CacheLayer_quant  # noqa: E402
+from exllamav3.constants import PAGE_SIZE  # noqa: E402
 from exllamav3.generator.generator import _DRAFT_HIST  # noqa: E402
 from exllamav3.modules.transformer import TransformerBlock  # noqa: E402
 from exllamav3.tp2.p2p import ARENA_MAXB  # noqa: E402
@@ -143,6 +144,106 @@ def resolve_max_chunk(device):
     chunk = fits[0] if fits else CHUNK_MIN
     return chunk, dict(total_mib = total_mib, kv_mib = kv_mib, kv_ref_mib = kv_ref_mib, limit_mib = limit,
                        peak_mib = _peak_mib(chunk), free_mib = _free / (1024 * 1024))
+
+# --- adaptive prefill chunk (depth-aware OOM guard) ---------------------------------------------------------------
+# A prefill chunk's transient (peak over the steady allocation) is the larger of two terms, fitted to 598 measured
+# chunks of a 876k-token prefill (FP4 KV, 1M cache): activations, ~382 KiB per row, flat in depth; and a depth term
+# that takes over past ~300k tokens (the uncompressed pool layer's fp16 staging window and the indexer score
+# slab): ~461 MiB + 1280 B per context token at 2048 rows, plus the row term for rows beyond 2048. A fixed chunk
+# that fits a shallow prompt can therefore run out of memory deep into a long one. Before every prefill forward
+# the limiter reads free memory once and solves both terms for the largest page-aligned chunk that fits under a
+# small safety margin, capped at the planned chunk; both ranks take the minimum.
+PREFILL_ADAPTIVE = os.environ.get("PREFILL_ADAPTIVE", "1") == "1"
+PREFILL_ROW_BYTES = float(os.environ.get("PREFILL_ROW_KIB", "382")) * 2**10        # activations per prefill row
+PREFILL_DEPTH_BASE = float(os.environ.get("PREFILL_DEPTH_BASE_MIB", "461")) * 2**20
+PREFILL_DEPTH_BYTES = float(os.environ.get("PREFILL_DEPTH_BYTES", "1280"))          # per context token
+PREFILL_DEPTH_ROWS = 2048                                                            # rows the depth term was fit at
+# Safety cushion left free on the card at the predicted peak. Torch's held-but-free memory counts as usable
+# (expandable segments let any freed block serve any later shape); PREFILL_FRAG > 0 discounts that share of it
+PREFILL_MARGIN_MIB = float(os.environ.get("PREFILL_MARGIN_MIB", "1024"))
+PREFILL_FRAG = float(os.environ.get("PREFILL_FRAG", "0"))
+PREFILL_ADAPTIVE_LOG = os.environ.get("PREFILL_ADAPTIVE_LOG", "0") == "1"
+
+
+def prefill_rise(start, rows):
+    """Predicted transient bytes over the steady allocation for a chunk of `rows` starting at `start`."""
+    deep = PREFILL_DEPTH_BASE + PREFILL_DEPTH_BYTES * (start + rows) + PREFILL_ROW_BYTES * max(0, rows - PREFILL_DEPTH_ROWS)
+    return max(PREFILL_ROW_BYTES * rows, deep)
+
+
+def prefill_fit(start, room):
+    """Largest row count whose prefill_rise at `start` is <= room: the minimum of each term solved for rows."""
+    by_rows = room / PREFILL_ROW_BYTES
+    by_depth_lo = (room - PREFILL_DEPTH_BASE - PREFILL_DEPTH_BYTES * start) / PREFILL_DEPTH_BYTES   # rows <= 2048
+    by_depth = by_depth_lo if by_depth_lo <= PREFILL_DEPTH_ROWS else \
+        (room - PREFILL_DEPTH_BASE - PREFILL_DEPTH_BYTES * start + PREFILL_ROW_BYTES * PREFILL_DEPTH_ROWS) \
+        / (PREFILL_DEPTH_BYTES + PREFILL_ROW_BYTES)
+    return min(by_rows, by_depth)
+
+
+class PrefillChunkLimiter:
+    """Generator.prefill_chunk_limit: one free-memory read and one solve per prefill chunk for the largest
+    page-aligned chunk that fits (at most the planned chunk, at least one page), agreed (MIN) across ranks. Keeps
+    the highest per-chunk allocator peak it has seen (it resets torch's peak counter per chunk to measure each),
+    and the time each decision takes."""
+
+    def __init__(self, device):
+        self.device = device
+        self.agree = torch.zeros(1, dtype = torch.int32, device = device)
+        self.prev = None
+        self.peak = 0
+        self.shrunk = 0
+        self.decide_us = []
+
+    def __call__(self, start: int, chunk: int) -> int:
+        t0 = time.perf_counter()
+        dev = self.device
+        alloc = torch.cuda.memory_allocated(dev)
+        peak = torch.cuda.max_memory_allocated(dev)
+        self.peak = max(self.peak, peak)
+        if PREFILL_ADAPTIVE_LOG and self.prev is not None:
+            p_start, p_rows, p_alloc, p_t = self.prev
+            dt = t0 - p_t
+            log(f"PREFILL_CHUNK_PEAK start={p_start} rows={p_rows} rise_MiB={(peak - p_alloc) / 2**20:.0f} "
+                f"predicted_MiB={prefill_rise(p_start, p_rows) / 2**20:.0f} ms={dt * 1e3:.0f} "
+                f"rows_per_s={p_rows / dt:.0f}")
+        torch.cuda.reset_peak_memory_stats(dev)
+        # The cushion is kept on the card, not inside torch's pool: torch's caching allocator holds freed blocks
+        # (reserved - allocated) that a larger chunk cannot always reuse, so count only memory the card still
+        # has free plus what torch can hand back, less the cushion
+        free, _ = torch.cuda.mem_get_info(dev)
+        reserved = torch.cuda.memory_reserved(dev)
+        room = free + reserved - alloc - PREFILL_MARGIN_MIB * 2**20 - (reserved - alloc) * PREFILL_FRAG
+        rows = max(PAGE_SIZE, min(chunk, int(prefill_fit(start, room)) // PAGE_SIZE * PAGE_SIZE))
+        self.agree.fill_(rows)
+        dist.all_reduce(self.agree, op = dist.ReduceOp.MIN)
+        rows = int(self.agree.item())
+        self.decide_us.append((time.perf_counter() - t0) * 1e6)
+        if rows < chunk or PREFILL_ADAPTIVE_LOG:
+            self.shrunk += rows < chunk
+            if PREFILL_ADAPTIVE_LOG:
+                total = torch.cuda.mem_get_info(dev)[1]
+                log(f"PREFILL_CHUNK_ADAPT start={start} planned={chunk} rows={rows} room_MiB={room / 2**20:.0f} "
+                    f"free_MiB={free / 2**20:.0f} reserved_MiB={reserved / 2**20:.0f} alloc_MiB={alloc / 2**20:.0f} "
+                    f"non_torch_MiB={(total - free - reserved) / 2**20:.0f}")
+        self.prev = (start, rows, alloc, time.perf_counter())
+        return rows
+
+    def prefill_done(self):
+        """A prompt's prefill finished: record its last chunk's peak, then hand torch's held-but-free blocks back
+        to the card. Prefill chunks free their transients into torch's general pool, while decode captures its
+        CUDA graphs from a separate pool that can only grow into memory the card still has free; without this the
+        first decode capture after a prefill that used big chunks finds the card full. Called once per prompt."""
+        dev = self.device
+        self.peak = max(self.peak, torch.cuda.max_memory_allocated(dev))
+        if PREFILL_ADAPTIVE_LOG and self.prev is not None:
+            p_start, p_rows, p_alloc, p_t = self.prev
+            dt = time.perf_counter() - p_t
+            log(f"PREFILL_CHUNK_PEAK start={p_start} rows={p_rows} "
+                f"rise_MiB={(torch.cuda.max_memory_allocated(dev) - p_alloc) / 2**20:.0f} "
+                f"predicted_MiB={prefill_rise(p_start, p_rows) / 2**20:.0f} ms={dt * 1e3:.0f} rows_per_s={p_rows / dt:.0f}")
+        self.prev = None
+        torch.cuda.empty_cache()
 
 PROMPTS = [
     "The capital of France is",
@@ -573,6 +674,8 @@ def main():
         log(f"DRAFT_K requested={NUM_DRAFT} effective={generator.num_draft_tokens} "
             f"block={generator.max_draft_size} "
             f"clamped={'yes' if generator.num_draft_tokens != NUM_DRAFT else 'no'}")
+    chunk_limiter = PrefillChunkLimiter(device) if PREFILL_ADAPTIVE else None
+    generator.prefill_chunk_limit = chunk_limiter
     if MEM_BREAKDOWN:
         # Resident memory by owner after load (target + drafter + caches + generator statics), before any job
         from exllamav3.util.memory import vram_accounting
@@ -874,10 +977,15 @@ def main():
                     f"target_ms={target_ms:.3f} host_ms={wall_ms - draft_ms - target_ms:.3f} "
                     f"draft_wait_ms={draft_wait:.3f} target_wait_ms={target_wait:.3f} "
                     f"draft_py_ms={draft_host:.3f} target_py_ms={target_host:.3f}")
-    log(f"MEM max_alloc_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f}")
+    run_peak = max(torch.cuda.max_memory_allocated(device), chunk_limiter.peak if chunk_limiter else 0)
+    log(f"MEM max_alloc_GiB={run_peak / 2**30:.2f}")
+    if chunk_limiter is not None and chunk_limiter.decide_us:
+        us = sorted(chunk_limiter.decide_us)
+        log(f"PREFILL_ADAPTIVE chunks={len(us)} shrunk_chunks={chunk_limiter.shrunk} "
+            f"decide_us_median={us[len(us) // 2]:.0f} decide_us_max={us[-1]:.0f}")
     if MEM_BREAKDOWN:
         g = 2 ** 30
-        log(f"MEMB peak_since_load allocated={torch.cuda.max_memory_allocated(device) / g:.3f} "
+        log(f"MEMB peak_since_load allocated={run_peak / g:.3f} "
             f"reserved={torch.cuda.max_memory_reserved(device) / g:.3f} "
             f"device_used_now={(torch.cuda.mem_get_info(device)[1] - torch.cuda.mem_get_info(device)[0]) / g:.3f}")
     if LOGITS_OUT:

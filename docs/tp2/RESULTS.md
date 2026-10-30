@@ -306,6 +306,43 @@ Peak during a request (reserved = PyTorch pool; card = whole device, read at end
 Card used ≈ loaded reserved + rise + ~1.7 GiB outside PyTorch. A 4096-row chunk at 1M leaves ~0.6 GiB of the
 94.97 GiB card; 2048 rows leave ~1.7 GiB at a ~12% longer time to first token (54.6 vs 47.9 s at 131k).
 
+### 9c. Prefill chunk size and the adaptive chunk limiter
+
+Fixed chunks (FP4 KV, 1M cache, `PREFILL_ADAPTIVE=0`), time to first token / prefill rate / card used at peak:
+
+| Chunk | 26.9k prompt | 131k prompt | Card used |
+|---|---|---|---|
+| 1024 | 11.32 s, 2,375 tok/s | 66.5 s, 1,974 tok/s | 92.65–92.80 GiB |
+| 2048 | 9.36 s, 2,872 tok/s | 54.9 s, 2,392 tok/s | 93.23–93.27 GiB |
+| 4096 | 8.24 s, 3,262 tok/s | 47.8 s, 2,746 tok/s | 94.19–94.34 GiB |
+
+A chunk's transient grows with its depth as well as its rows (the uncompressed pool layer's fp16 staging window
+and the indexer score slab: ~1.25 KiB per context token past ~300k), so a chunk that fits a shallow prompt can run
+out of memory deep in a long one. `PREFILL_ADAPTIVE=1` (default) reads free memory once per chunk and solves for
+the largest chunk (whole pages, at most `MAX_CHUNK`) that leaves 1 GiB free; ~0.57 ms per decision. ABBA at host
+load ≤ 3.7, 26.9k prompt, all six runs token-identical:
+
+| Setting | Time to first token | Peak reserved |
+|---|---|---|
+| Fixed 4096 | 8.20 / 8.34 s | 92.36 GiB |
+| Adaptive, planned 4096 (never shrank) | 8.30 / 8.36 s | 92.29 GiB |
+| Adaptive, planned 8192 (5,120–6,656 rows used) | 8.14 / 8.15 s | 92.90 GiB |
+
+876k-token prompt, adaptive, planned 8192: 369 chunks, 6,656 rows shrinking to 3,328 by the end, prediction never
+more than 66 MiB under the measured rise; time to first token 390.6 s (2,243 tok/s), peak 92.97 GiB reserved, decode
+6.43 ms/token, both planted facts (10% and 90% depth) answered. Odd chunk sizes cost no per-row speed (3,584-row
+chunks 3,200–3,330 rows/s against 3,300–3,390 for 4096).
+
+Two fixes came with it: per-shape staging/output buffers in `DSV4Attention._forward_cached_one` were kept for the
+life of the process (one copy per distinct chunk size, ~200 MiB each); prefill-sized ones now go through the
+caching allocator (`g_tensor_cache.get_scratch`), decode-sized ones stay kept for graph capture. And held prefill
+memory is returned to the card when a prompt's prefill ends, since decode captures its graphs from a separate pool.
+
+With `KV_BITS=4`, output can differ between chunk sizes where the top two candidates are nearly tied: on the
+26.9k prompt the second token's top-2 logit gap is 0.047 at chunks 1024 and 2048 (different winners) against
+0.89–1.34 with 16-bit KV, which is token-identical across 1024 / 2048 / 4096. The limiter itself adds no
+difference: adaptive runs are token-identical to a fixed chunk of the same size.
+
 ## 10. What this is and is not
 
 - **Is:** a true TP=2 runtime for a 2.565 bpw mixed-bitrate EXL3 checkpoint of a 100B-class MoE model, fitting

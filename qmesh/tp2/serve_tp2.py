@@ -112,6 +112,7 @@ def setup():
                           draft_confidence=tp.DSPARK_TARGET_ACC,
                           record_draft_stats=tp.DSPARK and (tp.DSPARK_DYNAMIC or tp.DSPARK_POLICY == "auto"))
     generator.prefix_cache_min_match = tp.PREFIX_CACHE_MIN_MATCH if tp.PREFIX_CACHE else None
+    generator.prefill_chunk_limit = tp.PrefillChunkLimiter(device) if tp.PREFILL_ADAPTIVE else None
     generator.observe_draft_confidence = tp.DSPARK_POLICY == "auto"
     generator.count_draft_forwards = tp.DSPARK_COUNT_FORWARDS
     generator.draft_forward_count = 0
