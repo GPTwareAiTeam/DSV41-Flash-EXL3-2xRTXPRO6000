@@ -95,7 +95,9 @@ WikiText-2 windows: 2.1820 / 2.1827 / 2.1827, ±0.025).
 
 - 2 × NVIDIA RTX PRO 6000 Blackwell (96 GB), PCIe peer-to-peer, one NUMA node. Needs `sm_120a`.
 - Python ≥ 3.10, PyTorch with CUDA 12.8+ and `sm_120a`, the CUDA toolkit, `ninja`, `gcc`.
-- About 87–91 GiB per GPU for weights, drafter and graphs; the rest is KV cache (16-bit KV by default).
+- About 87–91 GiB per GPU for weights, drafter and graphs; the rest is KV cache (16-bit KV by default). The KV
+  cache costs 3,200 bytes per token per GPU; the drafter keeps only a small fixed window per user, independent of
+  context length.
 
 Install the way you install upstream — the extension builds on first import:
 
@@ -155,8 +157,8 @@ Add `CTX_TOKENS=131072` for long context or `BATCH=4` for concurrent streams. Ev
 - 8 concurrent users with speculation do not run: out of memory at 16k KV per user, and a drafter graph-capture
   failure at 8k per user. 8 users without speculation run.
 - Little VRAM is spare. At the default 4096-row prefill chunk (1 user, 32k context, speculation on) a 24k prompt
-  still runs with 0.75 GiB per GPU taken by another process and fails at 1.25 GiB. With `MAX_CHUNK=2048` it runs
-  with 2.25 GiB taken (the most tested), at a cost in prefill speed.
+  still runs with 1.42 GiB per GPU used by another process and fails at 1.92 GiB. With `MAX_CHUNK=2048` it runs
+  with 2.92 GiB used (the most tested), at a cost in prefill speed.
 - K=7 speculation needs a block-7 drafter head (only diffbot's exists) and does not beat K=5 on our test set;
   parked for v2 (see `docs/tp2/notes/`).
 
