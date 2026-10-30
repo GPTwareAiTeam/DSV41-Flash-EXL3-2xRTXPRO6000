@@ -124,6 +124,16 @@ def _dsv4_dump(tag, layer, pos, ec, m, tensors, kl, bt_row):
         return
     import os as _os
     d = {k: v.detach().float().cpu().clone() for k, v in tensors.items() if v is not None}
+    if kl is not None and kl.kv_format == "fp4" and ec > 0 and bt_row is not None:
+        e = torch.arange(ec, device = kl.pool_fp4.device)
+        ri = bt_row[0, e // kl.epp].long() * kl.epp + e % kl.epp
+        lat = ext.dsv4_fp4_dequant(kl.pool_fp4.view(-1, 256)[ri].contiguous(),
+                                    kl.pool_fp4_scale.view(-1, 32)[ri].contiguous(), False)
+        d["pool_c"] = lat[:, :kl.D_c].float().cpu()
+        d["pool_r"] = lat[:, kl.D_c:].float().cpu()
+        if kl.D_i:
+            d["pool_idx"] = ext.dsv4_fp4_dequant(kl.pool_idx_fp4.view(-1, 64)[ri].contiguous(),
+                                                kl.pool_idx_scale.view(-1, 4)[ri].contiguous(), True).float().cpu()
     if kl is not None and kl.pool_r is not None and ec > 0 and bt_row is not None:
         epp = kl.epp
         e = torch.arange(ec, device = kl.pool_r.device)
@@ -223,11 +233,20 @@ def _pdup(tag, layer, pos, width, tensors, pool = None, selection = None):
         kl, bt, live = pool
         ids = torch.arange(int(live), device = bt.device)
         rows = bt.reshape(-1)[ids // kl.epp].long() * kl.epp + ids % kl.epp
-        if kl.pool_idx is not None:
-            d["pool_idx"] = kl.pool_idx.view(-1, kl.D_i)[rows].detach().to("cpu", copy = True)
-        d["pool_r"] = kl.pool_r.view(-1, kl.D_r)[rows].detach().to("cpu", copy = True)
-        if getattr(kl, "pool_c", None) is not None:
-            d["pool_c"] = kl.pool_c.view(-1, kl.D_c)[rows].detach().to("cpu", copy = True)
+        if kl.kv_format == "fp4":
+            lat = ext.dsv4_fp4_dequant(kl.pool_fp4.view(-1, 256)[rows].contiguous(),
+                                        kl.pool_fp4_scale.view(-1, 32)[rows].contiguous(), False)
+            d["pool_c"] = lat[:, :kl.D_c].cpu()
+            d["pool_r"] = lat[:, kl.D_c:].cpu()
+            if kl.pool_idx_fp4 is not None:
+                d["pool_idx"] = ext.dsv4_fp4_dequant(kl.pool_idx_fp4.view(-1, 64)[rows].contiguous(),
+                                                    kl.pool_idx_scale.view(-1, 4)[rows].contiguous(), True).cpu()
+        else:
+            if kl.pool_idx is not None:
+                d["pool_idx"] = kl.pool_idx.view(-1, kl.D_i)[rows].detach().to("cpu", copy = True)
+            d["pool_r"] = kl.pool_r.view(-1, kl.D_r)[rows].detach().to("cpu", copy = True)
+            if kl.pool_c is not None:
+                d["pool_c"] = kl.pool_c.view(-1, kl.D_c)[rows].detach().to("cpu", copy = True)
     rank = int(os.environ.get("RANK", "0"))
     path = f"{out_dir}/r{rank}s{pos}_L{layer}_{tag}.pt"
     torch.save(d, path)
@@ -867,8 +886,13 @@ class DSV4Attention(Module):
     def cache_layer_type(self, default, kwargs: dict):
         """DSA pools are always CacheLayer_dsa; a quantized Cache request packs the pool's
         nope part at k_bits (the rope part and indexer keys stay fp16). Falls back to fp16
-        pools when the nope width is not a multiple of 32."""
+        pools when the nope width is not a multiple of 32. kv_format="fp4" stores whole
+        latent rows and indexer keys in DeepSeek's trained FP4 format instead."""
         from ..cache import CacheLayer_quant
+        kv_format = kwargs.get("kv_format", "fp16")
+        if kv_format != "fp16":
+            assert not issubclass(default, CacheLayer_quant), "kv_format and k_bits cannot be combined"
+            return CacheLayer_dsa, {"kv_format": kv_format}
         if issubclass(default, CacheLayer_quant) and (self.head_dim - self.rope_head_dim) % 32 == 0:
             return CacheLayer_dsa, {"k_bits": kwargs["k_bits"], "v_bits": kwargs.get("v_bits")}
         return CacheLayer_dsa, {}
@@ -1521,6 +1545,7 @@ class DSV4Attention(Module):
         block_table = None,
         epp = 0,
         shared = None,
+        idx_scales = None,
     ):
         """Lightning-indexer scoring + top-k selection over the indexer key pool (ec valid
         rows). The indexer query rope uses the compress table at the query positions == this
@@ -1598,6 +1623,7 @@ class DSV4Attention(Module):
                         s_i = dsa_indexer_scores(q_idx[0, r0 + i:r0 + i + 1], wts[0, r0 + i:r0 + i + 1],
                                                  idx_pool[rows_ent[i]],
                                                  cap * self.compress_rate, self.compress_rate, cap,
+                                                 idx_scales = idx_scales[rows_ent[i]].contiguous() if idx_scales is not None else None,
                                                  scores = scores[i:i + 1])
                         s_i.masked_fill_(ent[i] >= vis[i], ninf)
                         s_i.masked_fill_(ent[i] < 0, ninf)
@@ -1615,7 +1641,8 @@ class DSV4Attention(Module):
                 ent = ent[ent < ec]
                 rows = ent if block_table is None else block_table.reshape(-1)[ent // epp].long() * epp + ent % epp
                 scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool[rows], ent.numel() * self.compress_rate,
-                                            self.compress_rate, ent.numel())
+                                            self.compress_rate, ent.numel(),
+                                            idx_scales = idx_scales[rows].contiguous() if idx_scales is not None else None)
                 scores.masked_fill_(drop[:, ent // bs], ninf)
                 scores.masked_fill_(ent >= vis[:, None], ninf)
                 ext.dsa_topk(scores, sel, min(k, ent.numel()), None, 0)
@@ -1625,7 +1652,7 @@ class DSV4Attention(Module):
                     selection = (self.compress_rate, bs))
                 return
             scores = dsa_indexer_scores(q_idx[0, r0:r1], wts[0, r0:r1], idx_pool, pos0 + r0, self.compress_rate, ec,
-                                        block_table = block_table, epp = epp)
+                                        block_table = block_table, epp = epp, idx_scales = idx_scales)
             if mode == "source":
                 nf = ec // bs
                 full, tail = scores[:, :nf * bs].unflatten(1, (nf, bs)), scores[:, nf * bs:]
@@ -1753,9 +1780,13 @@ class DSV4Attention(Module):
                 ent[row].masked_fill_(ent[row] >= bounds[row], -1)
                 entc = ent[row].clamp(min = 0)
                 pool_rows = bt_st[0][(entc // kl.epp).long()].long() * kl.epp + (entc % kl.epp).long()
-                keys = kl.pool_idx.view(-1, Di)[pool_rows]
+                if kl.kv_format == "fp4":
+                    keys = kl.pool_idx_fp4.view(-1, 64)[pool_rows]
+                    scales = kl.pool_idx_scale.view(-1, 4)[pool_rows]
+                else:
+                    keys, scales = kl.pool_idx.view(-1, Di)[pool_rows], None
                 dsa_indexer_scores(qi[row:row + 1], wts[row:row + 1], keys,
-                                   cap * m, m, cap, scores = scores[row:row + 1])
+                                   cap * m, m, cap, scores = scores[row:row + 1], idx_scales = scales)
                 scores[row].masked_fill_(ent[row] < 0, ninf)
             ext.dsa_topk(scores, indices, min(self.index_topk, cap), None, 0)
             indices.copy_(torch.where(indices < 0, indices, ent.gather(1, indices.clamp(min = 0))))
@@ -1774,9 +1805,13 @@ class DSV4Attention(Module):
         ent.masked_fill_(ent >= a_ec[0], -1)
         entc = ent.clamp(min = 0)
         rows = bt_st[0][(entc // kl.epp).long()].long() * kl.epp + (entc % kl.epp).long()
-        keys = kl.pool_idx.view(-1, Di)[rows]
+        if kl.kv_format == "fp4":
+            keys = kl.pool_idx_fp4.view(-1, 64)[rows]
+            scales = kl.pool_idx_scale.view(-1, 4)[rows]
+        else:
+            keys, scales = kl.pool_idx.view(-1, Di)[rows], None
         scores = g_tensor_cache.get(device, (R, cap), torch.half, "dsv4_b_scores_cap")
-        dsa_indexer_scores(qi, wts, keys, cap * m, m, cap, scores = scores)
+        dsa_indexer_scores(qi, wts, keys, cap * m, m, cap, scores = scores, idx_scales = scales)
         scores.masked_fill_(cand[entc // bs].unsqueeze(0), ninf)
         scores.masked_fill_((ent >= a_ec[0]).unsqueeze(0), ninf)
         scores.masked_fill_((ent < 0).unsqueeze(0), ninf)
@@ -2090,7 +2125,8 @@ class DSV4Attention(Module):
         krow = None
         if self.compressor is not None:
             comp, idx = self.compressor, self.indexer
-            if kl.quant:
+            fp4 = kl.kv_format == "fp4"
+            if kl.quant or fp4:
                 # Packed pool: per-job staging rows, then quantize + scatter through each
                 # job's block-table row
                 stage = g_tensor_cache.get(device, (B, S // m + 1, self.head_dim), torch.half, "dsv4_b_stage")
@@ -2099,9 +2135,10 @@ class DSV4Attention(Module):
                     rsl.comp_ovl, comp.ape, comp.fused_norm_w, comp.norm.rms_norm_eps,
                     comp.fused_inv_freq, stage, None,
                     0, a_pos, m, a_slots, None, 0, True)
-                ext.dsv4_pool_quant_scatter(
-                    stage, kl.pool_c_view(), kl.pool_s.view(-1, kl.G), kl.pool_r.view(-1, kl.D_r),
-                    bt_st, 0, a_pos, m, S, kl.epp)
+                if kl.quant:
+                    ext.dsv4_pool_quant_scatter(
+                        stage, kl.pool_c_view(), kl.pool_s.view(-1, kl.G), kl.pool_r.view(-1, kl.D_r),
+                        bt_st, 0, a_pos, m, S, kl.epp)
             else:
                 ext.dsv4_compress(
                     comp_kv, comp_gate, rsl.comp_buf_kv, rsl.comp_buf_gate,
@@ -2109,12 +2146,23 @@ class DSV4Attention(Module):
                     comp.fused_inv_freq, kl.pool_c.view(-1, kl.D_c), kl.pool_r.view(-1, kl.D_r),
                     0, a_pos, m, a_slots, bt_st, kl.epp, False)
             if self.layer_type == "csa":
+                idx_stage = (g_tensor_cache.get(device, (B, S // m + 1, kl.D_i), torch.half, "dsv4_b_idx_stage")
+                             if fp4 else None)
                 ext.dsv4_compress(
                     idx_kv, idx_gate, rsl.idx_buf_kv, rsl.idx_buf_gate,
                     rsl.idx_ovl, idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
-                    idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None,
-                    0, a_pos, m, a_slots, bt_st, kl.epp, False)
-            if self.idx_wk is not None:
+                    idx.fused_inv_freq, idx_stage if fp4 else kl.pool_idx.view(-1, kl.D_i), None,
+                    0, a_pos, m, a_slots, None if fp4 else bt_st, 0 if fp4 else kl.epp, fp4)
+                if fp4:
+                    ext.dsv4_fp4_scatter(idx_stage, kl.pool_idx_fp4.view(-1, 64), kl.pool_idx_scale.view(-1, 4),
+                                         bt_st, 0, a_pos, m, S, kl.epp, True)
+            if fp4 and self.idx_wk is not None:
+                entries = (a_pos[:, None] // m + _cached_arange(device, S // m + 1)[None, :]).reshape(-1)
+                keys = self._indexer_keys(stage.view(-1, self.head_dim), params, entries.to(torch.int))
+                ext.dsv4_fp4_scatter(keys.view(B, S // m + 1, kl.D_i),
+                                     kl.pool_idx_fp4.view(-1, 64), kl.pool_idx_scale.view(-1, 4),
+                                     bt_st, 0, a_pos, m, S, kl.epp, True)
+            elif self.idx_wk is not None:
                 pool_r_flat = kl.pool_r.view(-1, kl.D_r)
                 idx_flat = kl.pool_idx.view(-1, kl.D_i)
                 if S == 1:
@@ -2159,6 +2207,9 @@ class DSV4Attention(Module):
                             idx_flat.index_copy_(0, row, torch.where(new, keys, idx_flat[row]))
                 if _pdup_dir:
                     krow = idx_flat[row]
+            if fp4:
+                ext.dsv4_fp4_scatter(stage, kl.pool_fp4.view(-1, 256), kl.pool_fp4_scale.view(-1, 32),
+                                     bt_st, 0, a_pos, m, S, kl.epp, False)
 
         # Pool selection: every layer the eager path scans for (indexer_mode "full": V4.1 layers that
         # own an indexer head, whether or not they own the pool they index -- index_source_layer_ids
@@ -2209,7 +2260,8 @@ class DSV4Attention(Module):
                     if cand_regime and s_max % bs:
                         s_max = -(-s_max // bs) * bs
                     scores = g_tensor_cache.get(device, (R, s_max), torch.half, "dsv4_b_scores")
-                    args = (qi.view(R, Hi, Di), wts.view(R, Hi), kl.pool_idx.view(-1, Di),
+                    args = (qi.view(R, Hi, Di), wts.view(R, Hi),
+                            kl.pool_idx_fp4.view(-1, 64) if kl.kv_format == "fp4" else kl.pool_idx.view(-1, Di),
                             scores, a_ec, R, a_pos, a_ec, bt_st, bt_st.stride(0))
                     consts = dict(
                         H_i = Hi, D_i = Di, S_stride = s_max, compress_rate = m,
@@ -2217,6 +2269,8 @@ class DSV4Attention(Module):
                         SEQ = S, MULTIROW = 1, EPP = kl.epp,
                         DEBUG_BOUNDS = 1 if dsa_debug_bounds else 0,
                         DEBUG_PAGES = kl.num_pages if dsa_debug_bounds else 0)
+                    if kl.kv_format == "fp4":
+                        consts.update(idx_scales = kl.pool_idx_scale.view(-1, 4), FP4 = True)
                     if tiled:
                         consts["BLOCK_M"] = bm
                     else:
@@ -2275,7 +2329,8 @@ class DSV4Attention(Module):
             bt = bt_st
             epp = kl.epp
             pool_c = kl.pool_c_view()
-            pool_r = kl.pool_r.view(-1, self.rope_head_dim)
+            pool_r = (g_tensor_cache.get(device, (1, self.rope_head_dim), torch.half, "dsv4_b_pr0")
+                      if kl.kv_format == "fp4" else kl.pool_r.view(-1, self.rope_head_dim))
             qc = kl.qc()
         else:
             epp = 256
@@ -2558,8 +2613,11 @@ class DSV4Attention(Module):
             # written into the paged pools through the job's block table, ring/snapshot
             # state updated. With the fan the projections are already done: feed the
             # compress kernels directly
-            pool_r_flat = kl.pool_r.view(-1, kl.D_r)
-            if kl.quant or self.idx_wk is not None:
+            fp4 = kl.kv_format == "fp4"
+            pool_r_flat = None if fp4 else kl.pool_r.view(-1, kl.D_r)
+            idx_stage = (g_tensor_cache.get(device, (seq // m + 1, kl.D_i), torch.half, "dsv4_idx_stage")
+                         if fp4 and self.layer_type == "csa" else None)
+            if kl.quant or fp4 or self.idx_wk is not None:
                 # Packed pool: compress into transient staging rows (this step's entries),
                 # then quantize + scatter through the block table
                 stage = g_tensor_cache.get(device, (seq // m + 1, self.head_dim), torch.half, "dsv4_stage")
@@ -2578,8 +2636,8 @@ class DSV4Attention(Module):
                     ext.dsv4_compress(
                         fouts[4], fouts[5], rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
                         rsl.idx_ovl[slot], idx.ape, idx.fused_norm_w, idx.norm.rms_norm_eps,
-                        idx.fused_inv_freq, kl.pool_idx.view(-1, kl.D_i), None, pos0,
-                        None, m, None, bt_row, epp, False)
+                        idx.fused_inv_freq, idx_stage if fp4 else kl.pool_idx.view(-1, kl.D_i), None, pos0,
+                        None, m, None, None if fp4 else bt_row, 0 if fp4 else epp, fp4)
             else:
                 self.compressor.forward_fused(
                     x, params, rsl.comp_buf_kv[slot], rsl.comp_buf_gate[slot],
@@ -2588,20 +2646,24 @@ class DSV4Attention(Module):
                 if self.layer_type == "csa":
                     self.indexer.forward_fused(
                         x, params, rsl.idx_buf_kv[slot], rsl.idx_buf_gate[slot],
-                        rsl.idx_ovl[slot], kl.pool_idx.view(-1, kl.D_i), None, pos0,
-                        bt_row, epp)
+                        rsl.idx_ovl[slot], idx_stage if fp4 else kl.pool_idx.view(-1, kl.D_i), None, pos0,
+                        None if fp4 else bt_row, 0 if fp4 else epp, stage_rel = fp4)
             if os.environ.get("EXL3_DSV4_B1_DBG"):
                 print(f"EAGER L{self.layer_idx} pos={pos0} seq={seq} m={m} ec={ec} "
                       f"e0={pos0 // m} n={ec - pos0 // m}", flush=True)
             if self.idx_wk is not None and ec > pos0 // m:
                 e0 = pos0 // m
-                rows = torch.arange(e0, ec, device = device)
-                rows = bt_row[0, rows // epp].long() * epp + rows % epp
                 keys = self._indexer_keys(stage[:ec - e0], params, e0)
-                if not kl.quant and os.environ.get("EXL3_DSV41_FUSED_POOL_SCATTER", "1") != "0":
+                if fp4:
+                    ext.dsv4_fp4_scatter(keys, kl.pool_idx_fp4.view(-1, 64), kl.pool_idx_scale.view(-1, 4),
+                                         bt_row, pos0, None, m, seq, epp, True)
+                else:
+                    rows = torch.arange(e0, ec, device = device)
+                    rows = bt_row[0, rows // epp].long() * epp + rows % epp
+                if not fp4 and not kl.quant and os.environ.get("EXL3_DSV41_FUSED_POOL_SCATTER", "1") != "0":
                     ext.dsv4_pool_scatter(rows, keys, stage[:ec - e0],
                                           kl.pool_idx.view(-1, kl.D_i), kl.pool_c.view(-1, kl.D_c), pool_r_flat)
-                else:
+                elif not fp4:
                     kl.pool_idx.view(-1, kl.D_i)[rows] = keys
                     if not kl.quant:
                         kl.pool_c.view(-1, kl.D_c)[rows] = stage[:ec - e0, :kl.D_c]
@@ -2610,9 +2672,15 @@ class DSV4Attention(Module):
                 ext.dsv4_pool_quant_scatter(
                     stage, kl.pool_c_view(), kl.pool_s.view(-1, kl.G), pool_r_flat,
                     bt_row, pos0, None, m, seq, epp)
+            if fp4:
+                ext.dsv4_fp4_scatter(stage, kl.pool_fp4.view(-1, 256), kl.pool_fp4_scale.view(-1, 32),
+                                     bt_row, pos0, None, m, seq, epp, False)
+                if idx_stage is not None and self.idx_wk is None:
+                    ext.dsv4_fp4_scatter(idx_stage, kl.pool_idx_fp4.view(-1, 64), kl.pool_idx_scale.view(-1, 4),
+                                         bt_row, pos0, None, m, seq, epp, True)
             pool_len = ec
         elif self.kv_source is not None:
-            assert kl.pool_r.device == device, "DSV4Attention: shared pool on another device"
+            assert kl.device == device, "DSV4Attention: shared pool on another device"
             dense_m, epp, pool_len = self.compress_rate, kl.epp, ec
 
         if topk_regime:
@@ -2622,15 +2690,18 @@ class DSV4Attention(Module):
             sh = params.setdefault("dsv4_shared", {}).setdefault(slot, {})
             if self.indexer_mode == "full":
                 sh["topk"] = self._indexer_topk(
-                    x, params, q_res, kl.pool_idx.view(-1, kl.D_i), ec, pos0, q_idx_pre,
-                    block_table = bt_row, epp = epp, shared = sh)
+                    x, params, q_res, kl.pool_idx_fp4.view(-1, 64) if kl.kv_format == "fp4" else kl.pool_idx.view(-1, kl.D_i),
+                    ec, pos0, q_idx_pre, block_table = bt_row, epp = epp, shared = sh,
+                    idx_scales = kl.pool_idx_scale.view(-1, 4) if kl.kv_format == "fp4" else None)
             elif sh["topk"][0].device != device:
                 sh["topk"] = to_device(sh["topk"][0], device), sh["topk"][1]
             indices, k_len = sh["topk"]
 
         qc = None
         if self.kv_source is not None:
-            pool_c, pool_r = kl.pool_c_view(), kl.pool_r
+            pool_c = kl.pool_c_view()
+            pool_r = (g_tensor_cache.get(device, (1, kl.D_r), torch.half, "dsv4_pool_r0")
+                      if kl.kv_format == "fp4" else kl.pool_r)
             qc = kl.qc()
             bt = bt_row
         else:

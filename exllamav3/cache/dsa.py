@@ -53,6 +53,10 @@ class CacheLayer_dsa(CacheLayer):
     the int32 words and pool_s the fp16 group scales. The rope part (pool_r) and the indexer
     keys (pool_idx) stay fp16: they are small and feed every positional score / selection.
     Requires D_c to be a multiple of 32 (448 on DeepSeek-V4).
+
+    With kv_format="fp4", complete 512-wide latent rows use packed E2M1 and one E4M3
+    scale per 16 values. Indexer rows use packed E2M1 and one E8M0 scale per 32 values.
+    This is a separate format from k_bits and includes the positional columns.
     """
 
     def __init__(
@@ -64,10 +68,14 @@ class CacheLayer_dsa(CacheLayer):
         k_bits: int = 0,
         v_bits: int | None = None,
         compand_a: float = 0.0,
+        kv_format: str = "fp16",
         **kwargs
     ):
         super().__init__(config, attention, cache_id, max_num_tokens)
         assert compand_a == 0.0, "compander is not supported by the online-dequant loaders"
+        assert kv_format in ("fp16", "fp4"), "unknown DSA KV format"
+        assert kv_format != "fp4" or not k_bits, "FP4 and k_bits cannot be combined"
+        self.kv_format = kv_format
         self.k_bits = k_bits
         self.v_bits = v_bits
         assert max_num_tokens % PAGE_SIZE == 0, \
@@ -83,6 +91,8 @@ class CacheLayer_dsa(CacheLayer):
         self.D_c = D - D_r
         self.D_r = D_r
         self.D_i = attention.index_head_dim if getattr(attention, "indexer_mode", None) == "full" else 0
+        if kv_format == "fp4":
+            assert D == 512 and self.D_i in (0, 128), "FP4 DSA requires 512-wide latents and 128-wide index keys"
         if k_bits:
             assert 2 <= k_bits <= 8, "quantized DSA pool must be from 2 to 8 bits"
             assert self.D_c % 32 == 0, "quantized DSA pool requires head_dim - rope_dim to be a multiple of 32"
@@ -92,6 +102,8 @@ class CacheLayer_dsa(CacheLayer):
         self.pool_s = None
         self.pool_r = None
         self.pool_idx = None
+        self.pool_fp4 = self.pool_fp4_scale = None
+        self.pool_idx_fp4 = self.pool_idx_scale = None
         self.device = None
         self._slot_bt = None
         self.mirrors = {}
@@ -105,6 +117,13 @@ class CacheLayer_dsa(CacheLayer):
         getattr(self.attention, "_bc_dsa_batch", {}).clear()
         self.device = device
         self.mirrors = {}
+        if self.kv_format == "fp4":
+            self.pool_fp4 = torch.zeros((self.num_pages, self.epp, 256), dtype = torch.uint8, device = device)
+            self.pool_fp4_scale = torch.zeros((self.num_pages, self.epp, 32), dtype = torch.uint8, device = device)
+            if self.D_i:
+                self.pool_idx_fp4 = torch.zeros((self.num_pages, self.epp, 64), dtype = torch.uint8, device = device)
+                self.pool_idx_scale = torch.zeros((self.num_pages, self.epp, 4), dtype = torch.uint8, device = device)
+            return
         if self.k_bits:
             self.pool_q = torch.zeros((self.num_pages, self.epp, self.G * self.k_bits), dtype = torch.int32, device = device)
             self.pool_s = torch.zeros((self.num_pages, self.epp, self.G), dtype = torch.half, device = device)
@@ -119,6 +138,7 @@ class CacheLayer_dsa(CacheLayer):
         getattr(self.attention, "_bc_dsa_batch", {}).clear()
         self.device = None
         self.pool_c = self.pool_q = self.pool_s = self.pool_r = self.pool_idx = None
+        self.pool_fp4 = self.pool_fp4_scale = self.pool_idx_fp4 = self.pool_idx_scale = None
         self._slot_bt = None
         self.mirrors = {}
 
@@ -126,7 +146,8 @@ class CacheLayer_dsa(CacheLayer):
         """Second copy of the pools for the layers that read them on another device: paged like
         the pools (copy_page, get_tensors) and filled by pull()."""
         mirror = CacheLayer_dsa(
-            self.config, self.attention, self.cache_id, self.max_num_tokens, self.k_bits, self.v_bits
+            self.config, self.attention, self.cache_id, self.max_num_tokens, self.k_bits, self.v_bits,
+            kv_format = self.kv_format
         )
         mirror.alloc(device)
         self.mirrors[device] = mirror
@@ -141,14 +162,17 @@ class CacheLayer_dsa(CacheLayer):
                 dst[i, a:b].copy_(to_device(src[i, a:b], self.device))
 
     def pool_c_view(self) -> torch.Tensor:
-        """Flat nope pool for the attention kernels: (rows, D_c) fp16, or the packed
-        (rows, G * bits) int32 words with qc() giving the scales."""
+        """Flat pool: FP16 nope rows, H32 words, or packed complete FP4 latent rows."""
+        if self.kv_format == "fp4":
+            return self.pool_fp4.view(-1, 256)
         if self.k_bits:
             return self.pool_q.view(-1, self.G * self.k_bits)
         return self.pool_c.view(-1, self.D_c)
 
     def qc(self):
-        """(scales (rows, G) fp16, bits) for dsa_attn's packed-pool mode, or None."""
+        """Return scales and format: positive bits for H32, -1 for FP4, or None."""
+        if self.kv_format == "fp4":
+            return self.pool_fp4_scale.view(-1, 32), -1
         if self.k_bits:
             return self.pool_s.view(-1, self.G), self.k_bits
         return None
@@ -166,6 +190,15 @@ class CacheLayer_dsa(CacheLayer):
         ne = min(num_tokens // self.compress_rate, self.epp)
         if ne <= 0:
             return
+        if self.kv_format == "fp4":
+            assert source.kv_format == self.kv_format
+            for dst, src in zip((self.pool_fp4, self.pool_fp4_scale, self.pool_idx_fp4, self.pool_idx_scale),
+                                (source.pool_fp4, source.pool_fp4_scale, source.pool_idx_fp4, source.pool_idx_scale)):
+                if dst is not None:
+                    dst[to_page, :ne].copy_(src[from_page, :ne], non_blocking = True)
+            for device, mirror in self.mirrors.items():
+                mirror.copy_page(source.mirrors.get(device, source), from_page, to_page, num_tokens)
+            return
         if self.k_bits:
             self.pool_q[to_page, :ne].copy_(source.pool_q[from_page, :ne], non_blocking = True)
             self.pool_s[to_page, :ne].copy_(source.pool_s[from_page, :ne], non_blocking = True)
@@ -178,11 +211,14 @@ class CacheLayer_dsa(CacheLayer):
             mirror.copy_page(source.mirrors.get(device, source), from_page, to_page, num_tokens)
 
     def get_tensors(self):
-        return [t for t in [self.pool_c, self.pool_q, self.pool_s, self.pool_r, self.pool_idx] if t is not None] + \
+        return [t for t in [self.pool_c, self.pool_q, self.pool_s, self.pool_r, self.pool_idx,
+                            self.pool_fp4, self.pool_fp4_scale, self.pool_idx_fp4, self.pool_idx_scale] if t is not None] + \
             [t for mirror in self.mirrors.values() for t in mirror.get_tensors()]
 
     def storage_size(self):
         rows = self.num_pages * self.epp
+        if self.kv_format == "fp4":
+            return rows * (288 + (68 if self.D_i else 0))
         if self.k_bits:
             return rows * (self.G * self.k_bits * torch.int32.itemsize +
                            (self.G + self.D_r + self.D_i) * torch.half.itemsize)
@@ -214,6 +250,7 @@ class CacheLayer_dsa(CacheLayer):
                 "max_num_tokens": self.max_num_tokens,
                 "k_bits": self.k_bits,
                 "v_bits": self.v_bits,
+                "kv_format": self.kv_format,
             }
         }
 

@@ -101,7 +101,8 @@ def cache_fingerprint(caches: list, canonical: list[dict], image_size: int) -> t
             "model": model_identity(model.config) if model is not None else None,
             "layers": [
                 [_layer_key(key, layer), type(layer).__name__,
-                 getattr(layer, "k_bits", None), getattr(layer, "v_bits", None)]
+                 getattr(layer, "k_bits", None), getattr(layer, "v_bits", None)] +
+                ([layer.kv_format] if getattr(layer, "kv_format", "fp16") != "fp16" else [])
                 for key, layer in cache.layers.items()
             ],
             "recurrent": [
