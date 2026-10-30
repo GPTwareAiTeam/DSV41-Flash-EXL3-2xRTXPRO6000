@@ -46,6 +46,33 @@ from .triton_paged import _rot_h32, _qc_load_v, _get_h32
 from .smem import pick_config, shared_bytes, halving_ladder
 from . import dsa_mqa
 
+@triton.jit
+def _fp4_kv_load(packed, scales, rows, cols, mask, valid):
+    b = tl.load(packed + rows[:, None] * 256 + cols[None, :] // 2,
+                mask = mask[:, None] & valid[None, :], other = 0).to(tl.int32)
+    code = (b >> ((cols[None, :] % 2) * 4)) & 15
+    mag = code & 7
+    value = tl.where(mag < 4, mag.to(tl.float32) * 0.5,
+                     tl.where(mag == 4, 2., tl.where(mag == 5, 3., tl.where(mag == 6, 4., 6.))))
+    value = tl.where((code & 8) != 0, -value, value)
+    sb = tl.load(scales + rows[:, None] * 32 + cols[None, :] // 16,
+                 mask = mask[:, None] & valid[None, :], other = 0).to(tl.uint8)
+    scale = sb.to(tl.float8e4nv, bitcast = True).to(tl.float32)
+    return (value * scale).to(tl.float16)
+
+@triton.jit
+def _fp4_idx_load(packed, scales, rows, cols, mask):
+    b = tl.load(packed + rows[None, :] * 64 + cols[:, None] // 2,
+                mask = mask[None, :], other = 0).to(tl.int32)
+    code = (b >> ((cols[:, None] % 2) * 4)) & 15
+    mag = code & 7
+    value = tl.where(mag < 4, mag.to(tl.float32) * 0.5,
+                     tl.where(mag == 4, 2., tl.where(mag == 5, 3., tl.where(mag == 6, 4., 6.))))
+    value = tl.where((code & 8) != 0, -value, value)
+    sb = tl.load(scales + rows[None, :] * 4 + cols[:, None] // 32,
+                 mask = mask[None, :], other = 0).to(tl.int32)
+    return (value * (sb << 23).to(tl.float32, bitcast = True)).to(tl.float16)
+
 @triton.jit(do_not_specialize = [
     "k_len", "win_len", "pool_len", "num_pages_per_row", "q_pos0", "R",
     "win_floor", "ring_beg",
@@ -234,15 +261,20 @@ def _dsa_attn_kernel(
             tl.device_assert(tl.where(in_range, idx_s < pool_len, True), "dsa_attn: entry idx >= pool_len")
             tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_attn: pool page OOB")
         tok = phys * page_size + idx_s % page_size
-        if QC > 0:
+        if QC == -1:
+            vc = _fp4_kv_load(pool_c, pool_s, tok, offs_c, in_range, valid_c)
+        elif QC > 0:
             vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
         else:
             vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                          mask = in_range[:, None] & valid_c[None, :], other = 0.0)
         scores = tl.dot(qc, tl.trans(vc))
         if D_r > 0:
-            vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
-                         mask = in_range[:, None], other = 0.0)
+            if QC == -1:
+                vr = _fp4_kv_load(pool_c, pool_s, tok, D_c + offs_r, in_range, tl.full((D_r,), True, tl.int1))
+            else:
+                vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
+                             mask = in_range[:, None], other = 0.0)
             scores = tl.dot(qr, tl.trans(vr), acc = scores)
         scores = scores * scale
         scores = tl.where(in_range[None, :], scores, -float("inf"))
@@ -476,15 +508,20 @@ def _dsa_attn_split_kernel(
             tl.device_assert(tl.where(in_range, idx_s < pool_len, True), "dsa_split: entry idx >= pool_len")
             tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_split: pool page OOB")
         tok = phys * page_size + idx_s % page_size
-        if QC > 0:
+        if QC == -1:
+            vc = _fp4_kv_load(pool_c, pool_s, tok, offs_c, in_range, valid_c)
+        elif QC > 0:
             vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
         else:
             vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                          mask = in_range[:, None] & valid_c[None, :], other = 0.0)
         scores = tl.dot(qc, tl.trans(vc))
         if D_r > 0:
-            vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
-                         mask = in_range[:, None], other = 0.0)
+            if QC == -1:
+                vr = _fp4_kv_load(pool_c, pool_s, tok, D_c + offs_r, in_range, tl.full((D_r,), True, tl.int1))
+            else:
+                vr = tl.load(pool_r + tok[:, None] * D_r + offs_r[None, :],
+                             mask = in_range[:, None], other = 0.0)
             scores = tl.dot(qr, tl.trans(vr), acc = scores)
         scores = scores * scale
         scores = tl.where(in_range[None, :], scores, -float("inf"))
@@ -635,6 +672,8 @@ def _dsa_indexer_kernel(
     MULTIROW: tl.constexpr = 0,
     DEBUG_BOUNDS: tl.constexpr = 0,
     DEBUG_PAGES: tl.constexpr = 0,
+    idx_scales = None,
+    FP4: tl.constexpr = 0,
 ):
     """Lightning-indexer scoring: scores[r, s] = sum_h w[r, h] * relu(q[r, h] . k[s]) * scale.
     GEMM-shaped with a per-head ReLU epilogue; the head loop runs H_i full MMA dots against
@@ -665,8 +704,11 @@ def _dsa_indexer_kernel(
         k_rows = phys * EPP + offs_n % EPP
     else:
         k_rows = offs_n
-    kt = tl.load(k_idx + k_rows[None, :] * D_i + offs_d[:, None],
-                 mask = valid_n[None, :], other = 0.0)
+    if FP4:
+        kt = _fp4_idx_load(k_idx, idx_scales, k_rows, offs_d, valid_n)
+    else:
+        kt = tl.load(k_idx + k_rows[None, :] * D_i + offs_d[:, None],
+                     mask = valid_n[None, :], other = 0.0)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for h in range(H_i):
@@ -708,6 +750,8 @@ def _dsa_indexer_fewq_kernel(
     EPP: tl.constexpr = 0,           # pool entries per page; 0 = contiguous k_idx
     DEBUG_BOUNDS: tl.constexpr = 0,
     DEBUG_PAGES: tl.constexpr = 0,
+    idx_scales = None,
+    FP4: tl.constexpr = 0,
 ):
     """Few-query variant (decode): one program per (query row, key tile) with HEADS as
     the MMA M dim. A single dot replaces the head loop, which is a serial latency chain
@@ -743,8 +787,11 @@ def _dsa_indexer_fewq_kernel(
         k_rows = phys * EPP + offs_n % EPP
     else:
         k_rows = offs_n
-    kt = tl.load(k_idx + k_rows[None, :] * D_i + offs_d[:, None],
-                 mask = valid_n[None, :], other = 0.0)                     # (D, N)
+    if FP4:
+        kt = _fp4_idx_load(k_idx, idx_scales, k_rows, offs_d, valid_n)
+    else:
+        kt = tl.load(k_idx + k_rows[None, :] * D_i + offs_d[:, None],
+                     mask = valid_n[None, :], other = 0.0)
     logits = tl.dot(qh, kt)                                                # (H_pad, N)
     wh = tl.load(w + r * H_i + offs_h, mask = valid_h, other = 0.0)
     acc = tl.sum(tl.maximum(logits, 0.0) * wh[:, None].to(tl.float32), axis = 0) * scale
@@ -989,7 +1036,7 @@ def dsa_attn(
             assert out.shape == out_shape
 
     dummy_i = block_table  # any valid int32 pointer for unused int args
-    if (qc is not None and _dsa_qc_stage and multirow is None and not nc_block
+    if (qc is not None and qc[1] > 0 and _dsa_qc_stage and multirow is None and not nc_block
             and R >= _dsa_qc_stage_min_r and block_table.shape[0] == 1
             and 0 < pool_len <= _dsa_qc_stage_max_entries):
         pool_c, pool_r, block_table = _stage_packed_pool(
@@ -998,8 +1045,12 @@ def dsa_attn(
         dummy_i = block_table
     if qc is not None:
         pool_s, qc_bits = qc
-        assert D_c % 32 == 0 and pool_c.dtype == torch.int32 and pool_s.dtype == torch.half
-        h32_t = _get_h32(q.device)
+        if qc_bits == -1:
+            assert D_c + D_r == 512 and pool_c.dtype == torch.uint8 and pool_s.dtype == torch.uint8
+            h32_t = q
+        else:
+            assert D_c % 32 == 0 and pool_c.dtype == torch.int32 and pool_s.dtype == torch.half
+            h32_t = _get_h32(q.device)
         pc_arg = pool_c
     else:
         pool_s, qc_bits, h32_t = q, 0, q   # any valid fp16 pointers for the unused args
@@ -1036,7 +1087,7 @@ def dsa_attn(
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 16)
     if dsa_debug_bounds:
-        pool_rows = pool_s.numel() // (D_c // 32) if qc is not None else pool_c.numel() // max(D_c, 1)
+        pool_rows = pool_c.numel() // 256 if qc is not None and qc_bits == -1 else (pool_s.numel() // (D_c // 32) if qc is not None else pool_c.numel() // max(D_c, 1))
         dbg_pages = -(-pool_rows // max(page_size, 1))
     else:
         dbg_pages = 0
@@ -1111,7 +1162,7 @@ def dsa_attn(
                 _, ws_ml, ws_acc = workspace(bh)
                 return shared_bytes(_dsa_attn_split_kernel, s_args(ws_ml, ws_acc), **s_consts(bh, bn), num_warps = num_warps, num_stages = ns)
             # ROCm: the MQA decode kernel (dsa_mqa.py) where the shape allows it, at its own tiling
-            mqa = dsa_mqa.decode_eligible(s_consts(dsa_mqa.DECODE_BLOCK_H, dsa_mqa.DECODE_BLOCK_N)) if DSA_MQA else None
+            mqa = dsa_mqa.decode_eligible(s_consts(dsa_mqa.DECODE_BLOCK_H, dsa_mqa.DECODE_BLOCK_N)) if DSA_MQA and qc_bits != -1 else None
             if mqa is not None:
                 block_h = dsa_mqa.DECODE_BLOCK_H
                 hb, ws_ml, ws_acc = workspace(block_h)
@@ -1164,7 +1215,7 @@ def dsa_attn(
             QC = qc_bits,
         )
     # ROCm: the MQA prefill kernel (dsa_mqa.py) where the shape allows it, at its own tiling
-    if DSA_MQA:
+    if DSA_MQA and qc_bits != -1:
         c = m_consts((block_h, block_n, num_stages))
         mqa = dsa_mqa.prefill_eligible(c)
         if mqa is not None:
@@ -1213,6 +1264,7 @@ def dsa_indexer_scores(
     block_table = None,      # (npr,) or (1, npr) i32 page table of the (single) job
     epp = 0,                 # pool entries per page (paged mode)
     scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
+    idx_scales = None,
 ):
     """Indexer scores (R, T) fp16 with -inf past each query's causal entry bound
     min((q_pos0 + r + 1) // compress_rate, bound_max); feed to topk."""
@@ -1256,6 +1308,7 @@ def dsa_indexer_scores(
                     scale = scale,
                     BLOCK_N = bn, EPP = epp,
                     DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
+                    idx_scales = idx_scales, FP4 = idx_scales is not None,
                 )
             # kv tile ladder (smem.py); the score stride stays the caller's, tiles only shrink
             block_n = pick_config(
@@ -1273,6 +1326,7 @@ def dsa_indexer_scores(
                     scale = scale,
                     BLOCK_M = bm, BLOCK_N = bn, EPP = epp,
                     DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
+                    idx_scales = idx_scales, FP4 = idx_scales is not None,
                 )
             ladder = [(block_m, block_n)] + [(bm, bn) for bn in halving_ladder(block_n) for bm in halving_ladder(block_m) if (bm, bn) != (block_m, block_n)]
             block_m, block_n = pick_config(

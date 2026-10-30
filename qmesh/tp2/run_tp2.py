@@ -76,9 +76,11 @@ if PREFIX_CACHE_CAPACITY < 0 or PREFIX_CACHE_MIN_MATCH < 0:
     raise ValueError("prefix cache capacity and minimum match must be nonnegative")
 if PREFIX_CACHE:
     os.environ["EXL3_PREFILL_RC_SPLIT"] = "1"
-if KV_BITS not in (8, 16):
-    raise ValueError("KV_BITS must be 8 or 16")
-KV_CACHE_KWARGS = {"layer_type": CacheLayer_quant, "k_bits": 8, "v_bits": 8} if KV_BITS == 8 else {}
+if KV_BITS not in (4, 8, 16):
+    raise ValueError("KV_BITS must be 4, 8 or 16")
+# KV_BITS=4: DeepSeek's trained FP4 layout for the main compressed pools (latent + indexer keys)
+KV_CACHE_KWARGS = ({"layer_type": CacheLayer_quant, "k_bits": 8, "v_bits": 8} if KV_BITS == 8 else
+                   {"kv_format": "fp4"} if KV_BITS == 4 else {})
 IGNORE_EOS = os.environ.get("IGNORE_EOS", "0") == "1"
 COMM = os.environ.get("COMM", "p2p")  # nccl | p2p | hybrid (hybrid: P2P <64KB, NCCL >=64KB)
 P2P_STATS_OUT = os.environ.get("P2P_STATS_OUT")  # p2p only: prefix; enables device spin/timing stats, dumped at run end to <prefix>.rank<r>.json
@@ -109,7 +111,7 @@ VRAM_RESERVE_MIB = float(os.environ.get("VRAM_RESERVE_MIB", "2048"))  # graphs, 
 # Measured long-context DSpark with an 8192-row chunk exceeded the device by
 # about 640 MiB; reserve additional space for drafter weights and graphs.
 DSPARK_RESERVE_MIB = float(os.environ.get("DSPARK_RESERVE_MIB", "2048"))
-KV_BYTES_PER_TOKEN = float(os.environ.get("KV_BYTES_PER_TOKEN", "2150" if KV_BITS == 8 else "3200"))  # per rank, pool only
+KV_BYTES_PER_TOKEN = float(os.environ.get("KV_BYTES_PER_TOKEN", {4: "890", 8: "2150"}.get(KV_BITS, "3200")))  # per rank, pool only
 CHUNK_PEAK_TABLE = sorted((int(rows), float(mib)) for rows, mib in
                           (pair.split("=") for pair in CHUNK_PEAK_TABLE_RAW.split(",") if pair.strip()))
 

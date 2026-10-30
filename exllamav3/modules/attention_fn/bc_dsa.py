@@ -37,7 +37,7 @@ BLOCK_H = 16
 def _compile_split(dev, sig_s: dict, consts_s: dict):
     """The decode split kernel: on ROCm the MQA kernel (dsa_mqa.py) where the shape allows it, else upstream's
     at 8 warps, which spills far less to scratch on these parts"""
-    if DSA_MQA:
+    if DSA_MQA and consts_s.get("QC") != -1:
         t = dsa_mqa.decode_eligible(consts_s)
         if t is not None:
             sig = dict(sig_s) | {n: "constexpr" for n in ("HP", "BD", "KC", "KSTAGES")}
@@ -64,13 +64,15 @@ class BCDsa:
         self.H = m.num_q_heads
         self.G = m.o_groups
         self.o_lora = m.wo_a[0].out_features
-        self.m_rate = m.compress_rate if m.compressor is not None else 1
+        self.reads_pool = m.kv_source is not None
+        self.m_rate = m.compress_rate if self.reads_pool else 1
         self.window = m.sliding_window
         self.has_comp = m.compressor is not None
-        self.has_idx = m.indexer is not None
+        self.has_idx_comp = m.indexer is not None
+        self.has_idx = m.indexer_mode == "full"
         self.kl = kl
-        self.pool_bits = kl.k_bits if (self.has_comp and kl.quant) else 0
-        self.epp = kl.epp if self.has_comp else PAGE_SIZE
+        self.pool_bits = (-1 if kl.kv_format == "fp4" else kl.k_bits if kl.quant else 0) if self.reads_pool else 0
+        self.epp = kl.epp if self.reads_pool else PAGE_SIZE
         self.slot = rs.slot
         slot = rs.slot
 
@@ -78,7 +80,7 @@ class BCDsa:
         # already happened by the time decode reaches here)
         if self.has_comp and m.compressor.bc is None:
             raise RuntimeError("compressor BC missing")
-        if self.has_idx and m.indexer.bc is None:
+        if self.has_idx_comp and m.indexer.bc is None:
             raise RuntimeError("indexer BC missing")
         if m.wo_a_multi is None:
             raise RuntimeError("wo_a multilinear missing")
@@ -125,7 +127,7 @@ class BCDsa:
         fan_lins = [m.q_a, m.wkv]
         if self.has_comp:
             fan_lins += [m.compressor.wkv, m.compressor.wgate]
-        if self.has_idx:
+        if self.has_idx_comp:
             fan_lins += [m.indexer.wkv, m.indexer.wgate]
         fan_inner = [l.inner for l in fan_lins]
         self.fan_ns = [l.out_features for l in fan_lins]
@@ -148,15 +150,15 @@ class BCDsa:
                 n = torch.tensor(self.fan_ns, dtype = torch.int32, device = dev),
                 idx = torch.arange(len(fan_lins), dtype = torch.long, device = dev).unsqueeze(0),
             )
-        cap = kl.capacity if self.has_comp else PAGE_SIZE
-        bt = self.bt_st.view(1, -1) if self.has_comp else \
+        cap = kl.capacity if self.reads_pool else PAGE_SIZE
+        bt = self.bt_st.view(1, -1) if self.reads_pool else \
             torch.zeros((1, 1), dtype = torch.int32, device = self.device)
 
         self.bc = ext.BC_DSV4Attention(
             _exl3_bc(m.q_a), _exl3_bc(m.q_b), _exl3_bc(m.wkv), _exl3_bc(m.wo_b),
             _exl3_bc(m.idx_wq_b) if self.has_idx else _exl3_bc(m.q_a), idx_w,
             m.compressor.bc if self.has_comp else None,
-            m.indexer.bc if self.has_idx else None,
+            m.indexer.bc if self.has_idx_comp else None,
             mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh, m.woa_indices,
             mu.K, mu.mcg, mu.mul1,
             m.q_norm.weight.data, m.q_ones, m.kv_norm_w,
@@ -165,12 +167,12 @@ class BCDsa:
             rsl.comp_buf_kv[slot] if self.has_comp else None,
             rsl.comp_buf_gate[slot] if self.has_comp else None,
             rsl.comp_ovl[slot] if (self.has_comp and rsl.comp_ovl is not None) else None,
-            kl.pool_c_view() if self.has_comp else None,
-            kl.pool_r.view(-1, kl.D_r) if self.has_comp else None,
-            rsl.idx_buf_kv[slot] if self.has_idx else None,
-            rsl.idx_buf_gate[slot] if self.has_idx else None,
-            rsl.idx_ovl[slot] if self.has_idx else None,
-            kl.pool_idx.view(-1, kl.D_i) if self.has_idx else None,
+            kl.pool_c_view() if self.reads_pool else None,
+            (kl.pool_fp4.view(-1, 256) if self.pool_bits == -1 else kl.pool_r.view(-1, kl.D_r)) if self.reads_pool else None,
+            rsl.idx_buf_kv[slot] if self.has_idx_comp else None,
+            rsl.idx_buf_gate[slot] if self.has_idx_comp else None,
+            rsl.idx_ovl[slot] if self.has_idx_comp else None,
+            (kl.pool_idx_fp4.view(-1, 64) if self.pool_bits == -1 else kl.pool_idx.view(-1, kl.D_i)) if self.has_idx else None,
             bt, self.pos_dev, self.rb_dev,
             self.hidden, self.H, self.head_dim, self.rd, q_lora,
             self.G, self.o_lora,
@@ -185,17 +187,38 @@ class BCDsa:
             self.fan["n"] if self.fan else None,
             self.fan["idx"] if self.fan else None,
             *self._pool_quant_args(kl, (MAX_QLEN // self.m_rate + 1, self.head_dim), "bcd_stage"),
+            *self._idx_fp4_args(kl, (MAX_QLEN // self.m_rate + 1, kl.D_i if self.has_idx else 0), "bcd_idx_stage"),
+            *self._idx_wk_args(1, MAX_QLEN, "bcd"),
         )
         self.scores_max = -(-cap // 128) * 128
 
     def _pool_quant_args(self, kl, stage_shape, tag):
         """Packed-pool extras for the C++ graph: scales, per-step fp16 staging static (the
         compressor emits this step's entries there, quantize + scatter follows), H32, bits."""
-        if not (self.has_comp and kl.quant):
+        if self.reads_pool and kl.kv_format == "fp4":
+            return kl.pool_fp4_scale.view(-1, 32), (g_tensor_cache.get(self.device, stage_shape, torch.half, tag) if self.has_comp else None), None, -1
+        if not (self.reads_pool and kl.quant):
             return None, None, None, 0
         from .triton_paged import _get_h32
-        stage = g_tensor_cache.get(self.device, stage_shape, torch.half, tag)
+        stage = g_tensor_cache.get(self.device, stage_shape, torch.half, tag) if self.has_comp else None
         return kl.pool_s.view(-1, kl.G), stage, _get_h32(self.device), kl.k_bits
+
+    def _idx_fp4_args(self, kl, shape, tag):
+        if self.has_idx and self.pool_bits == -1:
+            return kl.pool_idx_scale.view(-1, 4), g_tensor_cache.get(self.device, shape, torch.half, tag)
+        return None, None
+
+    def _idx_wk_args(self, batch, max_seq, tag):
+        m = self.module
+        if self.pool_bits != -1 or not self.has_comp or m.idx_wk is None:
+            return None, None, 0.0, None, None, None
+        wk = _exl3_bc(m.idx_wk)
+        if wk is None:
+            raise RuntimeError("index key projection is not EXL3")
+        rows = max_seq // self.m_rate + 1
+        pos = torch.empty((batch, rows), dtype = torch.int32, device = self.device)
+        xh = torch.empty((batch * rows, self.head_dim), dtype = torch.half, device = self.device)
+        return wk, m.idx_k_norm.weight.data, m.idx_k_norm.rms_norm_eps, m.inv_freq_compress, pos, xh
 
     def _configure(self, seq, regime):
         dev = self.device
@@ -223,7 +246,7 @@ class BCDsa:
         mgc_comp = mgc_idx = None
         if self.has_comp:
             mgc_comp = st((2, seq, m_mod.compressor.wkv.out_features), torch.half, "bcd_mgc")
-        if self.has_idx:
+        if self.has_idx_comp:
             mgc_idx = st((2, seq, m_mod.indexer.wkv.out_features), torch.half, "bcd_mgi")
         qidx_st = wts_st = scores_st = indices_st = None
         k_fewq = None
@@ -248,6 +271,15 @@ class BCDsa:
                 scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = 128,
                 SEQ = 1, MULTIROW = 0, EPP = self.epp, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
             )
+            if self.pool_bits == -1:
+                sig["k_idx"] = "*u8:16"
+                sig["idx_scales"] = "*u8:16"
+                sig["FP4"] = "constexpr"
+                consts["FP4"] = 1
+            else:
+                sig["idx_scales"] = "constexpr"
+                sig["FP4"] = "constexpr"
+                consts.update(idx_scales = None, FP4 = 0)
             k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel, sig, consts, 8, 2)
 
         hb = -(-H // BLOCK_H)
@@ -265,13 +297,13 @@ class BCDsa:
         kp = -(-self.module.index_topk // 32) * 32 if self.has_idx else 32
         sig_s = {
             "q": "*fp16:16", "ring": "*fp16:16", "kv_chunk": "*fp16:16",
-            "pool_c": "*i32:16" if self.pool_bits else "*fp16:16",
+            "pool_c": "*u8:16" if self.pool_bits == -1 else "*i32:16" if self.pool_bits else "*fp16:16",
             "pool_r": "*fp16:16", "block_table": "*i32:16", "indices": "*i32:16",
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16",
             "k_len": "i32", "win_len": "i32", "pool_len": "i32",
             "num_pages_per_row": "i32", "q_pos0": "i32", "win_floor": "i32", "ring_beg": "i32",
             "slot_ids": "i32", "ring_stride": "i32",
-            "pool_s": "*fp16:16", "h32": "*fp16:16",
+            "pool_s": "*u8:16" if self.pool_bits == -1 else "*fp16:16", "h32": "*fp16:16",
         } | {n: "constexpr" for n in (
             "H", "page_size", "D_c", "D_c_pad", "D_r", "K_pad", "compress_rate", "scale",
             "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT", "QC")}
@@ -306,7 +338,7 @@ class BCDsa:
             outs = [qa_st, kv_st]
             if self.has_comp:
                 outs += [mgc_comp[0], mgc_comp[1]]
-            if self.has_idx:
+            if self.has_idx_comp:
                 outs += [mgc_idx[0], mgc_idx[1]]
             fan_c = torch.tensor([o.data_ptr() for o in outs], dtype = torch.long, device = dev)
             fan_ah = st((len(outs), seq, self.hidden), torch.half, "bcd_fanah")
@@ -329,9 +361,9 @@ class BCDsa:
         # that step (page-granular, rare)
         if pos - win_beg + seq > rsl.ring_rows:
             return None
-        ec = (pos + seq) // self.m_rate if self.has_comp else 0
+        ec = (pos + seq) // self.m_rate if self.reads_pool else 0
         regime = 1 if (self.has_idx and ec > self.module.index_topk) else 0
-        if self.has_comp and (bt_row is None or ec > bt_row.shape[1] * self.epp):
+        if self.reads_pool and (bt_row is None or ec > bt_row.shape[1] * self.epp):
             return None
 
         if self.bc.needs_configure(seq, regime):
@@ -343,7 +375,7 @@ class BCDsa:
         # Refresh the block-table static once per job step (any compressor layer may be the
         # one to do it; sliding layers never touch it, so this is tracked separately from
         # the position mirror)
-        if self.has_comp:
+        if self.reads_pool:
             serial = getattr(rs, "serial", -1)
             if self.bt_mirror[0] != serial or self.bt_mirror[1] != pos:
                 npr = min(bt_row.shape[1], self.bt_st.shape[0])
@@ -365,6 +397,8 @@ class BCDsa:
 
 
 def build_bc_dsa(module, rs, rsl, kl):
+    if module.indexer_mode == "shared":
+        return None
     try:
         return BCDsa(module, rs, rsl, kl)
     except Exception:
@@ -393,13 +427,15 @@ class BCDsaBatch:
         self.H = m.num_q_heads
         self.G = m.o_groups
         self.o_lora = m.wo_a[0].out_features
-        self.m_rate = m.compress_rate if m.compressor is not None else 1
+        self.reads_pool = m.kv_source is not None
+        self.m_rate = m.compress_rate if self.reads_pool else 1
         self.window = m.sliding_window
         self.has_comp = m.compressor is not None
-        self.has_idx = m.indexer is not None
+        self.has_idx_comp = m.indexer is not None
+        self.has_idx = m.indexer_mode == "full"
         self.kl = kl
-        self.pool_bits = kl.k_bits if (self.has_comp and kl.quant) else 0
-        self.epp = kl.epp if self.has_comp else PAGE_SIZE
+        self.pool_bits = (-1 if kl.kv_format == "fp4" else kl.k_bits if kl.quant else 0) if self.reads_pool else 0
+        self.epp = kl.epp if self.reads_pool else PAGE_SIZE
         self.kp = -(-m.index_topk // 32) * 32 if self.has_idx else 32
 
         if m.wo_a_multi is None:
@@ -423,7 +459,7 @@ class BCDsaBatch:
             if not m.compressor.fused_ready:
                 m.compressor._build_fused()
             fan_lins += [m.compressor.wkv, m.compressor.wgate]
-        if self.has_idx:
+        if self.has_idx_comp:
             if not m.indexer.fused_ready:
                 m.indexer._build_fused()
             fan_lins += [m.indexer.wkv, m.indexer.wgate]
@@ -458,7 +494,7 @@ class BCDsaBatch:
 
         # Per-step device state: (6, MAX_B) [pos, floor, beg, ec, slot, klen] + block
         # tables. Pinned staging is a ring: the host runs ahead of the replay stream
-        num_pages = kl.num_pages if self.has_comp else 1
+        num_pages = kl.num_pages if self.reads_pool else 1
         self.arr = torch.zeros((6, self.MAX_B), dtype = torch.int32, device = dev)
         self.bt_st = torch.zeros((self.MAX_B, num_pages), dtype = torch.int32, device = dev)
         self.pins = [torch.zeros((6, self.MAX_B), dtype = torch.int32, pin_memory = True)
@@ -480,20 +516,20 @@ class BCDsaBatch:
             comp.fused_norm_w if self.has_comp else None,
             comp.fused_inv_freq if self.has_comp else None,
             comp.norm.rms_norm_eps if self.has_comp else 0.0,
-            idx.ape if self.has_idx else None,
-            idx.fused_norm_w if self.has_idx else None,
-            idx.fused_inv_freq if self.has_idx else None,
-            idx.norm.rms_norm_eps if self.has_idx else 0.0,
+            idx.ape if self.has_idx_comp else None,
+            idx.fused_norm_w if self.has_idx_comp else None,
+            idx.fused_inv_freq if self.has_idx_comp else None,
+            idx.norm.rms_norm_eps if self.has_idx_comp else 0.0,
             rsl.ring,
             rsl.comp_buf_kv if self.has_comp else None,
             rsl.comp_buf_gate if self.has_comp else None,
             rsl.comp_ovl if (self.has_comp and rsl.comp_ovl is not None) else None,
-            kl.pool_c_view() if self.has_comp else None,
-            kl.pool_r.view(-1, kl.D_r) if self.has_comp else None,
-            rsl.idx_buf_kv if self.has_idx else None,
-            rsl.idx_buf_gate if self.has_idx else None,
-            rsl.idx_ovl if self.has_idx else None,
-            kl.pool_idx.view(-1, kl.D_i) if self.has_idx else None,
+            kl.pool_c_view() if self.reads_pool else None,
+            (kl.pool_fp4.view(-1, 256) if self.pool_bits == -1 else kl.pool_r.view(-1, kl.D_r)) if self.reads_pool else None,
+            rsl.idx_buf_kv if self.has_idx_comp else None,
+            rsl.idx_buf_gate if self.has_idx_comp else None,
+            rsl.idx_ovl if self.has_idx_comp else None,
+            (kl.pool_idx_fp4.view(-1, 64) if self.pool_bits == -1 else kl.pool_idx.view(-1, kl.D_i)) if self.has_idx else None,
             self.arr, self.bt_st,
             self.hidden, self.H, self.head_dim, self.rd, q_lora,
             self.G, self.o_lora,
@@ -511,8 +547,10 @@ class BCDsaBatch:
             self.fan2["mcg"] if self.fan2 else False,
             self.fan2["mul1"] if self.fan2 else False,
             *BCDsa._pool_quant_args(self, kl, (self.MAX_B, MAX_S // self.m_rate + 1, self.head_dim), "bcdb_stage"),
+            *BCDsa._idx_fp4_args(self, kl, (self.MAX_B, MAX_S // self.m_rate + 1, kl.D_i if self.has_idx else 0), "bcdb_idx_stage"),
+            *BCDsa._idx_wk_args(self, self.MAX_B, MAX_S, "bcdb"),
         )
-        cap = kl.capacity if self.has_comp else PAGE_SIZE
+        cap = kl.capacity if self.reads_pool else PAGE_SIZE
         self.scores_max = -(-cap // 128) * 128
 
     def _configure(self, B, S):
@@ -539,7 +577,7 @@ class BCDsaBatch:
         mgc_comp = mgc_idx = None
         if self.has_comp:
             mgc_comp = st((2, R, m_mod.compressor.wkv.out_features), torch.half, "bcdb_mgc")
-        if self.has_idx:
+        if self.has_idx_comp:
             mgc_idx = st((2, R, m_mod.indexer.wkv.out_features), torch.half, "bcdb_mgi")
 
         qidx_st = wts_st = scores_st = indices_st = None
@@ -563,6 +601,15 @@ class BCDsaBatch:
                 scale = Di ** -0.5 * Hi ** -0.5, BLOCK_N = 128,
                 SEQ = S, MULTIROW = 1, EPP = self.epp, DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
             )
+            if self.pool_bits == -1:
+                sig["k_idx"] = "*u8:16"
+                sig["idx_scales"] = "*u8:16"
+                sig["FP4"] = "constexpr"
+                consts["FP4"] = 1
+            else:
+                sig["idx_scales"] = "constexpr"
+                sig["FP4"] = "constexpr"
+                consts.update(idx_scales = None, FP4 = 0)
             k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel, sig, consts, 8, 2)
 
         hb = -(-H // BLOCK_H)
@@ -578,13 +625,13 @@ class BCDsaBatch:
         D_c = hd - self.rd
         sig_s = {
             "q": "*fp16:16", "ring": "*fp16:16", "kv_chunk": "*fp16:16",
-            "pool_c": "*i32:16" if self.pool_bits else "*fp16:16",
+            "pool_c": "*u8:16" if self.pool_bits == -1 else "*i32:16" if self.pool_bits else "*fp16:16",
             "pool_r": "*fp16:16", "block_table": "*i32:16", "indices": "*i32:16",
             "ws_ml": "*fp32:16", "ws_acc": "*fp32:16",
             "k_len": "*i32:16", "win_len": "i32", "pool_len": "*i32:16",
             "num_pages_per_row": "i32", "q_pos0": "*i32:16", "win_floor": "*i32:16",
             "ring_beg": "*i32:16", "slot_ids": "*i32:16", "ring_stride": "i32",
-            "pool_s": "*fp16:16", "h32": "*fp16:16",
+            "pool_s": "*u8:16" if self.pool_bits == -1 else "*fp16:16", "h32": "*fp16:16",
         } | {n: "constexpr" for n in (
             "H", "page_size", "D_c", "D_c_pad", "D_r", "K_pad", "compress_rate", "scale",
             "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ", "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT", "QC")}
@@ -617,7 +664,7 @@ class BCDsaBatch:
         outs = [qa_st, kv_st]
         if self.has_comp:
             outs += [mgc_comp[0], mgc_comp[1]]
-        if self.has_idx:
+        if self.has_idx_comp:
             outs += [mgc_idx[0], mgc_idx[1]]
         fan_c = torch.tensor([o.data_ptr() for o in outs], dtype = torch.long, device = dev)
         fan_ah = st((len(outs), R, self.hidden), torch.half, "bcdb_fanah")
@@ -647,7 +694,7 @@ class BCDsaBatch:
                                        dtype = torch.int32))
         pin[5, :B] = self.kp
         self.arr.copy_(pin, non_blocking = True)
-        if self.has_comp:
+        if self.reads_pool:
             npr = min(bt.shape[1], self.bt_st.shape[1])
             self.bt_st[:B, :npr].copy_(bt[:B, :npr])
 
@@ -656,6 +703,8 @@ class BCDsaBatch:
 
 
 def build_bc_dsa_batch(module, rsl, kl):
+    if module.indexer_mode == "shared":
+        return None
     try:
         return BCDsaBatch(module, rsl, kl)
     except Exception:

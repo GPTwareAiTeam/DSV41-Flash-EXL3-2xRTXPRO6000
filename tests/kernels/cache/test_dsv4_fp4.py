@@ -67,3 +67,46 @@ def test_invalid(idx):
     p, s = ext.dsv4_fp4_quant(x, idx)
     with pytest.raises(RuntimeError): ext.dsv4_fp4_dequant(p, s.float(), idx)
     with pytest.raises(RuntimeError): ext.dsv4_fp4_dequant(p, s[:, :-1], idx)
+
+
+@pytest.mark.parametrize('idx', [False, True])
+def test_paged_scatter(idx):
+    width, groups = (128, 4) if idx else (512, 32)
+    stage = torch.randn((2, 3, width), device='cuda', dtype=torch.float16)
+    packed = torch.zeros((12, width // 2), device='cuda', dtype=torch.uint8)
+    scales = torch.zeros((12, groups), device='cuda', dtype=torch.uint8)
+    bt = torch.tensor([[2, 0, 1], [0, 2, 1]], device='cuda', dtype=torch.int32)
+    positions = torch.tensor([3, 7], device='cuda', dtype=torch.int32)
+    ext.dsv4_fp4_scatter(stage, packed, scales, bt, 0, positions, 4, 9, 4, idx)
+    for job, pos in enumerate((3, 7)):
+        n = (pos + 9) // 4 - pos // 4
+        for w in range(n):
+            entry = pos // 4 + w
+            row = int(bt[job, entry // 4]) * 4 + entry % 4
+            p, s = ext.dsv4_fp4_quant(stage[job, w:w+1], idx)
+            assert torch.equal(packed[row], p[0])
+            assert torch.equal(scales[row], s[0])
+
+
+@pytest.mark.parametrize('idx', [False, True])
+def test_captured_scatter_matches_eager(idx):
+    width, groups = (128, 4) if idx else (512, 32)
+    stage = torch.randn((2, 3, width), device='cuda', dtype=torch.float16)
+    bt = torch.tensor([[2, 0, 1], [3, 5, 4]], device='cuda', dtype=torch.int32)
+    positions = torch.tensor([3, 7], device='cuda', dtype=torch.int32)
+    packed = torch.zeros((24, width // 2), device='cuda', dtype=torch.uint8)
+    scales = torch.zeros((24, groups), device='cuda', dtype=torch.uint8)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ext.dsv4_fp4_scatter(stage, packed, scales, bt, 0, positions, 4, 9, 4, idx)
+    for pos in ([3, 7], [8, 1]):
+        positions.copy_(torch.tensor(pos, dtype=torch.int32, device='cuda'))
+        stage.normal_()
+        packed.zero_()
+        scales.zero_()
+        expected_p = torch.zeros_like(packed)
+        expected_s = torch.zeros_like(scales)
+        ext.dsv4_fp4_scatter(stage, expected_p, expected_s, bt, 0, positions, 4, 9, 4, idx)
+        graph.replay()
+        assert torch.equal(packed, expected_p)
+        assert torch.equal(scales, expected_s)
