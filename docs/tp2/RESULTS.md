@@ -211,7 +211,9 @@ Numbers above are only reported for runs that passed these:
 - **Token identity across ranks.** Both ranks sample with a rank-agreed greedy sampler; every result table
   above comes from a run where rank 0 and rank 1 emitted the same token ids for the same job.
 - **Token identity across trees** for every optimization: the fused merges, the compaction, and the MoE kernel
-  patches were each accepted only with byte-identical tokens against the pre-change tree on both ranks.
+  patches were each accepted only with byte-identical tokens against the pre-change tree on both ranks. Both
+  trees must run on copies of the same GEMM autotune file (`EXLLAMAV3_TUNE_CACHE`): the autotuner stores its
+  picks per machine/container, and different picks change results enough to flip greedy tokens.
 - **Capture actually replayed.** `cudaGraphLaunch` counters are checked, not assumed: a capture-gate mismatch
   silently halves throughput and produces plausible-looking numbers (this happened twice).
 - **Batch invariance as measured in §6**, including the retraction.
@@ -238,6 +240,27 @@ cutoff, `COMM=p2p`, 4096-row prefill chunk), interleaved A/B blocks, logs under 
 
 Earlier sections record the development history on earlier trees; where they disagree with this table, this
 table is the release build.
+
+### 9a. Drafter window ring (after v1.0.0)
+
+The drafter's context-sized cache (3 layers × 512 fp16 values = 3,072 B per token per GPU) was replaced by a
+768-row ring per user per layer. Release build vs ring build, both on byte-identical copies of one GEMM autotune
+file (`EXLLAMAV3_TUNE_CACHE`; see 8), logs under `<artifacts>/kvc/logs/` and `<artifacts>/ideas/`:
+
+| Check | Release | Ring |
+|---|---|---|
+| Alternating 24k / short jobs, both orders, 512 tokens | — | token-identical on both ranks, every job |
+| Short prompts (code, summary, chat), ABBA, tok/s | 188.0 / 226.8 / 218.8, 188.3 / 232.0 / 221.7 | 187.6 / 229.4 / 221.2, 185.5 / 230.9 / 220.8 (identical tokens) |
+| Prefix cache, 25.8k prompt twice, 256 tokens | TTFT 9,012 → 194 ms | TTFT 9,024 → 186 ms (turn 2 = turn 1 = release) |
+| 2 users / 4 users, total tok/s | 124.5 / 126.4 | 125.4 / 129.0 (identical tokens) |
+| Free after drafter load, 64k cache | 3.92 GiB | 4.12 GiB |
+| Free after drafter load, 512k cache | 1.25 GiB | 2.75 GiB |
+| 150k-token prompt, 512k cache, `MAX_CHUNK=2048` | out of memory | runs, 85.5 tok/s decode, peak 91.98 GiB |
+| 150k-token prompt, 1M cache | — | out of memory (main KV cache alone is 3.1 GiB per 1M tokens over the 512k case) |
+
+Without pinned tuning, two containers' independent autotune picks change the target's hidden states by ~1e-4
+relative at layer 0 and ~1e-2 by the last layer; that alone flipped greedy tokens at positions 132 and 368 in the
+first comparison and is not a property of either build.
 
 ## 10. What this is and is not
 
