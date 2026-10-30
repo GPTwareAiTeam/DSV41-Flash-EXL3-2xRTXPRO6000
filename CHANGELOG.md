@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- **`KV_BITS=4`: the main KV cache in DeepSeek's trained FP4 format.** The compressed latent (512 values, rope
+  included) is stored as packed E2M1 with one E4M3 scale per 16 values (288 bytes per entry), indexer keys as
+  packed E2M1 with one E8M0 scale per 32 (68 bytes); the quantizer matches DeepSeek's `fp4_act_quant` bit for
+  bit. Main cache 3,200 → ~890 bytes per token per GPU. Prefill unpacks each chunk's pages once (exact decode)
+  for the fp16 kernels; decode and verify decode in-kernel. Measured against 16-bit: decode 200.2 vs 201.6 tok/s
+  and time to first token 8.34 vs 8.36 s at 24k (4 ABBA pairs); 5/5 planted facts at 128k in prose and code,
+  same as 16-bit; repeat- and rank-identical. Output differs from 16-bit (lossy by design).
+- **`MEM_BREAKDOWN=1`** logs per-GPU resident GiB by owner after load and the peak since load.
+
+With the drafter ring below, both together: 1M-token context fits (cache 0.87 GiB per GPU); a 131k-token
+prompt in a 1M cache peaks at 93.23 GiB of 94.97 per GPU with a 2048-row prefill chunk and 94.34 GiB with 4096.
+
 ### Changed
 
 - **The drafter's cache is a small per-user window instead of a context-sized copy.** The DSpark drafter only

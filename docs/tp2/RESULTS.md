@@ -262,6 +262,46 @@ Without pinned tuning, two containers' independent autotune picks change the tar
 relative at layer 0 and ~1e-2 by the last layer; that alone flipped greedy tokens at positions 132 and 368 in the
 first comparison and is not a property of either build.
 
+### 9b. FP4 main KV cache (`KV_BITS=4`) and per-GPU memory
+
+Same tree, fp16 vs FP4 main pools, pinned GEMM tuning, logs under `<artifacts>/fp4kv/logs/` and
+`<artifacts>/comb/logs/`. FP4 output differs from 16-bit by design; FP4 runs are repeat- and rank-identical.
+
+| Check | 16-bit cache | FP4 cache |
+|---|---|---|
+| Decode, 24k prompt, 256 tokens, 4 ABBA pairs (median) | 201.6 tok/s | 200.2 tok/s |
+| Time to first token, same runs | 8.36 s | 8.34 s |
+| Five planted facts at 10–90% depth, 128k prose / code | 5/5, 5/5 | 5/5, 5/5 (also 5/5 in a 1M cache) |
+| Main cache per token per GPU | 3,200 B | ~890 B |
+
+Kernel times, FP4 / fp16, one GPU at model shapes (24k / 128k pools): prefill attention 1.02 / 1.01, prefill
+indexer 1.04 / 1.01, decode attention 1.04 / 1.02, decode indexer 0.90 / 1.00, verify (6 rows) attention
+1.02 / 0.97, verify indexer 0.64 / 0.40.
+
+Per-GPU memory with the drafter ring and FP4 together (`MEM_BREAKDOWN=1`, identical on both GPUs), loaded:
+
+| Item | GiB |
+|---|---|
+| Target weights (routed experts 81.16 of it) | 86.31 |
+| Drafter weights | 3.75 |
+| Graph statics / workspaces | 2.75 |
+| Recurrent state (window rings, compressor, drafter ring) | 0.03 |
+| KV cache at 64k / 512k / 1M | 0.05 / 0.44 / 0.87 |
+| Outside PyTorch (CUDA context, libraries) | 1.51 |
+
+Peak during a request (reserved = PyTorch pool; card = whole device, read at end of run):
+
+| Cache | Prompt | Prefill chunk | Peak reserved | Card used | Rise over loaded |
+|---|---|---|---|---|---|
+| 64k | 26.9k | 4096 | 91.77 | 93.43 | 2.56 |
+| 512k | 162.8k | 2048 | 91.17 | 92.82 | 1.59 |
+| 1M | 162.8k | 2048 | 91.59 | 93.25 | 1.57 |
+| 1M | 131.2k | 2048 | 91.64 | 93.23 | 1.62 |
+| 1M | 131.2k | 4096 | 92.76 | 94.34 | 2.73 |
+
+Card used ≈ loaded reserved + rise + ~1.7 GiB outside PyTorch. A 4096-row chunk at 1M leaves ~0.6 GiB of the
+94.97 GiB card; 2048 rows leave ~1.7 GiB at a ~12% longer time to first token (54.6 vs 47.9 s at 131k).
+
 ## 10. What this is and is not
 
 - **Is:** a true TP=2 runtime for a 2.565 bpw mixed-bitrate EXL3 checkpoint of a 100B-class MoE model, fitting
