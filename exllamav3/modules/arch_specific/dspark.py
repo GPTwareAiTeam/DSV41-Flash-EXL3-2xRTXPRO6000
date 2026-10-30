@@ -9,6 +9,8 @@ from ...modules.dsv4 import DSV4Attention
 from ...modules.attention_fn.dsa_triton import dsa_attn
 from ...util.rope import RopeStyle
 from ...util.tensor import get_for_device
+from ...constants import PAGE_SIZE
+from ...cache.dsa import DSparkLayerState
 
 import os
 dspark_fp8_kv = os.environ.get("EXL3_DSPARK_FP8KV", "0") != "0"
@@ -50,20 +52,29 @@ def to_dev(t: torch.Tensor, device) -> torch.Tensor:
 class DSparkAttention(DSV4Attention):
     """
     Compressor-less DSV4 attention with DSpark draft semantics: same projection set and
-    tensor keys as a trunk sliding layer (so conversion is identical), but a paged main-kv
-    cache layer instead of recurrent ring state, and a block-parallel non-causal forward.
+    tensor keys as a trunk sliding layer (so conversion is identical), a per-sequence window
+    ring of main-kv rows (DSparkLayerState) as its cache, and a block-parallel non-causal forward.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Paged main-kv layer, no recurrent ring state
-        self.caps["recurrent_cache"] = False
-        self.caps["kv_cache"] = True
+        # The forward reads the sliding_window rows below the drafted block; the ring keeps two more pages so a
+        # rewind of up to a page (and the padding rows of a batched write) never reaches the rows it still needs
+        self.caps["recurrent_cache"] = True
+        self.caps["kv_cache"] = False
+        self.layer_state_cls = DSparkLayerState
+        self.dspark_ring_rows = -(-(self.sliding_window + 2 * PAGE_SIZE) // PAGE_SIZE) * PAGE_SIZE
 
 
-    def cache_layer_type(self, default, kwargs: dict):
-        from ...cache.dsa import CacheLayer_dspark
-        return CacheLayer_dspark, {}
+    def ring_layer(self, params: dict) -> DSparkLayerState:
+        return params["cache"].get_recurrent_layer((self.layer_idx, params.get("layer_instance", 0)))
+
+
+    @override
+    def b1_prep(self, params, seq = 1):
+        """The trunk's captured decode body serves DSV4 sliding-window states only. The draft block
+        always runs this class's own forward (eager or block graph), never the trunk body."""
+        return None
 
 
     @override
@@ -75,9 +86,10 @@ class DSparkAttention(DSV4Attention):
         sinks. All through the trunk's own kernels (fused norm+rope, dsa_attn NC_BLOCK)."""
         bsz, s, _ = x.shape
         device = x.device
-        cache = params["cache"]
-        kl = cache.layers[(self.layer_idx, params.get("layer_instance", 0))]
-        block_table = get_for_device(params, "block_table", self.device)
+        rsl = self.ring_layer(params)
+        block_table = params.get("dspark_graph_block_table")
+        if block_table is None:
+            block_table = get_for_device(params, "block_table", self.device)
         seqlens = params["cache_seqlens"]                       # host values
         H, D, rd = self.num_q_heads, self.head_dim, self.rope_head_dim
         positions = get_for_device(params, "cache_seqlens", device)
@@ -90,7 +102,7 @@ class DSparkAttention(DSV4Attention):
         hpg = H // self.o_groups
         pc0 = x.new_empty((1, D - rd), dtype = torch.half)
         pr0 = x.new_empty((1, rd), dtype = torch.half)
-        main_kv = kl.kv.view(-1, D)
+        main_kv = rsl.ring.view(-1, D)
         outs = []
 
         # TODO: Batched DSpark-attn fwd
@@ -124,14 +136,15 @@ class DSparkAttention(DSV4Attention):
 
     def update_kv_rows(self, main_x: torch.Tensor, params: dict):
         """Write main-kv rows for target positions cache_seqlens[r] .. + s from the
-        projected tap state main_x (bsz, s, hidden) fp16. The fused rope kernel applies
-        the weighted kv norm (passed in the q-norm slot) and the partial rotation."""
-        cache = params["cache"]
-        kl = cache.layers[(self.layer_idx, params.get("layer_instance", 0))]
+        projected tap state main_x (bsz, s, hidden) fp16 into the window rings through the
+        params' ring block table. The fused rope kernel applies the weighted kv norm (passed
+        in the q-norm slot) and the partial rotation."""
+        rsl = self.ring_layer(params)
         block_table = get_for_device(params, "block_table", self.device)
         mx = to_dev(main_x, self.device)
         bsz, s, _ = mx.shape
         D, rd = self.head_dim, self.rope_head_dim
+        assert s <= rsl.ring_rows, "DSpark ring write longer than the ring (rows would collide)"
         kv = self.wkv.forward(mx, params).view(bsz, s, 1, D)
         positions = get_for_device(params, "cache_seqlens", mx.device)
         ext.rope(
@@ -142,7 +155,7 @@ class DSparkAttention(DSV4Attention):
         )
         if dspark_fp8_kv:
             fp8_fake_quant_(kv[..., : D - rd])
-        kl.write_rows(kv.view(bsz, s, D), positions, block_table)
+        ext.dspark_write_rows(kv.view(bsz, s, D).contiguous(), rsl.ring, block_table, positions)
 
 
 class DSparkInputLayer(Module):

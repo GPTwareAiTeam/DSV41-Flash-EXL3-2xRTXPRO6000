@@ -459,65 +459,181 @@ class DSV4LayerState:
         }
 
 
-class CacheLayer_dspark(CacheLayer):
+class DSparkLayerState:
     """
-    Paged storage for one DSpark drafter block's main-kv rows: one (head_dim,) fp16 row per
-    TARGET position, derived from the trunk's tap states by update_kv_from_target. Rides
-    the standard page table (rows for position p live at block_table[p // PAGE_SIZE],
-    p % PAGE_SIZE), so draft and target cache layouts stay aligned for free. The drafter
-    only ever reads the trailing attention window.
+    Window ring for one DSpark drafter block's main-kv rows: one (head_dim,) fp16 row per TARGET position,
+    derived from the trunk's tap states by update_kv_from_target. The drafter only reads the trailing
+    sliding_window rows below the block it drafts, so each state slot keeps ring_rows rows (window plus two
+    pages of rollback room) instead of a context-sized paged plane.
+
+    Addressing is modular: position p lives at ring row p % ring_rows of its slot. ring_rows is a whole number
+    of pages, so token page k of a sequence always maps to ring page k % pages_per_slot of that slot, and a
+    slot's block table (DSparkState.block_table) is constant. The drafter's paged kernels (dspark_write_rows,
+    dsa_attn NC_BLOCK) therefore read and write the ring unchanged, and a captured graph's block table only
+    changes when a different slot takes the row. One extra page past the slots (trash_page) takes the rows of a
+    batched write that belong to no sequence.
     """
 
-    def __init__(
-        self,
-        config,
-        attention,
-        cache_id: int,
-        max_num_tokens: int,
-        **kwargs
-    ):
-        super().__init__(config, attention, cache_id, max_num_tokens)
-        assert max_num_tokens % PAGE_SIZE == 0
-        self.num_pages = max_num_tokens // PAGE_SIZE
-        self.width = attention.head_dim
-        self.kv = None
+    def __init__(self, module, max_batch_size: int, max_history: int, cache_id: int):
+        self.module = module
+        self.cache_id = cache_id
+        self.max_batch_size = max_batch_size
+        self.max_history = max_history
+        self.ring_rows = module.dspark_ring_rows
+        assert self.ring_rows % PAGE_SIZE == 0
+        self.pages_per_slot = self.ring_rows // PAGE_SIZE
+        self.width = module.head_dim
+        self.trash_page = max_batch_size * self.pages_per_slot
+        self.ring = torch.empty((self.trash_page + 1, PAGE_SIZE, self.width),
+                                dtype = torch.half, device = "meta")
         self.device = None
 
-    def alloc(self, device: torch.device):
+    def get_checkpoint_size(self):
+        return self.ring_rows * self.width * torch.half.itemsize
+
+    def storage_size(self):
+        return self.ring.numel() * self.ring.element_size()
+
+    def alloc(self, device):
         self.device = device
-        self.kv = torch.zeros((self.num_pages, PAGE_SIZE, self.width), dtype = torch.half,
-                              device = device)
+        self.ring = torch.zeros_like(self.ring, device = device)
 
     def free(self):
         self.device = None
-        self.kv = None
+        self.ring = torch.empty_like(self.ring, device = "meta")
 
-    def get_kv(self, cache_seqlens, block_table, sliding_window = -1):
-        return self.kv, None
+    def clear(self, idx: int):
+        p = self.pages_per_slot
+        self.ring[idx * p : (idx + 1) * p].zero_()
 
-    def update_kv(self, cache_seqlens, block_table, k, v, length):
-        pass
+    def rewind(self, slot: int, last_history: int, num_tokens: int):
+        pass   # position bookkeeping only (DSparkState)
 
-    def update_kv_direct(self, cache_seqlens, block_table, k, v, length):
-        pass
+    def _rows(self, slot: int, lo: int, hi: int) -> torch.Tensor:
+        """Flat ring row indices of positions [lo, hi) of a slot (hi - lo <= ring_rows, so all distinct)"""
+        pos = torch.arange(lo, hi, dtype = torch.long, device = self.device)
+        return slot * self.ring_rows + pos % self.ring_rows
 
-    def write_rows(self, rows: torch.Tensor, cache_seqlens, block_table):
-        """rows (bsz, s, width) fp16; write at positions cache_seqlens[r] .. + s per row.
-        cache_seqlens and block_table are device tensors (paged scatter kernel)."""
-        from ..ext import exllamav3_ext as ext
-        ext.dspark_write_rows(rows.contiguous(), self.kv, block_table, cache_seqlens)
+    def stash(self, slot: int, lo: int, position: int):
+        return host_copy(self.ring.view(-1, self.width)[self._rows(slot, lo, position)])
 
-    def copy_page(self, source, from_page: int, to_page: int, num_tokens: int):
-        self.kv[to_page, :num_tokens].copy_(source.kv[from_page, :num_tokens], non_blocking = True)
-
-    def get_tensors(self):
-        return [self.kv]
-
-    def storage_size(self):
-        return self.num_pages * PAGE_SIZE * self.width * torch.half.itemsize
-
-    def overhead_size(self):
-        return 0
+    def unstash(self, slot: int, stashed: torch.Tensor, position: int):
+        n = stashed.shape[0]
+        assert n <= self.ring_rows and stashed.shape[1] == self.width, \
+            "DSpark ring checkpoint shape does not match the destination slot"
+        self.ring.view(-1, self.width)[self._rows(slot, position - n, position)] = \
+            stashed.to(self.device, non_blocking = True)
 
     def tp_export(self, plan):
         raise NotImplementedError("Tensor-parallel loading is not supported for DSpark layers")
+
+
+class DSparkState:
+    """
+    Job-level state of a DSpark drafter (its cache's recurrent_state_cls), the draft side of a PairedState.
+    position is the next target position whose main-kv row the drafter has not received. Rows of positions
+    [valid_from(), position) are intact in every layer's ring: writes land at position % ring_rows, so a write
+    up to `written` has overwritten everything below written - ring_rows, and a checkpoint restore only brings
+    back the rows it stored (from `floor`). The drafter reads the sliding_window rows below position, so a
+    rewind must leave that many intact rows (rollback_capacity).
+    """
+
+    exported = False
+    guaranteed_rollback = PAGE_SIZE
+
+    def __init__(
+        self,
+        cache: Cache,
+        slot: int,
+        position: int,
+        clear: bool = True,
+        stashed: dict | None = None,
+        test_state: bool = False,
+    ):
+        assert test_state or position == 0 or stashed is not None
+        self.cache = cache
+        self.slot = slot
+        self.position = position
+        self.last_history = 0
+        layers = cache.get_all_recurrent_layers()
+        first = next(iter(layers.values()))
+        self.ring_rows = first.ring_rows
+        self.pages_per_slot = first.pages_per_slot
+        self.trash_page = first.trash_page
+        self.window = first.module.sliding_window
+        self.floor = 0
+        self.written = position
+        if stashed is not None:
+            self.unstash(stashed)
+        self.checkpoint_size = sum(l.get_checkpoint_size() for l in layers.values())
+        if clear and stashed is None:
+            for l in layers.values():
+                l.clear(slot)
+
+    def free(self):
+        self.cache.release_state(self)
+
+    def block_table(self, width: int) -> torch.Tensor:
+        """(1, width) int32 host block table into this slot's ring: token page k -> ring page
+        slot * pages_per_slot + k % pages_per_slot"""
+        p = self.pages_per_slot
+        return (self.slot * p + torch.arange(width, dtype = torch.int32) % p).unsqueeze(0)
+
+    def trash_table(self, width: int) -> torch.Tensor:
+        """(1, width) int32 host block table whose every page is the layers' trash page: rows written through it
+        land in no slot"""
+        return torch.full((1, width), self.trash_page, dtype = torch.int32)
+
+    def valid_from(self) -> int:
+        return max(self.floor, self.written - self.ring_rows)
+
+    def rollback_capacity(self) -> int:
+        lo = self.valid_from()
+        if lo == 0:
+            return self.position
+        return max(0, self.position - lo - self.window)
+
+    def rewind(self, num_tokens: int):
+        assert num_tokens <= self.rollback_capacity(), \
+            f"DSparkState: rewind {num_tokens} exceeds capacity {self.rollback_capacity()}"
+        self.position -= num_tokens
+        self.last_history = 0
+
+    def post_advance(self):
+        pass
+
+    def wrote(self, pos0: int, accepted: int, rows_written: int):
+        """Rows were written at [pos0, pos0 + rows_written); the first `accepted` of them are this sequence's
+        (the rest are a batch's padding, overwritten before they are read)"""
+        assert self.position == pos0, \
+            f"DSparkState: rows written at {pos0}, state at {self.position}"
+        self.written = max(self.written, pos0 + rows_written)
+        self.position = pos0 + accepted
+        self.last_history = 0
+
+    def stash(self):
+        lo = max(self.valid_from(), self.position - self.ring_rows)
+        stashed = {
+            "position": self.position,
+            "checkpoint_size": self.checkpoint_size,
+        }
+        for k, l in self.cache.get_all_recurrent_layers().items():
+            stashed[k] = l.stash(self.slot, lo, self.position)
+        return stashed
+
+    def unstash(self, stashed: dict):
+        assert self.position == stashed["position"]
+        n = None
+        for k, l in self.cache.get_all_recurrent_layers().items():
+            t = stashed[k]
+            assert n is None or t.shape[0] == n, "DSpark ring checkpoint layers disagree on their row count"
+            n = t.shape[0]
+            l.unstash(self.slot, t, self.position)
+        self.floor = self.position - n
+        self.written = self.position
+
+    def reset(self):
+        self.position = 0
+        self.last_history = 0
+        self.floor = 0
+        self.written = 0
