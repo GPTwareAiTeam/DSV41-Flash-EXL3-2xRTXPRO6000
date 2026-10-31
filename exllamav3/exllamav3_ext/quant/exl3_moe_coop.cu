@@ -214,7 +214,7 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     const int nproj = p.gated ? 2 : 1;
     p.a_global = p.bsz > 1;
 
-    // Measured per stage (qmesh/notes/MoEKernelTP2.md): gate/up (A) prefers the narrow tile at bsz > 1 (bsz 6:
+    // Measured per stage (docs/tp2/notes/MoEKernelTP2.md): gate/up (A) prefers the narrow tile at bsz > 1 (bsz 6:
     // A 218 -> 181 us), down (B) the wide tile (B 97 -> 103 us, A+B 316 -> 283 us). bsz 1 keeps A narrow, B wide.
     // EXL3_MOE_COOP_WIDE overrides both stages; EXL3_MOE_COOP_WIDE_A / _B override one (testing)
     static const int wide_env_a = moe_coop_wide_env("EXL3_MOE_COOP_WIDE_A");

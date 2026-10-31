@@ -1,6 +1,6 @@
-<p align="center"><b>dsv41-6000-tp2</b> — DeepSeek-V4.1-Flash on two RTX PRO 6000 GPUs, tensor-parallel</p>
+<p align="center"><b>DSV41-Flash-EXL3-2xRTXPRO6000</b> — DeepSeek-V4.1-Flash-1017, mixed-bitrate EXL3, on two RTX PRO 6000 Max-Q GPUs, tensor-parallel</p>
 
-# dsv41-6000-tp2
+# DeepSeek-V4.1-Flash-1017 EXL3 Mixed-Bitrate on 2× RTX PRO 6000 Max-Q (TP=2)
 
 ## Credits
 
@@ -28,8 +28,9 @@ A downstream fork of ExLlamaV3 that runs one very large mixture-of-experts model
 average: 1,400 hottest experts at 4 bpw, 4,860 at 3, 9,100 at 2; a 2.565 bpw build is the higher-quality
 alternative), fully resident on-GPU, with speculative decoding.
 
-Upstream remains intact (`exllamav3/`, `examples/`, `tests/`, `util/`, `doc/`); the TP=2 work lives in `qmesh/`
-and is documented in `docs/tp2/`. Upstream's own README is preserved as [README.exllamav3.md](README.exllamav3.md).
+Upstream remains intact (`exllamav3/`, `examples/`, `tests/`, `util/`, `doc/`); the TP=2 runner, server and tools
+live in `qmesh/tp2/` (the directory name is historical) and are documented in `docs/tp2/`. Upstream's own README is
+preserved as [README.exllamav3.md](README.exllamav3.md).
 
 Status: **v1.2.0** (hot/cold drafter experts; final measurements below).
 
@@ -132,8 +133,8 @@ WikiText-2 windows: 2.1820 / 2.1827 / 2.1827, ±0.025).
 Install the way you install upstream — the extension builds on first import:
 
 ```sh
-git clone https://github.com/GPTwareAiTeam/QMesh-EXL3-Runtime.git qmesh
-cd qmesh
+git clone https://github.com/GPTwareAiTeam/DSV41-Flash-EXL3-2xRTXPRO6000.git
+cd DSV41-Flash-EXL3-2xRTXPRO6000
 pip install -e .
 TORCH_CUDA_ARCH_LIST=12.0a python -c "import exllamav3"   # JIT-builds the extension
 ```

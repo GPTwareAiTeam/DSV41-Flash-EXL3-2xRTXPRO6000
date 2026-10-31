@@ -2,7 +2,7 @@
 TP=2 rank-0 fused MoE decode microbenchmark (real checkpoint slices, one GPU).
 
 Shape per GPU: H = 5120, per-rank I = 1152 (routed and shared experts split on the intermediate width, per
-TP2_DESIGN.md shard rules), 384 experts, top-6 routed + 1 shared expert (weight 1.0, its own tables).
+docs/tp2/DESIGN.md shard rules), 384 experts, top-6 routed + 1 shared expert (weight 1.0, its own tables).
 Slices (rank 0, read straight from the checkpoint with safetensors, no full-expert load):
   w1/w3 (gate/up): trellis[:, 0:72, :] (output tiles, first 1152 of 2304 columns), svh[0:1152], suh full
   w2   (down):     trellis[0:72, :, :] (input tiles, first 1152 of 2304 rows), suh[0:1152], svh full,
