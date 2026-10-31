@@ -1454,7 +1454,7 @@ class Job:
                 prefill_end = min(prefill_end, (prefill_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
             # Depth-aware limit (memory headroom): it only ever shortens a chunk, to a whole number of pages from
             # prefill_start (at least one); a chunk already shorter than that (the prompt's tail) is left as is
-            limit = self.generator.prefill_chunk_limit
+            limit = getattr(self.generator, "prefill_chunk_limit", None)
             if limit is not None and prefill_end - prefill_start > PAGE_SIZE:
                 allowed = limit(prefill_start, prefill_end - prefill_start)
                 if allowed < prefill_end - prefill_start:
@@ -1686,7 +1686,7 @@ class Job:
                     seq.prefill_complete = True
                     # Prefill's freed chunk buffers stay in torch's general pool, but the decode step's CUDA
                     # graphs allocate from their own pool and need memory the card still has free
-                    done = getattr(self.generator.prefill_chunk_limit, "prefill_done", None)
+                    done = getattr(getattr(self.generator, "prefill_chunk_limit", None), "prefill_done", None)
                     if done is not None:
                         done()
 
