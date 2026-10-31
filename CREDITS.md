@@ -1,77 +1,87 @@
 # Credits
 
-This runtime is a delta on top of a large amount of other people's work. Every entry below is a dependency of
-the shipped runtime or of the published checkpoint, or a source the results are compared against.
+This project is a TP=2 runtime, quantisation recipe and kernel set for DeepSeek-V4.1-Flash-1017 on two RTX PRO 6000
+Max-Q cards, built on turboderp's ExLlamaV3. This file says what comes from where: what upstream provides, what other
+people's code or ideas we used, and what was written here. [README.md](README.md) lists this project's own work in
+detail; [docs/tp2/RESULTS.md](docs/tp2/RESULTS.md) has the measurements behind it.
 
 ## Upstream engine
 
-**Turboderp — [ExLlamaV3](https://github.com/turboderp-org/exllamav3)** (MIT, see [LICENSE](LICENSE)).
-The engine, the EXL3 quantisation format and trellis/codebook decode, the mixed-bitrate MoE kernels, the
-sampler, the cache design and the model loaders are upstream work. This repository is a derivative work
-throughout: it adds a tensor-parallel (TP=2) backend, a pre-sharded checkpoint format, the runner and server, and
-the decode/speculation changes described in [docs/tp2/](docs/tp2/). Upstream's README is preserved as
-[README.exllamav3.md](README.exllamav3.md) and its copyright notice is retained as MIT requires.
+**turboderp — [ExLlamaV3](https://github.com/turboderp-org/exllamav3)** (MIT, see [LICENSE](LICENSE)).
+The engine this runtime builds on: the EXL3 quantisation format, the trellis quantiser and decode kernels, the
+cooperative MoE kernel, the DeepSeek-V4 attention and DSpark drafter component, the paged cache, recurrent
+checkpoints, sampler, loaders and generator. Upstream's full history and authorship are kept in this repository, its
+README is preserved as [README.exllamav3.md](README.exllamav3.md), and its copyright notice is retained as MIT
+requires. Upstream contributors' commits (turboderp and others) are upstream work; this project's commits begin on
+2026-10-25.
 
-## Model
+## Model and base checkpoint
 
-**DeepSeek — [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** (MIT).
-The model architecture (DSA sparse attention with indexer and compressed KV, hyper-connections, MoE) and the
-DSpark / multi-token-prediction drafter design that this runtime's speculative path implements.
+- **DeepSeek-V4.1-Flash-1017** (MIT): the model and the DSpark multi-token-prediction drafter design.
+- **dealignai — [DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8)**
+  (MIT; gated: 18+, lawful use, user accepts responsibility for outputs): the base checkpoint our mixed-bitrate EXL3
+  builds were quantised from. It is an abliterated (refusal-removed) fine-tune, so the quality figures we publish,
+  measured against the original model's outputs, include the effect of that edit as well as quantisation.
 
-**dealignai — [DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8)**
-(MIT; gated: 18+, lawful use, user accepts responsibility for outputs). The base checkpoint our mixed-bitrate
-EXL3 quantisation was made from. It is an abliterated (refusal-removed) fine-tune of DeepSeek-V4.1-Flash-1017;
-quality figures we publish are measured against reference outputs of the original model and therefore include
-the effect of that edit, not only of quantisation.
+## Other people's code or ideas used here
 
-## Third-party code compiled into the runtime
-
-- **MoE decode candidates kit (`decode_moe_candidates`)** — produced by the project owner's external agent and
-  provided to this project. Two of its candidates ship in the MoE cooperative decode kernel
-  (`exllamav3/exllamav3_ext/quant/exl3_moe_coop*.cu[h]`): **C1, the prefetch-ring hoist** (`EXL3_MOE_HOIST`:
-  the weight prefetch is issued before the block prologue) and **C5, programmatic dependent launch of kernel B**
-  (`EXL3_MOE_PDL`, `EXL3_MOE_COOP_PDL`). Both are bitwise identical to the baseline arithmetic. The kit's CPU
-  emulator, `bench_moe_coop.py` benchmark harness and its memory-latency classification rule were used to
-  evaluate the MoE kernel.
-- **Diffbot** ([DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000), MIT):
-  - drafter head, optional only (`DSPARK_HEAD=diffbot`). The converter `qmesh/tp2/drafter_overlay.py` reads their
+- **[diffbot — DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000)** (MIT):
+  - **Drafter head, optional** (`DSPARK_HEAD=diffbot`). Our converter `qmesh/tp2/drafter_overlay.py` reads their
     published drafter pack; no diffbot weights are redistributed. Licence and attribution:
     [docs/tp2/diffbot-drafter-k7.LICENSE.txt](docs/tp2/diffbot-drafter-k7.LICENSE.txt),
-    [docs/tp2/diffbot-drafter-k7.CREDITS.md](docs/tp2/diffbot-drafter-k7.CREDITS.md);
-  - idea of an 8-bit peer-push prefill all-reduce (their `fp8ar`): our `PREFILL_AR` (`qmesh/tp2/prefill_ar.py`,
-    `exllamav3_ext/parallel/prefill_ar.cu`) is our own implementation with int8 and exact modes, opt-in;
-  - studied, not shipped: their flat decode MoE loop (cp.async weight ring, 128-wide K tiles, swapped MMA) and
-    length-aware row top-k (`kernels/xmoe`, `kernels/rowtopk`, MIT). The streaming idea ported to our coop kernel was
-    bit-identical but slower (branch `tp2/moeflat-1031`, opt-in `EXL3_MOE_COOP_STREAM=1`, not merged); results in
-    [docs/tp2/RESULTS.md](docs/tp2/RESULTS.md) section 11.
-  Their AGPL vLLM patches were not read or used.
-- **philbert440 — 1Cat-vLLM PR #1243** — idea only: scale the drafter's input taps by a power of two before the
-  fp16 cast. Implemented as `EXL3_DSPARK_TAP_SCALE` (`exllamav3/modules/transformer.py`); neutral on our build,
-  default 1.0.
-- **Flash Linear Attention (FLA)** — Songlin Yang, Yu Zhang, Zhiyuan Li — MIT, vendored under
-  `exllamav3/vendor/fla/` with its licence intact.
-- **ROCm WMMA GEMM** — Adel Johar — MIT, vendored under `exllamav3/exllamav3_ext/rocm/vendor/rocm_wmma_gemm/`
-  with its licence intact.
-- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT) — inherited through upstream: DRY sampler semantics,
-  GBNF grammar syntax and the perplexity protocol (`exllamav3/eval/ppl.py`, reused by `qmesh/tp2/panel_ppl.py`).
+    [docs/tp2/diffbot-drafter-k7.CREDITS.md](docs/tp2/diffbot-drafter-k7.CREDITS.md). Our own drafter head is the
+    default and is faster on every content type we tested.
+  - **Idea: an 8-bit peer-push prefill all-reduce** (their `fp8ar`). `PREFILL_AR` (`qmesh/tp2/prefill_ar.py`,
+    `exllamav3_ext/parallel/prefill_ar.cu`) is our own implementation, with int8 and exact modes; opt-in.
+  - **Studied and measured, not shipped:** their flat decode MoE loop (cp.async weight ring, 128-wide K tiles,
+    swapped MMA) and length-aware row top-k (`kernels/xmoe`, `kernels/rowtopk`, MIT). The weight-streaming idea, ported
+    to our mixed-rate kernel, was bit-identical but slower (branch `tp2/moeflat-1031`, not merged); our indexer
+    already scans only the live width that row top-k targets ([RESULTS](docs/tp2/RESULTS.md) section 11d).
+  - Their deployment on the same cards is the reference point our numbers are compared against.
+  - Their AGPL vLLM patches were not read or used.
+- **philbert440 — 1Cat-vLLM PR #1243** — idea only: scale the drafter's input taps by a power of two before the fp16
+  cast. Implemented and measured as `EXL3_DSPARK_TAP_SCALE` (`exllamav3/modules/transformer.py`); neutral here, so the
+  default stays 1.0.
+- **sudoingX** and **HeNryous** — published DeepSeek-V4.1-Flash quantisation panels. `qmesh/tp2/panel_ppl.py`
+  reproduces sudoingX's panel protocol exactly, so our builds are scored on the same positions as theirs.
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT) — the WikiText-2 perplexity protocol (`perplexity.c`),
+  used by `qmesh/tp2/panel_ppl.py` as our prefill-chunk invariance gate.
 
-## Reference data (no code taken)
+## Written for this project
 
-Used for targets, comparisons and cross-checks only:
+All of the TP=2 runtime and the items under *Built here* in [README.md](README.md): the sharded checkpoint and shard
+tool, the one-shot P2P all-reduce, captured decode and verify graphs, the mixed per-expert-rate MoE kernels, FP4 KV,
+the adaptive drafter gate and drafter ring, hot/cold drafter experts, adaptive prefill chunking, the prefix cache
+across ranks, the exact multi-row router, the runner, the server, and the measurement harness.
 
-- **sudoingX** and **HeNryous** — published DeepSeek-V4.1-Flash quantisation panels (perplexity and KL against
-  the original model); our perplexity scorer reproduces sudoingX's panel protocol exactly.
-- **diffbot** — the primary comparable deployment (same GPU class, TP=2, PCIe) and its published throughput and
-  acceptance figures.
-- **sybil-solutions**, **sfxnz**, **MiaAI-Lab**, **SSHdotCodes**, **acrogenesis**, **llamaperf** — public
-  performance reports used as reference points.
+Two of the MoE kernel changes, the prefetch-ring hoist (`EXL3_MOE_HOIST`) and programmatic dependent launch of the
+second MoE kernel (`EXL3_MOE_PDL`, `EXL3_MOE_COOP_PDL`), came from a candidate kit produced for this project (with a
+CPU emulator, a benchmark harness and a memory-latency classification rule used to evaluate them); both are bitwise
+identical to the previous arithmetic.
+
+## Reference data only (no code taken)
+
+**sybil-solutions**, **sfxnz**, **MiaAI-Lab**, **SSHdotCodes**, **acrogenesis**, **llamaperf** — public performance
+reports used as reference points.
+
+## Inherited through upstream, not used by this runtime
+
+Upstream vendors code for other models and other GPUs. It stays in the tree with its licences intact, but nothing
+in this runtime's path uses it:
+
+- **Flash Linear Attention (FLA)** — Songlin Yang, Yu Zhang, Zhiyuan Li — MIT, `exllamav3/vendor/fla/`: linear
+  attention for Mamba / Gated-DeltaNet style models. DeepSeek-V4 does not use it.
+- **ROCm WMMA GEMM** — Adel Johar — MIT, `exllamav3/exllamav3_ext/rocm/vendor/rocm_wmma_gemm/`: AMD GPU support.
+  CUDA builds exclude `rocm/` sources (`exllamav3/util/cuda_flags.py`), so it is not compiled for these cards.
+- **llama.cpp** semantics in upstream's sampler (DRY, GBNF grammar), not used by this runtime's greedy and server
+  paths beyond upstream's defaults.
 
 ## Tools
 
-**PyTorch** (runtime and CUDA graph capture), **NCCL** (rendezvous and prefill reduction), **CUDA** (P2P
-all-reduce kernel, graph API), **Triton**, **safetensors**, **tokenizers** and **Ninja**.
+**PyTorch** (runtime and CUDA graph capture), **NCCL** (rendezvous and prefill reduction), **CUDA**, **Triton**,
+**safetensors**, **tokenizers** and **Ninja**.
 
 ## Licence
 
 MIT, inherited from upstream; the text in [LICENSE](LICENSE) is unchanged. Model weights are not part of this
-repository; the original model (DeepSeek) and the base checkpoint (dealignai) are both published under MIT.
+repository; the original model and the base checkpoint (dealignai) are both published under MIT.
