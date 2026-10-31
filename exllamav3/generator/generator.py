@@ -46,6 +46,9 @@ _DSPARK_PROBE = bool(int(__import__("os").environ.get("DSPARK_PROBE", "0")))
 _DSPARK_ORACLE = None
 # EXL3_DRAFT_HIST=1: count verify rounds by accepted draft count (index = drafts accepted, 0..K), printed by the runner
 _DRAFT_HIST = [0] * 16 if __import__("os").environ.get("EXL3_DRAFT_HIST", "0") != "0" else None
+# Drafter training data recorder (DSpark, batch 1): EXL3_DSPARK_RECORD=1 keeps one record per draft round in
+# Generator.dspark_records (the runner saves them); off by default, no cost when off
+_DSPARK_RECORD = True if __import__("os").environ.get("EXL3_DSPARK_RECORD", "0") == "1" else None
 if __import__("os").environ.get("DSPARK_ORACLE"):
     import json as _json
     _DSPARK_ORACLE = _json.load(open(__import__("os").environ["DSPARK_ORACLE"]))
@@ -1487,6 +1490,27 @@ class Generator:
 
         if conf_len_dev is None:
             self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        if _DSPARK_RECORD is not None and "dspark_prenorm" in params and batch_size == 1:
+            # One record per round: the round's first output index (labels come from the job's final tokens: a
+            # DSpark block is drafted in parallel from noise tokens, so position i's state depends only on the
+            # context, and the target's token at that index is its exact label), this rank's head top-64 over its
+            # vocab shard for each block position, the pre-norm state (confidence input) and the seed token
+            dm = self.draft_model
+            if getattr(self, "_rec_head_w", None) is None:
+                lm = dm.own_head if dm.own_head is not None else self.model.modules[self.model.logit_layer_idx]
+                self._rec_head_w = lm.inner.get_weight_tensor().half()
+                self.dspark_records = []
+            st = out_state[:1].reshape(-1, out_state.shape[-1]).to(self._rec_head_w.device).half()
+            lg = (st @ self._rec_head_w).float()
+            v, ix = lg.topk(64, dim = -1)
+            job = next(j for j in self.active_jobs if j.is_prefill_done())
+            self.dspark_records.append({
+                "serial": job.serial_number, "new_tokens": job.new_tokens,
+                "state": out_state[:1].detach().half().cpu(),
+                "top_v": v.half().cpu(), "top_i": ix.int().cpu(),
+                "prenorm": params["dspark_prenorm"][:1].detach().half().cpu(),
+                "seed": int(batch_ids[0, -1]),
+            })
         rprof.mark("d_ids_end")
         return self.draft_ids_pinned[:, :window]
 
