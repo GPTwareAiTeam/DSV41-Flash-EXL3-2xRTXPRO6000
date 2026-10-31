@@ -3,7 +3,7 @@
 ## v1.1.0 (2026-10-31)
 
 Project renamed **dsv41-6000-tp2**. Default checkpoint: 2.499 bpw routed experts (1,400 @ 4, 4,860 @ 3, 9,100 @ 2;
-non-expert tensors identical to 2.565), 4-bit drafter experts. Measurements: docs/tp2/RESULTS.md section 10.
+non-expert tensors identical to 2.565), 3-bit drafter experts. Measurements: docs/tp2/RESULTS.md section 10.
 
 ### Added
 
