@@ -21,6 +21,10 @@ os.environ.setdefault("NUM_DRAFT", "5")
 os.environ.setdefault("EXL3_MOE_SPLIT_FUSED", "0")
 os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/root/.cache/torch_extensions")
+# Same measured defaults as run_tp2 (graphs + captured single-token attention); set before exllamav3 is imported,
+# which reads them at import time
+os.environ.setdefault("EXL3_WHOLE_GRAPH", "1")
+os.environ.setdefault("EXL3_DSV4_B1_BATCH", "1")
 
 import torch
 import torch.distributed as dist

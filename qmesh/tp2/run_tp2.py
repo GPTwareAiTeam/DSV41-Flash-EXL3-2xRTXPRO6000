@@ -24,6 +24,11 @@ import time
 os.environ.setdefault("EXL3_MOE_SPLIT_FUSED", "0")
 os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/root/.cache/torch_extensions")
+# The configuration every published number was measured with: piecewise CUDA graphs for decode and the captured
+# single-token attention body. Both engine dials default off in the shared code; the TP=2 runner and server (which
+# imports this module) turn them on. =0 restores the eager paths
+os.environ.setdefault("EXL3_WHOLE_GRAPH", "1")
+os.environ.setdefault("EXL3_DSV4_B1_BATCH", "1")
 
 import torch
 import torch.distributed as dist
@@ -66,7 +71,7 @@ CACHE_TOKENS_PER_SEQ = int(os.environ.get("CACHE_TOKENS_PER_SEQ", "4096"))  # KV
 # you want to support, e.g. 1048576 for 1M; the chunk auto-sizer then gives whatever VRAM is left to the prefill chunk.
 CTX_TOKENS = int(os.environ.get("CTX_TOKENS", "0"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", str(CTX_TOKENS if CTX_TOKENS else BATCH * CACHE_TOKENS_PER_SEQ)))
-KV_BITS = int(os.environ.get("KV_BITS", "16"))
+KV_BITS = int(os.environ.get("KV_BITS", "4"))
 PREFIX_CACHE = os.environ.get("EXL3_PREFIX_CACHE", "1") == "1"
 PREFIX_CACHE_CAPACITY = int(os.environ.get("EXL3_PREFIX_CACHE_CAPACITY", str(4 * 1024**3)))
 PREFIX_CACHE_MIN_MATCH = int(os.environ.get("EXL3_PREFIX_CACHE_MIN_MATCH", "256"))

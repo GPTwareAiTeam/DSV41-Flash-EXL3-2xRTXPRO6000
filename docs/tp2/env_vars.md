@@ -43,7 +43,7 @@ invocation.
 | `WARM` | `0` | `1` runs every prompt twice and times the second pass, so the graph/allocator warmup is excluded. Also makes ~24k TTFT an artefact of page reuse — do not quote TTFT from a `WARM=1` run. |
 | `WARM_TOKENS` | `8` | Untimed warm pass length. Never 0 when graphs are on: the first step is the capture. |
 | `BATCH` | `1` | Concurrent streams: number of cache slots and `max_batch_size`. B>1 requires `EXL3_DSV4_B1_BATCH=1` or it silently falls back to the eager batched path (2× slower). |
-| `KV_BITS` | `16` | `4` stores the compressed main pools in DeepSeek's trained FP4 format (packed E2M1; E4M3 scale per 16 latent values, E8M0 per 32 index-key values): 3200 → ~890 B/token/rank, decode and prefill within 1% of 16-bit. `8` selects `CacheLayer_quant` (3200 → 2150 B/token/rank) but breaks graph capture and is numerically wrong when the capture is bypassed. |
+| `KV_BITS` | `4` | `4` (default) stores the compressed main pools in DeepSeek's trained FP4 format (packed E2M1; E4M3 scale per 16 latent values, E8M0 per 32 index-key values): 3200 → ~890 B/token/rank, decode and prefill within 1% of 16-bit. `8` selects `CacheLayer_quant` (3200 → 2150 B/token/rank) but breaks graph capture and is numerically wrong when the capture is bypassed. |
 | `CACHE_TOKENS_PER_SEQ` | `4096` | KV pool tokens per stream when `CTX_TOKENS` is 0. |
 | `CTX_TOKENS` | `0` | Total KV budget in tokens; 0 = `BATCH × CACHE_TOKENS_PER_SEQ`. Set it to the context you actually want to serve (e.g. `1048576`) and the chunk auto-sizer gets whatever VRAM is left. |
 | `KV_BYTES_PER_TOKEN` | `890` with `KV_BITS=4`, `2150` with `KV_BITS=8`, else `3200` | Per-rank pool cost used by the chunk sizing arithmetic. Only change it if you change the cache type. |
@@ -103,12 +103,12 @@ invocation.
 
 ## Engine-level switches that matter for TP=2
 
-Defaults shown are the compiled-in defaults; the shipped recipe sets the first three to `1`.
+Defaults shown are the engine's compiled-in defaults. The TP=2 runner and server (`qmesh/tp2/run_tp2.py`, `serve_tp2.py`) set `EXL3_WHOLE_GRAPH=1` and `EXL3_DSV4_B1_BATCH=1` unless they are already in the environment.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `EXL3_WHOLE_GRAPH` | `0` | Capture the decode step as piecewise CUDA graphs, one segment per transformer block. **Turn this on** — it is 13.15 → 10.97 ms/token, the single largest decode win. |
-| `EXL3_DSV4_B1_BATCH` | `0` | Use the captured single-token body for batches; required for `BATCH>1` to reach the fast path. Without it B4 measures 39 instead of 17.9 ms/token and looks plausible. |
+| `EXL3_WHOLE_GRAPH` | `0` (runner/server: `1`) | Capture the decode step as piecewise CUDA graphs, one segment per transformer block. **Turn this on** — it is 13.15 → 10.97 ms/token, the single largest decode win. |
+| `EXL3_DSV4_B1_BATCH` | `0` (runner/server: `1`) | Use the captured single-token body for batches; required for `BATCH>1` to reach the fast path. Without it B4 measures 39 instead of 17.9 ms/token and looks plausible. |
 | `EXL3_DSV4_NO_XFAN` / `EXL3_DSV41_XFAN` | `0` / `0` | Attention fan-out layout. V4.1 (no q head-norm) needs `EXL3_DSV41_XFAN=1` for the fused path; leave both alone unless you are changing attention. |
 | `EXL3_WHOLE_GRAPH_MAXSEQ` | `8` | Longest sequence the piecewise capture will handle; beyond it the block runs eager. |
 | `EXL3_PW_MERGE` | `1` | Merge consecutive eligible decode blocks into one graph. |
@@ -126,7 +126,7 @@ Defaults shown are the compiled-in defaults; the shipped recipe sets the first t
 | `EXL3_MOE_CPU_SWAP` | `1` (runner forces `0`) | CPU-swapped expert path; off in TP=2 because every expert is resident. |
 | `EXL3_DSPARK_CONF` | `0.5` | Drafter confidence gate. Set `0` when running `DSPARK_DYNAMIC` so the two gates do not compound. |
 | `EXL3_DSPARK_GATE` | `auto` | How each round's verify width is chosen. `auto`: confidence gate whose cutoff drops to `EXL3_DSPARK_AUTO_LO` on low-acceptance text (+0.6% tok/s over 19 prompts, best +3.0%, worst −0.9%). `thr`: fixed `EXL3_DSPARK_CONF`. `ev`: expected-value width, opt-in (losses up to −12% tok/s on some prompts). Details in [doc/env_vars.md](../../doc/env_vars.md). |
-| `EXL3_DSPARK_AUTO_LO`, `EXL3_DSPARK_AUTO_SWITCH`, `EXL3_DSPARK_AUTO_HL` | `0.35`, `1.5`, `32` | `auto` gate: low cutoff, accepted-drafts-per-round switch point, and half-life in rounds of its running average. |
+| `EXL3_DSPARK_AUTO_LO`, `EXL3_DSPARK_AUTO_SWITCH`, `EXL3_DSPARK_AUTO_HL` | `0.25`, `2.0`, `32` | `auto` gate: low cutoff, accepted-drafts-per-round switch point, and half-life in rounds of its running average. |
 | `EXL3_DSPARK_EV_SCALE`, `_EV_GAMMA`, `_EV_COST`, `_EV_KMIN` | see doc/env_vars.md | `ev` gate calibration. |
 | `EXL3_ROUTER_INT8` | `0` | `1` opts into the int8 multi-row router projection; the default fp16 router is the tested path. |
 | `EXL3_DSPARK_TAP_SCALE` | `1.0` | Scale on the drafter's input taps. |
