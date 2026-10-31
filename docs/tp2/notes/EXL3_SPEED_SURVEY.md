@@ -57,12 +57,12 @@ Ranked by expected value for us. "Have" column is the OUR_HAVE check (see sectio
 | 6 | **Per-expert CUDA-graph-capturable grouped EXL3 GEMV** (`grouped_exl3` decode 1–8 rows/expert; `grouped_exl3_prefill` ≤256 rows; batch-invariant) | SSHdotCodes | decode 31.65→49.13 mean (1.55×) vs MXFP4 (different quant + kernels); cold weight timing decode 0.91–0.93× MXFP4 time | **Partial.** We have mixed-K fused MoE + per-expert K tables; no batch-invariant claim tested. |
 | 7 | **Expert residency tiers**: pinned host RAM for least-used experts (5,296 of 15,360 routed) + 512 VRAM slots/GPU + second CUDA stream for cold experts; optional `CPU_EXPERTS=1` inside graphs | diffbot | CPU runtime 224→262 (1-stream agentic), 110→128 (4-stream agg) | **Partial/N/A.** We fit all experts in VRAM at 2.565 bpw (`[INFERENCE]`: our footprint is smaller than diffbot's 3-bit ~204 GB routed); the cold-tier mechanism is not needed unless VRAM is tight. Hybrid transport is in OUR_HAVE. |
 | 8 | **Fixed-K specialization + draft length, not drafter head** | diffbot | k=7 vs k=3 on code: draft length gives nearly all of +43%; code head only 0–4% | **Partial**: DSpark K=5 with width-keyed graphs is ours; K=7 not tested in our tree. |
-| 9 | **DSpark tap scale** (`EXL3_DSPARK_TAP_SCALE=1/64`) | philbert440 (V100): tap fix 43.5→62.7 code; DS-Spark MiaAI | On our box: AL 3.09/3.30/2.58 → 2.84/3.49/2.68 (mixed, neutral) | **Yes**, shipped default-off (commit 4a02976e). Not a win here. |
+| 9 | **DSpark tap scale** (`EXL3_DSPARK_TAP_SCALE=1/64`) | philbert440 (V100): tap fix 43.5→62.7 code; DS-Spark MiaAI | On our box: AL 3.09/3.30/2.58 → 2.84/3.49/2.68 (mixed, neutral) | **Yes**, shipped default-off (commit 03b68b84). Not a win here. |
 | 10 | **Engram WILLNEED read-ahead + NVMe record size 16K** | sfxnz | prefill novel 8k 184→838; 32k 231→811 | **No** (our Engram tables are replicated per rank and streamed from disk per `TP2Prep.md:66`; no read-ahead found). Matters only when Engram is cold. |
 | 11 | **Quality gate**: KL + GSM8K/HumanEval + noise floor 0.005–0.008 | diffbot | KL neutral 0.052 / 0.031 / 0.011 / 0.034 | **Yes** in our notes (`MixedK.md`); keep. |
 | 12 | **Calibrated LDLQ 3-bit experts** (coolbho3k method; AtomicChat calib, 320×4096 windows) | diffbot | no speed claim; quality base | `[INFERENCE]` not relevant to our 2.565 bpw pack unless we re-quantize; uncalibrated PixelML K=3 flagged as quality risk, do not copy. |
 | 13 | **Packed FP4 / 8-bit KV** | philbert440 (FP4 packed), llamaperf 8-bit | n/r | **No** (we are fp16 KV, per COMMUNITY_RESEARCH). |
-| 14 | **Fused HC prefill** | ours (cf6946a1) | 2048 3502.6→3542.2; 4096 4131.5→4218.5 tok/s | **Yes.** |
+| 14 | **Fused HC prefill** | ours (2b2d6ec4) | 2048 3502.6→3542.2; 4096 4131.5→4218.5 tok/s | **Yes.** |
 | 15 | **Piecewise + merged CUDA graphs; width-keyed DSpark graphs** | ours | n/r in community sources | **Yes**: this is in OUR_HAVE. Community equivalents: diffbot `kernels/xmoe` flat decode scheduler; acrogenesis per-token graph of hyperconnection mixer (optional, inconsistent). |
 
 Lower-confidence items seen but not ranked: acrogenesis LFU expert eviction (residency only); diffbot's Engram int4 + fp16 per-32 scale (111 GB, pinned host UVA read in graphs).
@@ -75,7 +75,7 @@ Lower-confidence items seen but not ranked: acrogenesis LFU expert eviction (res
 |---|---|---|
 | Mixed-K fused MoE | Have | `docs/tp2/notes/MixedK.md`; `MoEKernelTP2.md` |
 | Per-expert K tables | Have | `MixedK.md` (option (b) rejected, template switch chosen) |
-| Piecewise + merged CUDA graphs | Have | `docs/tp2/notes/GraphCapture.md`; commit 3068d30c (`piecewise: capture B1 attention body inside the block segment`) |
+| Piecewise + merged CUDA graphs | Have | `docs/tp2/notes/GraphCapture.md`; commit 435e5c31 (`piecewise: capture B1 attention body inside the block segment`) |
 | P2P one-shot all-reduce | Have (fp32 fixed-order) | `exllamav3/exllamav3_ext/parallel/p2p_oneshot.cu:171–198` (arena, cudaIpc); `docs/tp2/notes/P2PAllReduce.md` |
 | 8-bit prefill all-reduce | **Missing** | No 8-bit/int8 AR found in `parallel/` (only `all_reduce.cu` generic path). |
 | DSpark K=5 with width-keyed graphs | Have | `TP2Runner.md`, `GraphCapture.md` |
@@ -86,8 +86,8 @@ Lower-confidence items seen but not ranked: acrogenesis LFU expert eviction (res
 | Tiled prefill MoE | Planned, not in tree | COMMUNITY_RESEARCH item 4 (our prefill MoE 30.6% of prefill) |
 | Fused decode attention / indexer | Missing (indexer fused decode open) | COMMUNITY_RESEARCH item 6 |
 | Length-aware indexer top-k | Missing | not found in tree |
-| Fused HC | Have | cf6946a1 |
-| DSpark tap scale | Have, default off, neutral | `TP2Runner.md:73`; commit 4a02976e |
+| Fused HC | Have | 2b2d6ec4 |
+| DSpark tap scale | Have, default off, neutral | `TP2Runner.md:73`; commit 03b68b84 |
 | Engram read-ahead | Missing | `TP2Prep.md:66` (tables streamed, no WILLNEED) |
 
 Note: grep found no DeepSeek model source under `exllamav3/models/` in this tree; the DeepSeek path is in `qmesh/` and the overlay. Indexer / top-k claims above are therefore "not found in tree" and should be double-checked by the main agent against `qmesh/tp2/` before any change.

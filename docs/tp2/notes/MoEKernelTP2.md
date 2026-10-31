@@ -7,14 +7,14 @@ Branch `tp2/moe-kernel`. Layer 3, mixed-K. Device: 188 SMs.
 ## Committed
 | commit | change |
 |---|---|
-| 6f6998bf | 256-thread blocks (WK=8) |
-| 760ec369 | shared expert folded into the fused coop launch (index E); width-sized fold scratch; MINB=3 |
+| e9a8913e | 256-thread blocks (WK=8) |
+| 91bc5226 | shared expert folded into the fused coop launch (index E); width-sized fold scratch; MINB=3 |
 
 ## Measured bsz1 (device time per kernel)
 | config | A (us) | B (us) | total (us) |
 |---|---|---|---|
-| WK=8, pre-fold (6f6998bf) | 34.8 | 20.1 | 54.9 (+ separate shared launch, 88.7 end-to-end) |
-| folded, MINB=3 (760ec369) | 34.55 | 19.89 | 54.44 |
+| WK=8, pre-fold (e9a8913e) | 34.8 | 20.1 | 54.9 (+ separate shared launch, 88.7 end-to-end) |
+| folded, MINB=3 (91bc5226) | 34.55 | 19.89 | 54.44 |
 
 Folded graph total measured earlier: 59.2 us. Gap to kernel sum: ~4.8 us.
 Target: total bsz1 <= 45 us. **Not met (54.44 us).**
@@ -57,7 +57,7 @@ Full `tests/kernels/moe/`: 263 passed (259 baseline + 4 fold cases).
 
 ## Idea 6: merge A and B into one launch (IMPLEMENTED, default off, LOST)
 
-Implemented behind `EXL3_MOE_COOP_SINGLE=1` (mixed-K only; uniform-K stays on two launches). Commit `9158b147`.
+Implemented behind `EXL3_MOE_COOP_SINGLE=1` (mixed-K only; uniform-K stays on two launches). Commit `b0648715`.
 - A/B bodies are `__device__` functions (`moe_a_body`/`moe_b_body`); the two-launch kernels are thin wrappers, so the default path is behavior-neutral.
 - Publish: A's last arriver sets `ready_a[s*(I/128)+chunk]` after `store_h4` with `__threadfence`. B spins on every (slot, chunk) of its run; a stuck wait traps after 20 s.
 - Queue: one persistent grid, `min(resident, nA+nB)` CTAs, `atomicAdd(queue_head)` claims A items before B items. `resident` from `cudaOccupancyMaxActiveBlocksPerMultiprocessor` × SMs.
@@ -73,7 +73,7 @@ Measured (folded graph, µs, layer 3; two-launch / single-launch):
 | 6 | 307.07 | 384.47 |
 | 8 | 399.83 | 507.22 |
 
-Two-launch matches baseline e7025c67 (59.9 / 97.3 / 309.6 / 403.8). Routed and folded rel err ~1e-3 on both paths.
+Two-launch matches baseline 1fe57efb (59.9 / 97.3 / 309.6 / 403.8). Routed and folded rel err ~1e-3 on both paths.
 
 Cause of the loss: not isolated. Not profiled per kernel on the fused path.
 

@@ -5,7 +5,7 @@
 This file preserves historical measurements below, not a current runbook. For current priorities and long-context results see `docs/tp2/notes/MASTER_PLAN.md`. Batching is batch-invariant across streams (identical rows and neighbour-independence are bitwise); it is not bitwise equal to B1 — see "batch invariance" below.
 
 ## 2026-10-28 — long-context compaction integration
-Tested tree `e781583f` (merge `1a3d9648`) exported to `<artifacts>/merged_src` in container `tp2-ctr`, extension cache `<artifacts>/ext_integrator`; baseline `388a0da9` ran from `<repo>` with the shared extension cache. Harness: `integrator_postmerge_1028.sh` and `integrator_premerge_1028.sh` under `<artifacts>`. Both use `COMM=p2p`, `EXL3_WHOLE_GRAPH=1`, `EXL3_DSV4_B1_BATCH=1`, `WARM=1`, `IGNORE_EOS=1`.
+Tested tree `7df906dc` (merge `f00f3c50`) exported to `<artifacts>/merged_src` in container `tp2-ctr`, extension cache `<artifacts>/ext_integrator`; baseline `38a29ec9` ran from `<repo>` with the shared extension cache. Harness: `integrator_postmerge_1028.sh` and `integrator_premerge_1028.sh` under `<artifacts>`. Both use `COMM=p2p`, `EXL3_WHOLE_GRAPH=1`, `EXL3_DSV4_B1_BATCH=1`, `WARM=1`, `IGNORE_EOS=1`.
 - Short prompts 0/1/2, 128 tokens: baseline **10.74 / 10.82 / 10.76**, merged **10.70 / 10.80 / 10.74 ms/token** (both ranks); all generated tokens match across trees and ranks. DSpark K=5 on the merged tree: rank 0 **7.87 / 6.79 / 8.95**, rank 1 **7.86 / 6.79 / 8.95 ms/token**.
 - Long prompt 0, 24,167 tokens (`LONG_PROMPT_TOKENS=20000`, chunk 2048, cache 65536), 32 generated tokens: merged **15.99 / 15.98 ms/token** rank 0/1. A separate baseline run generated identical tokens on both ranks, but measured 54.60 / 54.46 ms/token at high host load. A back-to-back pair (`integrator_24kpair_1028.sh`) again had identical tokens but unstable timings: baseline 18.86 / 18.84, merged 70.64 / 70.88 ms/token. These runs do not support a speed comparison; prior controlled comparisons are in the master plan. The historical `longdecode_clean_1028c_24k_f1` tokens differed from the integration run at token index 12 on both ranks; its settings/provenance were not identical.
 - Post-merge block host load averages (1/5/15 min) were 38.18/23.99/23.08 at start and 10.15/18.33/21.19 at end. The pair ran at 33.40/39.55/33.54 initially, 27.22/37.62/33.06 between arms and 32.69/27.80/28.97 at end. `pytest tests/kernels/moe tests/kernels/dsa/test_dsa_compact_ent.py -q`: **273 passed**.
@@ -85,7 +85,7 @@ identical unless noted):
 Round anatomy (DSpark K=5, measured with CUDA events): draft **1.9 ms**, target+verify **21.5 ms**, host ~3 ms; exactly ONE drafter forward per round (DFlash block path). These measurements do not establish a DRAM floor or generalize to every workload.
 
 ## 2026-10-27 — attention-core capture lands: plain decode 13.3 -> 11.0 ms/tok
-Validated on main (`b85deac0` merged from `tp2/attncap`): **10.97 / 11.02 / 10.98 ms/tok** (prompts 0-2, both ranks
+Validated on main (`b1a5423f` merged from `tp2/attncap`): **10.97 / 11.02 / 10.98 ms/tok** (prompts 0-2, both ranks
 identical) vs **13.35 / 13.35 / 13.17** before. 1134-token prompt 14.77 -> 14.15.
 Root cause of the earlier "capture is slower" readings: `b1_prep` required `q_head_norm=True` while `_batch_ok_b1`
 required `False`, so the captured body never ran and every measurement was the eager fallback. Gates removed,

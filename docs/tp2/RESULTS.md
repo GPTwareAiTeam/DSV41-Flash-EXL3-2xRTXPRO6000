@@ -375,7 +375,7 @@ against 2.565's 1.6886 / 1.7041 (+0.66% / +0.57%). WikiText-2, all 140 chunks: 2
 
 ABBA × 2, same container and extension:
 
-| | v1.0 (85827062, 2.565) | v1.1, 2.565 | v1.1, 2.499 |
+| | v1.0 (b1392654, 2.565) | v1.1, 2.565 | v1.1, 2.499 |
 |---|---|---|---|
 | 6 short prompts, mean tok/s | 158.3 | — | 158.9 |
 | 26.9k prompt, tok/s | 197.5 | 202.0 | 172 (4-bit drafter experts) / 164.8 (3-bit) |
