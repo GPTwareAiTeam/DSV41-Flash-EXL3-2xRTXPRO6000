@@ -43,7 +43,7 @@ the captured sampling graph (no host cost, no re-capture).
 - `thr`: the threshold gate above, fixed `EXL3_DSPARK_CONF`.
 - `auto`: the threshold gate with a content-adaptive threshold. An exponential average of accepted drafts per
   verify round (half-life `EXL3_DSPARK_AUTO_HL`, default `32` rounds) selects `EXL3_DSPARK_AUTO_LO` (default
-  `0.35`) while it is below `EXL3_DSPARK_AUTO_SWITCH` (default `1.5`) — low-acceptance text such as prose and
+  `0.25`) while it is below `EXL3_DSPARK_AUTO_SWITCH` (default `2.0`) — low-acceptance text such as prose and
   multilingual — and `EXL3_DSPARK_CONF` otherwise. Measured on 19 prompts (2k–72k context): +0.6% tok/s overall,
   best +3.0% (multilingual 2k), worst −0.9%. The estimate resets when a new job starts. The threshold is a
   persistent device tensor the captured graph reads, so switching levels never re-captures.

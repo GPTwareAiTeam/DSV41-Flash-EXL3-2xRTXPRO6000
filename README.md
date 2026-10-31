@@ -95,7 +95,7 @@ WikiText-2 windows: 2.1820 / 2.1827 / 2.1827, ±0.025).
 
 - 2 × NVIDIA RTX PRO 6000 Blackwell (96 GB), PCIe peer-to-peer, one NUMA node. Needs `sm_120a`.
 - Python ≥ 3.10, PyTorch with CUDA 12.8+ and `sm_120a`, the CUDA toolkit, `ninja`, `gcc`.
-- About 87–91 GiB per GPU for weights, drafter and graphs; the rest is KV cache (16-bit KV by default). The KV
+- About 87–91 GiB per GPU for weights, drafter and graphs; the rest is KV cache (FP4 KV by default, ~890 bytes per token per GPU). The KV
   cache costs 3,200 bytes per token per GPU; the drafter keeps only a small fixed window per user, independent of
   context length.
 
@@ -131,7 +131,7 @@ Direct runner, one process per GPU (`qmesh/tp2/launch_tp2.sh` does this, with CP
 ```sh
 for r in 0 1; do
   RANK=$r WORLD_SIZE=2 INIT_METHOD=file:///tmp/rdv/rendezvous P2P_RDV=/tmp/rdv/p2p \
-  TORCH_CUDA_ARCH_LIST=12.0a EXL3_WHOLE_GRAPH=1 EXL3_DSV4_B1_BATCH=1 DSPARK=1 \
+  TORCH_CUDA_ARCH_LIST=12.0a DSPARK=1 \
   python -m qmesh.tp2.run_tp2 > /tmp/rdv/rank$r.log 2>&1 &
 done; wait
 ```

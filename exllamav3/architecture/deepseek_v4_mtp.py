@@ -58,8 +58,10 @@ _EV_COST_RAW = _os.environ.get("EXL3_DSPARK_EV_COST", "1:16.35,2:18.9,3:20.7,4:2
 #         round (half-life EXL3_DSPARK_AUTO_HL rounds) selects EXL3_DSPARK_AUTO_LO while it is below
 #         EXL3_DSPARK_AUTO_SWITCH (low-acceptance text: prose, multilingual), else EXL3_DSPARK_CONF. The threshold
 #         lives in a device tensor the captured sampling graph reads, so switching never re-captures.
-_AUTO_LO = float(_os.environ.get("EXL3_DSPARK_AUTO_LO", "0.35"))
-_AUTO_SWITCH = float(_os.environ.get("EXL3_DSPARK_AUTO_SWITCH", "1.5"))
+# Defaults retuned for the 2.499-bpw TP=2 checkpoint (7 prompts, 256 tokens, ABBA: 143.3/144.7 -> 153.4/154.0 tok/s
+# vs 0.35 / 1.5; 5 of 7 prompts faster, two short ones -2..-7%). Only the verify width changes, never the output
+_AUTO_LO = float(_os.environ.get("EXL3_DSPARK_AUTO_LO", "0.25"))
+_AUTO_SWITCH = float(_os.environ.get("EXL3_DSPARK_AUTO_SWITCH", "2.0"))
 _AUTO_HL = float(_os.environ.get("EXL3_DSPARK_AUTO_HL", "32"))
 
 

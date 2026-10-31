@@ -24,6 +24,14 @@ prompt in a 1M cache peaks at 93.23 GiB of 94.97 per GPU with a 2048-row prefill
 
 ### Changed
 
+- **The runner and server now default to the measured configuration**: CUDA graphs (`EXL3_WHOLE_GRAPH=1`), the
+  captured single-token attention body (`EXL3_DSV4_B1_BATCH=1`) and the FP4 KV cache (`KV_BITS=4`). Before, the
+  documented `serve_tp2.sh start` ran with none of them (no graph replays in its smoke logs, 16-bit KV). Each can
+  be set to `0` / `16` to restore the old behaviour.
+- **Drafter gate retuned** (`EXL3_DSPARK_AUTO_LO` 0.35 → 0.25, `EXL3_DSPARK_AUTO_SWITCH` 1.5 → 2.0) for the 2.499-bpw
+  checkpoint: 7 prompts, 256 tokens, ABBA, 143.3 / 144.7 → 153.4 / 154.0 tok/s (+6.8%); 5 of 7 faster, two short
+  prompts 2–7% slower. Only the number of drafted tokens checked per round changes; output is unchanged.
+
 - **The drafter's cache is a small per-user window instead of a context-sized copy.** The DSpark drafter only
   ever reads the last 128 positions, but it kept a 3-layer, 512-wide row for every position of the context:
   3,072 bytes per token per GPU on top of the 3,200-byte main KV cache. It now keeps a 768-row ring per user
