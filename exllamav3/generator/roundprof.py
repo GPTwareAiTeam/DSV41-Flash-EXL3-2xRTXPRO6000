@@ -83,6 +83,19 @@ else:
         if totals:
             print(f"[RPROF] round_total_ms median={statistics.median(totals):.3f} "
                   f"min={min(totals):.3f} max={max(totals):.3f} n={len(totals)}", flush = True)
+            # Slow rounds (> 2x median): where their time went, to separate stalls from steady per-round cost
+            med = statistics.median(totals)
+            slow = 0
+            for r in rounds:
+                rs = sorted([m for m in _marks if m[0] == r], key = lambda m: m[2])
+                if len(rs) < 2 or (rs[-1][2] - rs[0][2]) / 1e6 <= 2 * med:
+                    continue
+                slow += 1
+                segs = [(f"{a[1]}->{b[1]}", (b[2] - a[2]) / 1e6, a[3].elapsed_time(b[3])) for a, b in zip(rs, rs[1:])]
+                worst = max(segs, key = lambda x: x[1])
+                print(f"[RPROF] slow round={r} total_ms={(rs[-1][2] - rs[0][2]) / 1e6:.1f} "
+                      f"worst={worst[0]} host_ms={worst[1]:.1f} gpu_ms={worst[2]:.1f}", flush = True)
+            print(f"[RPROF] slow_rounds={slow} sum_total_ms={sum(totals):.1f}", flush = True)
         # Counters
         agg = {}
         _rs = set(rounds)
