@@ -28,6 +28,9 @@ dsv4_batch_eager = os.environ.get("EXL3_DSV4_BATCH_EAGER", "1") != "0"
 # Capture the batched step as one CUDA graph per (cache layer, B, S) after two warmup
 # runs; EXL3_DSV4_BATCH_GRAPH=0 keeps the eager batched chain
 dsv4_batch_graph = os.environ.get("EXL3_DSV4_BATCH_GRAPH", "1") != "0"
+# No-q-head-norm models (DSV4.1) keep the per-job loop for bsz > 1 unless EXL3_DSV41_BATCH=1 (A/B: the batched
+# body's one projection pass over all rows is not yet shown token-identical to the per-job path there)
+dsv41_batch = os.environ.get("EXL3_DSV41_BATCH", "0") != "0"
 # bsz==1 single-token decode through the batched body (device-driven attention core, capturable in a
 # piecewise segment). OFF by default: measured ~2.3 ms/token SLOWER than the eager core and not
 # token-exact yet, so it stays experimental (EXL3_DSV4_B1_BATCH=1 to test it)
@@ -1981,7 +1984,7 @@ class DSV4Attention(Module):
             return self._forward_cached_one(
                 x, params, rsg[0], self._get_rsl(rsg[0], layer_instance), out_dtype,
                 kl = kl, bt_row = bt[:1] if bt is not None else None)
-        if not dsv4_batch_eager or not self.q_head_norm:
+        if not dsv4_batch_eager or not (self.q_head_norm or dsv41_batch):
             # Per-job loop: each job dispatches into its per-slot whole-step graph (or the
             # eager core). Measured faster than the batched-eager path below at bsz 2-8 --
             # graph replays beat batched GEMVs + per-job eager cores. The batched path is
