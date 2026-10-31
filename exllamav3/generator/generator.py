@@ -1849,6 +1849,7 @@ class Generator:
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
                 accepted_length = 1
+                job.verify_rounds += 1
                 rejected = 0
                 W = batch_logits.shape[1]
 

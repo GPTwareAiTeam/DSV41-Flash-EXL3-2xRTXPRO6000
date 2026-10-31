@@ -18,3 +18,7 @@ exllamav3/exllamav3_ext/**/hip_*
 
 # per-machine test model registry overrides (tests/testlib/models.py)
 tests/models.local.yaml
+
+# Phase A-F artifacts (jsonl/logs) and locally built seam binaries
+artifacts/
+qmesh/native/bin/

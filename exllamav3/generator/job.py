@@ -275,6 +275,7 @@ class Job:
         self.time_generate = rq_state.get("time_generate", 0.0)
         self.accepted_draft_tokens = rq_state.get("accepted_draft_tokens", 0)
         self.rejected_draft_tokens = rq_state.get("rejected_draft_tokens", 0)
+        self.verify_rounds = rq_state.get("verify_rounds", 0)
         self.rq_prompt_tokens = rq_state.get("prompt_tokens")
         self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
