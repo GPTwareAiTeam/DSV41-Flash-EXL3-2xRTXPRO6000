@@ -301,6 +301,10 @@ if os.environ.get("LONG_PROMPT_FILE"):
 elif LONG_PROMPT_TOKENS:
     _reps = max(1, LONG_PROMPT_TOKENS // _tokens_per_unit)
     PROMPTS = [p + (_unit * _reps) for p in PROMPTS]
+if os.environ.get("PROMPTS_FILE"):
+    # A JSON list of user prompts replaces the built-in set (PROMPT_IDS index into it), e.g. drafter data collection
+    with open(os.environ["PROMPTS_FILE"], encoding = "utf-8") as f:
+        PROMPTS = json.load(f)
 
 
 def log(msg: str):
@@ -906,6 +910,12 @@ def main():
                 if result.get("eos"):
                     eos_info = result.get("eos_reason")
         total = time.time() - t1
+        recs = getattr(generator, "dspark_records", None)
+        if recs is not None and os.environ.get("DSPARK_RECORD_OUT"):
+            # Drafter training data for this prompt: per-round records + the generated tokens (their labels)
+            torch.save({"tokens": tokens, "records": recs, "prompt_tokens": ids.shape[-1], "prompt_idx": idx},
+                       f"{os.environ['DSPARK_RECORD_OUT']}.p{idx}.pass{pass_i}.rank{RANK}.pt")
+            generator.dspark_records = []
         if not timed:
             continue
         if DSPARK_COUNT_FORWARDS:
