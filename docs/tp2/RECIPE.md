@@ -29,11 +29,12 @@ measured numbers in [`RESULTS.md`](RESULTS.md) are from this pair.
 | Output (TP=2, pre-sharded offline) | `<models>/dsv41-exl3-mixed-2.565-shard2/{rank0,rank1}/` |
 | Output size | ~179 GiB total (safetensors + index + config + `shard_manifest.json`) |
 
-The bitrate mix is chosen by *expert hotness*: experts that fire most often keep 3.5 bpw, cold experts
-drop to 2.0. Quantization error therefore lands where it is least likely to be read, which is why the
-average can sit at 2.565 bpw without the quality collapse a uniform 2.5 bpw checkpoint shows. Assigning
-per-expert bitrates is done at conversion time by the router-frequency table of the base model; nothing
-is requantized or re-ranked at load time.
+The bitrate mix is chosen by *expert hotness*: experts that fire most often get more bits, cold experts fewer.
+Quantization error therefore lands where it is least likely to be read, which is why the average can sit at
+2.5 bpw without the quality collapse a uniform 2.5 bpw checkpoint shows. Hotness comes from Strata's routing
+profile (Niko1221/Strata, `data/dsv41/profile-2.25.bin`, commit `81dd215d`): all 15,360 trunk experts are ranked
+by selection count and the ranking is cut into tiers (2.499: 1,400 @ 4, 4,860 @ 3, 9,100 @ 2 bpw). Bitrates are
+assigned at conversion time; nothing is requantized or re-ranked at load time.
 
 Engram tables (layers 1 and 14) stay **outside** the shards: FP8 E4M3 + E8M0 scale, held in host DDR5
 ECC RAM as one shared read-only copy for both ranks.
