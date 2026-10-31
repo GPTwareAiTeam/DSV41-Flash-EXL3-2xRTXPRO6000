@@ -30,7 +30,9 @@ prompt in a 1M cache peaks at 93.23 GiB of 94.97 per GPU with a 2048-row prefill
   be set to `0` / `16` to restore the old behaviour.
 - **Drafter gate retuned** (`EXL3_DSPARK_AUTO_LO` 0.35 → 0.25, `EXL3_DSPARK_AUTO_SWITCH` 1.5 → 2.0) for the 2.499-bpw
   checkpoint: 7 prompts, 256 tokens, ABBA, 143.3 / 144.7 → 153.4 / 154.0 tok/s (+6.8%); 5 of 7 faster, two short
-  prompts 2–7% slower. Only the number of drafted tokens checked per round changes; output is unchanged.
+  prompts 2–7% slower. It changes how many drafted tokens are verified per round; a different verify width is a
+  different numeric path, so greedy output can differ on near-tied tokens (26.9k prompt: different token stream,
+  same planted-fact answers at 131k).
 
 - **The drafter's cache is a small per-user window instead of a context-sized copy.** The DSpark drafter only
   ever reads the last 128 positions, but it kept a 3-layer, 512-wide row for every position of the context:
