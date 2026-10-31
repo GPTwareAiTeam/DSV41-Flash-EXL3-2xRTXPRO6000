@@ -32,9 +32,9 @@ prompt in a 1M cache peaks at 93.23 GiB of 94.97 per GPU with a 2048-row prefill
   both ranks (alternating 24k/short jobs, speed set, prefix-cache turn 2, 2 and 4 users); speed unchanged within
   noise; 0.19 GiB more free per GPU at a 64k cache and 1.50 GiB at 512k. A 150k-token prompt in a 512k cache now
   runs (85.5 tok/s decode); v1.0.0 runs out of memory there.
-- **Indexer prefill defaults: 128-row score slabs (`EXL3_DSV4_SCORE_SLAB=128`) and FP4 index keys read
-  in-kernel (`EXL3_DSA_IDX_FP4_DIRECT=1`).** Smaller transient score matrix and no fp16 key copy at depth;
-  131k-token prompt time to first token 47.53 → 48.31 s (+1.6%), token-identical.
+- **Indexer prefill default: 128-row score slabs (`EXL3_DSV4_SCORE_SLAB=128`).** Smaller transient score matrix
+  at depth, same selected entries, token-identical. `EXL3_DSA_IDX_FP4_DIRECT=1` (read FP4 index keys in-kernel in
+  prefill, 128 MiB less at 1M) is opt-in: its scores differ in the last fp16 bit and change generated tokens.
 - **Deep-context top-k attention reads FP4 pool entries in-kernel** once the pool window exceeds
   `EXL3_DSA_FP4_GATHER_DIRECT_MIN` entries (default 262,144) instead of unpacking the whole window to fp16. One
   2048-row chunk at a 1M-entry pool: 3.2 ms / 1.23 GiB transient → 2.2 ms / 64 MiB. Same values (within 1e-4 of the
