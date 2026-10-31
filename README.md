@@ -51,7 +51,8 @@ runtime's production prefill path:
 | object-oriented-architects | 2.7 | 1.5931 | 1.6146 |
 | sudoingx v1.2 | 2.70 | 1.5946 | 1.6159 |
 | LibertAIDAI | 2.9 | 1.6040 | 1.6155 |
-| **This release (abliterated base)** | **2.565** | **1.6886** | **1.7041** |
+| This build, 2.565 checkpoint (abliterated base) | 2.565 | 1.6886 | 1.7041 |
+| **This build, 2.499 checkpoint (default, abliterated base)** | **2.499** | **1.6998** | **1.7138** |
 
 Read this table with two caveats:
 
