@@ -945,9 +945,11 @@ _dsa_qc_stage_min_r = int(os.environ.get("EXL3_DSA_QC_STAGE_MIN_R", "64"))
 _dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", str(1 << 20)))
 # FP4 staging decodes this many pool rows per slice (each slice holds a 1 KiB/row fp16 copy briefly)
 _fp4_stage_slice_rows = int(os.environ.get("EXL3_DSA_FP4_STAGE_SLICE", str(1 << 16)))
-# Indexer scoring reads FP4 keys in-kernel even for many-query (prefill) calls instead of unpacking them to fp16 first:
-# same values, no fp16 key copy (128 MiB at a 1M context). 0 = unpack once per call (slightly faster, more memory)
-_dsa_idx_fp4_direct = os.environ.get("EXL3_DSA_IDX_FP4_DIRECT", "1") == "1"
+# Indexer scoring for many-query (prefill) calls over FP4 keys: default unpacks the job's key pages to fp16 once and
+# scores through the fp16 kernel. EXL3_DSA_IDX_FP4_DIRECT=1 reads the FP4 keys in-kernel instead (no fp16 key copy,
+# 128 MiB less at a 1M context) but its scores differ in the last fp16 bit (up to 1e-3 on ~1% of entries), which
+# changes generated tokens downstream, so it stays opt-in
+_dsa_idx_fp4_direct = os.environ.get("EXL3_DSA_IDX_FP4_DIRECT", "0") == "1"
 # Gathered (top-k) FP4 attention decodes the selected entries in-kernel instead of staging the pool window once the
 # window holds more than this many entries (262144 entries = 256 MiB of fp16 staging). Measured, one 2048-row chunk:
 # 131k-entry pool staged 1.0 ms / direct 1.9 ms; 1M-entry pool staged 3.2 ms, 1.23 GiB / direct 2.2 ms, 64 MiB
