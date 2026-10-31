@@ -22,11 +22,14 @@ ABBA pairs. Full tables and logs: [docs/tp2/RESULTS.md](docs/tp2/RESULTS.md) sec
 
 | Checkpoint | 6 short prompts (mean) | 26.9k prompt | 131k prompt | Free VRAM per GPU after load |
 |---|---|---|---|---|
-| 2.499 bpw (default) | 159 | 172 | 170 | 5.45 GiB |
+| 2.499 bpw (default, 3-bit drafter experts) | 159 | 166 | 170 | 6.32 GiB |
 | 2.565 bpw | 158 | 202 | 158 | 3.43 GiB |
 
 Speed differences between the two come from the drafter (tokens accepted per verify step), not the kernels: a
-verify step costs the same on both. Acceptance depends on content, so the gap varies by prompt.
+verify step costs the same on both. Acceptance depends on content: on five 24k corpus prompts (code, math, prose,
+structured, multilingual) the two average the same, 137 vs 138 tok/s (2.499 faster on math, slower on code).
+
+**8 concurrent users** (2k-token prompts, prefix cache on, 256 tokens each): 229–240 tok/s total on 2.499.
 
 **Context and users**: 1M-token context per GPU pair (FP4 KV, ~890 bytes per token per GPU); 8 concurrent users
 at 131k each in one shared cache answer every planted fact; an 876k-token prompt prefills in ~6 minutes.

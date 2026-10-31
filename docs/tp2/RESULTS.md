@@ -358,7 +358,7 @@ experts not re-quantised are byte-identical to their source build.
 | | 2.565 | 2.499 |
 |---|---|---|
 | Target weights per GPU | 86.31 GiB | 84.18 GiB |
-| Free per GPU after load (4-bit drafter experts) | 3.43 GiB | 5.45 GiB |
+| Free per GPU after load | 3.43 GiB (4-bit drafter experts) | 6.32 GiB (3-bit drafter experts; 5.45 with 4-bit) |
 | WikiText-2 ppl, 8 × 2048 chunks, 16 / FP4 KV | 2.038 / 2.044 | 2.078 / 2.079 |
 | 1017 panel, 8 conversations, 16 / FP4 KV | 1.777 / 1.778 | 1.789 / 1.789 |
 | sudoingx panel, 8 conversations, 16 / FP4 KV | 1.675 / 1.676 | 1.681 / 1.681 |
@@ -385,6 +385,16 @@ ABBA × 2, same container and extension:
 
 Per verify step v1.1 is as fast or faster; the 2.499 checkpoint's speed differences come from drafter acceptance.
 
+24k corpus prompts, 256 tokens, decode tok/s (2.565 / 2.499 + 3-bit drafter / 2.499 + 4-bit): code 154 / 137 / 142,
+math 141 / 175 / 162, prose 112 / 109 / 112, structured 182 / 175 / 185, multilingual 97 / 94 / 91; mean 137 / 138 / 138.
+
+8 users (code 2k prompt × 8, prefix cache on, 256 tokens, K=5): 229–240 tok/s total, first token 0.52 s (v1.0 on
+2.565, same setup with K=3: 212 tok/s).
+
+Drafter work on 2.499 that did not ship: a low-rank output adapter fit to 46,691 recorded draft rounds
+(`EXL3_DSPARK_RECORD`) gained +0.5% held-out tokens/round once the markov bias is included; fixed draft widths and
+a context-aware gate traded short-prompt speed for 24k speed with no net gain (and change the continuation).
+
 ### 10c. Changes and their measured effect
 
 | Change | Measured |
@@ -397,7 +407,7 @@ Per verify step v1.1 is as fast or faster; the 2.499 checkpoint's speed differen
 | FP4 index keys in-kernel in prefill (opt-in only) | not bit-exact: changes tokens; off by default |
 | FP4 direct gather at depth (opt-in only) | bit-exact; 876k prefill 5% slower; off by default |
 | Batched V4.1 attention for B>1 (opt-in only) | slower (59–86 vs 36–37 ms/token per user), not token-identical |
-| Drafter experts 3-bit | 0.77 GiB/GPU less; 26.9k −5%, short/131k even; 4-bit kept as default |
+| Drafter experts 3-bit (default) | 0.77 GiB/GPU less; 7 prompts ABBA 153.3 / 154.7 vs 4-bit 152.0 / 152.6 tok/s |
 
 ### 10d. Identity
 
