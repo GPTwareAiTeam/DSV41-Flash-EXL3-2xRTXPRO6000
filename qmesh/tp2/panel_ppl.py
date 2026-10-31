@@ -39,6 +39,10 @@ import os
 import sys
 import time
 
+# Scoring runs the NCCL backend (TPBackendNCCL), which cannot run inside CUDA graph capture; run_tp2 now defaults the
+# piecewise decode graphs on, so this scorer keeps them off unless the caller sets them explicitly
+os.environ.setdefault("EXL3_WHOLE_GRAPH", "0")
+os.environ.setdefault("EXL3_DSV4_B1_BATCH", "0")
 import torch
 import torch.distributed as dist
 
