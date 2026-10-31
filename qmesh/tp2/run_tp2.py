@@ -26,9 +26,11 @@ os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 os.environ.setdefault("TORCH_EXTENSIONS_DIR", "/root/.cache/torch_extensions")
 # The configuration every published number was measured with: piecewise CUDA graphs for decode and the captured
 # single-token attention body. Both engine dials default off in the shared code; the TP=2 runner and server (which
-# imports this module) turn them on. =0 restores the eager paths
-os.environ.setdefault("EXL3_WHOLE_GRAPH", "1")
-os.environ.setdefault("EXL3_DSV4_B1_BATCH", "1")
+# imports this module) turn them on with the P2P backend (the default COMM), the only one that runs inside a graph
+# capture. =0 restores the eager paths
+if os.environ.get("COMM", "p2p") == "p2p":
+    os.environ.setdefault("EXL3_WHOLE_GRAPH", "1")
+    os.environ.setdefault("EXL3_DSV4_B1_BATCH", "1")
 
 import torch
 import torch.distributed as dist

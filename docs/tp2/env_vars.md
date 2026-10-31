@@ -103,7 +103,7 @@ invocation.
 
 ## Engine-level switches that matter for TP=2
 
-Defaults shown are the engine's compiled-in defaults. The TP=2 runner and server (`qmesh/tp2/run_tp2.py`, `serve_tp2.py`) set `EXL3_WHOLE_GRAPH=1` and `EXL3_DSV4_B1_BATCH=1` unless they are already in the environment.
+Defaults shown are the engine's compiled-in defaults. The TP=2 runner and server (`qmesh/tp2/run_tp2.py`, `serve_tp2.py`) set `EXL3_WHOLE_GRAPH=1` and `EXL3_DSV4_B1_BATCH=1` with `COMM=p2p` (the default) unless they are already in the environment; the NCCL backend cannot run inside a graph capture, so `COMM=nccl` and the perplexity scorer (`panel_ppl.py`) keep them off.
 
 | Variable | Default | Effect |
 |---|---|---|
