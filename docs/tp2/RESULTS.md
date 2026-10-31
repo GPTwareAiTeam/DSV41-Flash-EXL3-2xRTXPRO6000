@@ -368,6 +368,9 @@ experts not re-quantised are byte-identical to their source build.
 
 FP4 KV costs +0.3% WikiText perplexity and +0.05% on the panels against 16-bit KV.
 
+Full panels (199 conversations each, 237,457 / 254,846 scored positions, FP4 KV): 2.499 scores 1.6998 / 1.7138
+against 2.565's 1.6886 / 1.7041 (+0.66% / +0.57%). WikiText-2, all 140 chunks: 2.5241 ± 0.0129.
+
 ### 10b. Speed, release v1.0 vs v1.1
 
 ABBA × 2, same container and extension:
