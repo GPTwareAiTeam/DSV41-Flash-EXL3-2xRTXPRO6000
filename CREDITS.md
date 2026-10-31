@@ -64,18 +64,6 @@ identical to the previous arithmetic.
 **sybil-solutions**, **sfxnz**, **MiaAI-Lab**, **SSHdotCodes**, **acrogenesis**, **llamaperf** — public performance
 reports used as reference points.
 
-## Inherited through upstream, not used by this runtime
-
-Upstream vendors code for other models and other GPUs. It stays in the tree with its licences intact, but nothing
-in this runtime's path uses it:
-
-- **Flash Linear Attention (FLA)** — Songlin Yang, Yu Zhang, Zhiyuan Li — MIT, `exllamav3/vendor/fla/`: linear
-  attention for Mamba / Gated-DeltaNet style models. DeepSeek-V4 does not use it.
-- **ROCm WMMA GEMM** — Adel Johar — MIT, `exllamav3/exllamav3_ext/rocm/vendor/rocm_wmma_gemm/`: AMD GPU support.
-  CUDA builds exclude `rocm/` sources (`exllamav3/util/cuda_flags.py`), so it is not compiled for these cards.
-- **llama.cpp** semantics in upstream's sampler (DRY, GBNF grammar), not used by this runtime's greedy and server
-  paths beyond upstream's defaults.
-
 ## Tools
 
 **PyTorch** (runtime and CUDA graph capture), **NCCL** (rendezvous and prefill reduction), **CUDA**, **Triton**,

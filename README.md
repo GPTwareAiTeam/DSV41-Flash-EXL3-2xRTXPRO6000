@@ -42,9 +42,7 @@ this model and these cards. About 22,600 lines across 254 commits are this proje
 | **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT) | The WikiText-2 perplexity protocol. | Our prefill-chunk invariance gate. |
 
 Reference numbers only, no code taken: sfxnz, MiaAI-Lab, SSHdotCodes, sybil-solutions, acrogenesis, llamaperf.
-Upstream also vendors Flash Linear Attention and Adel Johar's ROCm WMMA GEMM for other models and AMD GPUs; neither
-is on this runtime's path (DeepSeek-V4 uses neither, and ROCm sources are excluded from CUDA builds). Full detail:
-[CREDITS.md](CREDITS.md). The code is MIT; the licence text is unchanged in [LICENSE](LICENSE).
+Full detail: [CREDITS.md](CREDITS.md). The code is MIT; the licence text is unchanged in [LICENSE](LICENSE).
 
 ## Model and layout
 
