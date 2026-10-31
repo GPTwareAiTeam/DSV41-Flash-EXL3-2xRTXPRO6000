@@ -415,17 +415,133 @@ Release v1.0 and v1.1 produce the same tokens on the same weights and drafter ga
 Prefix cache: turn 2 = turn 1. Both ranks token-identical in every run. Batch width changes greedy output on
 near-tied tokens (2/4 users vs single: 2 of 4 streams differ, first at token 2–250), as in section 6.
 
-## 11. What this is and is not
+## 11. v1.2 investigations (2026-10-31)
 
-- **Is:** a true TP=2 runtime for a 2.565 bpw mixed-bitrate EXL3 checkpoint of a 100B-class MoE model, fitting
-  two 96 GB cards with speculative decoding always on, at 97–189 tok/s single-user decode at 24k context
-  depending on content, 124 tok/s at 128k, and prefix caching for repeated long prompts.
+Settings unless noted: 2.499 checkpoint, TP=2, FP4 KV, graphs, pinned GEMM tuning **warmed per variant before
+timing** (a GEMM shape without a tune entry autotunes mid-decode: one ~1.5 s round, a false 15–20% loss on 8-bit
+variants until warmed), 256 tokens, ignore EOS. Logs: `<artifacts>/{dtrain,drafterhq,dq2,hc}/`.
+
+### 11a. Why code is slower than other content (same prompt)
+
+Same 24k prompt file per content, three drafter/checkpoint arms, ABCCBA, repeat-identical tokens:
+
+| code_24k | tok/s | tokens/round | wall ms/round | verify GPU ms (`EXL3_ROUND_PROF`) |
+|---|---|---|---|---|
+| 2.499 + 3-bit drafter experts | 137.9 / 137.9 | 3.19 | 23.7 | 17.6–17.8 |
+| 2.499 + 4-bit drafter experts | 144.1 / 143.9 | 3.12 | 21.6 | 18.6 |
+| 2.565 + 4-bit drafter experts | 156.5 / 155.5 | 3.46 | 22.0 | 19.0 |
+
+The verify step is not slower on 2.499; acceptance is lower. The two checkpoints diverge at token 24 on code
+(token 2 on math, where 2.499 wins 176 vs 140) and the continuations offer the drafter different positions. The
+3-bit drafter's forward costs 1.42 ms vs 1.27 (4-bit): its 4-bit shared expert breaks the uniform-rate fold, so it
+launches separately.
+
+### 11b. Drafter quantisation matrix
+
+Routed experts / attention + main_proj / shared expert, bpw. Speed block: all variants back to back, then reversed;
+fixed width 5 on code_24k. Acceptance: 40 held-out prompts, auto gate, paired bootstrap over prompts.
+
+| Variant | Drafter fwd GPU ms | Free GiB/GPU | Held tokens/round auto / fixed-5 | Held tok/s vs 3/4/4, 95% CI |
+|---|---|---|---|---|
+| 3/4/4 (v1.1) | 1.415 | 7.12 | 3.261 / 3.350 | — |
+| 4/4/4 | 1.28 | 6.26 | 3.294 / 3.376 | +1.37% [−0.18, +2.86] |
+| 3/6/6 | 1.52 | 6.98 | 3.306 / 3.359 | +0.44% [−1.61, +2.91] |
+| 3/8/8 | 1.53 | 6.98 | 3.307 / 3.361 | −0.24% [−1.58, +1.01] |
+| 4/8/8 | 1.54 | 6.11 | 3.319 / 3.370 | +0.98% [−0.47, +2.51] |
+| 4/4/8 | 1.43 | 6.26 | (fixed width only, below) | — |
+| 2/8/8, 2/6/6, 4/6/6 | 1.50–1.54 | — | 3.317 (2/8/8, fixed-5) | — |
+
+Conditional acceptance per draft position is the same for every variant (~0.77, 0.73, 0.71, 0.72, 0.70): drafter
+precision is not what limits acceptance. Fixed K=3 / K=5 on five 24k prompts, 4 variants (aggregate tok/s):
+3/4/4 129.9 / 126.9, 4/4/4 130.8 / 129.3, 4/8/8 130.1 / 128.9, 4/4/8 130.2 / 126.7.
+
+### 11c. Hot/cold drafter experts
+
+Drafter routing picks (instrumented arm): each of the 3 drafter blocks has 128 routed experts, top 6 per token;
+use concentrates with depth (block 2: 3 experts carry half of all picks, 21–33 carry 99%). Tiers from 153 training
+prompts + 24 multilingual prompts (disjoint from every evaluation set):
+
+| Variant | Tiers (bpw: experts per block 0/1/2) | Drafter ms | Free GiB | K=3 / K=5 aggregate tok/s (five 24k prompts) |
+|---|---|---|---|---|
+| 3/4/4 (v1.1) | 3: 128/128/128 | 1.41 | 7.12 | 127.0 / 126.2 |
+| 4/4/4 | 4: all | 1.26 | 6.26 | 130.3 / 128.7 |
+| **hot 4 / cold 2 (v1.2)** | 4: 101/72/49, 2: rest | 1.26 | 7.00 | 131.3 / 128.6 |
+| hottest 8 / hot 4 / cold 2 | 8: 8/8/8, 4: 94/63/40, 2: rest | 1.30 | 6.75 | 131.2 / 127.9 |
+
+40 held-out prompts, auto gate, two ABBA sessions: hot 4 / cold 2 vs 3/4/4 +1.36% [−0.20, +2.79] and +0.94%
+[−1.05, +2.80]. The hot tier is 4 bpw like the drafter's shared expert, so the shared expert stays folded.
+
+### 11d. Diffbot kernel ideas and routing prep
+
+| Idea | Result |
+|---|---|
+| Decode MoE down projection with a 4-stage 16-byte cp.async shared-memory weight ring (diffbot `xmoe` flat loop) | bit-identical (rows 1–8, mixed 2/3/4/6 bpw) and token-identical; slower: 90.70 → 104.53 µs/layer (gate/up 123.57 → 124.10). Branch `tp2/moeflat-1031`, opt-in, not merged. |
+| Nsight, 6 rows, baseline coop kernels | DRAM 68% (A) / 61% (B) of peak, ~46% long-scoreboard stalls, tensor pipe 19–23%: memory-latency bound; swapped MMA has weak support |
+| Row top-k (diffbot `rowtopk`) | their kernel reads a padded max_model_len width; our indexer top-k already scans only the live compressed width |
+| Fused routing prep (fold the norm into the carried hyper-connection mix, defer the apply under TP) | exact, token-identical, but no launch reduction: the folded norm is limited to width 4096 (model: 5120). Dropped. |
+| Drafter shared-expert fold for a uniform-rate layer whose shared expert has another rate | token-identical; 136.0 → 136.1 tok/s short-prompt aggregate (no gain). Branch `tp2/dfold-1031`, not merged. |
+
+## 12. v1.2 final measurements (2026-10-31)
+
+Tree `tp2/adaptive-chunk` at the v1.2 commit, one extension build, container `exl3-tp2:clean-20261028`, shipped
+defaults (DSpark K=5 with the auto gate, FP4 KV, graphs, CPU-pinned ranks), v1.2 drafter (hot 4 / cold 2), pinned
+GEMM tuning warmed once, 256 tokens, ignore EOS, prefix cache off. Logs: `<artifacts>/final2/logs/`.
+Unit tests: `tests/kernels/moe tests/generator tests/cache` 554 passed, 1 pre-existing failure
+(`test_failing_allocate_pages_is_contained`, fails on v1.0 too). v1.1's drafter on the v1.2 build is token-identical
+to the v1.1 build (6 prompts, both ranks); v1.2 drafter rank- and repeat-identical.
+
+### 12a. Single user, by content (ABBA: v1.1 drafter, v1.2, v1.2, v1.1)
+
+| Prompt set | v1.1 drafter tok/s | v1.2 tok/s | tokens/round v1.1 → v1.2 |
+|---|---|---|---|
+| code 24k | 139.9 / 138.0 | 129.9 / 130.4 | 3.19 → 2.88 |
+| math 24k | 176.6 / 176.4 | 161.6 / 163.8 | 4.57 → 4.38 |
+| prose 24k | 111.2 / 111.5 | 113.2 / 113.8 | 2.45 → 2.46 |
+| structured 24k | 176.6 / 175.1 | 185.5 / 185.3 | 4.15 → 4.18 |
+| multilingual 24k | 98.6 / 99.3 | 90.9 / 92.7 | 2.10 → 1.89 |
+| 7 short prompts | 159.1 / 159.1 | 157.3 / 158.8 | 3.52 → 3.50 |
+| 40 held-out prompts | 151.8 / 155.5 | 157.3 / 157.5 | 3.26 → 3.26 |
+| all (sum of tokens / sum of decode time) | 150.7 / 153.5 | 153.9 / 154.4 | |
+
+Held-out prompts, per-prompt best of two: v1.2 +0.94% [−1.05, +2.80]. Single 24k prompts swing ±10% either way
+because each drafter changes near-tied greedy choices and the continuation differs (30 of 40 held-out outputs
+differ between the arms); the held-out set is the basis for the default.
+
+### 12b. Concurrent users (one shared cache; every user prefills; decode throughput excludes prefill)
+
+| Users | 2k prompts: total / per user tok/s | 24k prompts: total / per user tok/s | Last first token, 2k / 24k | Peak reserved GiB, 2k / 24k |
+|---|---|---|---|---|
+| 1 | 156.2 / 156.2 | 131.2 / 131.2 | 0.8 s / 8.3 s | 87.8 / 88.8 |
+| 2 | 146.6 / 73.3 | 146.9 / 73.4 | 1.6 s / 16.7 s | 87.9 / 89.4 |
+| 4 | 176.1 / 44.0 | 162.7 / 40.7 | 3.2 s / 33.7 s | 88.2 / 89.8 |
+| 8 | 255.0 / 31.9 | 230.0 / 28.8 | 6.4 s / 66.7 s | 88.7 / 90.1 |
+| 16 | 215.3 / 13.5 | 253.6 / 15.9 | 12.9 s / 133.2 s | 89.9 / 90.9 |
+
+Cache sized at 8k (2k prompts) or 32k (24k prompts) tokens per user; speculation on in every run (K=5 effective).
+Decode attention runs one user at a time, so total throughput levels off at ~250 tok/s.
+
+### 12c. Context limits
+
+| Test | Result |
+|---|---|
+| Shared cache 8,388,608 tokens, 8 users | fails at load (out of memory) |
+| Shared cache 6,291,456 tokens, 8 users × 2k | loads (1.61 GiB free); before the shared-page fix: recurrent-checkpoint assert; after: out of memory in decode |
+| **Shared cache 5,242,880 tokens**, 8 users × 2k | runs; KV 4.35 GiB/GPU, 2.47 GiB free after load, peak 93.0 GiB reserved |
+| 5,242,880 cache, 1 user × 131,233-token needle prompt | 5/5 facts; first token 49.9 s; decode 5.76 ms/token; peak 92.7 GiB reserved |
+| 5,242,880 cache, 8 users × 131,233 tokens | 40/40 facts; last first token 407 s; 25.5 ms/token per user; peak 92.7 GiB reserved |
+| 1,048,576 cache, 876,328-token prompt, adaptive prefill (MAX_CHUNK 8192) | both facts (10% and 90% depth) answered; first token 352.0 s (2,490 tok/s); 214 chunks; decode 9.95 ms/token |
+
+## 13. What this is and is not
+
+- **Is:** a true TP=2 runtime for a 2.499 bpw mixed-bitrate EXL3 checkpoint of a 100B-class MoE model, fitting
+  two 96 GB cards with speculative decoding, at 91–185 tok/s single-user decode at 24k context depending on content,
+  a 5M-token shared KV cache (8 users × 131k), a single 876k-token prompt, and prefix caching for repeated prompts.
 - **Is not:** a claim to beat every other runtime. As a reference point published by a third party on the same
   hardware class for a *different* checkpoint and configuration (diffbot, EXL3 3 bpw, fp8 KV, their own
   drafter): 156.9 tok/s single-stream at 2k context, 362.9 tok/s aggregate with 4 streams at 46k, and
   11.2–11.5k tok/s fresh 40k prefill warm ([public-number survey](notes/EXL3_SPEED_SURVEY.md)). Different
   checkpoint, different KV precision, different batching policy. This runtime does not win on multi-user
   throughput or prefill.
-- **Known limits**, all measured: decode attention runs per user when several users are active (weak
-  multi-user scaling); 8 users with speculation do not run; FP8 KV breaks capture; the 8-bit prefill all-reduce
-  fails the coherence gate.
+- **Known limits**, all measured: decode attention runs per user when several users are active (total levels off
+  at ~250 tok/s); FP8 KV breaks capture; the 8-bit prefill all-reduce fails the coherence gate; cold prefill
+  2.5–3.0k tok/s.

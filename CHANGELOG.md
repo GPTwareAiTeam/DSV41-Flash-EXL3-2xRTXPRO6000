@@ -1,5 +1,49 @@
 # Changelog
 
+## v1.2.0 (2026-10-31)
+
+Final v1 release. Default checkpoint unchanged (2.499 bpw routed experts); new default drafter experts.
+Measurements: docs/tp2/RESULTS.md sections 11 and 12.
+
+### Changed
+
+- **Hot/cold drafter experts (default).** The drafter's routed experts that take 99% of its routing picks
+  (101 / 72 / 49 of 128 in blocks 0 / 1 / 2) are at 4 bpw, the rest at 2 bpw; the 3-bit uniform set was v1.1's
+  default. Tiers come from routing counts on 153 training prompts plus 24 multilingual prompts
+  (`qmesh/tp2/data/drafter_expert_usage.json`), disjoint from the evaluation sets; the hot set covers 98.4–99.8% of
+  picks on every evaluation set. Same acceptance and drafter time as all-4-bit (1.26 vs 1.41 ms per round for 3-bit:
+  the hot tier matches the 4-bit shared expert, so it stays folded into the routed launch), 0.12 GiB/GPU more than
+  3-bit (7.00 vs 7.12 GiB free) instead of 0.86. 40 held-out prompts: +0.9% / +1.4% over v1.1 in two sessions
+  (95% CIs touch zero). Target-model output is unchanged by the drafter; the continuation can differ on near-tied
+  tokens because verify widths differ.
+
+### Added
+
+- `qmesh/tp2/quant_drafter_experts.py` (drafter routed experts at one rate), `qmesh/tp2/drafter_experts.py`
+  (per-expert rate tiers from a usage table, split per rank with shard_tool's rules).
+- Mixed per-expert MoE decode kernels gain the 8-bit case; mixed-K tables admit 6 and 8 bpw.
+- `EXL3_ROUND_PROF=1` reports slow rounds (>2× median) and their worst segment. Found that a GEMM shape without a
+  tune-cache entry autotunes mid-decode (one ~1.5 s round).
+- `docs/tp2/V2_BACKLOG.md`: per-matrix (w1/w2/w3) bit widths, drafter retraining, prefill, per-content draft width.
+
+### Fixed
+
+- **Crash with identical prompts under memory pressure.** Identical prompts in a batch share cache pages from
+  allocation on; when one sequence's prefill chunk ended on a page boundary it reset the fill level of the next page
+  even if a sibling had already completed it, and the sibling's recurrent checkpoint then failed
+  (`assert page.kv_position == PAGE_SIZE`). Seen with 8 users at a 6M-token cache, where the adaptive limiter splits
+  prompts into chunks out of step. Prefill no longer shrinks a complete page; regression test
+  `tests/generator/test_shared_page_prefill.py`.
+- `doc/env_vars.md` listed `EXL3_DSV41_FUSED_ROPE`, `EXL3_DSV4_FUSED_INDEXER_ROPE` and
+  `EXL3_DSV41_FUSED_POOL_SCATTER` as off; they default on.
+- Removed stale merge-conflict copies (`*.py:conflicts/*`) from the tree.
+
+### Measured, not shipped
+
+- Diffbot-style decode MoE weight streaming (cp.async ring): bit-identical, slower (down projection 90.7 → 104.5
+  µs/layer). Routing-prep fusion: no launch reduction at hidden size 5120. Drafter attention / shared expert at
+  6 or 8 bpw: ≤2% acceptance for +0.1 ms per round. Drafter shared-expert fold patch: no measurable gain.
+
 ## v1.1.0 (2026-10-31)
 
 Project renamed **dsv41-6000-tp2**. Default checkpoint: 2.499 bpw routed experts (1,400 @ 4, 4,860 @ 3, 9,100 @ 2;

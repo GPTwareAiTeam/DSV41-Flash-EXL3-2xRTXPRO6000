@@ -33,15 +33,27 @@ the effect of that edit, not only of quantisation.
   (`EXL3_MOE_PDL`, `EXL3_MOE_COOP_PDL`). Both are bitwise identical to the baseline arithmetic. The kit's CPU
   emulator, `bench_moe_coop.py` benchmark harness and its memory-latency classification rule were used to
   evaluate the MoE kernel.
-- **Diffbot drafter head** (MIT) — optional only (`DSPARK_HEAD=diffbot`). The converter
-  `qmesh/tp2/drafter_overlay.py` reads their published drafter pack; no diffbot weights are redistributed.
-  Licence and attribution: [docs/tp2/diffbot-drafter-k7.LICENSE.txt](docs/tp2/diffbot-drafter-k7.LICENSE.txt),
-  [docs/tp2/diffbot-drafter-k7.CREDITS.md](docs/tp2/diffbot-drafter-k7.CREDITS.md). Their AGPL vLLM patches
-  were not used.
+- **Diffbot** ([DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000), MIT):
+  - drafter head, optional only (`DSPARK_HEAD=diffbot`). The converter `qmesh/tp2/drafter_overlay.py` reads their
+    published drafter pack; no diffbot weights are redistributed. Licence and attribution:
+    [docs/tp2/diffbot-drafter-k7.LICENSE.txt](docs/tp2/diffbot-drafter-k7.LICENSE.txt),
+    [docs/tp2/diffbot-drafter-k7.CREDITS.md](docs/tp2/diffbot-drafter-k7.CREDITS.md);
+  - idea of an 8-bit peer-push prefill all-reduce (their `fp8ar`): our `PREFILL_AR` (`qmesh/tp2/prefill_ar.py`,
+    `exllamav3_ext/parallel/prefill_ar.cu`) is our own implementation with int8 and exact modes, opt-in;
+  - studied, not shipped: their flat decode MoE loop (cp.async weight ring, 128-wide K tiles, swapped MMA) and
+    length-aware row top-k (`kernels/xmoe`, `kernels/rowtopk`, MIT). The streaming idea ported to our coop kernel was
+    bit-identical but slower (branch `tp2/moeflat-1031`, opt-in `EXL3_MOE_COOP_STREAM=1`, not merged); results in
+    [docs/tp2/RESULTS.md](docs/tp2/RESULTS.md) section 11.
+  Their AGPL vLLM patches were not read or used.
+- **philbert440 — 1Cat-vLLM PR #1243** — idea only: scale the drafter's input taps by a power of two before the
+  fp16 cast. Implemented as `EXL3_DSPARK_TAP_SCALE` (`exllamav3/modules/transformer.py`); neutral on our build,
+  default 1.0.
 - **Flash Linear Attention (FLA)** — Songlin Yang, Yu Zhang, Zhiyuan Li — MIT, vendored under
   `exllamav3/vendor/fla/` with its licence intact.
 - **ROCm WMMA GEMM** — Adel Johar — MIT, vendored under `exllamav3/exllamav3_ext/rocm/vendor/rocm_wmma_gemm/`
   with its licence intact.
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT) — inherited through upstream: DRY sampler semantics,
+  GBNF grammar syntax and the perplexity protocol (`exllamav3/eval/ppl.py`, reused by `qmesh/tp2/panel_ppl.py`).
 
 ## Reference data (no code taken)
 
@@ -51,8 +63,8 @@ Used for targets, comparisons and cross-checks only:
   the original model); our perplexity scorer reproduces sudoingX's panel protocol exactly.
 - **diffbot** — the primary comparable deployment (same GPU class, TP=2, PCIe) and its published throughput and
   acceptance figures.
-- **sybil-solutions**, **philbert440 / 1Cat-vLLM PR #1243**, **sfxnz**, **MiaAI-Lab**, **SSHdotCodes**,
-  **acrogenesis**, **llamaperf** — public performance reports used as reference points.
+- **sybil-solutions**, **sfxnz**, **MiaAI-Lab**, **SSHdotCodes**, **acrogenesis**, **llamaperf** — public
+  performance reports used as reference points.
 
 ## Tools
 
