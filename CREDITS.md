@@ -22,6 +22,11 @@ requires. Upstream contributors' commits (turboderp and others) are upstream wor
   (MIT; gated: 18+, lawful use, user accepts responsibility for outputs): the base checkpoint our mixed-bitrate EXL3
   builds were quantised from. It is an abliterated (refusal-removed) fine-tune, so the quality figures we publish,
   measured against the original model's outputs, include the effect of that edit as well as quantisation.
+- **Niko1221 — [Strata](https://github.com/Niko1221/Strata)** (MIT): the expert routing-frequency profile behind
+  the main checkpoint's hot/cold bitrate tiers — `data/dsv41/profile-2.25.bin` at commit `81dd215d` (sha256
+  `c8de062c…`, 426,449,520 top-6 selections across the 40 trunk layers). We ranked all 15,360 trunk experts by its
+  counts and cut the ranking into our 2.565 and 2.499 bpw tiers. The drafter's own hot/cold tiers were measured here
+  (`qmesh/tp2/data/drafter_expert_usage.json`), since the profile has no drafter counts.
 
 ## Other people's code or ideas used here
 
