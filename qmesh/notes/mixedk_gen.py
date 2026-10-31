@@ -2,24 +2,28 @@
 # Mixed-K decode A/B kernels: the GEMV tile is dispatched per block on the expert's half-bit rate k2
 # (2*bits + half). Only the rates in CASES are instantiated; the host validates the tables against them.
 import sys
-SRC = '/home/treadall/qmesh-exl3-runtime/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh'
+SRC = '/home/treadall/recipe-2xrtx-tp2-moe/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh'
 OUT = sys.argv[1] if len(sys.argv) > 1 else '/tmp/mk/mixed_kernel.cuh'
 src = open(SRC).read().split('\n')
 
-def body(lo, hi):
-    return src[lo-1:hi]
+def kernel_body(name):
+    # Locate a shared device body and return it through its column-zero closing brace.
+    start = None
+    for i, ln in enumerate(src):
+        if ln.startswith(f'void {name}('):
+            start = i
+            break
+    assert start is not None, name
+    assert src[start - 1].startswith('__device__'), src[start - 1]
+    assert src[start - 2].startswith('template <int bits, int cb, bool WIDE'), src[start - 2]
+    end = next(j for j in range(start, len(src)) if src[j] == '}')
+    return src[start + 1:end + 1]
 
-def strip_head(lines, name):
-    assert lines[0].startswith('template <int bits, int cb, bool WIDE'), lines[0]
-    assert lines[1].startswith('__global__'), lines[1]
-    assert lines[2].startswith(f'void {name}('), lines[2]
-    return lines[3:]
+A = kernel_body('moe_a_body')
+B = kernel_body('moe_b_body')
 
-A = strip_head(body(676, 805), 'exl3_moe_coop_a_kernel')
-B = strip_head(body(812, 959), 'exl3_moe_coop_b_kernel')
-
-# (k2, bits, half). k2 = 2*bits + half, mul1 rates 2, 2.5, 3, 3.5, 4
-CASES = [(4, 2, False), (5, 2, True), (6, 3, False), (7, 3, True), (8, 4, False)]
+# (k2, bits, half). k2 = 2*bits + half. mul1 rates 2, 2.5, 3, 3.5, 4 (routed) and 6 (shared expert, staged path)
+CASES = [(4, 2, False), (5, 2, True), (6, 3, False), (7, 3, True), (8, 4, False), (12, 6, False), (16, 8, False)]
 
 def gemv_lines(lines, macro, k2_expr):
     out = []
@@ -66,13 +70,51 @@ L.append('')
 L += dispatch('MIXED_GEMV_B')
 L.append('')
 
-def kernel(name, lines):
-    out = ['template <int cb, bool WIDE>', '__global__ __launch_bounds__(THREADS)', f'void {name}(const MoeCoopParams p)']
-    return out + lines
+def body(name, lines):
+    return ['template <int cb, bool WIDE>', '__device__ __forceinline__',
+            f'void {name}(const MoeCoopParams& p, int item, uint32_t* smem_dyn)'] + lines
 
-L += kernel('exl3_moe_coop_a_mixed_kernel', gemv_lines(A, 'MIXED_GEMV_A', '(is_gate ? p.k2_g : p.k2_u)[local]'))
+L += body('mixed_a_body', gemv_lines(A, 'MIXED_GEMV_A', '(is_gate ? p.k2_g : p.k2_u)[local]'))
 L.append('')
-L += kernel('exl3_moe_coop_b_mixed_kernel', gemv_lines(B, 'MIXED_GEMV_B', 'p.k2_d[local]'))
+L += body('mixed_b_body', gemv_lines(B, 'MIXED_GEMV_B', 'p.k2_d[local]'))
+L += r'''
+template <int cb, bool WIDE>
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
+void exl3_moe_coop_a_mixed_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
+        p.ctr_b[i] = 0;
+    mixed_a_body<cb, WIDE>(p, blockIdx.x, smem_dyn);
+}
+
+template <int cb, bool WIDE>
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
+void exl3_moe_coop_b_mixed_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_a_len; i += gridDim.x * THREADS)
+        p.ctr_a[i] = 0;
+    mixed_b_body<cb, WIDE>(p, blockIdx.x, smem_dyn);
+}
+
+template <bool WIDE_A, bool WIDE_B>
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
+void exl3_moe_coop_fused_mixed_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    __shared__ int next_item;
+    for (;;)
+    {
+        if (threadIdx.x == 0) next_item = atomicAdd(p.queue_head, 1);
+        __syncthreads();
+        if (next_item >= p.nA + p.nB) break;
+        if (next_item < p.nA) mixed_a_body<2, WIDE_A>(p, next_item, smem_dyn);
+        else mixed_b_body<2, WIDE_B>(p, next_item - p.nA, smem_dyn);
+        __syncthreads();
+    }
+}
+'''.splitlines()
 L.append('')
 L.append('}  // namespace exl3_moe_coop_mixed_ns')
 open(OUT, 'w').write('\n'.join(L) + '\n')

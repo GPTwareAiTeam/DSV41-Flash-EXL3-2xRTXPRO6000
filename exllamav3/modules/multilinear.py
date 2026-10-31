@@ -28,8 +28,8 @@ class MultiLinear:
         Ks = [l.inner.K for l in linears]
         self.mixed_k = mixed_k or any(K != Ks[0] for K in Ks)
         if self.mixed_k:
-            assert all(float(K * 2).is_integer() and 4 <= K * 2 <= 8 for K in Ks), \
-                f"MultiLinear: mixed-K rates must be in {{2,2.5,3,3.5,4}}, got {Ks}"
+            assert all(int(round(K * 2)) in (4, 5, 6, 7, 8, 12, 16) and float(K * 2).is_integer() for K in Ks), \
+                f"MultiLinear: mixed-K rates must be in {{2,2.5,3,3.5,4,6,8}}, got {Ks}"
             # Placeholder scalar: mixed-K kernels read the per-expert table, never this value
             self.K = float(Ks[0])
             self.k2 = torch.tensor([int(round(2 * K)) for K in Ks], dtype = torch.uint8, device = device)
