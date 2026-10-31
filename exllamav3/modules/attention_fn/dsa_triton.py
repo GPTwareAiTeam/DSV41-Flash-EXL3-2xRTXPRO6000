@@ -950,10 +950,11 @@ _fp4_stage_slice_rows = int(os.environ.get("EXL3_DSA_FP4_STAGE_SLICE", str(1 << 
 # 128 MiB less at a 1M context) but its scores differ in the last fp16 bit (up to 1e-3 on ~1% of entries), which
 # changes generated tokens downstream, so it stays opt-in
 _dsa_idx_fp4_direct = os.environ.get("EXL3_DSA_IDX_FP4_DIRECT", "0") == "1"
-# Gathered (top-k) FP4 attention decodes the selected entries in-kernel instead of staging the pool window once the
-# window holds more than this many entries (262144 entries = 256 MiB of fp16 staging). Measured, one 2048-row chunk:
-# 131k-entry pool staged 1.0 ms / direct 1.9 ms; 1M-entry pool staged 3.2 ms, 1.23 GiB / direct 2.2 ms, 64 MiB
-_fp4_gather_direct_min = int(os.environ.get("EXL3_DSA_FP4_GATHER_DIRECT_MIN", str(1 << 18)))
+# Gathered (top-k) FP4 attention can decode the selected entries in-kernel instead of staging the pool window, once
+# the window holds more than this many entries. Bit-identical output. One 2048-row chunk at a 1M-entry pool: staged
+# 3.2 ms / 1.23 GiB transient vs direct 2.2 ms / 64 MiB; but the full model's 876k-token prefill measured 5% slower
+# (375 vs 357 s) for 0.14 GiB lower peak, so it is opt-in (e.g. EXL3_DSA_FP4_GATHER_DIRECT_MIN=262144)
+_fp4_gather_direct_min = int(os.environ.get("EXL3_DSA_FP4_GATHER_DIRECT_MIN", str(1 << 40)))
 
 
 def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r):

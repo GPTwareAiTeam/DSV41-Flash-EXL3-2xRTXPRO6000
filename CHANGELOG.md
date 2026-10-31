@@ -35,10 +35,10 @@ prompt in a 1M cache peaks at 93.23 GiB of 94.97 per GPU with a 2048-row prefill
 - **Indexer prefill default: 128-row score slabs (`EXL3_DSV4_SCORE_SLAB=128`).** Smaller transient score matrix
   at depth, same selected entries, token-identical. `EXL3_DSA_IDX_FP4_DIRECT=1` (read FP4 index keys in-kernel in
   prefill, 128 MiB less at 1M) is opt-in: its scores differ in the last fp16 bit and change generated tokens.
-- **Deep-context top-k attention reads FP4 pool entries in-kernel** once the pool window exceeds
-  `EXL3_DSA_FP4_GATHER_DIRECT_MIN` entries (default 262,144) instead of unpacking the whole window to fp16. One
-  2048-row chunk at a 1M-entry pool: 3.2 ms / 1.23 GiB transient → 2.2 ms / 64 MiB. Same values (within 1e-4 of the
-  fp16 kernel on the dequantized pool); full-model identity at depth not yet run.
+- **Opt-in: deep-context top-k attention reads FP4 pool entries in-kernel** (`EXL3_DSA_FP4_GATHER_DIRECT_MIN`,
+  e.g. 262144) instead of unpacking the whole window to fp16. Bit-identical. One 2048-row chunk at a 1M-entry pool:
+  3.2 ms / 1.23 GiB transient → 2.2 ms / 64 MiB; the full 876k-token prefill measured 5% slower (375 vs 357 s) for
+  0.14 GiB lower peak, so it is off by default.
 - **Verify steps score every row's candidate entries in one launch.** The candidate-block indexer layers scored
   each verify row in its own Python iteration (key gather, launch, two fills per row); the few-query indexer
   kernel now reads each row's pool rows through the entry map the compaction kernel already builds. Bit-identical

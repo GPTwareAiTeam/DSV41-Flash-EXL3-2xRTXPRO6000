@@ -116,7 +116,7 @@ Defaults shown are the compiled-in defaults; the shipped recipe sets the first t
 | `EXL3_DSV41_FUSED_ROPE`, `EXL3_DSV41_FUSED_POOL_SCATTER`, `EXL3_DSV4_FUSED_INDEXER_ROPE` | `0` (default-on in the shipped recipe) | Three fused launch merges: −1.0% short-context, −1.4% at 24k, launches/step 630.8 → 585.0. Each `=0` disables one. |
 | `EXL3_DSV4_SCORE_SLAB` | `128` | Query rows per indexer score slab in prefill. Smaller = less transient memory at depth (the slab is rows × pool entries fp16). |
 | `EXL3_DSA_IDX_FP4_DIRECT` | `0` | `1` reads FP4 indexer keys in-kernel in prefill scoring instead of unpacking them to fp16 once per call: 128 MiB less at 1M, but scores differ in the last fp16 bit and generated tokens change, so off by default. |
-| `EXL3_DSA_FP4_GATHER_DIRECT_MIN` | `262144` | Pool entries above which top-k (gathered) FP4 attention decodes the selected entries in-kernel instead of staging the whole window (1.23 GiB → 64 MiB per call at 1M). Same values either way. |
+| `EXL3_DSA_FP4_GATHER_DIRECT_MIN` | off (`2^40`) | Pool entries above which top-k FP4 attention decodes the selected entries in-kernel instead of staging the window (1.23 GiB → 64 MiB per call at 1M; bit-identical). Off by default: the full 876k prefill measured 5% slower for 0.14 GiB lower peak. `262144` turns it on for memory-bound runs. |
 | `EXL3_MOE_COOP_KSPLIT` | unset | Split the coop MoE kernel's k dimension. Measured worse at 2 and 3; leave unset. |
 | `EXL3_MOE_COOP_WIDE` / `_WIDE_A` / `_WIDE_B` | unset | Wider tiles. All measured slower at bsz1 (the kernel is parallelism-limited, not bandwidth-limited). |
 | `EXL3_MOE_COOP_SINGLE` | `0` | Single-pass coop kernel variant. |
