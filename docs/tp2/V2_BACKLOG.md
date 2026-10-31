@@ -42,6 +42,15 @@ Fixed K=3 vs K=5 swings decode 7–14% by content (K=3 better on code/prose/mult
 A context-aware gate regressed on single prompts because width changes alter near-tied greedy choices; any new gate
 needs many-prompt evidence (the 40 held-out prompts with a paired CI), not single 24k prompts.
 
+Shipped today: the on-GPU confidence gate (`EXL3_DSPARK_GATE=auto`), which picks the verified prefix per round
+from the drafter's confidence and adapts its cutoff to the content. On 24k prompts it is within 1–9% of the best
+fixed width (code: auto 139 vs K=3 152 tok/s; math: 176 vs K=5 181; prose: 113 vs K=3 115).
+
+Written, not shipped: a host-side expected-value width chooser (`kselect.py`, 2026-10-29: per-pass acceptance per
+position × measured round cost, candidates K∈{3,4,5}, hysteresis, a small probe budget, rank-identical from integer
+draft stats). Its GPU evaluation was never run, and the patch is kept outside this tree. Start here: run it against
+the auto gate on the 40 held-out prompts with a paired CI.
+
 ## 5. MoE kernel
 
 Coop down projection runs at 61% of DRAM peak, gate/up 68%, long-scoreboard stalls ~46%, tensor pipe 19–23%

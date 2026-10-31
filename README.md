@@ -2,35 +2,59 @@
 
 # DeepSeek-V4.1-Flash-1017 EXL3 Mixed-Bitrate on 2× RTX PRO 6000 Max-Q (TP=2)
 
-## Credits
+## What this project is, and whose work it builds on
 
-This runtime is built on other people's work. Who we took code or ideas from, what we took, and what we changed:
+This is an independent runtime for one job: serving DeepSeek-V4.1-Flash-1017 from two RTX PRO 6000 Max-Q cards
+over PCIe, with the whole model resident on the GPUs. It starts from turboderp's ExLlamaV3 engine, then adds a
+tensor-parallel runtime, a quantisation recipe, a speculative-decoding stack and a set of new kernels written for
+this model and these cards. About 22,600 lines across 254 commits are this project's own work.
 
-| Project | Licence | What we took | What we did with it |
-|---|---|---|---|
-| **[turboderp — ExLlamaV3](https://github.com/turboderp-org/exllamav3)** | MIT | The engine: EXL3 format, trellis quantiser and decode kernels, mixed-bitrate MoE kernels, DSA attention, caches, sampler, loaders, generator. | Extended into a TP=2 runtime: sharded checkpoint, one-shot P2P all-reduce, captured decode and verify graphs, FP4 KV cache, DSpark speculative decoding with an adaptive gate, prefix cache, per-expert mixed rates in one launch, adaptive prefill chunking, OpenAI server. |
-| **[diffbot — DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000)** | MIT | Optional drafter head (`DSPARK_HEAD=diffbot`, converted by our `qmesh/tp2/drafter_overlay.py`); the idea of an 8-bit peer-push prefill all-reduce; their deployment as the reference for this hardware. Their flat decode MoE loop and row-wise top-k were studied. | All-reduce re-implemented with int8 and exact modes (`PREFILL_AR`, opt-in). Their MoE weight-streaming idea, ported to our mixed-rate kernel, was bit-identical but slower (not merged); their row top-k targets a padded width our indexer already avoids (docs/tp2/RESULTS.md section 11d). Our drafter head is faster on every content type we tested. Their AGPL vLLM patches were not read or used. |
-| **philbert440 — 1Cat-vLLM PR #1243** | — | Idea: scale the drafter's input taps by a power of two before the fp16 cast. | Implemented as `EXL3_DSPARK_TAP_SCALE` with a probe; neutral on our build, so the default stays 1.0. |
-| **[Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)** (Songlin Yang, Yu Zhang, Zhiyuan Li) | MIT | Vendored forward Triton kernels (`exllamav3/vendor/fla/`), via upstream. | Trimmed to forward-only by upstream's vendoring script. |
-| **Adel Johar — ROCm WMMA GEMM** | MIT | Vendored GEMM kernel (`exllamav3/exllamav3_ext/rocm/vendor/rocm_wmma_gemm/`), via upstream. | Unchanged. |
-| **[llama.cpp](https://github.com/ggml-org/llama.cpp)** | MIT | Via upstream: the DRY sampler semantics, GBNF grammar syntax and the perplexity protocol. | The perplexity protocol is our chunk-invariance quality gate. |
-| **[dealignai — DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8)** | MIT, gated | The base checkpoint. | Re-quantised to mixed per-expert EXL3 (2.565 and 2.499 bpw). |
-| **sudoingX, HeNryous** | — | Published quantisation panels. | sudoingX's panel protocol is reproduced exactly by `qmesh/tp2/panel_ppl.py`. |
-| **MoE decode candidates kit** | — | Two candidates in the MoE cooperative kernel: prefetch-ring hoist (`EXL3_MOE_HOIST`) and programmatic dependent launch (`EXL3_MOE_PDL`). | Both bitwise identical to the baseline; +2.4% and +7.6% per MoE call. |
+### Built here
+
+- **The TP=2 runtime.** Sharded checkpoint format and bit-exact shard tool, the per-GPU runner and the
+  OpenAI-compatible server, and a one-shot CUDA-IPC all-reduce over PCIe (4.9 µs per call vs NCCL's 11.8).
+- **Captured decode and verify.** Piecewise CUDA graphs for every decode and speculative verify step, the captured
+  single-token attention body, cross-block graph merging, and capture sized from fixed capacities so mixed request
+  lengths never re-capture (13.15 → 10.97 ms per token from graphs alone).
+- **The mixed-bitrate checkpoint.** The 2.565 and 2.499 bpw builds: experts ranked by routing frequency and given 2,
+  3 or 4 bpw each, with mixed per-expert rates decoded inside one MoE launch (new mixed-rate kernel variants,
+  shared-expert fold, 256-thread blocks, prefetch-ring hoist and programmatic dependent launch).
+- **FP4 KV cache.** Packs the main cache in DeepSeek's trained FP4 layout and decodes it in-kernel: 3,200 → ~890
+  bytes per token per GPU, which is what makes the 5M-token shared cache fit.
+- **Speculative decoding tuned for this checkpoint.** Adaptive K: the verify width is chosen every round on the GPU
+  from the drafter's confidence, with a cutoff that adapts to the content. Also a per-user drafter ring instead of a
+  context-sized drafter cache, the drafter captured as GPU graphs, and the hot/cold drafter experts.
+- **Memory and long-context work.** Adaptive prefill chunking from a measured memory model (an 876k-token prompt
+  completes), indexer score slabs, long-context candidate compaction, the prefix cache made to work across both
+  ranks, an exact multi-row router, and the shared-page prefill fix.
+- **Measurement.** Every default here was chosen by back-to-back A/B with token-identity gates; the numbers and the
+  ideas that did not pay off are in [docs/tp2/RESULTS.md](docs/tp2/RESULTS.md).
+
+### Built on, with thanks
+
+| Who | What this project uses | What we did with it |
+|---|---|---|
+| **[turboderp — ExLlamaV3](https://github.com/turboderp-org/exllamav3)** (MIT) | The engine underneath: the EXL3 format, trellis quantiser and decode kernels, the cooperative MoE kernel, DeepSeek-V4 attention and the DSpark drafter component, the paged cache and recurrent checkpoints, loaders and generator. | Everything listed under *Built here* sits on top of it. Upstream's history and authorship are kept in full. |
+| **[diffbot](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000)** (MIT) | The reference deployment on the same cards; an optional drafter head (`DSPARK_HEAD=diffbot`); the idea of an 8-bit peer-push prefill all-reduce. | Our own all-reduce with int8 and exact modes (`PREFILL_AR`, opt-in). We also tested their flat MoE loop's weight streaming and their row top-k: bit-identical but slower on our mixed-rate checkpoint, and not needed by our indexer ([RESULTS](docs/tp2/RESULTS.md) section 11d). Our drafter head is faster on every content type we tested. Their AGPL vLLM patches were not read or used. |
+| **philbert440 — 1Cat-vLLM PR #1243** | The idea of scaling the drafter's input taps by a power of two before the fp16 cast. | Implemented and measured (`EXL3_DSPARK_TAP_SCALE`); neutral here, so the default stays 1.0. |
+| **[dealignai](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-1017-UNCENSORED-FP8)** (MIT, gated) | The base FP8 checkpoint. | Re-quantised into our mixed-bitrate EXL3 builds. |
+| **sudoingX, HeNryous** | Published quantisation panels. | sudoingX's panel protocol is reproduced exactly (`qmesh/tp2/panel_ppl.py`) to score our builds against theirs. |
+| **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT) | The WikiText-2 perplexity protocol. | Our prefill-chunk invariance gate. |
 
 Reference numbers only, no code taken: sfxnz, MiaAI-Lab, SSHdotCodes, sybil-solutions, acrogenesis, llamaperf.
-Full detail: [CREDITS.md](CREDITS.md). The code is MIT; the licence text is unchanged in [LICENSE](LICENSE).
+Upstream also vendors Flash Linear Attention and Adel Johar's ROCm WMMA GEMM for other models and AMD GPUs; neither
+is on this runtime's path (DeepSeek-V4 uses neither, and ROCm sources are excluded from CUDA builds). Full detail:
+[CREDITS.md](CREDITS.md). The code is MIT; the licence text is unchanged in [LICENSE](LICENSE).
 
-## What it is
+## Model and layout
 
-A downstream fork of ExLlamaV3 that runs one very large mixture-of-experts model as a **true TP=2 runtime** on
-**2 × 96 GB GPUs**: a mixed-bitrate EXL3 quantisation of **DeepSeek-V4.1-Flash-1017** (2.499 bpw routed-expert
-average: 1,400 hottest experts at 4 bpw, 4,860 at 3, 9,100 at 2; a 2.565 bpw build is the higher-quality
-alternative), fully resident on-GPU, with speculative decoding.
+**DeepSeek-V4.1-Flash-1017**, mixed-bitrate EXL3: 2.499 bpw routed-expert average by default (1,400 hottest experts
+at 4 bpw, 4,860 at 3, 9,100 at 2); a 2.565 bpw build is the higher-quality alternative. Fully resident on two 96 GB
+GPUs, true TP=2, speculative decoding on.
 
-Upstream remains intact (`exllamav3/`, `examples/`, `tests/`, `util/`, `doc/`); the TP=2 runner, server and tools
-live in `qmesh/tp2/` (the directory name is historical) and are documented in `docs/tp2/`. Upstream's own README is
-preserved as [README.exllamav3.md](README.exllamav3.md).
+Upstream's tree is kept intact (`exllamav3/`, `examples/`, `tests/`, `util/`, `doc/`) with this project's engine
+changes inside it; the TP=2 runner, server and tools live in `qmesh/tp2/` (the directory name is historical) and are
+documented in `docs/tp2/`. Upstream's own README is preserved as [README.exllamav3.md](README.exllamav3.md).
 
 Status: **v1.2.0** (hot/cold drafter experts; final measurements below).
 
@@ -41,7 +65,8 @@ Status: **v1.2.0** (hot/cold drafter experts; final measurements below).
 | **True TP=2** | on | Attention heads, KV heads, vocab and the MoE intermediate dimension split two ways; one process per GPU. | — |
 | **One-shot P2P all-reduce** (`COMM=p2p`) | on | CUDA-IPC arena over PCIe, device-side sequence counters, safe inside graphs. | 4.93 µs/call vs NCCL 11.84 µs |
 | **Captured decode and verify** | on | Each decode step and each speculative verify step replays CUDA graphs instead of ~1,600 launches; graphs are sized from fixed capacities, so mixed short/long requests never re-capture. | 13.15 → 10.97 ms/token |
-| **DSpark speculative decoding** (`DSPARK=1`) | on in the server | The drafter proposes 5 tokens per round; its confidence head picks how many to verify, with a content-adaptive cutoff on the GPU (`EXL3_DSPARK_GATE=auto`). | 93.7 → 130–185 tok/s by content |
+| **DSpark speculative decoding** (`DSPARK=1`) | on in the server | The drafter proposes 5 tokens per round as one captured block; the target verifies them in one captured step and keeps the longest correct prefix, so output is decided by the target alone. | 93.7 → 130–185 tok/s by content |
+| **Adaptive K (verify width per round)** (`EXL3_DSPARK_GATE=auto`) | on | Each round, the drafter's confidence head scores its 5 positions and only the confident prefix is verified (K = 0–5 rows, chosen on the GPU inside the captured graph, no host round trip). The confidence cutoff itself adapts to the content: an average of accepted drafts per round switches between a bold cutoff on low-acceptance text (prose, multilingual) and a strict one on high-acceptance text (math, structured). Both ranks agree by construction. | 24k prompts, auto vs always verifying 5: prose 113 vs 98, code 139 vs 141, math 176 vs 181 tok/s. Retuned for 2.499: +6.8% on 7 prompts. The best fixed width per content is still 1–9% faster (code: K=3, 152), which the V2 backlog targets. |
 | **Hot/cold drafter experts** (new) | on | Drafter routed experts that take 99% of routing picks at 4 bpw, the rest at 2 bpw (`qmesh/tp2/drafter_experts.py`). | 4-bit acceptance for 0.12 GiB/GPU over 3-bit |
 | **FP4 KV cache** (`KV_BITS=4`) | on | Main cache in DeepSeek's trained FP4 format, decoded in-kernel. | 3,200 → ~890 bytes/token/GPU; decode within 1% of 16-bit |
 | **Adaptive prefill chunk** (`PREFILL_ADAPTIVE=1`) | on | Before every chunk, reads free memory and solves a measured peak model (rows + context depth) for the largest chunk that leaves 1 GiB free. Only ever shortens a chunk; both ranks agree. | 876k-token prompt completes (chunks 6,656 → 3,328 rows); ~0.57 ms per decision |
