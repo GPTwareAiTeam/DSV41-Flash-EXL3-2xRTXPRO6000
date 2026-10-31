@@ -23,7 +23,7 @@ A = kernel_body('moe_a_body')
 B = kernel_body('moe_b_body')
 
 # (k2, bits, half). k2 = 2*bits + half. mul1 rates 2, 2.5, 3, 3.5, 4 (routed) and 6 (shared expert, staged path)
-CASES = [(4, 2, False), (5, 2, True), (6, 3, False), (7, 3, True), (8, 4, False), (12, 6, False)]
+CASES = [(4, 2, False), (5, 2, True), (6, 3, False), (7, 3, True), (8, 4, False), (12, 6, False), (16, 8, False)]
 
 def gemv_lines(lines, macro, k2_expr):
     out = []
