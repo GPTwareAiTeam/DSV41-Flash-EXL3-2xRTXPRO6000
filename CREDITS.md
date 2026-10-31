@@ -1,6 +1,6 @@
 # Credits
 
-QMesh is a runtime delta on top of a large amount of other people's work. Every entry below is a dependency of
+This runtime is a delta on top of a large amount of other people's work. Every entry below is a dependency of
 the shipped runtime or of the published checkpoint, or a source the results are compared against.
 
 ## Upstream engine

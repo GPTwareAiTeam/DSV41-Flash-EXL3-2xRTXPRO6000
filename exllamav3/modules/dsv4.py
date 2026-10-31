@@ -1268,7 +1268,7 @@ class DSV4Attention(Module):
         (both consume q_res) for the top-k regime."""
         self.x_fan_ready = True
         # No-q-head-norm models (DSV4.1): the fused fan is argmax-stable but not bit-identical (max abs
-        # logit diff 0.5-0.8, fp16 reduction order; qmesh/notes/DenseFuse.md), so it is opt-in there
+        # logit diff 0.5-0.8, fp16 reduction order; docs/tp2/notes/DenseFuse.md), so it is opt-in there
         if os.environ.get("EXL3_DSV4_NO_XFAN", "0") != "0" or \
                 (not self.q_head_norm and os.environ.get("EXL3_DSV41_XFAN", "0") == "0"):
             return

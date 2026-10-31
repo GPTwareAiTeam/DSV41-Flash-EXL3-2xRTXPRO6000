@@ -78,7 +78,7 @@ Lower-confidence items seen but not ranked: acrogenesis LFU expert eviction (res
 | Piecewise + merged CUDA graphs | Have | `docs/tp2/notes/GraphCapture.md`; commit 3068d30c (`piecewise: capture B1 attention body inside the block segment`) |
 | P2P one-shot all-reduce | Have (fp32 fixed-order) | `exllamav3/exllamav3_ext/parallel/p2p_oneshot.cu:171–198` (arena, cudaIpc); `docs/tp2/notes/P2PAllReduce.md` |
 | 8-bit prefill all-reduce | **Missing** | No 8-bit/int8 AR found in `parallel/` (only `all_reduce.cu` generic path). |
-| DSpark K=5 with width-keyed graphs | Have | `TP2Runner.md`, `OVERNIGHT_SUMMARY.md` |
+| DSpark K=5 with width-keyed graphs | Have | `TP2Runner.md`, `GraphCapture.md` |
 | Single-chunk prefill (`max_chunk_size=2048` in bringup) | Have, **but** chunk size 2048 is small vs diffbot's larger replay chunks | `docs/tp2/notes/TP2Bringup.md:6` |
 | Hybrid transport | Have | `P2PAllReduce.md` / `TP2Runner.md` |
 | Packed FP4 KV | Missing (fp16) | COMMUNITY_RESEARCH |

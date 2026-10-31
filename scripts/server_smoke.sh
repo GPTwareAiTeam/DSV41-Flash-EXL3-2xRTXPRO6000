@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run with bash scripts/server_smoke.sh. GPU access is serialized by gpu_run.sh.
 set -euo pipefail
-A=${ARTIFACTS_DIR:-/home/treadall/recipe-artifacts/2x-rtx-tp2}
-SRC=${SRC_DIR:-/home/treadall/server-src}
+A=${ARTIFACTS_DIR:?set ARTIFACTS_DIR to the host directory mounted at /artifacts}
+SRC=${SRC_DIR:?set SRC_DIR to this checkout}
 if [[ ${1:-} != --queued ]]; then
   exec "$A/gpu_run.sh" Server "${GPU_MINUTES:-45}" bash "$0" --queued
 fi

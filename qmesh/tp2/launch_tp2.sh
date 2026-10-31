@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch the 2-rank TP runner in container exl3-tp2 (one process per GPU, NCCL over file:// rendezvous).
 # Usage: qmesh/tp2/launch_tp2.sh <tag> [-e KEY=VAL ...]
-# Logs: /artifacts/tp2logs/<tag>_rank{0,1}.log (host: /home/treadall/recipe-artifacts/2x-rtx-tp2/tp2logs)
+# Logs: /artifacts/tp2logs/<tag>_rank{0,1}.log (the host directory mounted at /artifacts)
 set -euo pipefail
 TAG="${1:?tag}"; shift
 EXTRA=("$@")

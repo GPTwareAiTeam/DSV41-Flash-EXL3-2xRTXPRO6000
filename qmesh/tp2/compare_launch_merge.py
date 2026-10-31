@@ -17,7 +17,7 @@ import sys
 import time
 import uuid
 
-ARTIFACTS = Path('/home/treadall/recipe-artifacts/2x-rtx-tp2')
+ARTIFACTS = Path(os.environ.get('ARTIFACTS_DIR', '/artifacts'))
 LOGS = ARTIFACTS / 'tp2logs'
 CONTAINER = 'exl3-tp2-lm'
 DIALS = ('EXL3_DSV41_FUSED_ROPE', 'EXL3_DSV41_FUSED_POOL_SCATTER',

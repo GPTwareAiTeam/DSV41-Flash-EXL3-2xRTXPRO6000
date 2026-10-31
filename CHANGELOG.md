@@ -38,6 +38,16 @@ Measurements: docs/tp2/RESULTS.md sections 11 and 12.
   `EXL3_DSV41_FUSED_POOL_SCATTER` as off; they default on.
 - Removed stale merge-conflict copies (`*.py:conflicts/*`) from the tree.
 
+### Repository
+
+- The project has its own repository, `GPTwareAiTeam/DSV41-Flash-EXL3-2xRTXPRO6000`, with full history. It
+  started inside the QMesh repository (heterogeneous RTX + GB10 serving), which stays separate. Removed from this
+  tree: QMesh's remote expert tier (`qmesh/remote_host.py`, `worker_server.py`, `null_remote.py`,
+  `placement*`, `p7_smoke.py`, `pack_cold.py`, `probe_ffn.py`, `load.py`, `qmesh/graph/`) and its engine hook in
+  `block_sparse_mlp_cpu.py` (restored to upstream), root-level working notes, the duplicate `qmesh/notes/`
+  (curated copies are in `docs/tp2/notes/`), and upstream's funding file. Scripts read `ARTIFACTS_DIR` instead of
+  a host path.
+
 ### Measured, not shipped
 
 - Diffbot-style decode MoE weight streaming (cp.async ring): bit-identical, slower (down projection 90.7 → 104.5

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 tag=${1:?unique tag required}; shift
-logs=/home/treadall/recipe-artifacts/2x-rtx-tp2/tp2logs
-exec 9>/home/treadall/recipe-artifacts/2x-rtx-tp2/gpu.lock
+ARTIFACTS_DIR=${ARTIFACTS_DIR:?set ARTIFACTS_DIR to the host directory mounted at /artifacts}
+logs=$ARTIFACTS_DIR/tp2logs
+exec 9>$ARTIFACTS_DIR/gpu.lock
 flock 9
 while :; do
   f0=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0)
