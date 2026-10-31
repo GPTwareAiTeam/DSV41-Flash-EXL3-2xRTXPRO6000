@@ -170,6 +170,22 @@ DeepSeek V4.1 (no q head-norm) builds the x-side fan only with `EXL3_DSV41_XFAN=
 reduction order moves logits by up to ~0.8 (argmax unchanged), so the bit-exact per-projection
 path stays the default there.
 
+### `EXL3_DSV41_FUSED_ROPE` (default: `1`)
+
+Combines query RoPE and weighted KV head normalization plus RoPE into one extension launch for
+DeepSeek V4.1 layers without query head normalization. Set to `0` for the separate query and KV
+launches; layers with query head normalization are unchanged.
+
+### `EXL3_DSV4_FUSED_INDEXER_ROPE` (default: `1`)
+
+Rotates indexer keys and the latent's trailing RoPE slice in one extension launch, using the same
+positions and arithmetic as the separate launches. Set to `0` for the separate launches.
+
+### `EXL3_DSV41_FUSED_POOL_SCATTER` (default: `1`)
+
+Combines fp16 index-key and pooled latent scatter in the single cached path. Quantized pools are
+unchanged. Set to `0` for the separate scatters.
+
 ### `EXL3_QC_STAGING` (default: `1`)
 
 How quantized K/V caches feed the attention kernels (replaces the former `EXL3_QC_ATTN`). Only
