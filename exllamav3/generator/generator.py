@@ -295,6 +295,11 @@ class Generator:
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
+        # Optional per-chunk limiter: callable(prefill_start: int, chunk: int) -> int (a multiple of the page
+        # size, at most chunk), consulted before every prefill forward. Lets the runtime shrink chunks as the
+        # context deepens (memory headroom); qmesh/prefill_limit.py installs one. None keeps fixed chunks.
+        # An object may also expose prefill_done(), called when a sequence finishes its prefill.
+        self.prefill_chunk_limit = None
 
         # Prompt ingestion alongside generating jobs, see iterate()
         if shared_chunk_size is None:

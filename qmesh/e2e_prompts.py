@@ -33,6 +33,7 @@ os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 import torch
 
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
+from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
@@ -118,6 +119,9 @@ def main():
         generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=MAX_CHUNK,
                               draft_model=draft_model, draft_cache=draft_cache,
                               num_draft_tokens=NUM_DRAFT if DSPARK else None)
+        limiter = None
+        if PREFILL_ADAPTIVE:
+            generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(torch.device("cuda:0"))
         job = Job(input_ids=ids, max_new_tokens=MAX_NEW, sampler=GreedySampler())
         generator.enqueue(job)
         t0 = time.time()
@@ -152,6 +156,8 @@ def main():
             "accept_rate": round(acc / max(acc + rej, 1), 4) if (acc or rej) else None,
             "tokens_per_round": round(toks_per_round, 3) if toks_per_round else None,
             "gpu0_free_gib": round(free / 2**30, 2),
+            "prefill_chunks": limiter.chunks if limiter else None,
+            "prefill_shrunk": limiter.shrunk if limiter else None,
             "text": text[:400],
         }
         print(json.dumps(row, ensure_ascii=False), flush=True)

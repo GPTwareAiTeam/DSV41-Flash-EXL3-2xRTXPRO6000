@@ -16,6 +16,7 @@ os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 import torch
 
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
+from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
@@ -57,6 +58,8 @@ def main():
     generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=2048,
                           draft_model=draft_model, draft_cache=draft_cache,
                           num_draft_tokens=5 if dspark else None)
+    if PREFILL_ADAPTIVE:
+        generator.prefill_chunk_limit = PrefillChunkLimiter(torch.device("cuda:0"))
 
     for prompt in PROMPTS:
         ids = tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True)
