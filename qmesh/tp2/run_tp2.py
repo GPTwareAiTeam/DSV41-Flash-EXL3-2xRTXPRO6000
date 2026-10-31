@@ -790,8 +790,26 @@ def main():
             generator.enqueue(job)
         by_serial = {j.serial_number: s for j, s in zip(jobs, streams)}
         t1 = time.time()
+        # PROFILE_BATCH_STEP=N: profile the N-th generator iteration after every stream has its first token
+        # (a decode/verify step of the full batch), trace to PROFILE_TRACE.batch.rank<R>.json
+        prof_step = int(os.environ.get("PROFILE_BATCH_STEP", "0"))
+        steps_all, bprof = 0, None
         while generator.num_remaining_jobs():
-            for result in generator.iterate():
+            if prof_step and bprof is None and all(s["tokens"] for s in streams):
+                steps_all += 1
+                if steps_all == prof_step:
+                    from torch.profiler import profile, ProfilerActivity
+                    bprof = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA])
+                    torch.cuda.synchronize()
+                    bprof.start()
+            results = generator.iterate()
+            if bprof is not None and prof_step > 0:
+                torch.cuda.synchronize()
+                bprof.stop()
+                prof_step = 0
+                bprof.export_chrome_trace(os.environ.get("PROFILE_TRACE", "/artifacts/tp2logs/profile_trace.json") + f".batch.rank{RANK}.json")
+                log(f"PROFILE_BATCH_STEP recorded after {steps_all} full-batch steps")
+            for result in results:
                 if "error" in result:
                     raise result["error"]
                 s = by_serial.get(result.get("serial"))
