@@ -343,7 +343,66 @@ With `KV_BITS=4`, output can differ between chunk sizes where the top two candid
 0.89–1.34 with 16-bit KV, which is token-identical across 1024 / 2048 / 4096. The limiter itself adds no
 difference: adaptive runs are token-identical to a fixed chunk of the same size.
 
-## 10. What this is and is not
+## 10. v1.1 measurements (2026-10-30/31)
+
+Tree `recipe/2x-rtxpro6000-tp2` at the v1.1 merge, container `exl3-tp2:clean-20261028`, one extension build,
+pinned GEMM tuning per run, FP4 KV, 1M-token cache, DSpark K=5, 256 generated tokens (ignore-EOS) unless noted.
+Logs: `<artifacts>/rowmap/logs/`.
+
+### 10a. Checkpoints
+
+2.499 bpw re-quantisation of the routed experts (ranked by routing frequency): 1,400 at 4 bpw, 4,860 at 3,
+9,100 at 2. Every non-expert tensor is byte-identical to the 2.565 build (verified on all 40 layers); the 10,660
+experts not re-quantised are byte-identical to their source build.
+
+| | 2.565 | 2.499 |
+|---|---|---|
+| Target weights per GPU | 86.31 GiB | 84.18 GiB |
+| Free per GPU after load (4-bit drafter experts) | 3.43 GiB | 5.45 GiB |
+| WikiText-2 ppl, 8 × 2048 chunks, 16 / FP4 KV | 2.038 / 2.044 | 2.078 / 2.079 |
+| 1017 panel, 8 conversations, 16 / FP4 KV | 1.777 / 1.778 | 1.789 / 1.789 |
+| sudoingx panel, 8 conversations, 16 / FP4 KV | 1.675 / 1.676 | 1.681 / 1.681 |
+| 5 planted facts, 128k prose / code | 5/5, 5/5 | 5/5, 5/5 |
+| 876k-token prompt, 2 facts | 2/2 | 2/2 |
+| 8 users × 131k in one 1.5M cache, 5 facts each | — | 8 × 5/5, peak 91.1 GiB/GPU |
+
+FP4 KV costs +0.3% WikiText perplexity and +0.05% on the panels against 16-bit KV.
+
+### 10b. Speed, release v1.0 vs v1.1
+
+ABBA × 2, same container and extension:
+
+| | v1.0 (85827062, 2.565) | v1.1, 2.565 | v1.1, 2.499 |
+|---|---|---|---|
+| 6 short prompts, mean tok/s | 158.3 | — | 158.9 |
+| 26.9k prompt, tok/s | 197.5 | 202.0 | 172 (4-bit drafter experts) / 164.8 (3-bit) |
+| 131k prompt, tok/s | 157.7 | — | 170.1 |
+| Verify step, 26.9k | 24.8 ms | 23.5 ms | 25.5 ms |
+| Tokens per verify step, 26.9k | 4.90 | 4.72 | 4.18 / 4.20 |
+
+Per verify step v1.1 is as fast or faster; the 2.499 checkpoint's speed differences come from drafter acceptance.
+
+### 10c. Changes and their measured effect
+
+| Change | Measured |
+|---|---|
+| Runner/server default to graphs + captured single-token attention + FP4 KV | server smoke with no flags: 172 graph replays (was 0) |
+| Drafter auto gate 0.35/1.5 → 0.25/2.0 (2.499) | 7 prompts: 143.3 / 144.7 → 153.4 / 154.0 tok/s |
+| One-launch candidate scoring for verify rows | 26.9k, 3 ABBA pairs: 4.57 → 4.44 ms/token, token-identical |
+| Multi-user graph-capture fix (MoE count readback) | 8 users with the drafter: crash → runs |
+| Adaptive prefill chunk | 876k prompt with 8192 planned: completes |
+| FP4 index keys in-kernel in prefill (opt-in only) | not bit-exact: changes tokens; off by default |
+| FP4 direct gather at depth (opt-in only) | bit-exact; 876k prefill 5% slower; off by default |
+| Batched V4.1 attention for B>1 (opt-in only) | slower (59–86 vs 36–37 ms/token per user), not token-identical |
+| Drafter experts 3-bit | 0.77 GiB/GPU less; 26.9k −5%, short/131k even; 4-bit kept as default |
+
+### 10d. Identity
+
+Release v1.0 and v1.1 produce the same tokens on the same weights and drafter gate (26.9k prompt, 2.565).
+Prefix cache: turn 2 = turn 1. Both ranks token-identical in every run. Batch width changes greedy output on
+near-tied tokens (2/4 users vs single: 2 of 4 streams differ, first at token 2–250), as in section 6.
+
+## 11. What this is and is not
 
 - **Is:** a true TP=2 runtime for a 2.565 bpw mixed-bitrate EXL3 checkpoint of a 100B-class MoE model, fitting
   two 96 GB cards with speculative decoding always on, at 97–189 tok/s single-user decode at 24k context
