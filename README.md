@@ -1,43 +1,38 @@
-<p align="center"><b>QMesh</b> — a tensor-parallel runtime for very large EXL3 models on two workstation GPUs</p>
+<p align="center"><b>dsv41-6000-tp2</b> — DeepSeek-V4.1-Flash on two RTX PRO 6000 GPUs, tensor-parallel</p>
 
-# QMesh EXL3 Runtime
+# dsv41-6000-tp2
 
 A downstream fork of [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (MIT) that runs one very large
 mixture-of-experts model as a **true TP=2 runtime** on **2 × 96 GB GPUs**: a mixed-bitrate EXL3 quantisation of
-**DeepSeek-V4.1-Flash-1017** (2.565 bpw average — frequently used experts at higher precision, rarely used ones
-at lower), fully resident on-GPU, with speculative decoding always on.
+**DeepSeek-V4.1-Flash-1017** (2.499 bpw routed-expert average: 1,400 hottest experts at 4 bpw, 4,860 at 3,
+9,100 at 2; a 2.565 bpw build is the higher-quality alternative), fully resident on-GPU, with speculative decoding always on.
 
 Upstream remains intact (`exllamav3/`, `examples/`, `tests/`, `util/`, `doc/`); the TP=2 work lives in `qmesh/`
 and is documented in `docs/tp2/`. Upstream's own README is preserved as [README.exllamav3.md](README.exllamav3.md).
 
-Status: **v1.0.0**.
+Status: **v1.1.0** (FP4 KV cache, 8 users at long context, 2.499 bpw default checkpoint).
 
 ## Performance
 
 Measured on 2 × RTX PRO 6000 Blackwell Max-Q (PCIe, power-capped), greedy decoding, speculative decoding on
-(DSpark, K=5, adaptive confidence cutoff), CPU-pinned ranks. Full tables, configurations and logs:
-[docs/tp2/RESULTS.md](docs/tp2/RESULTS.md).
+(DSpark, K=5, adaptive confidence cutoff), FP4 KV cache, CPU-pinned ranks, pinned GEMM tuning, back-to-back
+ABBA pairs. Full tables and logs: [docs/tp2/RESULTS.md](docs/tp2/RESULTS.md) section 10.
 
-**Single-user decode, 24k-token context** (512 generated tokens):
+**Single-user decode, 256 generated tokens** (tok/s):
 
-| Content | tok/s |
-|---|---|
-| Math | 189 |
-| Code | 177 |
-| Structured data (JSON) | 169 |
-| Agentic coding, 24k (private sessions, not distributed) | 142 |
-| Multilingual (zh + en) | 100 |
-| Prose | 97 |
+| Checkpoint | 6 short prompts (mean) | 26.9k prompt | 131k prompt | Free VRAM per GPU after load |
+|---|---|---|---|---|
+| 2.499 bpw (default) | 159 | 172 | 170 | 5.45 GiB |
+| 2.565 bpw | 158 | 202 | 158 | 3.43 GiB |
 
-**Long context, single user** (decode tok/s): 72k agentic 128, 72k code 128, 128k agentic 124.
+Speed differences between the two come from the drafter (tokens accepted per verify step), not the kernels: a
+verify step costs the same on both. Acceptance depends on content, so the gap varies by prompt.
 
-**4 concurrent users** (12k-token prompts, 16k KV each): 189 tok/s total, 58 tok/s per user.
+**Context and users**: 1M-token context per GPU pair (FP4 KV, ~890 bytes per token per GPU); 8 concurrent users
+at 131k each in one shared cache answer every planted fact; an 876k-token prompt prefills in ~6 minutes.
 
-**Cold prefill** (no prefix cache): 2,614 tok/s at 24k, 2,782 at 72k, 2,746 at 128k (128k prompt → first token
-in 48 s). Repeat prompts hit the prefix cache instead: a 128k prompt seen before answers in under 0.1 s.
-
-The agentic prompts are the owner's own coding-assistant sessions; they are private and not included in this
-repository. To reproduce those rows, use your own agentic transcripts.
+**Cold prefill** (no prefix cache): ~2.6–2.8k tok/s (131k prompt → first token in 55 s). Repeat prompts hit the
+prefix cache instead.
 
 Read the note in RESULTS.md before comparing numbers: these cards are power-capped and drift, so only
 back-to-back interleaved A/B numbers are comparable.
@@ -71,7 +66,7 @@ Read this table with two caveats:
 Prefill-chunk invariance: the same text scores the same at 256-, 2048- and 4096-row prefill chunks (8k-token
 WikiText-2 windows: 2.1820 / 2.1827 / 2.1827, ±0.025).
 
-## What is in v1
+## What is in it
 
 - **True TP=2.** Attention heads, KV heads, vocab embedding/head and the MoE intermediate dimension are split two
   ways; each rank is a single-device ExLlamaV3 model (`tp_size=2`). Partial sums are combined by a one-shot
@@ -95,9 +90,9 @@ WikiText-2 windows: 2.1820 / 2.1827 / 2.1827, ±0.025).
 
 - 2 × NVIDIA RTX PRO 6000 Blackwell (96 GB), PCIe peer-to-peer, one NUMA node. Needs `sm_120a`.
 - Python ≥ 3.10, PyTorch with CUDA 12.8+ and `sm_120a`, the CUDA toolkit, `ninja`, `gcc`.
-- About 87–91 GiB per GPU for weights, drafter and graphs; the rest is KV cache (FP4 KV by default, ~890 bytes per token per GPU). The KV
-  cache costs 3,200 bytes per token per GPU; the drafter keeps only a small fixed window per user, independent of
-  context length.
+- About 89 GiB per GPU for weights, drafter and graphs (2.499 checkpoint); the rest is KV cache. FP4 KV (default)
+  costs ~890 bytes per token per GPU, 16-bit (`KV_BITS=16`) 3,200; the drafter keeps only a small fixed window per
+  user, independent of context length.
 
 Install the way you install upstream — the extension builds on first import:
 
@@ -149,18 +144,17 @@ Add `CTX_TOKENS=131072` for long context or `BATCH=4` for concurrent streams. Ev
 
 ## Known limitations
 
-- Cold prefill is ~2.6–2.8k tokens/s; a 128k prompt takes ~48 s to its first token. Repeated prefixes hit the
+- Cold prefill is ~2.6–2.8k tokens/s; a 128k prompt takes ~55 s to its first token. Repeated prefixes hit the
   prefix cache and skip that.
-- Multi-user throughput scales weakly: with several users, decode attention still runs one user at a time (only
-  the expert and dense layers are batched). 4 users reach 189 tok/s total. A whole-batch attention graph is the
-  planned fix.
-- 8 concurrent users with speculation do not run: out of memory at 16k KV per user, and a drafter graph-capture
-  failure at 8k per user. 8 users without speculation run.
-- Little VRAM is spare. At the default 4096-row prefill chunk (1 user, 32k context, speculation on) a 24k prompt
-  still runs with 1.42 GiB per GPU used by another process and fails at 1.92 GiB. With `MAX_CHUNK=2048` it runs
-  with 2.92 GiB used (the most tested), at a cost in prefill speed.
-- K=7 speculation needs a block-7 drafter head (only diffbot's exists) and does not beat K=5 on our test set;
-  parked for v2 (see `docs/tp2/notes/`).
+- Multi-user throughput scales weakly: decode attention runs one user at a time (only the expert and dense layers
+  are batched). 8 users at 27k each: ~28 tok/s per user, ~220 total — about one user's speed. The existing batched
+  attention path (`EXL3_DSV41_BATCH=1`) is slower on this model and not token-identical, so it is off.
+- Greedy output depends on the batch width (number of rows verified together): the same prompt can produce a
+  different continuation alone than alongside other users, or under a different drafter gate. Flips sit on
+  near-tied tokens; see RESULTS.md section 6.
+- The drafter was trained on the original model; on the 2.499 checkpoint it is accepted less often on some
+  content (26.9k prompt: 4.2 vs 4.7 tokens per verify step on 2.565). Fine-tuning it on the 2.499 checkpoint is
+  the planned fix.
 
 ## Credits and licence
 
