@@ -1656,7 +1656,13 @@ class Job:
                 p2 = min(p1 + 1, len(seq.allocated_pages))
                 for local_idx in range(p0, p2):
                     page = seq.allocated_pages[local_idx]
-                    page.kv_position = min(max(prefill_end - local_idx * PAGE_SIZE, 0), PAGE_SIZE)
+                    kvp = min(max(prefill_end - local_idx * PAGE_SIZE, 0), PAGE_SIZE)
+                    # Sequences with the same prefix share CachePage objects (identical prompts in a batch,
+                    # cached chains). A sibling that is ahead may already have completed the page one past this
+                    # chunk: its content is identical by construction, so never shrink a complete page.
+                    if kvp < PAGE_SIZE and page.kv_position == PAGE_SIZE:
+                        continue
+                    page.kv_position = kvp
                     if local_idx == 0:
                         page.prev_hash = None
                     else:
