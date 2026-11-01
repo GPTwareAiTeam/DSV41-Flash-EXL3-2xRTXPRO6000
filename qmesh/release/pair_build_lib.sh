@@ -133,13 +133,16 @@ PY
   # ---- build -------------------------------------------------------------------------------------
   local tmp="/pair/releases/$SHA/.lib-$arch-$$"
   local flags="-O2 -std=c++17 -arch=$sm -Xcompiler -fPIC -shared -x cu qmesh_expert_seam.cu -o $tmp/$PAIR_LIB.$arch.so -libverbs -lcuda -lcudart -Xlinker -rpath=$libdir -I."
-  # bin/ must exist and be owned by the host user: the container writes the .so as root, and the
-  # stamp next to it is written here, from the host (a root-created bin/ gave "Permission denied").
-  if [ "$side" = p7 ]; then mkdir -p "$REL/src/qmesh/native/bin"
-  else pair_gxsh "mkdir -p '$REL/src/qmesh/native/bin'"; fi
+  # bin/ must end up owned by the host user: the container writes the .so as root, and the stamp
+  # next to it is written here (a root-owned bin/ made the stamp write fail with "Permission denied").
+  local uid gid; uid=$(id -u); gid=$(id -g)
+  local bindir="$REL/src/qmesh/native/bin"
+  if [ "$side" = p7 ]; then mkdir -p "$bindir"
+  else pair_gxsh "mkdir -p '$bindir'"; fi
   inner="set -e; cd /pair/releases/$SHA/src/qmesh/native; mkdir -p bin $tmp; rm -rf $tmp/*; \
          nice -n 15 env MAX_JOBS=8 /usr/local/cuda/bin/nvcc $flags; \
          mv -f $tmp/$PAIR_LIB.$arch.so bin/$PAIR_LIB.$arch.so; rmdir $tmp; \
+         chown $uid:$gid bin bin/$PAIR_LIB.$arch.so; \
          sha256sum bin/$PAIR_LIB.$arch.so"
   pair_step "LIB_BUILD $side $ct arch=$arch sm=$sm build=$BUILD_ID"
   out=$(side_docker "$side" exec "$ct" bash -lc "$inner" 2>&1)

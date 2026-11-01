@@ -104,6 +104,12 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
     pair_step "EXT_FAIL $side rc=$rc $(printf '%s' "$out" | grep -E 'Error|error:|FAILED|EXT_' | tail -4 | tr '\n' ' ')"
     return 1
   fi
+  # The cache dir was created by the container as root; hand it to the host user, which writes the
+  # stamp next to it (and cleans old caches later).
+  local uid gid; uid=$(id -u); gid=$(id -g)
+  side_docker "$side" exec "$ct" sh -c "chown -R $uid:$gid $rel_c/ext" \
+    || { pair_step "EXT_FAIL $side chown_cache"; return 1; }
+
   local so sha_so
   so=$(printf '%s\n' "$out" | sed -n 's/^EXT_SO //p' | tail -1)
   [ -n "$so" ] || { pair_step "EXT_FAIL $side no_so_path"; return 1; }
