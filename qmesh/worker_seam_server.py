@@ -47,7 +47,13 @@ NL = qes.NL
 _IDS_LOG_MAX = int(os.environ.get("SEAM_IDS_LOG_MAX_ROWS", "6"))
 
 # Printed ids for a rejected request: the whole array for small calls (the values are the
-# diagnosis), capped for big ones.
+# diagnosis), capped for big ones. 8b2674f9 dropped this line while adding MOE_KERNEL below and
+# left its use in _check_ids behind, so every compute raised NameError and the server fail-stopped
+# on its first request (2026-11-01 17:31 GX2). That is the worst shape of bug this file can carry:
+# it lives on the rejection path, so only a healthy run reaches it, and taking the box down is the
+# opposite of what the check is for.
+_IDS_BAD_MAX = int(os.environ.get("SEAM_IDS_BAD_MAX_ROWS", "64"))
+
 # Cold-expert kernel (see _forward_piece). "cudaexl3" runs a layer through cuda-exl3's MoE gemm
 # (vendor/cuda-exl3), "mixedk" through exllamav3's mixed-K module. cuda-exl3 is the default: it is
 # faster in every bucket measured on GX2 (layer 5, 268 cold experts) -- 16.9 / 30.2 / 54.9 / 103.6
@@ -55,6 +61,12 @@ _IDS_LOG_MAX = int(os.environ.get("SEAM_IDS_LOG_MAX_ROWS", "6"))
 # one restack per layer into per-bitrate trellis stacks on first use, which also drops the
 # per-expert copies. A layer whose restack raises is served by the module from then on.
 MOE_KERNEL = os.environ.get("SEAM_MOE_KERNEL", "cudaexl3")
+
+# Read at import so a renamed or dropped constant stops the server before it serves anyone. The
+# 17:31 NameError resolved only when a client's first forward reached the audit, which cost that
+# client 30 s of timeouts and the box a full reload; the same mistake here costs one start.
+assert _IDS_LOG_MAX >= 0 and _IDS_BAD_MAX >= 0 and MOE_KERNEL in ("cudaexl3", "mixedk"), \
+    "cold-id audit caps and the kernel name must resolve at import"
 
 
 def _check_ids(layer, rows, ids, num_experts):
