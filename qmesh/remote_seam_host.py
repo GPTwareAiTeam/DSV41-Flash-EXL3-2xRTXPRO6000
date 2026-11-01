@@ -121,7 +121,7 @@ class RemoteSeamHost:
             x, ids, w = xp, idp, wp
         seam = self._seam(bucket, dev.index or 0)
         stream = torch.cuda.current_stream(dev)
-        prof = _PROF and n <= _PROF_MAX_ROWS
+        prof = _PROF and n <= _PROF_MAX_ROWS and not torch.cuda.is_current_stream_capturing()
         if prof:
             ev0 = torch.cuda.Event(enable_timing = True)
             ev0.record(stream)

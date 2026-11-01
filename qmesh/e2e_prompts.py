@@ -46,7 +46,7 @@ MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 DSPARK = os.environ.get("DSPARK") == "1"
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 WARMUP = int(os.environ.get("WARMUP", "0"))
-WARMUP_NEW = int(os.environ.get("WARMUP_NEW", str(MAX_NEW)))
+WARMUP_NEW = int(os.environ.get("WARMUP_NEW") or MAX_NEW)
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 OUT = os.environ.get("OUT", "")
 DEBUG_RESULTS = os.environ.get("DEBUG_RESULTS") == "1"
