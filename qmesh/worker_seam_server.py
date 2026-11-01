@@ -175,6 +175,13 @@ class SeamServer:
                   f"dev_{_dev_mem_mib()} "
                   f"calls={sum(len(v) for v in _times.values())} "
                   f"- exiting: a server that cannot compute must not answer", flush=True)
+            # The message above names the *calling* shape; only the traceback names the frame that
+            # raised. A CUDA illegal access surfaces at the next host sync (a `.tolist()`, a copy to
+            # host), so the frame is regularly several layers away from the kernel that faulted -
+            # without this, "rows=6" is the only evidence and it can be the wrong call entirely.
+            import traceback
+            for line in traceback.format_exc().rstrip().splitlines():
+                print(f"SEAM_COMPUTE_TRACE {line}", flush=True)
             sys.stderr.flush()
             os._exit(70)
         else:
