@@ -66,6 +66,7 @@ NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 WARMUP = int(os.environ.get("WARMUP", "0"))
 WARMUP_NEW = int(os.environ.get("WARMUP_NEW") or MAX_NEW)
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
+OUT = os.environ.get("OUT", "")
 MEM_BREAKDOWN = os.environ.get("MEM_BREAKDOWN") == "1"
 # MARGIN_PROBE=1 prints, per prompt, the top-2 logits that produced the first generated token and
 # their gap. Two arms can differ in text while agreeing on 128 tokens out of 128 until one near-tied
