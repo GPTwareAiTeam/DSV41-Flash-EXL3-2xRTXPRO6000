@@ -370,3 +370,20 @@ to that lib's sha and must be re-baselined when a release takes the tree over. I
 compute lock) while it serves no release tree: `pair_check.sh` reporting `DRIFT` there is expected
 until a release owns that container.
 
+## Release 2 does not measure like a hand-patched tree
+
+Release 2 (`3c361e8f`, the `--no-ff` merge of `39f07dc4`) is release 1 plus the compute lock, the
+2048 MiB margin default and the `1,6,64,256,2048` bucket default. Its seam fingerprint is
+**unchanged** (`fp:6a6bde315471d3f5`, proto 3): `qes.py`, `qmesh_expert_seam.cu` and `.h` did not
+move, so the wire, the staging cost and the per-row device cost are release 1's, and a release-1
+client could still talk to a release-2 server. What changed is how the server schedules work: one
+`_forward` at a time, whatever the handle count.
+
+That is why a release-2 number is not interchangeable with a number measured on a hand-patched
+tree. GxPort2's arms run `242854c1` (no lock) in `seam-gx1b`; a multi-handle client there can
+interleave two forbids inside one module scratch on one stream, and a run that survives is paying a
+different scheduling cost than the release's serialized one. The fingerprint says a *pair* is
+consistent and is the right check for mixing; it does not say two *trees* measure the same. A
+throughput baseline taken on a hand-patched tree is re-taken on the release before it is compared
+(`pair_ref.sh <pair> --compare` is where that comparison lives).
+
