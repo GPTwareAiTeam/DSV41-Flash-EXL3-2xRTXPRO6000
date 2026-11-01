@@ -236,12 +236,15 @@ def main():
     ap.add_argument("--port", type=int, default=47311)
     ap.add_argument("--stub", action="store_true",
                     help="answer every request with zeros (wire/protocol baseline, no expert compute)")
-    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,256,512,1024"),
+    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,256"),
                     help="row buckets this server can serve (ascending, one port per bucket from "
                          "--port+1). Clients request a subset; the superset default means one "
                          "long-lived server serves every benchmark arm without a reload. The largest "
                          "bucket is the per-call row limit the client splits prefill on, so size it "
-                         "to the GX box's memory headroom (1.18 MiB pinned per row per side).")
+                         "to the GX box's memory headroom (1.18 MiB pinned per row per side; a"
+                         "121 GiB GB10 with the 113.65 GiB cold pack loaded has ~0.5 GiB left, so"
+                         "1,6,256 = 309 MiB fits and 1,6,64,256 = 384 MiB is the measured ceiling;"
+                         "512 alone is 600 MiB and does not).")
     ap.add_argument("--wait", action="store_true",
                     help="queue a second client behind the active session instead of rejecting it "
                          "(also settable per client with SEAM_WAIT=1)")
@@ -270,9 +273,18 @@ def main():
     # allocated here, after the pack load, so the list has to have been sized to the box's free
     # memory beforehand (seam_server_ensure.sh --buckets auto does that): print the bill first.
     buckets = sorted({int(r) for r in args.buckets.split(",") if r.strip()})
+    want_mib = slab_mib(buckets)
+    avail_mib = _avail_mib()
+    fits = int(avail_mib < 0 or want_mib <= avail_mib - 64)
     print(f"SEAM_SERVER_SLAB buckets={','.join(map(str, buckets))} "
-          f"predicted_mib={slab_mib(buckets)} rows_max={buckets[-1]} "
-          f"avail_mib={_avail_mib()}", flush = True)
+          f"predicted_mib={want_mib} rows_max={buckets[-1]} "
+          f"avail_mib={avail_mib} fits={fits}", flush = True)
+    if not fits:
+        # The pack is already resident, so a slab that does not fit is paid by swapping the pack
+        # out page by page: every expert call then faults, and the box looks alive while crawling.
+        print(f"SEAM_SERVER_SLAB_WARN buckets=... predicted_mib={want_mib} avail_mib={avail_mib} "
+              f"over_mib={want_mib - avail_mib + 64}: lower --buckets or expect the pack to be "
+              f"swapped out (see seam_server_ensure.sh --buckets auto)", flush = True)
     placement_sha = hashlib.sha256(open(args.placement, "rb").read()).hexdigest()[:12]
     srv = qes.Server(args.dev, args.gid, args.port, 0, buckets, build = qes.build_id(),
                      placement_sha = placement_sha, wait = args.wait)
