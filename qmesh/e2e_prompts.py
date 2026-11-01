@@ -66,9 +66,14 @@ NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 WARMUP = int(os.environ.get("WARMUP", "0"))
 WARMUP_NEW = int(os.environ.get("WARMUP_NEW") or MAX_NEW)
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
-OUT = os.environ.get("OUT", "")
-DEBUG_RESULTS = os.environ.get("DEBUG_RESULTS") == "1"
 MEM_BREAKDOWN = os.environ.get("MEM_BREAKDOWN") == "1"
+# MARGIN_PROBE=1 prints, per prompt, the top-2 logits that produced the first generated token and
+# their gap. Two arms can differ in text while agreeing on 128 tokens out of 128 until one near-tied
+# step flips; the gap is what says whether a flip is a reordering artefact (gap far below the kernels'
+# measured 2e-3 relative difference) or a real disagreement. Read once per prompt, after the sampler
+# already consumed those logits, so it cannot change the token it measures.
+MARGIN_PROBE = os.environ.get("MARGIN_PROBE") == "1"
+DEBUG_RESULTS = os.environ.get("DEBUG_RESULTS") == "1"
 CORPUS_TOKENS = int(os.environ.get("CORPUS_TOKENS", "24000"))
 CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
 LONG_TOKENS = int(os.environ.get("LONG_TOKENS", "0"))
@@ -139,12 +144,22 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
         text = ""
         chunks = 0
         eos_result = None
+        probed = False
         while generator.num_remaining_jobs():
             for result in generator.iterate():
                 if DEBUG_RESULTS:
                     print("DBG " + json.dumps(
                         {k: (list(v.shape) if isinstance(v, torch.Tensor) else v)
                          for k, v in result.items() if k != "text"}, default=str), flush=True)
+                if MARGIN_PROBE and not probed and result.get("logits") is not None:
+                    probed = True
+                    top = torch.topk(result["logits"][0, 0].float(), 2)
+                    chosen = result.get("token_ids")
+                    print(f"MARGIN spec={spec} prompt={label} "
+                          f"top_ids={[int(t) for t in top.indices]} "
+                          f"top_logits={[round(float(v), 5) for v in top.values]} "
+                          f"gap={float(top.values[0] - top.values[1]):.5f} "
+                          f"chosen={int(chosen[0, 0]) if chosen is not None else -1}", flush=True)
                 chunk = result.get("text", "")
                 if chunk:
                     text += chunk
