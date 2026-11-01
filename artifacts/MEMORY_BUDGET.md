@@ -12,18 +12,22 @@ checkpoint `/models/dsv41/exl3-2.8535-p7hot-hc1`.
 - **Per-chunk rise: 3.0 GiB** for an 8192-row chunk (3056 MiB, 15 of 16 chunks); the **first chunk rose
   3.5 GiB** (3573 MiB) because the uncompressed-pool staging window and indexer slab are allocated on
   first use.
-- **Suggested overhead line: 6.8 GiB** [INFERENCE] = 8.86 free at peak − 2.0 margin (0.56 GiB measured
-  statics growth 0→131k, plus allocator slack). This is the room left for anything that is not the
-  current weights/KV/recurrent set.
-- **Expert room at that 6.8 GiB** [INFERENCE, planning]: additional hot experts that fit, by bits/weight
-  (expert = 35.4 M params ⇒ 4.22 MiB per bpw per expert; the pack's hot set measures 16.92 MiB/expert):
+- **Overhead to keep free = 6.25 GiB** = 13.11 after load − 6.86 room. Breakdown: 3.5 GiB first-chunk
+  transient (8192 rows, measured 3573 MiB) + 0.56 GiB statics at 131k (measured, 0.000 at load) + 2.0 GiB
+  margin for allocator slack and the limiter's own prediction error. The margin is the owner's choice.
+- **Room for extra experts = 6.86 GiB** [INFERENCE] (= 8.86 free at prefill peak − the same 2.0 margin).
+  Expert = 35.4 M params ⇒ 4.22 MiB per bpw per expert; the pack's hot set measures 16.92 MiB/expert,
+  so at 4 bpw one expert is 16.88 MiB:
 
-| bpw | MiB/expert | experts in 6.8 GiB |
+| bpw | MiB/expert | experts in 6.86 GiB |
 |---|---|---|
-| 2 | 8.44 | 825 |
-| 2.5 | 10.55 | 660 |
-| 3 | 12.66 | 550 |
-| 4 | 16.88 | 412 |
+| 2 | 8.44 | 832 |
+| 2.5 | 10.55 | 666 |
+| 3 | 12.66 | 555 |
+| 4 | 16.88 | 416 |
+
+- **Margin sensitivity**: each 1 GiB taken off the margin buys **+60 experts at 4 bpw / +121 at 2 bpw**
+  (1024 / 16.88 and 1024 / 8.44).
 
 Details, per-device tables and caveats below. Sections that report the long arm carry the run log name;
 rows marked *planning* come from the placement ledger and are not measurements.
