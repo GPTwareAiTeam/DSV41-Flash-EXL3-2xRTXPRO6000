@@ -322,6 +322,7 @@ class DeepseekV4MTPModel(Model):
         # Markov bigram head (per-token logit bias in the sampling loop) and confidence
         # head (per-position draft-length score), unquantized
         tp_size = getattr(config, "tp_size", 1)
+        self.tp_size = tp_size
         self.markov_w1 = Embedding(
             config = config,
             key = f"{last}.markov_head.markov_w1",
@@ -552,7 +553,7 @@ class DeepseekV4MTPModel(Model):
         if getattr(self, "_markov_w1_dev", None) is None:
             self._markov_w1_dev = to_dev(self.markov_w1.embedding.weight.data, dev)
         w2 = self.markov_w2
-        tp = self.config.tp_size
+        tp = self.tp_size
         out = torch.empty((b, s + 1), dtype = torch.long, device = dev)
         out[:, 0] = seed[:, -1]
         embs = []
@@ -686,7 +687,7 @@ class DeepseekV4MTPModel(Model):
         if getattr(self, "_markov_w1_dev", None) is None:
             self._markov_w1_dev = to_dev(self.markov_w1.embedding.weight.data, dev)
         w2 = self.markov_w2
-        tp = self.config.tp_size
+        tp = self.tp_size
         out = torch.empty((b, s + 1), dtype = torch.long, device = dev)
         out[:, 0] = seed[:, -1]
         embs = []
