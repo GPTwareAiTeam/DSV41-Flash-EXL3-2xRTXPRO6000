@@ -220,8 +220,18 @@ class RemoteSeamHost:
             print(f"SEAM_SPLIT layer={layer_idx} rows={x.shape[0]} chunk_rows={self.chunk_rows} "
                   f"calls={len(plan)} buckets={','.join(map(str, self.buckets))} plan={widths}",
                   flush = True)
-        parts = [self._issue_chunk(layer_idx, x[s:e], ids[s:e], w[s:e]) for s, e, _ in plan]
-        return parts[0] if len(parts) == 1 else torch.cat(parts, dim = 0)
+        if len(plan) == 1:
+            return self._issue_chunk(layer_idx, x, ids, w)
+        # One fp32 [rows,H] output that every chunk writes into: torch.cat would hold the parts and
+        # the copy at once (+rows*H*4 bytes, 235 MiB at 8192 rows), which the prefill memory budget
+        # does not have.
+        out = torch.empty(x.shape[0], HIDDEN, dtype = torch.float32, device = x.device)
+        pos = 0
+        for s, e, _ in plan:
+            part = self._issue_chunk(layer_idx, x[s:e], ids[s:e], w[s:e])
+            out[pos:pos + part.shape[0]] = part
+            pos += part.shape[0]
+        return out
 
     def submit_issue(self, layer_idx, y, selected, weights):
         """Decode-size batches (<= largest bucket) run as one chunk; the output is produced
