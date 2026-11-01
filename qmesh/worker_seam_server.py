@@ -74,16 +74,6 @@ class SeamServer:
         # fail_after: testing hook for the fail-stop below - raise on call N+1. 0 = never.
         self.fail_after = int(fail_after or 0)
         self.seen = 0
-        # One compute at a time. The C proxy calls this hook from a thread per open handle, and a
-        # client with several row buckets keeps several handles (1/6/64...) with one request in
-        # flight each, so two threads can be inside _forward at once: the pinned-slab pointers are
-        # per handle, but the module (its _buf_get scratch, its fused row buffers) and the one CUDA
-        # stream are not. The Python-side tensor bookkeeping of the two calls then interleaves while
-        # the other thread sits in stream.synchronize() or .cpu() with the GIL released - the same
-        # scratch buffer is rebuilt under a kernel that is still reading it. That is a CUDA illegal
-        # access / launch failure inside the GX compute, i.e. exactly the "6-row" deaths of
-        # 2026-11-01, and it cannot be seen by a single-handle benchmark (that is serialized).
-        self.compute_lock = threading.Lock()
         # ws_rows: serve each request in pieces of at most this many rows, so the peak device
         # workspace follows ws_rows instead of the row bucket (see _forward). 0 = one piece.
         placement = json.load(open(placement_path))
@@ -106,12 +96,7 @@ class SeamServer:
                            for layer in range(NL)]
         sizes = [os.path.getsize(p) if os.path.exists(p) else 0 for p in self.pack_paths]
         self.pack_mib = sum(sizes) / 2**20
-        # 2048, not 1024: the load itself costs ~1100-1300 MiB above the pack (page cache, the
-        # Config/Model parse, the expert tensors' transient copies), and compute needs >= ~1600 MiB
-        # post-load. A 1024 margin let GX2 land at avail 1177 / swapped 3766 and die on its first
-        # forward (2026-11-01, "unspecified launch failure" at rows=1). The starter should set this
-        # explicitly per box (GX2 is the tighter one); this default only stops a bare start.
-        margin = int(os.environ.get("SEAM_LOAD_MARGIN_MIB", "2048"))
+        margin = int(os.environ.get("SEAM_LOAD_MARGIN_MIB", "1024"))
         avail = _avail_mib()
         if not sizes[0]:
             print(f"SEAM_NO_PACK dir={model_dir} - expected cold-L00.safetensors", flush=True)
@@ -164,11 +149,7 @@ class SeamServer:
             if self.fail_after and self.seen > self.fail_after:
                 raise RuntimeError(f"injected compute failure on call {self.seen} (--fail-after "
                                    f"{self.fail_after})")
-            # The lock covers the whole forward, not just one piece: a request served in ws_rows
-            # pieces still builds its scratch between pieces, and the pieces of two requests must
-            # not interleave inside the module.
-            with self.compute_lock:
-                self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+            self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
         except Exception as e:  # noqa: BLE001 - see the docstring: no safe local recovery
             print(f"SEAM_COMPUTE_FAIL layer={layer} rows={rows} err={type(e).__name__}: {e} "
                   f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()} "
@@ -611,22 +592,17 @@ def main():
     ap.add_argument("--port", type=int, default=47311)
     ap.add_argument("--stub", action="store_true",
                     help="answer every request with zeros (wire/protocol baseline, no expert compute)")
-    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,64,256,2048"),
+    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,256"),
                     help="row buckets this server can serve (ascending, one port per bucket from "
                          "--port+1). Clients request a subset; the superset default means one "
                          "long-lived server serves every benchmark arm without a reload. The largest "
-                         "bucket is the per-call row limit the client splits prefill on, and that is "
-                         "what prefill throughput rides on: a 64-row chunk pays the ~40 ms fixed cost "
-                         "of one GX layer call, a 2048-row chunk pays it once for 32x the rows "
-                         "(28.5 us/row at 2048 vs 78 us/row at 512, measured on GX2). The bucket is "
-                         "paid twice: protocol v3 staging is ~30.2 KiB pinned per row per slot "
-                         "(61 MiB for 2048 at one slot, 122 at two), and the cold-expert forward "
-                         "needs ~147 KiB per row of transient device memory (measured: 301 MiB at "
-                         "2048 rows, 602 at 4096, 1202 at 8192). With a 113.65 GiB pack resident a "
-                         "GB10 has 0.7-1.4 GiB left, so 2048 is the largest bucket that fits with a "
-                         "margin (the fit is printed as slab_mib/ws_mib/fits in SEAM_SERVER_SLAB); a "
-                         "bigger bucket needs --ws-rows to cap the workspace, and a tighter box "
-                         "should serve 1024.")
+                         "bucket is the per-call row limit the client splits prefill on, so it is "
+                         "paid twice: protocol v3 staging is ~30.2 KiB pinned per row per slot, and "
+                         "the cold-expert forward needs ~147 KiB per row of transient device memory "
+                         "(measured: 301 MiB at 2048 rows, 602 at 4096, 1202 at 8192). With the "
+                         "113.65 GiB pack resident a GB10 has 733-876 MiB left, so 2048 rows is the "
+                         "largest bucket that fits with a margin; a bigger bucket needs --ws-rows to "
+                         "cap the workspace, and the fit is printed as ws_mib in SEAM_SERVER_SLAB.")
     ap.add_argument("--slab-slots", type = int,
                     default = int(os.environ.get("SEAM_SLAB_SLOTS", "1")),
                     help="payload slots per bucket (1..8): how many requests one client handle may "

@@ -12,16 +12,7 @@ narrower verify width does to the GX1 kernel time. The client requests SEAM_BUCK
 subset the server grants, so one long-lived server serves every arm: no restart per run.
 
 Env: SEAM_DEV, SEAM_GID, SEAM_PEER, SEAM_PORT, SEAM_BUCKETS (requested), BENCH_REPS (default 5),
-     BENCH_LAYERS (default 0 = all layers in the placement), PLACEMENT,
-     BENCH_HOT_ROWS (default 0: that many rows of every request get an all-hot routing, id -1 in
-     every slot with a nonzero weight - the drafter verify's "this token's top-k is hot" row, which
-     must contribute nothing to the cold gather and must still come back as a finite row),
-     BENCH_HOT_SLOTS (default 0: how many leading slots of the remaining rows are hot),
-     BENCH_INTERLEAVE (default 0 = sweep one width across all layers at a time; N = N cycles of
-     layer order with every width of BENCH_ROWS issued back to back on each layer, which is what a
-     real client does and the only way this bench sees a per-layer scratch/streaming bug),
-     BENCH_SYNC (default 1: host-synchronise after each call; 0 pipelines calls on the stream like
-     the client does, so several requests are in flight across buckets).
+     BENCH_LAYERS (default 0 = all layers in the placement), PLACEMENT
 """
 from __future__ import annotations
 
@@ -42,11 +33,6 @@ REPS = int(os.environ.get("BENCH_REPS", "5"))
 MAX_LAYERS = int(os.environ.get("BENCH_LAYERS", "0"))
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 ROWS = [int(r) for r in os.environ.get("BENCH_ROWS", "1,2,3,4,5,6,7").split(",")]
-INTERLEAVE = int(os.environ.get("BENCH_INTERLEAVE", "0"))
-SYNC = os.environ.get("BENCH_SYNC", "1") != "0"
-HOT_ROWS = int(os.environ.get("BENCH_HOT_ROWS", "0"))
-HOT_SLOTS = int(os.environ.get("BENCH_HOT_SLOTS", "0"))
-POOL = int(os.environ.get("BENCH_POOL", "0"))
 
 # Wire slab geometry, mirrored from qmesh/native/qmesh_expert_seam.cu:geometry() (protocol v3): one
 # pinned slab per row bucket *per side* (client cudaHostAlloc in qes_client_handle, server in
@@ -81,21 +67,6 @@ def mem(tag: str, buckets=(), extra: str = "") -> None:
           f"self_rss_mib={rss / 2 ** 20:.1f} slab_predict_mib={pred:.1f}"
           + (f" {extra}" if extra else ""), flush=True)
 
-def make_ids(n, nc, dev):
-    """(n, TOPK) cold expert ids for one request, in [0, nc).
-
-    BENCH_POOL=0 (default) spreads every assignment over the layer's whole cold range, so the
-    per-expert row counts come out flat - max ~5 rows for 64 tokens over ~270 experts. Real routing
-    is nothing like that: the failing arm's own tier trace printed a histogram with one expert
-    holding 257+ rows and two holding 1..32, because the tokens of one sentence pick near-identical
-    experts. BENCH_POOL=k draws every id from a pool of k experts, so an expert's row count is
-    ~n*TOPK/k and the dispatch takes the per-row-tile launches (MTILE_T1=16, MTILE_T2=32, m_tile
-    32/64) that a flat spread can never reach - the one path no earlier bench pass has exercised.
-    """
-    if POOL:
-        return torch.randint(0, min(POOL, nc), (n, TOPK), device=dev).to(torch.int32)
-    return torch.stack([torch.randperm(nc, device=dev)[:TOPK] for _ in range(n)]).to(torch.int32)
-
 
 def main():
     pl = json.load(open(PLACEMENT))
@@ -107,8 +78,7 @@ def main():
     print(f"SEAMROWS layers={len(layers)} cold_min={min(cold[l] for l in layers)} "
           f"cold_max={max(cold[l] for l in layers)} dev={DEV} peer={PEER} "
           f"requested={','.join(map(str, host.BUCKETS))} "
-          f"buckets={','.join(map(str, host.buckets))} reps={REPS} rows={ROWS} "
-          f"hot_rows={HOT_ROWS} hot_slots={HOT_SLOTS}", flush=True)
+          f"buckets={','.join(map(str, host.buckets))} reps={REPS} rows={ROWS}", flush=True)
     stream = torch.cuda.current_stream()
     torch.manual_seed(0)
     dev = torch.device("cuda:0")
@@ -131,53 +101,6 @@ def main():
     torch.cuda.synchronize(dev)
     mem("warm", need, f"buckets={','.join(map(str, need))}")
 
-    # BENCH_INTERLEAVE: issue every row count of ROWS back to back *on the same layer*, in layer
-    # order - the pattern a real client produces (a 64-row prefill piece, then its 2..6-row
-    # remainder, then the next layer), and the only way this bench can show a per-layer scratch or
-    # stream-ordering bug. The width sweep below runs all layers at one width and then all layers at
-    # the next, so it never puts two widths through one module within a millisecond.
-    if INTERLEAVE:
-        widths = run_rows
-        xs, ws, idss = {}, {}, {}
-        for n in widths:
-            xs[n] = (torch.randn(n, HIDDEN, dtype=torch.bfloat16, device=dev) * 0.02)
-            w = torch.rand(n, TOPK, dtype=torch.bfloat16, device=dev)
-            ws[n] = (w / w.sum(dim=-1, keepdim=True)).contiguous()
-        torch.cuda.synchronize(dev)
-        t0 = time.time()
-        t_il = {}
-        ncalls = 0
-        for L in list(layers) * max(1, INTERLEAVE):
-            nc = cold[L]
-            for n in widths:
-                idss[n] = make_ids(n, nc, dev)
-                if HOT_SLOTS:
-                    idss[n][:, :min(HOT_SLOTS, TOPK)] = -1
-                if HOT_ROWS:
-                    idss[n][:min(HOT_ROWS, n)] = -1
-            for _ in range(REPS):
-                # sync only per layer (SYNC=0): the client pipelines its calls on the stream and
-                # never host-waits between the widths of one layer
-                if SYNC:
-                    torch.cuda.synchronize(dev)
-                for n in widths:
-                    s0 = time.perf_counter_ns()
-                    host.submit_issue(L, xs[n], idss[n], ws[n])
-                    if SYNC:
-                        torch.cuda.synchronize(dev)
-                        t_il.setdefault(n, []).append((time.perf_counter_ns() - s0) / 1e3)
-                    ncalls += 1
-            torch.cuda.synchronize(dev)
-        for n in widths:
-            v = t_il.get(n) or [0.0]
-            print(f"SEAMROWS_INTERLEAVE n={n} calls={ncalls} sync={SYNC} "
-                  f"host_us_median={statistics.median(v):.1f} host_us_max={max(v):.1f}", flush=True)
-        print(f"SEAMROWS_INTERLEAVE_DONE layers={len(layers)} cycles={max(1, INTERLEAVE)} "
-              f"widths={','.join(map(str, widths))} reps={REPS} calls={ncalls} "
-              f"wall_s={time.time() - t0:.1f}", flush=True)
-        mem("interleave", need, f"widths={','.join(map(str, widths))}")
-        return
-
     table = {}
     opened = []
     t_start = time.time()
@@ -188,11 +111,7 @@ def main():
         dev_us, host_us = [], []
         for L in layers:
             nc = cold[L]
-            ids = make_ids(n, nc, dev)
-            if HOT_SLOTS:
-                ids[:, :min(HOT_SLOTS, TOPK)] = -1
-            if HOT_ROWS:
-                ids[:min(HOT_ROWS, n)] = -1     # whole row hot: nothing for the cold gather
+            ids = torch.stack([torch.randperm(nc, device=dev)[:TOPK] for _ in range(n)]).to(torch.int32)
             best_d, best_h = None, None
             for _ in range(REPS):
                 ev0 = torch.cuda.Event(enable_timing=True)
