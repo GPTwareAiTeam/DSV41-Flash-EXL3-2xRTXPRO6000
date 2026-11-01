@@ -96,15 +96,15 @@ def build_layer(base, cold_ids, device):
 
 
 class SeamServer:
-    def __init__(self, model_dir, placement_path, device, stub = False, fail_after = 0):
-        # fail_after: test hook for the fail-stop in compute() - raise on call N+1. 0 = never.
-        self.fail_after = int(fail_after or 0)
-        self.seen = 0
+    def __init__(self, model_dir, placement_path, device, stub = False, ws_rows = 0):
+        # ws_rows: serve each request in pieces of at most this many rows, so the peak device
+        # workspace follows ws_rows instead of the row bucket (see _forward). 0 = one piece.
         placement = json.load(open(placement_path))
         self.device = device
         self.stub = stub
         self.stream = None
         self.layers = {}
+        self.ws_rows = int(ws_rows or 0)
         if stub:
             # Wire/protocol baseline: no experts are needed and nothing here touches CUDA or
             # exllamav3, so a stub server is up in seconds even while the GPU holds another pack.
@@ -154,10 +154,31 @@ class SeamServer:
             _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
 
     def _forward(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
+        """Serve one request of `rows` rows, in internal pieces of at most ws_rows.
+
+        The row bucket and the device workspace are separate bills and this is what decouples them.
+        Measured on the dev pair (--ws-probe, pack resident): the cold-expert forward's scratch is
+        ~150 KiB per row, so a bucket of N rows costs 150*N KiB of transient device memory however
+        the slab is sized - 301 MiB at 2048 rows, 602 at 4096, 1202 at 8192, against 733 MiB of
+        headroom on GX2 and 876 on GX1. The scratch scales with the rows handed to the module, not
+        with the number of requests, so serving a big bucket as several ws_rows pieces makes the
+        peak depend on ws_rows instead. Pieces run in order on the same CUDA stream and the single
+        synchronise at the end still covers them; the pinned slab and the wire cost are unchanged,
+        which is the point: a bigger bucket then buys fewer per-layer calls (remote_seam_host
+        chunks a prefill at the largest granted bucket) without a bigger workspace.
+        """
         if self.stub:
             view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = 0.0
             return
         ffn, _ = self.layers[layer]
+        step = self.ws_rows if 0 < self.ws_rows < rows else rows
+        for r0 in range(0, rows, step):
+            self._forward_piece(ffn, min(step, rows - r0),
+                                x_ptr + r0 * HIDDEN * 2, ids_ptr + r0 * TOPK * 4,
+                                w_ptr + r0 * TOPK * 2, out_ptr + r0 * HIDDEN * 4)
+
+    def _forward_piece(self, ffn, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
+        """One mixed-K forward of `rows` rows straight out of, and back into, the pinned slab."""
         x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN).copy())
         x = x.view(torch.bfloat16).to(self.device).half()
         ids = torch.from_numpy(view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK).astype(np.int64))
@@ -216,6 +237,19 @@ def slab_mib(buckets, slots = 1) -> float:
         resp = rows * HIDDEN * 4
         total += (3 * 64 + al(req) + al(resp)) * slots
     return total / 2**20
+
+
+# Measured, not predicted: --ws-probe on the dev pair with the 113.65 GiB pack resident gave
+# 301 MiB of transient device memory at 2048 rows, 602 at 4096 and 1202 at 8192, i.e. 147 KiB per
+# row, and the slab is on top of that (slab_mib). A request served in ws_rows pieces pays this for
+# ws_rows, not for the bucket, so a big bucket is a wire/call-count decision, not a workspace one.
+WS_KIB_PER_ROW = 147
+
+
+def ws_mib_for(rows: int, ws_rows: int = 0) -> float:
+    """Transient device workspace the cold-expert forward needs for a request, MiB."""
+    n = ws_rows if 0 < ws_rows < rows else rows
+    return n * WS_KIB_PER_ROW / 1024
 
 
 def _avail_mib() -> int:
@@ -287,6 +321,52 @@ def ws_probe(server, spec, min_avail_mib):
         torch.cuda.empty_cache()
 
 
+def ws_check(server, rows):
+    """Does serving a request in ws_rows pieces compute the same thing as one piece?
+
+    Capping the workspace by chunking is only worth having if it is numerically harmless, and the
+    answer has to be measured: the mixed-K path pads each expert's token run and the accumulation
+    order inside a piece can differ from the order in a whole-bucket call. This runs the same
+    deterministic request twice - one piece, then ws_rows pieces - and prints the largest absolute
+    difference in the fp32 response (SEAM_WS_CHECK). `rows` must be a multiple of ws_rows.
+    """
+    if server.stub:
+        print("SEAM_WS_CHECK stub=1: nothing to compare without the cold experts", flush = True)
+        return
+    step = server.ws_rows
+    if not 0 < step < rows:
+        print(f"SEAM_WS_CHECK rows={rows} skipped: needs 0 < --ws-rows < rows", flush = True)
+        return
+    ncold = server.layers[0][1]
+    lane = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2) + rows * HIDDEN * 4
+    stage = torch.zeros(lane, dtype = torch.uint8, pin_memory = True)
+    base = stage.data_ptr()
+    x_ptr, ids_ptr = base, base + rows * HIDDEN * 2
+    w_ptr, out_ptr = ids_ptr + rows * TOPK * 4, ids_ptr + rows * TOPK * 4 + rows * TOPK * 2
+    # A deterministic ramp, not zeros: identical zeros would hide a piece that came back empty.
+    ramp = (np.arange(rows * HIDDEN, dtype = np.float32) % 97 / 97).astype(np.float32)
+    view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN)[:] = ramp.view(np.uint32) >> 16
+    view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)[:] = \
+        np.arange(rows * TOPK, dtype = np.int32).reshape(rows, TOPK) % max(ncold, 1)
+    view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:] = 0x3f00   # 0.5 in bf16
+
+    def run():
+        server._forward(0, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+        torch.cuda.synchronize(server.device)
+        return view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN).copy()
+
+    whole = run()
+    server.ws_rows = 0
+    piece = run()
+    server.ws_rows = step
+    scale = float(np.abs(whole).max()) or 1.0
+    print(f"SEAM_WS_CHECK rows={rows} ws_rows={step} pieces={rows // step} "
+          f"max_abs={float(np.abs(whole - piece).max()):.6g} rel={float(np.abs(whole - piece).max()) / scale:.3g} "
+          f"ref_absmax={scale:.6g} identical={bool(np.array_equal(whole, piece))}", flush = True)
+    del stage
+    torch.cuda.empty_cache()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default="/cold")
@@ -300,10 +380,13 @@ def main():
                     help="row buckets this server can serve (ascending, one port per bucket from "
                          "--port+1). Clients request a subset; the superset default means one "
                          "long-lived server serves every benchmark arm without a reload. The largest "
-                         "bucket is the per-call row limit the client splits prefill on, so size it "
-                         "to the GX box's memory headroom: protocol v3 staging is ~30.2 KiB pinned "
-                         "per row per slot, so 1,6,64,1024,2048 at one slot is 38 MiB and 4 slots "
-                         "of 2048 rows is 242 MiB, which fits a 121 GiB GB10 with the pack loaded.")
+                         "bucket is the per-call row limit the client splits prefill on, so it is "
+                         "paid twice: protocol v3 staging is ~30.2 KiB pinned per row per slot, and "
+                         "the cold-expert forward needs ~147 KiB per row of transient device memory "
+                         "(measured: 301 MiB at 2048 rows, 602 at 4096, 1202 at 8192). With the "
+                         "113.65 GiB pack resident a GB10 has 733-876 MiB left, so 2048 rows is the "
+                         "largest bucket that fits with a margin; a bigger bucket needs --ws-rows to "
+                         "cap the workspace, and the fit is printed as ws_mib in SEAM_SERVER_SLAB.")
     ap.add_argument("--slab-slots", type = int,
                     default = int(os.environ.get("SEAM_SLAB_SLOTS", "1")),
                     help="payload slots per bucket (1..8): how many requests one client handle may "
@@ -321,14 +404,33 @@ def main():
                     help = "skip a --ws-probe row count when MemAvailable is below this many MiB "
                            "(a full pack plus a nearly full box would swap, not fail, and the "
                            "number would be meaningless)")
+    ap.add_argument("--ws-rows", type = int, default = int(os.environ.get("SEAM_WS_ROWS", "0")),
+                    help = "serve each request in pieces of at most this many rows, so the peak "
+                           "device workspace follows this instead of the row bucket (measured "
+                           "~150 KiB per row of scratch in the cold-expert forward: 301 MiB at "
+                           "2048 rows, 602 at 4096, 1202 at 8192). 0 = one piece per request, "
+                           "which is what a bucket sized to the box's headroom needs. Set this "
+                           "when the bucket is bigger than the box's workspace, e.g. 2048 rows "
+                           "on a 733 MiB box keeps the peak near 150 MiB.")
+    ap.add_argument("--ws-check", type = int, default = 0, metavar = "ROWS",
+                    help = "run the same ROWS-row request once in one piece and once in --ws-rows "
+                           "pieces and print the largest difference (SEAM_WS_CHECK), then exit: "
+                           "proves that capping the workspace by chunking does not change the "
+                           "numbers. ROWS must be a multiple of --ws-rows.")
     args = ap.parse_args()
 
     device = torch.device("cuda:0")
     t0 = time.time()
-    server = SeamServer(args.model_dir, args.placement, device, stub = args.stub)
+    server = SeamServer(args.model_dir, args.placement, device, stub = args.stub,
+                        ws_rows = args.ws_rows)
     print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)}", flush=True)
-    if args.ws_probe:
-        ws_probe(server, args.ws_probe, args.ws_probe_min_avail)
+    if args.ws_probe or args.ws_check:
+        # Both modes share one pack load: the ladder first (it resets the peak counters), then the
+        # equivalence check, whose own peak does not matter.
+        if args.ws_probe:
+            ws_probe(server, args.ws_probe, args.ws_probe_min_avail)
+        if args.ws_check:
+            ws_check(server, args.ws_check)
         return
     threading.Thread(target = _reporter, daemon = True).start()
 
@@ -338,17 +440,19 @@ def main():
     # memory beforehand (seam_server_ensure.sh --buckets auto does that): print the bill first.
     buckets = sorted({int(r) for r in args.buckets.split(",") if r.strip()})
     want_mib = slab_mib(buckets, args.slab_slots)
+    ws_mib = ws_mib_for(buckets[-1], args.ws_rows)
     avail_mib = _avail_mib()
-    fits = int(avail_mib < 0 or want_mib <= avail_mib - 64)
+    fits = int(avail_mib < 0 or want_mib + ws_mib <= avail_mib - 64)
     print(f"SEAM_SERVER_SLAB buckets={','.join(map(str, buckets))} slots={args.slab_slots} "
-          f"predicted_mib={want_mib} rows_max={buckets[-1]} "
+          f"slab_mib={want_mib} ws_rows={args.ws_rows} ws_mib={ws_mib} rows_max={buckets[-1]} "
           f"avail_mib={avail_mib} fits={fits}", flush = True)
     if not fits:
-        # The pack is already resident, so a slab that does not fit is paid by swapping the pack
+        # The pack is already resident, so memory that does not fit is paid by swapping the pack
         # out page by page: every expert call then faults, and the box looks alive while crawling.
-        print(f"SEAM_SERVER_SLAB_WARN buckets=... predicted_mib={want_mib} avail_mib={avail_mib} "
-              f"over_mib={want_mib - avail_mib + 64}: lower --buckets or expect the pack to be "
-              f"swapped out (see seam_server_ensure.sh --buckets auto)", flush = True)
+        print(f"SEAM_SERVER_SLAB_WARN buckets=... slab_mib={want_mib} ws_mib={ws_mib} "
+              f"avail_mib={avail_mib} over_mib={want_mib + ws_mib - avail_mib + 64}: lower "
+              f"--buckets, set --ws-rows, or expect the pack to be swapped out (see "
+              f"seam_server_ensure.sh --buckets auto)", flush = True)
     placement_sha = hashlib.sha256(open(args.placement, "rb").read()).hexdigest()[:12]
     srv = qes.Server(args.dev, args.gid, args.port, 0, buckets, build = qes.build_id(),
                      placement_sha = placement_sha, wait = args.wait, slots = args.slab_slots)
