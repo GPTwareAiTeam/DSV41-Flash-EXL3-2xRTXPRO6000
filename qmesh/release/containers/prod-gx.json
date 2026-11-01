@@ -1,5 +1,5 @@
 {
-  "name": "seam-gx1v2",
+  "name": "seam-gx1-prod",
   "image": "qmesh-nccl2312-official-gx10:20260814-3",
   "workdir": "/workspace/vllm",
   "entrypoint": "sleep",
