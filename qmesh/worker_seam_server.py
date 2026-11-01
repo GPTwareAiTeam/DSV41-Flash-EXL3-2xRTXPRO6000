@@ -106,7 +106,12 @@ class SeamServer:
                            for layer in range(NL)]
         sizes = [os.path.getsize(p) if os.path.exists(p) else 0 for p in self.pack_paths]
         self.pack_mib = sum(sizes) / 2**20
-        margin = int(os.environ.get("SEAM_LOAD_MARGIN_MIB", "1024"))
+        # 2048, not 1024: the load itself costs ~1100-1300 MiB above the pack (page cache, the
+        # Config/Model parse, the expert tensors' transient copies), and compute needs >= ~1600 MiB
+        # post-load. A 1024 margin let GX2 land at avail 1177 / swapped 3766 and die on its first
+        # forward (2026-11-01, "unspecified launch failure" at rows=1). The starter should set this
+        # explicitly per box (GX2 is the tighter one); this default only stops a bare start.
+        margin = int(os.environ.get("SEAM_LOAD_MARGIN_MIB", "2048"))
         avail = _avail_mib()
         if not sizes[0]:
             print(f"SEAM_NO_PACK dir={model_dir} - expected cold-L00.safetensors", flush=True)
