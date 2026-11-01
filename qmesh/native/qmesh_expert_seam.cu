@@ -69,6 +69,10 @@ namespace {
 constexpr int ROWS_MAX = 8192;
 constexpr size_t LINE = 64;
 constexpr uint64_t WAIT_TIMEOUT_NS = 30ull * 1000 * 1000 * 1000;
+/* How long a re-issue may wait for the server to acknowledge the slot's previous request before
+ * the transport is declared stuck. The wait only happens when the caller has more requests in
+ * flight than there are slots. */
+constexpr uint64_t SLOT_ACK_TIMEOUT_NS = 30ull * 1000 * 1000 * 1000;
 
 /* Control channel: negotiation hello/reply and the data-handshake guard words. */
 constexpr uint32_t CTL_MAGIC = 0x32534551u;        /* "QES2" */
@@ -647,10 +651,23 @@ void dump_wire_ids(qes_handle* h, int slot, uint64_t seq) {
   const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, slot));
   const int32_t* ids = (const int32_t*)(h->slab + off_req(h, slot) + h->ids_off);
   const int n = h->rows * QES_TOPK;
+  const uint16_t* w = (const uint16_t*)(h->slab + off_req(h, slot) + h->w_off);
+  const uint16_t* x = (const uint16_t*)(h->slab + off_req(h, slot));
+  auto bf16f = [](uint16_t v) {
+    uint32_t u = (uint32_t)v << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+  };
   fprintf(stderr, "SEAM_WIRE_IDS port=%d rows=%u slot=%d seq=%llu layer=%u hdr_rows=%u n=%d ids=[",
           h->tcp_port, h->rows, slot, (unsigned long long)seq, hdr->layer, hdr->rows, n);
   for (int i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", ids[i]);
-  fprintf(stderr, "]\n");
+  /* The weights and the first hidden values ride in the same payload, so they say whether the
+   * request as a whole is the router's output for this layer (a bad id then comes from the
+   * router or from the translate) or a pad/stale slot (weight 0 where a pick should be). */
+  fprintf(stderr, "] w=[");
+  for (int i = 0; i < n; i++) fprintf(stderr, "%s%.6g", i ? " " : "", bf16f(w[i]));
+  fprintf(stderr, "] x0=%.6g x1=%.6g\n", bf16f(x[0]), bf16f(x[1 % QES_HIDDEN]));
   fflush(stderr);
 }
 
@@ -2069,18 +2086,36 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
             h->n_pending, h->rows, h->slots);
     return -4;
   }
+  /* Pick a free slot whose previous request the server has already answered. `pending` alone is not
+   * enough: the entry leaves `pending` when the collect is only *enqueued*, so the slot's staging
+   * bytes may still be the ones the NIC is reading while the next request's device-to-host copies
+   * land on top of them (a 24-byte id copy interleaving with the payload the proxy is posting put
+   * another layer's cold ids on the wire, measured 2026-11-01). The server reads the payload before
+   * it posts the response, so `fresp >= freq` proves the old bytes are free; the slot's own request
+   * counter is the seq to compare against. */
   int slot = -1;
-  for (int k = 0; k < h->slots && slot < 0; k++) {
-    const int cand = (h->next_slot + k) % h->slots;
-    bool used = false;
-    for (int p = 0; p < h->n_pending; p++)
-      if (h->pending[p].slot == cand) used = true;
-    if (!used) slot = cand;
-  }
-  if (slot < 0) {
-    set_err("qes_issue: no free slot on rows=%d (slots=%d, in_flight=%d)", h->rows, h->slots,
-            h->n_pending);
-    return -4;
+  const int64_t t0 = now_ns();
+  for (;;) {
+    for (int k = 0; k < h->slots && slot < 0; k++) {
+      const int cand = (h->next_slot + k) % h->slots;
+      bool used = false;
+      for (int p = 0; p < h->n_pending; p++)
+        if (h->pending[p].slot == cand) used = true;
+      if (used) continue;
+      const uint64_t last = load_acq(h->slab, off_freq(h, cand));
+      if (last && load_acq(h->slab, off_fresp(h, cand)) < last) continue;
+      slot = cand;
+    }
+    if (slot >= 0) break;
+    if (h->dead.load(std::memory_order_relaxed)) return seam_dead_check(h, "issue");
+    if (now_ns() - t0 > SLOT_ACK_TIMEOUT_NS) {
+      set_err("qes_issue: rows=%d port=%d: every slot is still unacknowledged after %llu s "
+              "(in_flight=%d, slots=%d): the seam transport is stuck",
+              h->rows, h->tcp_port, (unsigned long long)(SLOT_ACK_TIMEOUT_NS / 1000000000ull),
+              h->n_pending, h->slots);
+      return -4;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
   SlotHdr hdr{};
   hdr.magic = SLOT_MAGIC;

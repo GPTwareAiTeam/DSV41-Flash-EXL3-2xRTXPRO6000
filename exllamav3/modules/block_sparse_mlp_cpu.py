@@ -627,7 +627,13 @@ class BlockSparseMLP_CPU:
         graphs at baked addresses -- and the worker-side selection with -1 sentinels for
         GPU-resident picks); the static split is a tail offset."""
         if self._split_map is None:
-            sel_cpu = (selected_experts - self.cpu_split_first).clamp_min(-1)
+            # Cold-local id for a cold pick, -1 for anything else. Both ends need the guard: a
+            # selection id of `num_experts` (the sentinel the MoE path writes for "no expert") used
+            # to translate to `num_experts - first`, which is one past the worker's last cold expert
+            # and made the worker fail-stop the whole seam on a pick it could have skipped.
+            rel = selected_experts - self.cpu_split_first
+            n_cold = self.num_experts - self.cpu_split_first
+            sel_cpu = torch.where((rel >= 0) & (rel < n_cold), rel, torch.full_like(rel, -1))
             if _id_check:
                 _ids_check(self.key, self.cpu_split_first, self.num_experts, sel_cpu)
             return sel_cpu
