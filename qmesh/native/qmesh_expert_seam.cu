@@ -199,7 +199,15 @@ struct SlotHdr {
                       ignores it; the client's proxy checks the payload against it before sending
                       (see client_proxy), so an out-of-range id never reaches QES_ROLE_SERVER's
                       placement check as an unexplained fail-stop. */
-  uint64_t pad2[6]; /* keep the header one 64 B line */
+  /* The seq this header was written for, i.e. the value publish_kernel will put in F_REQ. The
+   * header is a host write and its payload copies are GPU work, so a slot that the client started
+   * to reuse before the proxy had posted the previous request carried a *new* header over the old
+   * payload: the proxy then checked the old ids against the new layer's cold set and refused a
+   * request the caller never sent (2026-11-01, "id 268 past a cold count of 254"). Both proxies now
+   * require this word to equal the seq they are handling, which turns that mix into a named
+   * failure instead of a wrong answer. */
+  uint64_t seq;
+  uint64_t pad2[5]; /* keep the header one 64 B line */
 };
 
 /* Data handshake, exchanged on a data port once per (session, bucket). */
@@ -434,6 +442,11 @@ struct qes_handle {
   std::atomic<uint64_t> calls{0};
   std::thread proxy;
   uint64_t handled[QES_MAX_SLOTS] = {}; /* proxy-owned: last seq forwarded/answered per slot */
+  /* Client-owned: the seq this client last wrote into each slot. The reuse rule used the GPU-written
+   * F_REQ, which reads 0 until publish_kernel has actually executed, so a slot could look unused
+   * while its first request was still queued and be overwritten before the proxy ever forwarded it.
+   * This counter is advanced by the issuing thread and is therefore never behind the bytes. */
+  uint64_t issued[QES_MAX_SLOTS] = {};
   /* Client side: requests in flight, oldest first. One layer may have several (a prefill chunk
    * split into micro-batches), so collect() pairs with the oldest request of that layer. */
   struct Pending {
@@ -658,6 +671,47 @@ void server_compute(qes_handle* h, int slot, int L) {
             (unsigned long long)(h->remote_base + off_resp(h, slot)));
 }
 
+/* QES_DUMP_IDS only: the tuples this client has already forwarded. A refusal that matches a tuple
+ * forwarded earlier for the same slot is a stale payload (the proxy read the slot before, or
+ * instead of, this request's copy); a refusal that matches nothing is a value only the current
+ * request could have produced, i.e. the caller's. Small calls only, and the callers gate the whole
+ * thing on the dump, so the compute path never touches it. */
+struct WirePast {
+  uint32_t layer, slot;
+  uint64_t seq;
+  int n;
+  int32_t ids[QES_TOPK * 2];
+};
+constexpr int WIRE_PAST = 16;
+WirePast g_wire_past[WIRE_PAST];
+int g_wire_past_n = 0;
+
+void wire_past_record(qes_handle* h, int slot, uint64_t seq, const int32_t* ids, int n) {
+  if (n > QES_TOPK * 2) return;
+  WirePast& p = g_wire_past[g_wire_past_n++ % WIRE_PAST];
+  const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, slot));
+  p.layer = hdr->layer;
+  p.slot = (uint32_t)slot;
+  p.seq = seq;
+  p.n = n;
+  memcpy(p.ids, ids, (size_t)n * sizeof(int32_t));
+}
+
+/* Newest forwarded tuple for this slot other than `skip_seq`, or nullptr. `skip` walks past that
+ * many hits. The request being checked is already in the ring when the check runs (dump_wire_ids
+ * records it first), so without `skip_seq` every refusal matched itself n/n and reported
+ * STALE_PAYLOAD. */
+const WirePast* wire_past_find(int slot, int skip, uint64_t skip_seq) {
+  for (int r = 0; r < g_wire_past_n && r < WIRE_PAST; r++) {
+    const WirePast& p = g_wire_past[(g_wire_past_n - 1 - r) % WIRE_PAST];
+    if ((int)p.slot != slot) continue;
+    if (p.seq == skip_seq) continue;
+    if (skip-- > 0) continue;
+    return &p;
+  }
+  return nullptr;
+}
+
 /* QES_DUMP_IDS=1: print the bytes this proxy is about to forward, per request, for calls small
  * enough that the values are readable. The proxy is the last point where the wire payload exists
  * as the client's own memory, and it costs a host read of memory it already owns, so this can run
@@ -683,8 +737,11 @@ void dump_wire_ids(qes_handle* h, int slot, uint64_t seq) {
     memcpy(&f, &u, sizeof(f));
     return f;
   };
-  fprintf(stderr, "SEAM_WIRE_IDS port=%d rows=%u slot=%d seq=%llu layer=%u hdr_rows=%u n=%d ids=[",
-          h->tcp_port, h->rows, slot, (unsigned long long)seq, hdr->layer, hdr->rows, n);
+  fprintf(stderr,
+          "SEAM_WIRE_IDS port=%d rows=%u slot=%d seq=%llu layer=%u hdr_rows=%u n_cold=%u n=%d "
+          "ids=[",
+          h->tcp_port, h->rows, slot, (unsigned long long)seq, hdr->layer, hdr->rows,
+          hdr->n_cold, n);
   for (int i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", ids[i]);
   fprintf(stderr, "] w=[");
   for (int i = 0; i < n; i++) fprintf(stderr, "%s%.6g", i ? " " : "", bf16f(w[i]));
@@ -699,6 +756,15 @@ void dump_wire_ids(qes_handle* h, int slot, uint64_t seq) {
     for (int i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", src[i]);
     fprintf(stderr, "]");
   }
+  /* What this slot carried the last time it was forwarded. A refusal whose ids equal this tuple
+   * is the transport re-reading an old payload; one that differs is the caller's own value. */
+  const WirePast* prev = wire_past_find(slot, 0, seq);
+  if (prev) {
+    fprintf(stderr, " prev=[layer=%u seq=%llu ids=", prev->layer, (unsigned long long)prev->seq);
+    for (int i = 0; i < prev->n; i++) fprintf(stderr, "%s%d", i ? " " : "", prev->ids[i]);
+    fprintf(stderr, "]");
+  }
+  wire_past_record(h, slot, seq, ids, n);
   fprintf(stderr, "\n");
   fflush(stderr);
 }
@@ -713,7 +779,7 @@ void dump_wire_ids(qes_handle* h, int slot, uint64_t seq) {
  * QES_ROLE_SERVER checks the same thing against its own placement and aborts the *process* on a
  * mismatch, which costs a full cold-pack reload (~150 s). Catching it on the sending side keeps the
  * server alive and names the request that would have killed it. */
-bool client_check_ids(qes_handle* h, int slot) {
+bool client_check_ids(qes_handle* h, int slot, uint64_t seq) {
   const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, slot));
   const int32_t n_cold = (int32_t)hdr->n_cold;
   if (n_cold <= 0) return true; /* the caller supplied no bound: nothing to check against */
@@ -729,13 +795,32 @@ bool client_check_ids(qes_handle* h, int slot) {
   }
   if (!bad) return true;
   fprintf(stderr,
-          "qes: NOT SENT: client ids out of range on rows=%u port=%d layer=%u slot=%d seq=%llu: "
-          "%d of %d pick(s) outside [-1,%d), first at %d: %d. The caller handed the seam an id its "
-          "own cold set cannot hold, so the server's placement for this layer would index out of "
-          "range; the request is dropped and this handle is taken down instead of the server.\n",
-          h->rows, h->tcp_port, hdr->layer, slot, (unsigned long long)h->handled[slot], bad, n,
-          n_cold, first_at, first_id);
-  fflush(stderr);
+          "qes: NOT SENT: client ids out of range on rows=%u port=%d layer=%u slot=%d seq=%llu "
+          "handled=%llu fresp=%llu: %d of %d pick(s) outside [-1,%d), first at %d: %d. The caller "
+          "handed the seam an id its own cold set cannot hold, so the server's placement for this "
+          "layer would index out of range; the request is dropped and this handle is taken down "
+          "instead of the server.\n",
+          h->rows, h->tcp_port, hdr->layer, slot, (unsigned long long)seq,
+          (unsigned long long)h->handled[slot],
+          (unsigned long long)load_acq(h->slab, off_fresp(h, slot)), bad, n, n_cold, first_at,
+          first_id);
+  if (dump_ids()) {
+    /* Same bytes as a tuple this slot already forwarded -> the payload is stale, not the caller's
+     * value; nothing matches -> the caller produced it and the id space (first/n_cold) is the
+     * suspect. Prints the two closest candidates for a partial match. */
+    for (int skip = 0; skip < 2; skip++) {
+      const WirePast* p = wire_past_find(slot, skip, seq);
+      if (!p) break;
+      int same = 0;
+      for (int i = 0; i < n && i < p->n; i++) same += ids[i] == p->ids[i];
+      fprintf(stderr,
+              "qes: id history slot=%d prev_layer=%u prev_seq=%llu matched=%d/%d ids=[", slot,
+              p->layer, (unsigned long long)p->seq, same, n);
+      for (int i = 0; i < p->n; i++) fprintf(stderr, "%s%d", i ? " " : "", p->ids[i]);
+      fprintf(stderr, "]%s\n", same == n ? " STALE_PAYLOAD" : "");
+    }
+    fflush(stderr);
+  }
   /* A dropped request must not be mistaken for a computed one, and the caller copies the response
    * as soon as the ack lands: poison the response and raise the fail word *before* releasing the
    * ack, or the GPU thread races the NaN loop and hands the caller the slot's stale (zero) bytes.
@@ -774,8 +859,33 @@ void client_proxy(qes_handle* h) {
     for (int i = 0; i < h->slots; i++) {
       uint64_t r = load_acq(h->slab, off_freq(h, i));
       if (r > h->handled[i]) {
+        /* The flag says "seq r is ready", the header says which layer/rows/n_cold that seq is. They
+         * are written by different engines (GPU kernel, caller's thread), so a slot that was reused
+         * under a request that had not been forwarded yet shows one request's ids next to another's
+         * layer. That is the only way a caller's own translate can look wrong here, and forwarding
+         * it would compute one layer with another's cold ids: drop it and name the mix. */
+        const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, i));
+        if (hdr->magic != SLOT_MAGIC || hdr->rows != (uint32_t)h->rows || hdr->seq != r) {
+          fprintf(stderr,
+                  "qes: NOT SENT: slot %d on rows=%u port=%d announced seq=%llu but its header says "
+                  "magic=0x%08x layer=%u rows=%u seq=%llu n_cold=%u: header and payload in that slot "
+                  "come from different requests, so the ids would be checked against another layer's "
+                  "cold set. The request is dropped and this handle is taken down instead of the "
+                  "server.\n",
+                  i, h->rows, h->tcp_port, (unsigned long long)r, hdr->magic, hdr->layer, hdr->rows,
+                  (unsigned long long)hdr->seq, hdr->n_cold);
+          fflush(stderr);
+          float* resp = (float*)(h->slab + off_resp(h, i));
+          for (size_t k = 0; k < h->resp_len / sizeof(float); k++) resp[k] = __builtin_nanf("");
+          __atomic_thread_fence(__ATOMIC_RELEASE);
+          __atomic_store_n((uint32_t*)(h->slab + off_fail(h, i)), 3u, __ATOMIC_RELEASE);
+          __atomic_store_n((uint64_t*)(h->slab + off_fresp(h, i)), r, __ATOMIC_RELEASE);
+          h->dead.store(true);
+          h->running.store(false);
+          return;
+        }
         dump_wire_ids(h, i, r);
-        if (!client_check_ids(h, i)) return;
+        if (!client_check_ids(h, i, r)) return;
         if (!post_payload(h, off_hdr(h, i), (uint32_t)(LINE + h->req_len)) ||
             !post_flag(h, off_freq(h, i), r)) {
           /* A WR the verbs layer rejects (SQ full, lkey or length outside this handle's registered
@@ -808,10 +918,12 @@ void server_proxy(qes_handle* h) {
       if (r <= h->handled[i]) continue;
       const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, i));
       if (hdr->magic != SLOT_MAGIC || hdr->rows != (uint32_t)h->rows ||
-          hdr->layer >= (uint32_t)QES_NL) {
+          hdr->layer >= (uint32_t)QES_NL || hdr->seq != r) {
         fprintf(stderr,
-                "qes: bad request header slot=%d magic=0x%08x layer=%u rows=%u want_rows=%d\n", i,
-                hdr->magic, hdr->layer, hdr->rows, h->rows);
+                "qes: bad request header slot=%d magic=0x%08x layer=%u rows=%u want_rows=%d "
+                "seq=%llu want_seq=%llu\n",
+                i, hdr->magic, hdr->layer, hdr->rows, h->rows, (unsigned long long)hdr->seq,
+                (unsigned long long)r);
         fflush(stderr);
         h->dead.store(true);
         h->running.store(false);
@@ -2214,8 +2326,10 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
    * bytes may still be the ones the NIC is reading while the next request's device-to-host copies
    * land on top of them (a 24-byte id copy interleaving with the payload the proxy is posting put
    * another layer's cold ids on the wire, measured 2026-11-01). The server reads the payload before
-   * it posts the response, so `fresp >= freq` proves the old bytes are free; the slot's own request
-   * counter is the seq to compare against. */
+   * it posts the response, so `fresp >= issued` proves the old bytes are free.
+   * `issued`, not the slab's F_REQ: F_REQ is bumped by a kernel on the caller's stream, so it still
+   * reads 0 for a request the GPU has not reached yet, and the slot was then reused under a request
+   * that had never been forwarded at all. */
   int slot = -1;
   const int64_t t0 = now_ns();
   for (;;) {
@@ -2225,8 +2339,8 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
       for (int p = 0; p < h->n_pending; p++)
         if (h->pending[p].slot == cand) used = true;
       if (used) continue;
-      const uint64_t last = load_acq(h->slab, off_freq(h, cand));
-      if (last && load_acq(h->slab, off_fresp(h, cand)) < last) continue;
+      const uint64_t mine = h->issued[cand];
+      if (mine && load_acq(h->slab, off_fresp(h, cand)) < mine) continue;
       slot = cand;
     }
     if (slot >= 0) break;
@@ -2245,6 +2359,10 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
   hdr.layer = (uint32_t)layer;
   hdr.rows = (uint32_t)h->rows;
   hdr.n_cold = n_cold > 0 ? (uint32_t)n_cold : 0u;
+  /* The seq publish_kernel is about to produce for this slot (it does `*F_REQ + 1`). Both proxies
+   * compare it against the seq they are handling, so a header that does not belong to the payload
+   * is caught here instead of being computed with the wrong layer's ids. */
+  hdr.seq = load_acq(h->slab, off_freq(h, slot)) + 1;
   memcpy(h->slab + off_hdr(h, slot), &hdr, sizeof(hdr));
   /* The header is a CPU write; order it before the GPU-side publish that lets the proxy forward
    * the payload (the NIC only sends it once the whole payload, header included, is visible). */
@@ -2272,6 +2390,8 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
             h->slab_bytes);
   publish_kernel<<<1, 1, 0, stream>>>((uint64_t*)(h->slab + off_freq(h, slot)));
   if (cudaGetLastError() != cudaSuccess) return -3;
+  /* Only after the publish is queued: this is what a later issue reads to decide the slot is free. */
+  h->issued[slot] = hdr.seq;
   h->pending[h->n_pending].layer = layer;
   h->pending[h->n_pending].slot = slot;
   h->n_pending++;

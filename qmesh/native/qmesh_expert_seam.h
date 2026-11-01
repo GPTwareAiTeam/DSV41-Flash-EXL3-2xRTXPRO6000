@@ -51,8 +51,9 @@
 #define QES_TOPK 6
 
 /* Control protocol version. Both sides must agree; a mismatch is reported on the client with
- * both versions and build ids as the message text. */
-#define QES_PROTO_VERSION 3
+ * both versions and build ids as the message text. v4: the request header carries the seq it was
+ * written for (SlotHdr.seq) and both proxies require it to match the flag they are handling. */
+#define QES_PROTO_VERSION 4
 #define QES_MAX_BUCKETS 12
 #define QES_MAX_SLOTS 8     /* payload slots per data handle (in-flight requests per bucket) */
 #define QES_BUILD_LEN 40
