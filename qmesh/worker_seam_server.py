@@ -262,6 +262,11 @@ def _swap_used_mib() -> int:
                 free = int(line.split()[1])
     except OSError:
         return -1
+    # The return was lost when release 1 was rebased onto proto-3: the function fell through to
+    # None, SEAM_SERVER_LOADED/SLAB printed swapped_mib=None and main()'s `if swapped_mib >
+    # SWAP_WARN_MIB` raised TypeError. On a stub that kills the server before SEAM_LISTEN; on a real
+    # load it kills it *after* the 153 s pack load. Caught by the 2026-11-01 failstop slot.
+    return (total - free) // 1024
 
 
 def _dev_mem_mib() -> str:
