@@ -63,6 +63,22 @@ the smoke -- which compares the build id the client reads with the one the serve
 a pair with byte-identical code mismatched. The adopted stamp is also checked against the commit: a
 digest or file count that does not describe `sha` is refused, not adopted.
 
+A release may also be a **merge** of a runtime branch into the release line, and that is how the
+server fixes arrive: `bd15ae60` merged `seam/session-multiclient` before release 1, and release 2 is
+the same merge for the compute lock (`39f07dc4`). The ancestry guard is what makes this deliberate
+rather than accidental -- `pair_cut.sh` refuses a sha that is not on `PAIR_BRANCH`
+(`tools/pair-release`), so a fix reaches a pair only after it is merged there:
+
+```
+git -C ~/recipe-gpu0-gx1-v2 merge --no-ff seam/session-multiclient    # in the release worktree
+pair_cut.sh dev <merge-sha>; pair_prepare.sh dev <merge-sha>          # then the flip ticket
+```
+
+Before cutting a merge, run the release suites on the merged tree (`git commit-tree` + a detached
+`git worktree add` runs them without moving any branch): the merge brings the runtime's own tests
+and the tooling's, and only the merged tree says whether they still agree.
+
+
 
 ## Life of an update
 
