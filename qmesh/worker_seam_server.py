@@ -42,6 +42,36 @@ HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
 NL = qes.NL
 
+# Per-call audit of the cold ids the client sent (see _check_ids). Logged for calls up to this many
+# rows: small calls are where a bad id shows, and the log stays quiet for prefill-sized buckets.
+_IDS_LOG_MAX = int(os.environ.get("SEAM_IDS_LOG_MAX_ROWS", "6"))
+
+
+def _check_ids(layer, rows, ids, num_experts):
+    """Audit one request's cold ids on the host, straight from the pinned slab (no device work).
+
+    Contract with the client: 0 <= id < num_experts addresses this layer's cold expert `id`, and a
+    negative id means "this pick is not cold on this layer" (the caller maps it to local expert 0
+    with weight 0, so it contributes exact zeros). A positive id outside the range is a client bug,
+    and computing with it reads past the module's expert tables inside a fused launch; the illegal
+    access then surfaces layers later, at whatever call next synchronises, which is why the
+    rows=6 death of 2026-11-01 has no explanation in its own log. So the range is enforced here,
+    where the ids arrive, and every small call is logged in full so the same run can rule the ids
+    in or out instead of guessing at the launch.
+    """
+    if rows <= 0 or ids.size == 0:
+        return
+    lo, hi = int(ids.min()), int(ids.max())
+    neg = int((ids < 0).sum())
+    bad = int((ids >= num_experts).sum())
+    if rows <= _IDS_LOG_MAX:
+        print(f"SEAM_IDS layer={layer} rows={rows} n={ids.size} min={lo} max={hi} "
+              f"miss={neg} n_cold={num_experts}", flush=True)
+    if bad:
+        raise RuntimeError(f"cold ids out of range: {bad} of {ids.size} picks in [{lo},{hi}] "
+                           f"for {num_experts} cold experts on layer {layer}, largest bad id "
+                           f"{int(ids[ids >= num_experts][:8].max())}")
+
 
 def build_layer(base, cold_ids, device):
     """Subset the layer's routed-expert module to `cold_ids` (checkpoint expert ids, ordered).
@@ -215,15 +245,17 @@ class SeamServer:
         ffn, _ = self.layers[layer]
         step = self.ws_rows if 0 < self.ws_rows < rows else rows
         for r0 in range(0, rows, step):
-            self._forward_piece(ffn, min(step, rows - r0),
+            self._forward_piece(layer, ffn, min(step, rows - r0),
                                 x_ptr + r0 * HIDDEN * 2, ids_ptr + r0 * TOPK * 4,
                                 w_ptr + r0 * TOPK * 2, out_ptr + r0 * HIDDEN * 4)
 
-    def _forward_piece(self, ffn, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
+    def _forward_piece(self, layer, ffn, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """One mixed-K forward of `rows` rows straight out of, and back into, the pinned slab."""
         x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN).copy())
         x = x.view(torch.bfloat16).to(self.device).half()
-        ids = torch.from_numpy(view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK).astype(np.int64))
+        ids_np = view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)
+        _check_ids(layer, rows, ids_np, ffn.num_experts)
+        ids = torch.from_numpy(ids_np.astype(np.int64))
         w = torch.from_numpy(view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK).copy())
         w = w.view(torch.bfloat16).float()
 
