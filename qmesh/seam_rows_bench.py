@@ -24,6 +24,7 @@ import time
 import torch
 
 from qmesh.remote_seam_host import RemoteSeamHost, HIDDEN, TOPK
+from qmesh.native import qes as _qes
 
 DEV = os.environ.get("SEAM_DEV", "rocep142s0f0")
 PEER = os.environ.get("SEAM_PEER", "10.0.100.2")
@@ -32,6 +33,37 @@ REPS = int(os.environ.get("BENCH_REPS", "5"))
 MAX_LAYERS = int(os.environ.get("BENCH_LAYERS", "0"))
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 ROWS = [int(r) for r in os.environ.get("BENCH_ROWS", "1,2,3,4,5,6,7").split(",")]
+
+# Wire slab geometry, mirrored from qmesh/native/qmesh_expert_seam.cu:geometry(): one pinned slab per
+# row bucket *per side* (client cudaHostAlloc at qes_client_handle, server at qes_server_open), with
+# QES_NL layer strides of align(req)+align(resp)+2 lines.
+LINE = 64
+NL = _qes.NL
+
+
+def slab_bytes(rows: int) -> int:
+    al = lambda v: (v + LINE - 1) // LINE * LINE  # noqa: E731
+    req = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2)
+    resp = rows * HIDDEN * 4
+    return (al(req) + al(resp) + 2 * LINE) * NL
+
+
+def mem(tag: str, buckets=(), extra: str = "") -> None:
+    """Memory state of the client side: container cgroup, this process, and the pinned slabs."""
+    cur = 0
+    try:
+        cur = int(open("/sys/fs/cgroup/memory.current").read().strip())
+    except OSError:
+        pass
+    rss = 0
+    try:
+        rss = int(open("/proc/self/statm").read().split()[1]) * 4096
+    except (OSError, IndexError):
+        pass
+    pred = sum(slab_bytes(b) for b in buckets) / 2 ** 20
+    print(f"SEAMROWS_MEM tag={tag} cgroup_mib={cur / 2 ** 20:.1f} "
+          f"self_rss_mib={rss / 2 ** 20:.1f} slab_predict_mib={pred:.1f}"
+          + (f" {extra}" if extra else ""), flush=True)
 
 
 def main():
@@ -49,17 +81,28 @@ def main():
     torch.manual_seed(0)
     dev = torch.device("cuda:0")
 
-    # Warm-up: connect one data handle per granted bucket, settle kernels and the slab copies
-    for b in host.buckets:
+    # Only the buckets these row counts pad into are opened: the client allocates one pinned slab per
+    # bucket it touches, so warming every bucket would hide the per-row-count memory cost.
+    big = max(host.buckets)
+    run_rows = [n for n in ROWS if n <= big]
+    for n in ROWS:
+        if n > big:
+            print(f"SEAMROWS_DROP n={n} reason=no-bucket max_bucket={big}", flush=True)
+    need = sorted({next(b for b in host.buckets if b >= n) for n in run_rows})
+    mem("connect", ())
+    # Warm-up: connect one data handle per bucket in use, settle kernels and the slab copies
+    for b in need:
         host.register_layer(f"layers.{layers[0]}", None)
         host.submit_issue(layers[0], torch.zeros(b, HIDDEN, dtype=torch.bfloat16, device=dev),
                           torch.zeros(b, TOPK, dtype=torch.int32, device=dev),
                           torch.zeros(b, TOPK, dtype=torch.bfloat16, device=dev))
     torch.cuda.synchronize(dev)
+    mem("warm", need, f"buckets={','.join(map(str, need))}")
 
     table = {}
+    opened = []
     t_start = time.time()
-    for n in ROWS:
+    for n in run_rows:
         x = (torch.randn(n, HIDDEN, dtype=torch.bfloat16, device=dev) * 0.02)
         w = torch.rand(n, TOPK, dtype=torch.bfloat16, device=dev)
         w = (w / w.sum(dim=-1, keepdim=True)).contiguous()
@@ -85,9 +128,15 @@ def main():
             host_us.append(best_h)
         md, mh = statistics.median(dev_us), statistics.median(host_us)
         table[n] = (md, mh)
-        print(f"SEAMROWS n={n} bucket={next(b for b in host.buckets if b >= n)} layers={len(layers)} "
-              f"dev_us_median={md:.1f} host_us_median={mh:.1f} dev_us_per_row={md / n:.1f} "
+        b = next(b for b in host.buckets if b >= n)
+        if b not in opened:
+            opened.append(b)
+        print(f"SEAMROWS n={n} bucket={b} layers={len(layers)} "
+              f"dev_us_median={md:.1f} dev_us_min={min(dev_us):.1f} dev_us_max={max(dev_us):.1f} "
+              f"host_us_median={mh:.1f} dev_us_per_row={md / n:.1f} dev_us_per_slot={md / b:.1f} "
               f"dev_ms_all_layers={md * len(layers) / 1e3:.2f}", flush=True)
+        print(f"SEAMROWS_MARK n={n} bucket={b}", flush=True)
+        mem(f"n={n}", sorted(opened), f"bucket={b}")
     print("SEAMROWS_TABLE rows bucket dev_us_median dev_us_per_row host_us_median", flush=True)
     for n, (md, mh) in table.items():
         b = next(b for b in host.buckets if b >= n)
