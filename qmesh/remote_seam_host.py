@@ -14,7 +14,8 @@ Env:
   SEAM_GID       GID index (default 5)
   SEAM_PEER      GX1 address (default 10.0.100.2)
   SEAM_PORT      seam control port (default 47311)
-  SEAM_BUCKETS   row buckets to *request* (default 1,6,64); the server's answer wins
+  SEAM_BUCKETS   row buckets to *request* (default 1,6,64,256,512,1024,2048,4096); the
+                 server's answer wins, so a superset request adapts to any server list
   SEAM_WAIT      1 = queue behind the server's active session instead of failing fast
   EXL3_SEAM_PROF 1 times issue -> collect per (bucket, rows) with CUDA events and dumps the per-layer
                  round trip at exit (wire + GX1 compute). Eager only: a captured graph records the
@@ -79,7 +80,7 @@ class RemoteSeamHost:
     # decode/verify, 256..4096 are the prefill widths (powers of two), and a server configured with
     # 64 still narrows a 2..63-row verify to the 64-row bucket as before. The largest granted
     # bucket is the per-call row limit used for prefill splitting.
-    BUCKETS = tuple(int(b) for b in os.environ.get("SEAM_BUCKETS", "1,6,256,512,1024,2048,4096")
+    BUCKETS = tuple(int(b) for b in os.environ.get("SEAM_BUCKETS", "1,6,64,256,512,1024,2048,4096")
                     .split(",") if b.strip())
 
 
