@@ -84,3 +84,9 @@ on both pairs on the same build, anything that failed and what was done about it
   NOT merged yet: real-mode decode/rows identity needs a GPU slot (after QuantHC B, ~07:15 EST), then GX1 battery.
 - 01:05 EST QuantHC: no rebalance (per-layer cost ~500 s fixed, calibration chain sequential). A ~05:50, B ~07:15,
   campaign ~08:20 EST. Layer gates pass (A 0-1, B 0-2).
+- 02:30 EST GraphDSpark: fix on branch fix/graph-dspark-export (034ba1cb, a593226c): the piecewise graph now
+  captures the drafter's export tap inside graph B (no extra launches/syncs); CPU tests 5 pass (unfixed source
+  fails 4/5). GPU parity test written: scripts/dspark_graph_parity.sh (WHOLE_GRAPH 0 vs 1, DSPARK=1, token
+  identity + ms/token). Merge-clean into v2. Queue after quant A on GPU0, before merging.
+- 02:25 EST sens/RESULTS.md written (per-matrix study); exl3-sens-1031/exl3-sens2-1031 removed.
+- 02:16 EST GX2 batch 1 archived (afd 214G + 5 dirs); GX2 340G free; ARCHIVE_INDEX + journal updated.
