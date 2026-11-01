@@ -517,6 +517,7 @@ def main():
         prefill_t = None
         prefill_peak = None
         out = None
+        gen = None  # first result that carries the generated token ids: an arm is often stopped
         n = 0  # results yielded (one per token, plus the prefill and eos markers)
         aborted = False
         while generator.num_remaining_jobs():
@@ -540,13 +541,15 @@ def main():
                     prefill_t = time.time() - t
                     prefill_peak = torch.cuda.max_memory_allocated(DEVICE)
                     torch.cuda.reset_peak_memory_stats(DEVICE)
+                if gen is None and r.get("token_ids") is not None:
+                    gen = r  # before eos, which a one-token or time-limited arm may never reach
                 if r.get("eos"):
                     out = r
                 n += 1
         torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated(DEVICE)
         prefill_peak = peak if prefill_peak is None else prefill_peak
-        out = out or {}
+        out = out or gen or {}
         return {"wall_s": time.time() - t, "ttft_s": first_t, "steps": n,
                 "chunks": limiter.chunks if limiter else None,
                 "shrunk": limiter.shrunk if limiter else None,
@@ -554,7 +557,12 @@ def main():
                 "aborted": aborted,
                 "peak_rise_mib": (prefill_peak - base_alloc) / 2 ** 20,
                 "decode_peak_rise_mib": (peak - base_alloc) / 2 ** 20,
-                "decide_us_median": limiter.summary()["decide_us_median"] if limiter else None}
+                "decide_us_median": limiter.summary()["decide_us_median"] if limiter else None,
+                # The tokens this arm produced, so two arms can be compared for identity and not
+                # only for rate. `out` is the eos chunk's result; an aborted or time-limited arm
+                # never reaches eos, so None here means "no identity" and must never be a match.
+                "gen_ids": None if not out.get("token_ids") else out["token_ids"].tolist()[0][:4],
+                "gen_text": out.get("text")}
 
     warm_ids = tokenizer.encode("Write a paragraph about the history of sailing ships.",
                                 add_bos = True, encode_special_tokens = True)
@@ -617,7 +625,8 @@ def main():
                   f"pieces={None if r['chunks'] is None else -(-chunk // SEAM_ROWS)} "
                   f"round_trips={None if r['chunks'] is None else -(-chunk // SEAM_ROWS) * COLD_LAYERS} "
                   f"round_trips_total={None if r['chunks'] is None else -(-chunk // SEAM_ROWS) * COLD_LAYERS * r['chunks']} "
-                  f"decide_us_median={r['decide_us_median']}", flush = True)
+                  f"decide_us_median={r['decide_us_median']} "
+                  f"gen_ids={r['gen_ids']} gen_text={r['gen_text']!r}", flush = True)
             free_now, _total_now = torch.cuda.mem_get_info(DEVICE)
             print(f"PREFILL_ARM_PEAK depth={depth} chunk={chunk} "
                   f"peak_rise_mib={r['peak_rise_mib']:.0f} "
