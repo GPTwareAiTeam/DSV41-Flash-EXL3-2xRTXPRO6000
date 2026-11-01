@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import sys
 
 os.environ.setdefault("EXL3_MOE_SPLIT_FUSED", "0")
 os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
