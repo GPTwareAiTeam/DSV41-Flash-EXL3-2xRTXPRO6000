@@ -592,17 +592,22 @@ def main():
     ap.add_argument("--port", type=int, default=47311)
     ap.add_argument("--stub", action="store_true",
                     help="answer every request with zeros (wire/protocol baseline, no expert compute)")
-    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,256"),
+    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,64,256,2048"),
                     help="row buckets this server can serve (ascending, one port per bucket from "
                          "--port+1). Clients request a subset; the superset default means one "
                          "long-lived server serves every benchmark arm without a reload. The largest "
-                         "bucket is the per-call row limit the client splits prefill on, so it is "
-                         "paid twice: protocol v3 staging is ~30.2 KiB pinned per row per slot, and "
-                         "the cold-expert forward needs ~147 KiB per row of transient device memory "
-                         "(measured: 301 MiB at 2048 rows, 602 at 4096, 1202 at 8192). With the "
-                         "113.65 GiB pack resident a GB10 has 733-876 MiB left, so 2048 rows is the "
-                         "largest bucket that fits with a margin; a bigger bucket needs --ws-rows to "
-                         "cap the workspace, and the fit is printed as ws_mib in SEAM_SERVER_SLAB.")
+                         "bucket is the per-call row limit the client splits prefill on, and that is "
+                         "what prefill throughput rides on: a 64-row chunk pays the ~40 ms fixed cost "
+                         "of one GX layer call, a 2048-row chunk pays it once for 32x the rows "
+                         "(28.5 us/row at 2048 vs 78 us/row at 512, measured on GX2). The bucket is "
+                         "paid twice: protocol v3 staging is ~30.2 KiB pinned per row per slot "
+                         "(61 MiB for 2048 at one slot, 122 at two), and the cold-expert forward "
+                         "needs ~147 KiB per row of transient device memory (measured: 301 MiB at "
+                         "2048 rows, 602 at 4096, 1202 at 8192). With a 113.65 GiB pack resident a "
+                         "GB10 has 0.7-1.4 GiB left, so 2048 is the largest bucket that fits with a "
+                         "margin (the fit is printed as slab_mib/ws_mib/fits in SEAM_SERVER_SLAB); a "
+                         "bigger bucket needs --ws-rows to cap the workspace, and a tighter box "
+                         "should serve 1024.")
     ap.add_argument("--slab-slots", type = int,
                     default = int(os.environ.get("SEAM_SLAB_SLOTS", "1")),
                     help="payload slots per bucket (1..8): how many requests one client handle may "
