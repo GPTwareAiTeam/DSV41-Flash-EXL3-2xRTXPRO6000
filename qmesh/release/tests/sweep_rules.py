@@ -158,6 +158,12 @@ check("nothing sets the slower wide-dispatch tier",
       not any("EXL3_MOE_FUSED_ROWS_WIDE" in l
               for f in ("pair_arm.sh", "pair_env.sh", "pair_smoke.sh", "pair_update_run.sh")
               for l in code_lines(src(f))), "")
+check("a dry run cannot declare a free GPU for a real ticket",
+      '[ "$PAIR_DRY" = 1 ] && [ -n "${PAIR_DRY_GPU:-}" ]' in src("pair_update_run.sh"), "")
+check("a rehearsed cut keeps its seeded release stand-in",
+      '[ "$PAIR_DRY" != 1 ]' in src("pair_cut.sh"), "")
+check("a release is stamped once for both sides",
+      "CUT_ADOPT" in src("pair_cut.sh") and "does not describe this commit" in src("pair_cut.sh"), "")
 check("release dir resolves a sha prefix", 'releases/"$1"*' in src("pair_lib.sh"), "")
 
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

@@ -31,7 +31,7 @@ printf '{"build_id":"%s","source_sha":"%s","sha256":"%s"}' "$BID" "$SHA" \
   "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" > "$REL_DIR/ext/BUILD_STAMP.json"
 cd "$REL"
 export PAIR_DRY=1 PAIR_DRY_SSH="$WORK/bin/stub_ssh" PAIR_ROOT_OVERRIDE="$WORK/pair" \
-       PAIR_QUEUE_ROOT="$WORK/noq" PAIR_STATE_OVERRIDE="$WORK/pairs"
+       PAIR_QUEUE="$WORK/noq" PAIR_DRY_GPU=free PAIR_STATE_OVERRIDE="$WORK/pairs"
 run() { ./pair_update_run.sh "$PAIR" "$@" 2>&1; }
 fails=0
 want() {  # <case> <expected-substring> <log>

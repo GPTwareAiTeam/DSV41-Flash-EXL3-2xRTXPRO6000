@@ -17,7 +17,7 @@ cd "$REL"
 # PAIR_QUEUE (not PAIR_QUEUE_ROOT) is what pair_lib.sh reads for the queue: pointing it at a directory
 # with no runner is what makes an accidental enqueue impossible in a stub sweep.
 export PAIR_DRY=1 PAIR_DRY_SSH="$WORK/bin/stub_ssh" PAIR_ROOT_OVERRIDE="$WORK/pair" \
-       PAIR_QUEUE="$WORK/noq" PAIR_STATE_OVERRIDE="$WORK/pairs"
+       PAIR_QUEUE="$WORK/noq" PAIR_DRY_GPU=free PAIR_STATE_OVERRIDE="$WORK/pairs"
 unset PAIR_PROMOTE
 EV="$WORK/pairs/dev/evidence/$SHA.json"
 fails=0

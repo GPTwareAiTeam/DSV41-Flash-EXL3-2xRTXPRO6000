@@ -42,7 +42,7 @@ want_not() {
 }
 
 export PAIR_DRY=1 PAIR_DRY_SSH="$WORK/bin/stub_ssh" PAIR_ROOT_OVERRIDE="$WORK/pair" \
-       PAIR_QUEUE_ROOT="$WORK/noq" PAIR_STATE_OVERRIDE="$WORK/pairs"
+       PAIR_QUEUE="$WORK/noq" PAIR_DRY_GPU=free PAIR_STATE_OVERRIDE="$WORK/pairs"
 cd "$WORK/run"
 python3 pair_containers.py apply dev "$SHA" --ts T >/dev/null 2>&1 || { echo "FAIL could not wire containers"; exit 1; }
 

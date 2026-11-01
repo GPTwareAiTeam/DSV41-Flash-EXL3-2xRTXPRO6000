@@ -121,6 +121,13 @@ pair_others_busy() {
   if [ "${n:-0}" != 0 ]; then printf 'gx_procs=%s ' "$n"; fi
 }
 gpu_free() {
+  # A dry run has no GPU to look at -- on a shared box it would be looking at somebody else's job (a
+  # colleague's A/B on the same card) and refusing for a reason that has nothing to do with this
+  # release. Only PAIR_DRY may state the answer; a real ticket always asks nvidia-smi.
+  if [ "$PAIR_DRY" = 1 ] && [ -n "${PAIR_DRY_GPU:-}" ]; then
+    [ "$PAIR_DRY_GPU" = free ]
+    return
+  fi
   local used
   used=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i "$GPU" 2>/dev/null)
   [ -z "$used" ]

@@ -70,6 +70,41 @@ print(hashlib.sha256("\n".join(sorted(rows)).encode()).hexdigest())
 FILES=$(git -C "$PAIR_REPO" ls-tree -r "$SHA" -- "${PAIR_VERIFY_PATHS[@]}" | wc -l)
 [ "$FILES" -gt 0 ] || pair_die "commit $SHA tracks none of ${PAIR_VERIFY_PATHS[*]}"
 
+# A release is one object with two copies. If either side already carries this sha, its RELEASE.json
+# is the truth for both: rendering a second one would stamp a different build_id/cut_at into the same
+# release, and the smoke compares the build id the client reads with the one the server reads -- a
+# mismatched pair with identical code (2026-11-01). Only --force re-stamps. A dry run is a rehearsal
+# over a seeded stand-in release and never ships, so it keeps its stand-in.
+adopt=""
+if [ "$FORCE" != 1 ] && [ "$PAIR_DRY" != 1 ]; then
+  rel_p7="$PAIR_ROOT/releases/$SHA/RELEASE.json"
+  if [ -f "$rel_p7" ]; then
+    adopt=$rel_p7
+  elif [ -n "$(pair_gxsh "[ -f '$PAIR_ROOT/releases/$SHA/RELEASE.json' ] && echo yes" 2>/dev/null)" ]; then
+    adopt=$(pair_gxsh "cat '$PAIR_ROOT/releases/$SHA/RELEASE.json'" 2>/dev/null)
+  fi
+fi
+if [ -n "$adopt" ]; then
+  RELEASE_JSON=$(cat "$adopt" 2>/dev/null || printf '%s\n' "$adopt")
+  build_of=$(
+    printf '%s\n' "$RELEASE_JSON" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    sys.exit("unreadable RELEASE.json: %s" % e)
+if d.get("sha") != sys.argv[1]:
+    sys.exit("RELEASE.json names %s, not %s" % (d.get("sha"), sys.argv[1]))
+if d.get("digest") != sys.argv[2] or d.get("files") != int(sys.argv[3]):
+    sys.exit("RELEASE.json was cut from a different tree (digest %s files %s, this commit is %s/%s)"
+             % (d.get("digest"), d.get("files"), sys.argv[2], sys.argv[3]))
+print(d.get("build_id") or "")
+' "$SHA" "$DIGEST" "$FILES"
+  ) || pair_die "release $SHA already exists but $adopt does not describe this commit: $build_of"
+  BUILD_ID=$build_of
+  [ -n "$BUILD_ID" ] || pair_die "release $SHA exists but its RELEASE.json has no build_id"
+  pair_step "CUT_ADOPT $PAIR sha=${SHA:0:8} build_id=$BUILD_ID (the pair already has this release)"
+else
 RELEASE_JSON=$(
   python3 - "$SHA" "$BRANCH_TIP" "$BUILD_ID" "$DIGEST" "$SEAM_FP" "$SEAM_VER" "$FILES" "$PAIR" "$STAMP" <<'PY'
 import json, sys
@@ -90,6 +125,7 @@ print(json.dumps({
 PY
 )
 [ -n "$RELEASE_JSON" ] || pair_die "failed to render RELEASE.json"
+fi
 
 pair_step "CUT $PAIR sha=${SHA:0:8} build_id=$BUILD_ID seam=fp:$SEAM_FP/proto:$SEAM_VER files=$FILES"
 

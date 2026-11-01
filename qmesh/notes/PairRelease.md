@@ -55,6 +55,15 @@ mistake before any docker call:
   three define the wire. A pair whose halves disagree on it is a protocol mismatch by definition,
   whatever a constant in the code says.
 
+`pair_cut.sh` stamps a release **once and for both sides**. If one box already carries
+`releases/<sha>/RELEASE.json`, the other side takes that file verbatim (`CUT_ADOPT`) instead of
+rendering its own; `--force` is the only way to re-stamp. Without that rule a prepare that found the
+P7 half already cut would give the GX half a fresh `build_id`/`cut_at` inside the same release, and
+the smoke -- which compares the build id the client reads with the one the server reads -- would call
+a pair with byte-identical code mismatched. The adopted stamp is also checked against the commit: a
+digest or file count that does not describe `sha` is refused, not adopted.
+
+
 ## Life of an update
 
 `pair_update.sh <pair> [sha] [--max-min N]` enqueues `pair_update_run.sh` through the pair's own
