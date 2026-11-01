@@ -630,6 +630,30 @@ void server_compute(qes_handle* h, int slot, int L) {
             (unsigned long long)(h->remote_base + off_resp(h, slot)));
 }
 
+/* QES_DUMP_IDS=1: print the bytes this proxy is about to forward, per request, for calls small
+ * enough that the values are readable. The proxy is the last point where the wire payload exists
+ * as the client's own memory, and it costs a host read of memory it already owns, so this can run
+ * on a live client without changing anything it measures. It exists because the worker's audit
+ * (SEAM_IDS) can only say what arrived: pairing the two shows whether an id that the worker
+ * rejects was sent by the client or mangled on the way, which is the difference between a client
+ * value bug and a transport bug. */
+bool dump_ids() {
+  static const bool on = std::getenv("QES_DUMP_IDS") && atoi(std::getenv("QES_DUMP_IDS")) != 0;
+  return on;
+}
+
+void dump_wire_ids(qes_handle* h, int slot, uint64_t seq) {
+  if (!dump_ids() || h->rows > 8) return;
+  const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, slot));
+  const int32_t* ids = (const int32_t*)(h->slab + off_req(h, slot) + h->ids_off);
+  const int n = h->rows * QES_TOPK;
+  fprintf(stderr, "SEAM_WIRE_IDS port=%d rows=%u slot=%d seq=%llu layer=%u hdr_rows=%u n=%d ids=[",
+          h->tcp_port, h->rows, slot, (unsigned long long)seq, hdr->layer, hdr->rows, n);
+  for (int i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", ids[i]);
+  fprintf(stderr, "]\n");
+  fflush(stderr);
+}
+
 /* Client proxy: forwards every new request seq in any slot. The slot's header (layer, rows) is
  * part of the payload, so the proxy posts the header and the payload in one WRITE. */
 /* A response that never came leaves the GPU waiter with no escape hatch, so wait_kernel raises the
@@ -655,6 +679,7 @@ void client_proxy(qes_handle* h) {
     for (int i = 0; i < h->slots; i++) {
       uint64_t r = load_acq(h->slab, off_freq(h, i));
       if (r > h->handled[i]) {
+        dump_wire_ids(h, i, r);
         if (!post_payload(h, off_hdr(h, i), (uint32_t)(LINE + h->req_len))) return;
         if (!post_flag(h, off_freq(h, i), r)) return;
         h->handled[i] = r;
