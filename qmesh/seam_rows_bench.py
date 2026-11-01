@@ -34,18 +34,20 @@ MAX_LAYERS = int(os.environ.get("BENCH_LAYERS", "0"))
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 ROWS = [int(r) for r in os.environ.get("BENCH_ROWS", "1,2,3,4,5,6,7").split(",")]
 
-# Wire slab geometry, mirrored from qmesh/native/qmesh_expert_seam.cu:geometry(): one pinned slab per
-# row bucket *per side* (client cudaHostAlloc at qes_client_handle, server at qes_server_open), with
-# QES_NL layer strides of align(req)+align(resp)+2 lines.
+# Wire slab geometry, mirrored from qmesh/native/qmesh_expert_seam.cu:geometry() (protocol v3): one
+# pinned slab per row bucket *per side* (client cudaHostAlloc in qes_client_handle, server in
+# qes_server_open) holding SEAM_SLAB_SLOTS payload slots of 3 flag/header lines + align(req) +
+# align(resp). The layer id rides in the request header, so this is ~30.2 KiB per row per slot
+# instead of the 1.18 MiB per row the per-layer stride needed.
 LINE = 64
-NL = _qes.NL
+SLOTS = int(os.environ.get("SEAM_SLAB_SLOTS", "1"))
 
 
 def slab_bytes(rows: int) -> int:
     al = lambda v: (v + LINE - 1) // LINE * LINE  # noqa: E731
     req = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2)
     resp = rows * HIDDEN * 4
-    return (al(req) + al(resp) + 2 * LINE) * NL
+    return (3 * LINE + al(req) + al(resp)) * SLOTS
 
 
 def mem(tag: str, buckets=(), extra: str = "") -> None:

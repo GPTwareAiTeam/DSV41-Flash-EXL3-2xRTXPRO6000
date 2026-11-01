@@ -35,7 +35,7 @@ def main():
     state = "idle" if n.text == "idle" else "busy"
     print(f"SEAM_STATUS host={args.host} port={args.port} state={state} version={n.version} "
           f"build={n.build_id} placement_sha={n.placement} layers={n.layers} "
-          f"buckets={','.join(map(str, n.bucket_list))} message={n.text}", flush = True)
+          f"buckets={','.join(map(str, n.bucket_list))} slots={n.slots} message={n.text}", flush = True)
     if args.require_idle and state != "idle":
         return 1
     return 0

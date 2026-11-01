@@ -110,6 +110,13 @@ class RemoteSeamHost:
         # Force the issue/collect branch for every batch shape (no socket fallback).
         self.stream_min_rows = 10**9
         self.layer_index = {}
+        # Micro-batches kept in flight per layer call (see submit_prefill). The server advertises
+        # its payload slot count in the negotiation reply; SEAM_NS caps how many of those slots
+        # this client uses, so one server with 4 slots can be measured at NS=1/2/4 without a
+        # reload. Decode is a single piece and is unaffected.
+        self.slots = 1
+        self.ns = 1
+        self._splits = set()
 
     def connect(self):
         """Negotiates the session with the GX server (idempotent). Raises RuntimeError with the
@@ -122,10 +129,14 @@ class RemoteSeamHost:
         self.buckets = ctl.buckets
         self.chunk_rows = self.buckets[-1]
         self.ctl = ctl
+        self.slots = max(1, int(getattr(ctl, "slots", 1)))
+        cap = int(os.environ.get("SEAM_NS", "0") or 0)
+        self.ns = self.slots if cap <= 0 else max(1, min(self.slots, cap))
         print(f"SEAM_NEGOTIATED host={self.host} port={self.port} "
               f"requested={','.join(map(str, self.BUCKETS))} "
               f"accepted={','.join(map(str, ctl.buckets))} "
               f"ports={','.join(map(str, ctl.ports))} chunk_rows={self.chunk_rows} "
+              f"server_slots={self.slots} ns={self.ns} "
               f"server_build={ctl.build} placement_sha={ctl.placement_sha} "
               f"proto={qes.PROTO_VERSION} layers={ctl.layers}", flush = True)
         return self
@@ -148,21 +159,29 @@ class RemoteSeamHost:
         self.layer_index[key] = idx
         return idx
 
+    def _pad(self, x, ids, w):
+        """Pads one piece up to the smallest granted bucket >= its rows (pad rows: id -1, weight
+        0 -> exact zero contribution). Returns (bucket, x, ids, w)."""
+        n = x.shape[0]
+        bucket = next(b for b in self.buckets if b >= n)
+        if bucket == n:
+            return bucket, x, ids, w
+        dev = x.device
+        xp = torch.zeros(bucket, HIDDEN, dtype = torch.bfloat16, device = dev)
+        idp = torch.full((bucket, TOPK), -1, dtype = torch.int32, device = dev)
+        wp = torch.zeros(bucket, TOPK, dtype = torch.bfloat16, device = dev)
+        xp[:n] = x
+        idp[:n] = ids
+        wp[:n] = w
+        return bucket, xp, idp, wp
+
     def _issue_chunk(self, layer_idx, x, ids, w):
         """x bf16 [n,H], ids i32 [n,K], w bf16 [n,K], n <= buckets[-1]. Pads to the smallest
         granted bucket >= n (pad rows: id -1, weight 0 -> exact zero contribution). Returns
         (seam, out)."""
         n = x.shape[0]
-        bucket = next(b for b in self.buckets if b >= n)
+        bucket, x, ids, w = self._pad(x, ids, w)
         dev = x.device
-        if bucket != n:
-            xp = torch.zeros(bucket, HIDDEN, dtype=torch.bfloat16, device=dev)
-            idp = torch.full((bucket, TOPK), -1, dtype=torch.int32, device=dev)
-            wp = torch.zeros(bucket, TOPK, dtype=torch.bfloat16, device=dev)
-            xp[:n] = x
-            idp[:n] = ids
-            wp[:n] = w
-            x, ids, w = xp, idp, wp
         seam = self._seam(bucket, dev.index or 0)
         stream = torch.cuda.current_stream(dev)
         prof = _PROF and n <= _PROF_MAX_ROWS and not torch.cuda.is_current_stream_capturing()
@@ -188,49 +207,79 @@ class RemoteSeamHost:
         w = weights.reshape(-1, TOPK).to(torch.bfloat16).contiguous()
         return x, ids, w
 
-    def _split(self, rows: int):
-        """Prefill split of `rows` onto the granted buckets: full chunks at chunk_rows, then the
-        remainder in the smallest granted bucket >= it. Returns [(start, stop, bucket)]; the bucket
-        is not a multiple of chunk_rows when the remainder pads (id -1 rows cost GX1 nothing but a
-        slot of compute)."""
-        step = self.chunk_rows
+    def _split(self, rows: int, step: int | None = None):
+        """Prefill split of `rows` onto the granted buckets, chunked at `step` (default chunk_rows)
+        with the remainder in the smallest granted bucket >= it. Returns [(start, stop, bucket)];
+        the bucket is not a multiple of `step` when the remainder pads (id -1 rows cost the GX
+        nothing but a slot of compute)."""
+        step = step or self.chunk_rows
         out = [(i, min(i + step, rows), step) for i in range(0, rows - rows % step, step)]
         rem = rows % step
         if rem:
             out.append((rows - rem, rows, next(b for b in self.buckets if b >= rem)))
         return out
 
-    def submit_prefill(self, layer_idx, y, selected, weights):
-        """Synchronous on the stream: each chunk is issued and collected before the next is
-        issued, so one layer's request slot is never rewritten while the GX1 server still reads
-        it. Returns fp32 [rows, HIDDEN] on the caller's stream.
+    def _collect_piece(self, layer_idx, piece, out, stream):
+        """Collects one in-flight piece into `out` at its row offset. The collect's host->device
+        copy and the issue's device->host copy are on the caller's stream, so this never waits on
+        the host: the wait kernel for piece m simply sits after piece m+1's issue in the stream."""
+        pos, n, bucket, _xp, _idp, _wp, seam = piece
+        direct = pos + bucket <= out.shape[0]
+        if direct:
+            dst = out[pos:pos + bucket]
+        else:
+            # Padded tail piece: the seam fills a whole bucket, only `n` rows are real.
+            dst = torch.empty(bucket, HIDDEN, dtype = torch.float32, device = out.device)
+        seam.collect(layer_idx, dst.data_ptr(), stream.cuda_stream)
+        if not direct:
+            out[pos:pos + n] = dst[:n]
 
-        Chunks are cut at chunk_rows (the largest granted bucket) with the remainder in the
-        smallest granted bucket that holds it, so a 8192-row prefill piece is 8 calls at 1024
-        plus nothing on GX boxes that can afford 1024 rows per call. This is independent of the
-        P7 prefill chunk limiter: whatever the limiter hands over is split here."""
+    def submit_prefill(self, layer_idx, y, selected, weights):
+        """Prefill one layer's chunk and return fp32 [rows, HIDDEN] on the caller's stream.
+
+        The chunk is split into micro-batches at chunk_rows (the largest granted bucket), and up
+        to `ns` of them are kept in flight at once: micro-batch m+1's request is on the wire (and
+        its slot's compute already queued on GX) while the client is still waiting for m's
+        response, so the transport and the GX expert compute overlap instead of alternating. All
+        of it is stream-ordered (issue = device->host copy + publish, collect = wait kernel +
+        host->device copy), so it stays graph-capturable and needs no host synchronisation: the
+        waits for m and m+1 are two kernels in the same stream, in order.
+
+        Causality is per micro-batch, not per layer: a micro-batch's layer L+1 call needs its own
+        layer L output, which the pieces keep in plan order. Overlap between layers of the *same*
+        tokens is still impossible (L+1 reads L's output)."""
         self.connect()
         x, ids, w = self._prep(y, selected, weights)
-        plan = self._split(x.shape[0])
-        shape = (x.shape[0], len(plan), tuple(b for _, _, b in plan))
+        rows = x.shape[0]
+        plan = self._split(rows)
+        ns = max(1, min(self.ns, len(plan)))
+        shape = (rows, ns, tuple(b for _, _, b in plan))
         if shape not in self._splits:
             self._splits.add(shape)
             widths = ",".join(f"{b}x{sum(1 for s, e, _ in plan if _ == b)}" for b in
                               dict.fromkeys(b for _, _, b in plan))
-            print(f"SEAM_SPLIT layer={layer_idx} rows={x.shape[0]} chunk_rows={self.chunk_rows} "
-                  f"calls={len(plan)} buckets={','.join(map(str, self.buckets))} plan={widths}",
-                  flush = True)
+            print(f"SEAM_SPLIT layer={layer_idx} rows={rows} chunk_rows={self.chunk_rows} "
+                  f"calls={len(plan)} ns={ns} server_slots={self.slots} "
+                  f"buckets={','.join(map(str, self.buckets))} plan={widths}", flush = True)
         if len(plan) == 1:
             return self._issue_chunk(layer_idx, x, ids, w)
-        # One fp32 [rows,H] output that every chunk writes into: torch.cat would hold the parts and
-        # the copy at once (+rows*H*4 bytes, 235 MiB at 8192 rows), which the prefill memory budget
-        # does not have.
-        out = torch.empty(x.shape[0], HIDDEN, dtype = torch.float32, device = x.device)
-        pos = 0
+        # One fp32 [rows,H] output that every micro-batch writes into: torch.cat would hold the
+        # parts and the copy at once (+rows*H*4 bytes, 235 MiB at 8192 rows), which the prefill
+        # memory budget does not have.
+        out = torch.empty(rows, HIDDEN, dtype = torch.float32, device = x.device)
+        stream = torch.cuda.current_stream(x.device)
+        dev_index = x.device.index or 0
+        inflight = []
         for s, e, _ in plan:
-            part = self._issue_chunk(layer_idx, x[s:e], ids[s:e], w[s:e])
-            out[pos:pos + part.shape[0]] = part
-            pos += part.shape[0]
+            if len(inflight) >= ns:
+                self._collect_piece(layer_idx, inflight.pop(0), out, stream)
+            bucket, xp, idp, wp = self._pad(x[s:e], ids[s:e], w[s:e])
+            seam = self._seam(bucket, dev_index)
+            seam.issue(layer_idx, xp.data_ptr(), idp.data_ptr(), wp.data_ptr(),
+                       stream.cuda_stream)
+            inflight.append((s, e - s, bucket, xp, idp, wp, seam))
+        while inflight:
+            self._collect_piece(layer_idx, inflight.pop(0), out, stream)
         return out
 
     def submit_issue(self, layer_idx, y, selected, weights):

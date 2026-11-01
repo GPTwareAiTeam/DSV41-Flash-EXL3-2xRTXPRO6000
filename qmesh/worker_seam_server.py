@@ -201,18 +201,20 @@ def view(addr, nbytes, dtype):
     return np.frombuffer(buf, dtype=dtype)
 
 
-def slab_mib(buckets) -> float:
+def slab_mib(buckets, slots = 1) -> float:
     """Pinned slab this server will allocate for `buckets`, MiB, one side.
 
-    Same geometry as qes_server_open() in qmesh/native/qmesh_expert_seam.cu: one slab per row
-    bucket, NL layers of align64(rows*(HIDDEN*2 + TOPK*6)) request bytes plus
-    align64(rows*HIDDEN*4) response bytes and two 64 B alignment pads."""
+    Same geometry as geometry() in qmesh/native/qmesh_expert_seam.cu (protocol v3): one slab per
+    row bucket holding `slots` payload slots, each
+    [64 B F_REQ][64 B F_RESP][64 B request header] + align64(rows*(HIDDEN*2 + TOPK*6)) request +
+    align64(rows*HIDDEN*4) response bytes. Slots are in-flight requests, not layers: the layer id
+    rides in the request header, so the whole staging cost is ~30.2 KiB per row per slot."""
     al = lambda v: (v + 63) // 64 * 64  # noqa: E731
     total = 0
     for rows in buckets:
         req = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2)
         resp = rows * HIDDEN * 4
-        total += (al(req) + al(resp) + 2 * 64) * NL
+        total += (3 * 64 + al(req) + al(resp)) * slots
     return total / 2**20
 
 
@@ -241,10 +243,15 @@ def main():
                          "--port+1). Clients request a subset; the superset default means one "
                          "long-lived server serves every benchmark arm without a reload. The largest "
                          "bucket is the per-call row limit the client splits prefill on, so size it "
-                         "to the GX box's memory headroom (1.18 MiB pinned per row per side; a"
-                         "121 GiB GB10 with the 113.65 GiB cold pack loaded has ~0.5 GiB left, so"
-                         "1,6,256 = 309 MiB fits and 1,6,64,256 = 384 MiB is the measured ceiling;"
-                         "512 alone is 600 MiB and does not).")
+                         "to the GX box's memory headroom: protocol v3 staging is ~30.2 KiB pinned "
+                         "per row per slot, so 1,6,64,1024,2048 at one slot is 38 MiB and 4 slots "
+                         "of 2048 rows is 242 MiB, which fits a 121 GiB GB10 with the pack loaded.")
+    ap.add_argument("--slab-slots", type = int,
+                    default = int(os.environ.get("SEAM_SLAB_SLOTS", "1")),
+                    help="payload slots per bucket (1..8): how many requests one client handle may "
+                         "keep in flight. NS>1 lets a client pipeline prefill micro-batches so the "
+                         "wire transfer of slot k+1 overlaps the GX compute of slot k. Costs "
+                         "NS x rows x 30.2 KiB of pinned memory per bucket.")
     ap.add_argument("--wait", action="store_true",
                     help="queue a second client behind the active session instead of rejecting it "
                          "(also settable per client with SEAM_WAIT=1)")
@@ -273,10 +280,10 @@ def main():
     # allocated here, after the pack load, so the list has to have been sized to the box's free
     # memory beforehand (seam_server_ensure.sh --buckets auto does that): print the bill first.
     buckets = sorted({int(r) for r in args.buckets.split(",") if r.strip()})
-    want_mib = slab_mib(buckets)
+    want_mib = slab_mib(buckets, args.slab_slots)
     avail_mib = _avail_mib()
     fits = int(avail_mib < 0 or want_mib <= avail_mib - 64)
-    print(f"SEAM_SERVER_SLAB buckets={','.join(map(str, buckets))} "
+    print(f"SEAM_SERVER_SLAB buckets={','.join(map(str, buckets))} slots={args.slab_slots} "
           f"predicted_mib={want_mib} rows_max={buckets[-1]} "
           f"avail_mib={avail_mib} fits={fits}", flush = True)
     if not fits:
@@ -287,7 +294,7 @@ def main():
               f"swapped out (see seam_server_ensure.sh --buckets auto)", flush = True)
     placement_sha = hashlib.sha256(open(args.placement, "rb").read()).hexdigest()[:12]
     srv = qes.Server(args.dev, args.gid, args.port, 0, buckets, build = qes.build_id(),
-                     placement_sha = placement_sha, wait = args.wait)
+                     placement_sha = placement_sha, wait = args.wait, slots = args.slab_slots)
     srv.set_fn(lambda L, R, x, ids, w, o: server.compute(L, R, x, ids, w, o))
     try:
         srv.run()   # serves client sessions until SIGINT/SIGTERM
