@@ -96,7 +96,11 @@ def build_layer(base, cold_ids, device):
 
 
 class SeamServer:
-    def __init__(self, model_dir, placement_path, device, stub = False, ws_rows = 0):
+    def __init__(self, model_dir, placement_path, device, stub = False, ws_rows = 0,
+                 fail_after = 0):
+        # fail_after: testing hook for the fail-stop below - raise on call N+1. 0 = never.
+        self.fail_after = int(fail_after or 0)
+        self.seen = 0
         # ws_rows: serve each request in pieces of at most this many rows, so the peak device
         # workspace follows ws_rows instead of the row bucket (see _forward). 0 = one piece.
         placement = json.load(open(placement_path))
@@ -142,8 +146,8 @@ class SeamServer:
         self.seen += 1
         try:
             if self.fail_after and self.seen > self.fail_after:
-                raise RuntimeError(f"injected compute failure on call {self.seen} "
-                                   f"(--fail-after {self.fail_after})")
+                raise RuntimeError(f"injected compute failure on call {self.seen} (--fail-after "
+                                   f"{self.fail_after})")
             self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
         except Exception as e:  # noqa: BLE001 - see the docstring: no safe local recovery
             print(f"SEAM_COMPUTE_FAIL layer={layer} rows={rows} err={type(e).__name__}: {e} "
@@ -442,13 +446,18 @@ def main():
                            "pieces and print the largest difference (SEAM_WS_CHECK), then exit: "
                            "proves that capping the workspace by chunking does not change the "
                            "numbers. ROWS must be a multiple of --ws-rows.")
+    ap.add_argument("--fail-after", type = int, default = int(os.environ.get("SEAM_FAIL_AFTER", "0")),
+                    help = "test hook: raise inside the compute hook on call N+1 (stub servers "
+                           "included), to prove that a failing compute fails the client instead of "
+                           "handing it the previous call's bytes. 0 = never.")
     args = ap.parse_args()
 
     device = torch.device("cuda:0")
     t0 = time.time()
     server = SeamServer(args.model_dir, args.placement, device, stub = args.stub,
-                        ws_rows = args.ws_rows)
-    print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)}", flush=True)
+                        ws_rows = args.ws_rows, fail_after = args.fail_after)
+    print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)} "
+          f"fail_after={args.fail_after}", flush=True)
     if args.ws_probe or args.ws_check:
         # Both modes share one pack load: the ladder first (it resets the peak counters), then the
         # equivalence check, whose own peak does not matter.
