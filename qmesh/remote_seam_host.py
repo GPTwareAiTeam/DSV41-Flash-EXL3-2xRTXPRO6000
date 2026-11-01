@@ -58,7 +58,10 @@ class RemoteSeamHost:
     id -1 and weight 0 (exact zeros on GX1), and batches above the largest bucket are issued in
     bucket-sized chunks. All work stays on the caller's stream."""
 
-    BUCKETS = (1, 6, 64)
+    # Row buckets, one seam handle each on consecutive ports from `port`. Must match the server's
+    # --buckets (same order: handles are accepted sequentially). SEAM_BUCKETS=1,2,3,4,5,6,64 stops a
+    # 2..5-row verify from padding up to the 6-row bucket on GX1
+    BUCKETS = tuple(int(b) for b in os.environ.get("SEAM_BUCKETS", "1,6,64").split(",") if b.strip())
 
 
     @classmethod

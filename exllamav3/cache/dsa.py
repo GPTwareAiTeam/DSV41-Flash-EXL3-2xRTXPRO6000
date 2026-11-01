@@ -113,6 +113,10 @@ class CacheLayer_dsa(CacheLayer):
         return self.k_bits > 0
 
     def alloc(self, device: torch.device):
+        # Captured BC DSA graphs bind this pool's storage; drop them before (re)allocating it so a
+        # replay can never read freed or replaced memory
+        getattr(self.attention, "_bc_dsa", {}).clear()
+        getattr(self.attention, "_bc_dsa_batch", {}).clear()
         device = torch.device(device)
         self.device = device
         self.mirrors = {}
@@ -133,6 +137,8 @@ class CacheLayer_dsa(CacheLayer):
             self.pool_idx = torch.zeros((self.num_pages, self.epp, self.D_i), dtype = torch.half, device = device)
 
     def free(self):
+        getattr(self.attention, "_bc_dsa", {}).clear()
+        getattr(self.attention, "_bc_dsa_batch", {}).clear()
         self.device = None
         self.pool_c = self.pool_q = self.pool_s = self.pool_r = self.pool_idx = None
         self.pool_fp4 = self.pool_fp4_scale = self.pool_idx_fp4 = self.pool_idx_scale = None
@@ -440,11 +446,15 @@ class DSV4LayerState:
 
 
     def alloc(self, device):
+        getattr(self.module, "_bc_dsa", {}).clear()
+        getattr(self.module, "_bc_dsa_batch", {}).clear()
         self.device = device
         self._set_tensors([torch.zeros_like(t, device = device) for t in self._tensors()])
 
 
     def free(self):
+        getattr(self.module, "_bc_dsa", {}).clear()
+        getattr(self.module, "_bc_dsa_batch", {}).clear()
         self.device = None
         self._set_tensors([torch.zeros_like(t, device = "meta") for t in self._tensors()])
 
