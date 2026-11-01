@@ -1133,6 +1133,14 @@ at::Tensor exl3_linear(const at::Tensor& x, const at::Tensor& trellis,
 // block shares an expert; the kernel just offsets the trellis and svh by that
 // expert. Split-k is off here: the block-count heuristic assumes a dense row
 // range, and MoE already has plenty of blocks from the expert dimension.
+//
+// With sorted_ids + topk_weights the epilogue adds routing-weighted rows into the
+// per-token output rather than writing routed rows (had128_warp_out_acc), which
+// makes that output an accumulator over routed rows -- and therefore over calls:
+// hand `out` back in with `accumulate=true` and the next set of experts lands on
+// the same tensor. That is how a layer split into bitrate groups avoids a
+// (tokens, n) output plus an elementwise sum per group; float is the dtype to do
+// it in, since half/bf16 round the running sum once per call.
 // ---------------------------------------------------------------------------
 
 at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
@@ -1142,7 +1150,8 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
                          at::ScalarType out_dtype,
                          const std::optional<at::Tensor>& sorted_ids,
                          const std::optional<at::Tensor>& topk_weights,
-                         int64_t num_tokens, int64_t top_k)
+                         int64_t num_tokens, int64_t top_k,
+                         const std::optional<at::Tensor>& out_buf, bool accumulate)
 {
     const at::cuda::OptionalCUDAGuard guard(a_had.device());
     TORCH_CHECK(trellis.is_contiguous() && trellis.dim() == 4,
@@ -1185,8 +1194,27 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
         w_f32 = topk_weights->to(at::kFloat).contiguous();
         moe_w = w_f32.data_ptr<float>();
     }
-    at::Tensor out = fuse_combine ? at::zeros({num_tokens, n_total}, opts)
-                                  : at::empty({rows, n_total}, opts);
+    TORCH_CHECK(!accumulate || fuse_combine,
+                "exl3_moe_gemm: accumulate needs the per-token output (sorted_ids + "
+                "topk_weights); routed-row output is written, not added");
+    at::Tensor out;
+    if (out_buf.has_value())
+    {
+        out = *out_buf;
+        const int64_t want_rows = fuse_combine ? num_tokens : rows;
+        TORCH_CHECK(out.is_contiguous() && out.dim() == 2 && out.size(0) == want_rows &&
+                        out.size(1) == n_total && out.scalar_type() == out_dtype,
+                    "exl3_moe_gemm: out must be contiguous (", want_rows, ", ", n_total,
+                    ") of the requested dtype, got ", out.sizes(), " ",
+                    out.scalar_type());
+        // accumulate keeps what earlier calls put there; otherwise this call owns
+        // the buffer and has to start from zero, the same memset the allocation did.
+        if (!accumulate)
+            out.zero_();
+    }
+    else
+        out = fuse_combine ? at::zeros({num_tokens, n_total}, opts)
+                           : at::empty({rows, n_total}, opts);
     const int moe_m_valid = have_sids ? (int) (num_tokens * top_k) : 0;
 
     ShardMap smap{};
@@ -1237,17 +1265,23 @@ at::Tensor exl3_moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis,
     const int* eids = expert_ids.data_ptr<int>();
     const int* nrows = n_rows.numel() ? n_rows.data_ptr<int>() : nullptr;
 
+    // One launch per dtype instead of a third copy of the argument list: the MoE epilogue is
+    // templated on OUT_T already, so float costs an instantiation, not a kernel.
+#define EXL3_MOE_LAUNCH(T_)                                                              \
+    dispatch_gemm<T_>(bits, half_k, cb, A, B, (T_*) out.data_ptr(), S, rows, k, n_total,  \
+                      n_total, 0, n_tiles_full, acc, split, smap, stream, eids, b_stride,  \
+                      n_total, (int) block_m, nrows, false, 0, moe_sid, moe_w,           \
+                      (int) top_k, moe_m_valid)
     if (out_dtype == at::kHalf)
-        dispatch_gemm<half>(bits, half_k, cb, A, B, (half*) out.data_ptr(), S, rows, k, n_total,
-                            n_total, 0, n_tiles_full, acc, split, smap, stream, eids,
-                            b_stride, n_total, (int) block_m, nrows, false, 0,
-                            moe_sid, moe_w, (int) top_k, moe_m_valid);
+        EXL3_MOE_LAUNCH(half);
+    else if (out_dtype == at::kBFloat16)
+        EXL3_MOE_LAUNCH(__nv_bfloat16);
+    else if (out_dtype == at::kFloat)
+        EXL3_MOE_LAUNCH(float);
     else
-        dispatch_gemm<__nv_bfloat16>(bits, half_k, cb, A, B, (__nv_bfloat16*) out.data_ptr(), S,
-                                     rows, k, n_total, n_total, 0, n_tiles_full, acc,
-                                     split, smap, stream, eids, b_stride, n_total,
-                                     (int) block_m, nrows, false, 0,
-                                     moe_sid, moe_w, (int) top_k, moe_m_valid);
+        TORCH_CHECK(false, "exl3_moe_gemm: out_dtype must be half, bf16 or float, got ",
+                    out_dtype);
+#undef EXL3_MOE_LAUNCH
     return out;
 }
 

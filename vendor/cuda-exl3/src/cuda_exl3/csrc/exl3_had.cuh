@@ -67,6 +67,31 @@ struct ActVec<__nv_bfloat16>
     }
 };
 
+// fp32 exists for the MoE output only, where the routing-weighted epilogue adds into a
+// per-token row and the caller wants one exact sum over bitrate groups rather than a rounded
+// fp16 running total. Same 4 values per lane as the other two.
+template <>
+struct ActVec<float>
+{
+    __device__ __forceinline__ static half4 load(const float* p, int lane)
+    {
+        float4 f = ((const float4*) p)[lane];
+        half4 v;
+        v.x = __floats2half2_rn(f.x, f.y);
+        v.y = __floats2half2_rn(f.z, f.w);
+        return v;
+    }
+    __device__ __forceinline__ static void store(float* p, int lane, half4 v)
+    {
+        float4 f;
+        f.x = __low2float(v.x);
+        f.y = __high2float(v.x);
+        f.z = __low2float(v.y);
+        f.w = __high2float(v.y);
+        ((float4*) p)[lane] = f;
+    }
+};
+
 // 1/sqrt(128): makes the transform orthonormal, matching how the quantizer
 // applied it. Both the input and output transforms carry this factor.
 #define EXL3_HAD128_RSCALE 0.088388347648318447f
@@ -299,6 +324,16 @@ __device__ __forceinline__ void had128_warp_out_acc(const half* __restrict__ in,
         __nv_bfloat162* dst = (__nv_bfloat162*) out;
         atomicAdd(dst + lane * 2,     __floats2bfloat162_rn(o0, o1));
         atomicAdd(dst + lane * 2 + 1, __floats2bfloat162_rn(o2, o3));
+    }
+    else if constexpr (std::is_same<OUT_T, float>::value)
+    {
+        // Exact: nothing is rounded until the caller reads the row, so several calls (the
+        // bitrate groups of one layer) can add into the same output without drift.
+        float* dst = out + lane * 4;
+        atomicAdd(dst + 0, o0);
+        atomicAdd(dst + 1, o1);
+        atomicAdd(dst + 2, o2);
+        atomicAdd(dst + 3, o3);
     }
     else
     {

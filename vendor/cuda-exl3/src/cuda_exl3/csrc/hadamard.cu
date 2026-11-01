@@ -229,12 +229,12 @@ __global__ void exl3_moe_combine_kernel(const T_* __restrict__ rows_out,
         for (int k = 0; k < top_k; ++k)
         {
             int r = inv[token * top_k + k];
-            // Under expert parallel this pair may be routed to an expert another
-            // rank owns. Every producer already skips those rows -- the gemm and
-            // the glu transform both return on e < 0 -- so the row was never
-            // written and must not be read: this rank simply contributes nothing
-            // and the all-reduce takes the owner's value. Reading it and scaling
-            // by the routing weight would not do, because NaN * 0 is NaN.
+            // -1 = this call's rows_out holds no row for that pick: the pick belongs to another
+            // shard of the routing, or to an expert another rank owns under expert parallel.
+            // Either way it contributes nothing here -- for the second case every producer
+            // already skipped the row, and scaling a row that was never written by its routing
+            // weight would not do, because NaN * 0 is NaN.
+            if (r < 0) continue;
             if (expert_ids && expert_ids[r / block_m] < 0) continue;
             acc += w[token * top_k + k] * (float) rows_out[(size_t) r * H + h];
         }
@@ -256,8 +256,11 @@ at::Tensor exl3_moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted
     auto stream = at::cuda::getCurrentCUDAStream();
 
     auto w = topk_weights.to(at::kFloat).contiguous();
-    auto inv = at::empty({(long long) M * top_k},
-                         at::TensorOptions().dtype(at::kInt).device(rows_out.device()));
+    // -1 marks a pick that this rows_out has no row for; the kernel skips those. A caller may
+    // hand in a sorted_ids that covers only part of the routing (one expert group of several),
+    // so the slots it does not map must be defined, not recycled memory.
+    auto inv = at::full({(long long) M * top_k}, -1,
+                        at::TensorOptions().dtype(at::kInt).device(rows_out.device()));
     exl3_moe_build_inv_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(
         sorted_ids.data_ptr<int>(), inv.data_ptr<int>(), rows, M * top_k);
 

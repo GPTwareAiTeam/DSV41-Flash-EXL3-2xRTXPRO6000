@@ -18,9 +18,14 @@ MAX_JOBS=${MAX_JOBS:-8}
 export TORCH_CUDA_ARCH_LIST MAX_JOBS
 nice -n 10 python3 setup.py build_ext --inplace
 
+# Import check: the GX path needs exl3_moe_gemm with the shared-accumulator arguments, and the
+# adapter's own probe reads that schema, so checking it here is checking the build.
 CUDA_EXL3_SRC="$here/vendor/cuda-exl3/src" python3 - <<'PY'
-import sys, os
+import os, sys
 sys.path.insert(0, os.environ["CUDA_EXL3_SRC"])
-import cuda_exl3.ops as ops
-print("cuda_exl3 ok:", ops.exl3_moe_gemm.__module__)
+import cuda_exl3.ops  # noqa: F401  (loads the extension)
+import torch
+schema = str(torch.ops.cuda_exl3_C.exl3_moe_gemm.default._schema)
+assert "accumulate" in schema, schema
+print("cuda_exl3 ok:", schema)
 PY

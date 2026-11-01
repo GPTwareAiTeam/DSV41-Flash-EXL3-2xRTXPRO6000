@@ -23,8 +23,9 @@ gate/up/down, so the group key is the trellis word count):
 
 `forward` takes the same half-precision token block the server already builds, the clamped
 int64 routing ids (misses -> expert 0 with weight 0, exactly like the incumbent path) and the
-routing weights, and returns fp32 (M, H): the per-group gemms accumulate in fp32 so the answer
-the response slab gets is not rounded twice.
+routing weights, and returns fp32 (M, H). The down projection's routing-weighted epilogue adds
+straight into one fp32 accumulator, so the bitrate groups cost one output buffer and no
+elementwise sum: the slab gets the layer's answer with a single rounding, at the end.
 """
 
 from __future__ import annotations
@@ -57,6 +58,16 @@ BLOCK_M_OVERRIDE = int(os.environ.get("CUDA_EXL3_MOE_BLOCK_M", "0"))
 # unsplit. Set CUDA_EXL3_MOE_ACC_CAP to re-enable it for an experiment.
 if int(os.environ.get("CUDA_EXL3_MOE_ACC_CAP", "0")) == 0:
     _C.exl3_set_moe_acc_cap(0)
+
+
+def _has_acc_out() -> bool:
+    """Does this build of the extension take the shared-accumulator (out, accumulate) pair?"""
+    try:
+        return "accumulate" in str(_C.exl3_moe_gemm.default._schema)
+    except Exception:  # a .so from before the fold: fall back to summing three outputs
+        return False
+
+HAS_ACC_OUT = _has_acc_out()
 
 
 def _bits_frac(words: int) -> tuple[int, bool]:
@@ -250,15 +261,22 @@ class CudaExl3Moe:
     def forward(self, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """x half (M, H), ids int64 (M, T) this layer's cold experts, w half (M, T) -> fp32 (M, H).
 
-        Each group does its own alignment over the picks it owns and its own gemm/combine, so the
-        outputs are summed in fp32 here; that keeps the caller's slab fp32 and leaves the mixed-K
-        module's dtype contract untouched.
+        Each group does its own alignment over the picks it owns and its own gemm/combine. The
+        down gemm adds routing-weighted rows into `acc` (the epilogue's atomics), so the groups
+        land on one fp32 (M, H) buffer in sequence and nothing sums afterwards; a build without
+        that entry point falls back to three fp16 outputs summed here.
         """
         ids = ids.to(self.device)
         M, T = ids.shape
         m_valid = M * T
         wf = w.float().contiguous()
+        # One layer-wide accumulator, zeroed by the first group that runs into it (accumulate=False)
+        # and added to by the rest. Allocated before the first restack so a missing 168 MiB shows
+        # up as a normal OOM here rather than inside a gemm.
+        acc = (torch.empty((M, self.hidden), dtype=torch.float32, device=x.device)
+               if HAS_ACC_OUT and not DETERMINISTIC else None)
         total = None
+        wrote = False
         # Optional per-phase attribution (CUDA_EXL3_MOE_TRACE=1, read by qmesh/prof_cx_phases.py):
         # each mark is an event on the caller's stream, so consecutive marks bound one op.
         trace = [] if TRACE else None
@@ -307,13 +325,25 @@ class CudaExl3Moe:
                 mark(f"combine:{tag}", block_m, rows)
                 out = _C.exl3_moe_combine(routed, sid, wf, M, eids, block_m)
                 del routed
+                mark(f"sum:{tag}", block_m, rows)
+                total = out.float() if total is None else total + out.float()
+                wrote = True
+            elif acc is not None:
+                # Straight into the layer's accumulator: the epilogue adds each routed row into
+                # its token's row, which is the same sum this used to do in a separate pass.
+                out = _C.exl3_moe_gemm(a2, grp.trellis2, grp.suh2, grp.svh2, eids, n_rows,
+                                       [self.hidden], grp.cb, block_m, torch.float,
+                                       sid, wf, M, T, acc, wrote)
+                total = out
+                wrote = True
             else:
                 out = _C.exl3_moe_gemm(a2, grp.trellis2, grp.suh2, grp.svh2, eids, n_rows,
                                        [self.hidden], grp.cb, block_m, torch.half,
                                        sid, wf, M, T)
-            del a2
-            mark(f"sum:{tag}", block_m, rows)
-            total = out.float() if total is None else total + out.float()
+                mark(f"sum:{tag}", block_m, rows)
+                total = out.float() if total is None else total + out.float()
+                wrote = True
+            del out, a2
         mark("end")
         if trace is not None:
             self.trace = trace

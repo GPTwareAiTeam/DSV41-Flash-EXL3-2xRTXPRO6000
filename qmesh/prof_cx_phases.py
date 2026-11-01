@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Attribute one cuda-exl3 cold-layer forward to its kernels, and price block_m at large M.
 
-`forward` runs four kernels per bitrate group (had_in, gemm to 2*I, glu_had_in, gemm to H) plus
-an fp32 fp16->fp32 conversion of the group result; at 8192 rows the layer is no longer weight
-bound (every cold expert is read once per tile block), so the open question is where the 80 ms
-of device time sits and whether a wider tile pays for the weights it re-reads.
+`forward` runs four kernels per bitrate group -- had_in, gemm to 2*I, glu_had_in, gemm to H -- and
+the last of them adds into the layer's fp32 accumulator, so there is no sum phase to find. At
+8192 rows the layer is weight bound: every cold expert's trellis is read once per tile block, so
+what is worth measuring is the split between the two gemms and whether a wider tile pays for the
+weights it re-reads.
 
 Reads `cx.trace` (CUDA_EXL3_MOE_TRACE), so every number here is one call's own events on the
 caller's stream.
@@ -48,7 +49,7 @@ def main():
     ap.add_argument("--layer", type=int, default=5)
     ap.add_argument("--rows-list", default="8192")
     ap.add_argument("--block-m-list", default="0,64,128",
-                    help="0 = the adapter's row-band rule, otherwise a forced tile (16/32/64/128)")
+                    help="0 = the adapter's cost model, otherwise a forced tile (16/32/64/128)")
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=2)
     args = ap.parse_args()
@@ -106,7 +107,7 @@ def main():
                     blocks = nrows // blk
                     wmib = blocks * per_expert_mib[id(g)]
                     shape.append(f"{label[7:]}:blk={blk} live={live} rows={nrows} "
-                                 f"pad={nrows / max(1, live):+.0%} blocks={blocks} "
+                                 f"pad={nrows / max(1, live):.2f}x blocks={blocks} "
                                  f"weights_mib={wmib:.0f}")
             print(f"PROF_CXPH_BM layer={args.layer} rows={rows} block_m={bm or 'auto'} "
                   f"total_ms={wall_ms:.2f} sum_ms={sum(per_family.values()):.2f}", flush=True)

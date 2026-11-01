@@ -155,8 +155,8 @@ def main():
                     help="after the incumbent measurements, restack the layer for cuda-exl3 "
                          "(qmesh.exl3_moe_cuda) and measure that path against the stored answers")
     ap.add_argument("--cx-block-m", type=int, default=0,
-                    help="force cuda-exl3's tile block_m (16/32/64/128) instead of the row-band "
-                         "rule, to price a wider tile against the weights it re-reads")
+                    help="force cuda-exl3's tile block_m (16/32/64/128) instead of the cost "
+                         "model, to price a wider tile against the weights it re-reads")
     args = ap.parse_args()
     if args.cx_block_m:
         import qmesh.exl3_moe_cuda as cx_mod
