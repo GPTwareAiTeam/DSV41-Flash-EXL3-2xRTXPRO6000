@@ -192,6 +192,31 @@ the evidence, then queues the prod ticket).
   build_id, lib stamp (arch, sm, source sha, build_id), ext stamp, container wiring, and the tree
   hash of the seam files against the other side and against the manifest.
 
+The guard is installed **last**, and only when it can pass: a pair with no manifest fails closed, so
+installing it before `pairs/<pair>.json` exists turns every job on that pair into `PAIR_DRIFT
+no_manifest`. And a `gpu_run_pair.sh` that a ticket is already executing must not be replaced under
+it — bash reads the file as it goes, and every live `bash …/gpu_run_pair.sh <Agent> …` is a byte
+offset into the old text. Order: dev manifest → prod manifest → both queues idle → install, `cmp`
+against the branch copy.
+
+## Prod's first release: new containers, new names
+
+Prod's GX row in `pairs.conf` still names `seam-gx1v2`, a container someone wired by hand before
+this tooling existed (wrong `/pair` mount, `TORCH_EXTENSIONS_DIR=/root/.cache/…`, `MAX_JOBS=12`).
+`pair_containers.py plan prod` therefore reports `RECREATE` for it — and a RECREATE is exactly what
+must not happen to a container that arms are running in. Prod moves to containers of its own
+instead:
+
+1. When prod's queue is idle and its arms are done, point the prod row of `pairs.conf` and the
+   `name` in `containers/prod-gx.json` at `seam-p7-prod` / `seam-gx1-prod`, and install the two files
+   byte-identically. `seam-p7v2`, `seam-gx1v2` and `seam-p7v2-robust` are then simply not ours: they
+   are never re-created, stopped or exec'd by this tooling again.
+2. `pair_prepare.sh prod <sha>` — plan now reads `RECREATE missing:seam-p7-prod`,
+   `RECREATE missing:seam-gx1-prod`, which is a create, and creates both while the arms keep their
+   own containers.
+3. `pair_promote.sh <sha>` — the ticket flips `current`/`extcache` inside the new pair containers,
+   smokes, writes the prod manifest and `pair_check.sh prod` must end `IN_SYNC`.
+
 ## Commands
 
 ```
