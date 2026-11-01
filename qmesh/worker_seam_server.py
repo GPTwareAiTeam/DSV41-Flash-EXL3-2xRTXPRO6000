@@ -17,6 +17,7 @@ import argparse
 import copy
 import json
 import os
+import threading
 import time
 
 import numpy as np
@@ -56,13 +57,17 @@ def build_layer(base, cold_ids, device):
 
 
 class SeamServer:
-    def __init__(self, model_dir, placement_path, device):
+    def __init__(self, model_dir, placement_path, device, stub = False):
         placement = json.load(open(placement_path))
         self.device = device
+        self.stub = stub
         self.stream = torch.cuda.Stream(device=device)
+        self.layers = {}
+        if stub:
+            # Wire/protocol baseline: no experts are needed, so the server is up in seconds.
+            return
         config = Config.from_directory(model_dir)
         model = Model.from_config(config)
-        self.layers = {}
         for layer in range(NL):
             cold = placement["layers"][str(layer)]["warm"]
             base = next(m for m in model.modules if m.key == f"layers.{layer}").mlp
@@ -74,6 +79,20 @@ class SeamServer:
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region."""
+        # Per-call device time, reported every minute as SEAM_COMPUTE (median/mean/max us per row
+        # bucket). Paired with the client's round-trip timing this splits the seam into GX1 compute
+        # and wire: wire = round trip - compute.
+        t0 = time.perf_counter_ns()
+        try:
+            self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+        finally:
+            with _lock:
+                _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
+
+    def _forward(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
+        if self.stub:
+            view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = 0.0
+            return
         ffn, _ = self.layers[layer]
         x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN).copy())
         x = x.view(torch.bfloat16).to(self.device).half()
@@ -92,6 +111,25 @@ class SeamServer:
             part.view(rows, HIDDEN).float().cpu().numpy()
 
 
+_times: dict = {}
+_lock = threading.Lock()
+
+
+def _reporter():
+    while True:
+        time.sleep(60)
+        with _lock:
+            if not _times:
+                continue
+            snap = {k: v for k, v in _times.items()}
+            _times.clear()
+        for rows in sorted(snap):
+            v = sorted(snap[rows])
+            n = len(v)
+            print(f"SEAM_COMPUTE rows={rows} n={n} p50_us={v[n // 2]:.1f} "
+                  f"mean_us={sum(v) / n:.1f} max_us={v[-1]:.1f}", flush=True)
+
+
 def view(addr, nbytes, dtype):
     """numpy view over raw pinned-slab memory (no copy)."""
     import ctypes
@@ -106,14 +144,17 @@ def main():
     ap.add_argument("--dev", default="rocep1s0f0")
     ap.add_argument("--gid", type=int, default=3)
     ap.add_argument("--port", type=int, default=47311)
+    ap.add_argument("--stub", action="store_true",
+                    help="answer every request with zeros (wire/protocol baseline, no expert compute)")
     ap.add_argument("--buckets", default="1,6,64",
                     help="row buckets; one seam handle per bucket on consecutive ports from --port")
     args = ap.parse_args()
 
     device = torch.device("cuda:0")
     t0 = time.time()
-    server = SeamServer(args.model_dir, args.placement, device)
-    print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s", flush=True)
+    server = SeamServer(args.model_dir, args.placement, device, stub = args.stub)
+    print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)}", flush=True)
+    threading.Thread(target = _reporter, daemon = True).start()
 
     # One handle per row bucket, on consecutive ports; the client uses the same mapping.
     seams = []
