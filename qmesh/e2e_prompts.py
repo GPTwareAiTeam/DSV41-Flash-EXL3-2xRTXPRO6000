@@ -16,6 +16,7 @@ line per prompt plus a summary. Timing comes from the engine's own job accountin
   LONG_TOKENS  one long-context prompt of this many tokens, tiled from CORPUS
   LONG_PROMPT_FILE  one long prompt read from a file (overrides CORPUS/LONG_TOKENS)
   MAX_NEW      new tokens per prompt (default 256)
+  WARMUP_NEW   new tokens for warm-up prompts (default MAX_NEW)
   MAX_CHUNK    prefill chunk (default 2048)
   DSPARK       1 to enable the DSpark draft model
   NUM_DRAFT    draft width K (default 5)
@@ -45,6 +46,7 @@ MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 DSPARK = os.environ.get("DSPARK") == "1"
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 WARMUP = int(os.environ.get("WARMUP", "0"))
+WARMUP_NEW = int(os.environ.get("WARMUP_NEW", str(MAX_NEW)))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 OUT = os.environ.get("OUT", "")
 DEBUG_RESULTS = os.environ.get("DEBUG_RESULTS") == "1"
@@ -180,12 +182,13 @@ def main():
     for idx, (label, prompt) in enumerate(prompts):
         ids = (long_ids if prompt is None else
                tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True))
-        assert int(ids.shape[-1]) + MAX_NEW <= CACHE_TOKENS, \
-            f"prompt {label}: {int(ids.shape[-1])} tokens + {MAX_NEW} new exceed CACHE_TOKENS={CACHE_TOKENS}"
+        mn = WARMUP_NEW if label.startswith("warm") else MAX_NEW
+        assert int(ids.shape[-1]) + mn <= CACHE_TOKENS, \
+            f"prompt {label}: {int(ids.shape[-1])} tokens + {mn} new exceed CACHE_TOKENS={CACHE_TOKENS}"
         limiter = None
         if PREFILL_ADAPTIVE:
             generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(torch.device("cuda:0"))
-        job = Job(input_ids=ids, max_new_tokens=MAX_NEW, sampler=GreedySampler())
+        job = Job(input_ids=ids, max_new_tokens=mn, sampler=GreedySampler())
         generator.enqueue(job)
         t0 = time.time()
         text = ""
