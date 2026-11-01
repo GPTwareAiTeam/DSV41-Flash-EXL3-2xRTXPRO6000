@@ -776,6 +776,13 @@ class Model(Model_TPMixin, Model_LSMixin):
         for host in getattr(self.config, "moe_cpu_hosts", {}).values():
             host.ensure_started()
 
+        # Slab-arena audit: a partially filled block keeps its whole block resident, because the
+        # weights carved from it are slices of it and their unused tail is unreachable. The loaded block
+        # set is final here, so hand those tails back (EXL3_LOAD_ARENA=compact) and report the fill
+        # (EXL3_ARENA_REPORT=1|2). Both are no-ops unless asked for
+        self.config.stc.arena_compact()
+        self.config.stc.arena_report("end_load")
+
 
     def get_layout_tree(self, pre_indent: int) -> str:
         def get_branch(module, b_indent) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import math
 from dataclasses import dataclass
+import weakref
 import torch
 import os, glob
 import numpy as np
@@ -435,9 +436,15 @@ class SafetensorsCollection:
         # 74k ~1MB + 150k tiny allocations -> 37k segments, 15.3 GB reserved-but-unallocated on
         # a 512-expert model). The boundary block is shared across brackets, so at most one
         # partially-external block per module stays pinned after an unload
-        self.arena = {}                    # device index -> [block (uint8), fill offset]
+        self.arena = {}                    # device index -> [block (uint8), fill offset, storage, cap, issued]
         self.arena_enable = os.environ.get("EXL3_LOAD_ARENA", "1") != "0"
         self.deferred_arena = True
+        # Every block opened in this process, open or not, with the tensors carved from it (weak refs,
+        # so tracking never keeps a weight alive). Used to audit block fill, to relocate the live tensors
+        # of a partially filled block into an exact-size block at the end of a load, and to drop blocks
+        # whose tensors are all gone
+        self.arena_all = {}                # device index -> [block entry, ...]
+        self.arena_track = self.ARENA_REPORT > 0 or self.ARENA_COMPACT
 
 
     def add_tensor_files(
@@ -685,20 +692,116 @@ class SafetensorsCollection:
         return result
 
 
-    ARENA_BLOCK = 128 << 20        # slab block size
+    # EXL3_ARENA_BLOCK_MIB shrinks the blocks so their unfilled tails stay small; EXL3_ARENA_REPORT=1
+    # prints per-block fill at every bracket end (2 = one line per block), and EXL3_LOAD_ARENA=compact
+    # additionally relocates the live tensors of any block with a large tail into an exact-size block at
+    # the end of the load. All three default to the shipped behaviour
+    ARENA_BLOCK = int(os.environ.get("EXL3_ARENA_BLOCK_MIB", "128")) << 20   # slab block size
     # Larger tensors get their own allocation (few, negligible allocator overhead at this
     # size). The cap matters even with first-fit backfill: a dense model's 32-64MB projections
     # shed block tails faster than its scarce small-tensor traffic can pack them (issue #313)
     ARENA_MAX_TENSOR = 16 << 20
     ARENA_ALIGN = 256
-    ARENA_MAX_OPEN = 8             # open (partially filled) blocks kept per device
+    ARENA_MAX_OPEN = int(os.environ.get("EXL3_ARENA_MAX_OPEN", "8"))   # open (partially filled) blocks per device
     ARENA_PRUNE = 4096             # remaining bytes below which a block counts as full
+    ARENA_REPORT = int(os.environ.get("EXL3_ARENA_REPORT", "0"))
+    ARENA_COMPACT = os.environ.get("EXL3_LOAD_ARENA", "1") == "compact"
+    ARENA_COMPACT_TAIL = int(os.environ.get("EXL3_ARENA_COMPACT_TAIL_MIB", "4")) << 20
 
     def release_arena(self):
         """Drop the open-block list. Blocks stay alive exactly as long as tensors sliced from
         them do; the list itself would otherwise keep partially filled blocks resident after
         their tensors are gone (model unload)"""
         self.arena = {}
+        self.arena_all = {}
+
+    def arena_report(self, tag: str):
+        """Per-device block fill, for auditing what a load leaves behind (EXL3_ARENA_REPORT >= 1). The
+        dead figure is the sum of each block's unfilled tail: unreachable by the tensors carved from the
+        block, so it stays resident until they are all gone"""
+        if not self.arena_track or not self.ARENA_REPORT:
+            return
+        for dev, entries in self.arena_all.items():
+            cap = sum(e[3] for e in entries)
+            used = sum(e[1] for e in entries)
+            live = sum(1 for e in entries for _o, r in e[4] if r() is not None)
+            print(f"ARENA_REPORT tag={tag} device={dev} blocks={len(entries)} open={len(self.arena.get(dev, []))} "
+                  f"capacity_MiB={cap / 2 ** 20:.0f} used_MiB={used / 2 ** 20:.0f} "
+                  f"dead_MiB={(cap - used) / 2 ** 20:.0f} issued={live}", flush = True)
+            if self.ARENA_REPORT < 2:
+                continue
+            opens = self.arena.get(dev, [])
+            for i, e in enumerate(entries):
+                n = sum(1 for _o, r in e[4] if r() is not None)
+                print(f"ARENA_BLOCK tag={tag} device={dev} block={i} "
+                      f"capacity_MiB={e[3] / 2 ** 20:.1f} used_MiB={e[1] / 2 ** 20:.1f} "
+                      f"dead_MiB={(e[3] - e[1]) / 2 ** 20:.1f} issued={n} "
+                      f"open={int(any(e is o for o in opens))}", flush = True)
+
+
+    def arena_compact(self):
+        """Hand back slab-block tails. A block's tensors are slices of it, so a partially filled block
+        keeps its whole block resident; here each such block's live tensors are copied into an exact-size
+        block (same offsets, so only the storage changes) and re-pointed with set_, then the old block is
+        dropped. Blocks whose tensors are all gone are dropped outright. Runs at the end of a load, where
+        the block set is final; a tensor the module only kept views of keeps its old block alive, which
+        costs the tail it was meant to free but never corrupts anything"""
+        if not (self.arena_track and self.ARENA_COMPACT):
+            return
+        before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        for dev, entries in list(self.arena_all.items()):
+            kept, moved, freed, moved_mib = [], 0, 0, 0
+            for e in entries:
+                block, used, storage, cap, issued = e
+                live = [(off, t) for off, r in issued if (t := r()) is not None]
+                if not live:
+                    # Every tensor carved from this block is gone: the block dies with the entry
+                    freed += cap
+                    continue
+                if cap - used < self.ARENA_COMPACT_TAIL:
+                    kept.append(e)
+                    continue
+                # Offsets stay as they are, so the tensors' shapes and strides are untouched. Copy every
+                # live tensor before re-pointing any of them: a failure then leaves the block intact
+                # instead of half moved
+                top = max(off + t.nbytes for off, t in live)
+                try:
+                    new = torch.empty(max(top, 1), dtype = torch.uint8, device = block.device)
+                    nst = new.untyped_storage()
+                    dsts = []
+                    for off, t in live:
+                        dst = torch.empty(0, dtype = t.dtype, device = t.device)
+                        dst = dst.set_(nst, off // t.dtype.itemsize, t.shape)
+                        dst.copy_(t)
+                        dsts.append((dst, t))
+                    for dst, t in dsts:
+                        t.set_(dst.untyped_storage(), dst.storage_offset(), t.shape)
+                except Exception as ex:  # never fail a load over an optional tail reclaim
+                    print(f"ARENA_COMPACT_SKIP device={dev} cap_MiB={cap / 2 ** 20:.0f} "
+                          f"err={type(ex).__name__}: {ex}", flush = True)
+                    kept.append(e)
+                    continue
+                ne = self._arena_entry(new, top)
+                ne[4] = [(off, weakref.ref(t)) for off, t in live]
+                kept.append(ne)
+                moved += 1
+                moved_mib += top / 2 ** 20
+                freed += cap - top
+            self.arena_all[dev] = kept
+            if moved or freed:
+                cap = sum(e[3] for e in kept)
+                used = sum(e[1] for e in kept)
+                print(f"ARENA_COMPACT device={dev} blocks_moved={moved} moved_MiB={moved_mib:.0f} "
+                      f"freed_MiB={freed / 2 ** 20:.0f} blocks_left={len(kept)} "
+                      f"capacity_MiB={cap / 2 ** 20:.0f} used_MiB={used / 2 ** 20:.0f} "
+                      f"dead_MiB={(cap - used) / 2 ** 20:.0f}", flush = True)
+        if torch.cuda.is_available():
+            # Ground truth: the net allocator change. A block whose only surviving references are views
+            # the module kept of its tensors cannot be dropped, so freed_MiB above can overstate the win
+            # and the copy would show up here as a loss
+            after = torch.cuda.memory_allocated()
+            print(f"ARENA_COMPACT_NET allocated_before_MiB={before / 2 ** 20:.0f} "
+                  f"after_MiB={after / 2 ** 20:.0f} delta_MiB={(after - before) / 2 ** 20:.0f}", flush = True)
 
 
     def _arena_alloc(self, shape, dtype: torch.dtype, device: torch.device, zeros: bool, enabled: bool = True):
@@ -733,6 +836,8 @@ class SafetensorsCollection:
             entry = self._arena_entry(torch.empty(self.ARENA_BLOCK, dtype = torch.uint8, device = device), 0)
             off = 0
             blocks.append(entry)
+            if self.arena_track:
+                self.arena_all.setdefault(device.index, []).append(entry)
             if len(blocks) > self.ARENA_MAX_OPEN:
                 # index-based removal: list.remove would compare entries elementwise (tensors)
                 del blocks[min(range(len(blocks)), key = lambda i: blocks[i][3] - blocks[i][1])]
@@ -743,12 +848,14 @@ class SafetensorsCollection:
         t = torch.empty(0, dtype = dtype, device = device).set_(entry[2], off // dtype.itemsize, shape)
         if zeros:
             t.zero_()
+        if self.arena_track:
+            entry[4].append((off, weakref.ref(t)))
         return t
 
 
     @staticmethod
     def _arena_entry(block: torch.Tensor, used: int) -> list:
-        return [block, used, block.untyped_storage(), block.numel()]
+        return [block, used, block.untyped_storage(), block.numel(), []]
 
     def get_tensor(
         self,
