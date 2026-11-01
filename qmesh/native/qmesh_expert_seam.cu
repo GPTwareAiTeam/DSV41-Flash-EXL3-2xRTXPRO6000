@@ -69,7 +69,24 @@ namespace {
  * one slot (protocol v3 layout). */
 constexpr int ROWS_MAX = 8192;
 constexpr size_t LINE = 64;
-constexpr uint64_t WAIT_TIMEOUT_NS = 30ull * 1000 * 1000 * 1000;
+/* How long a response may be outstanding before the slot is declared dead. 30 s is the right
+ * default for a healthy seam, but a GX that is genuinely working - a first call that has to page a
+ * cold layer in, a restack that runs inside the request - blows through it, and the client then calls
+ * a live server "the seam transport is dead" and abandons the run. SEAM_ACK_TIMEOUT_S raises it for
+ * such a run without changing what a hung transport looks like. */
+uint64_t env_ack_timeout_ns() {
+  const char* v = getenv("SEAM_ACK_TIMEOUT_S");
+  if (!v || !*v) return 30ull * 1000 * 1000 * 1000;
+  errno = 0;
+  char* end = nullptr;
+  unsigned long long s = strtoull(v, &end, 10);
+  if (errno || end == v || (*end && *end != ' ') || s < 1 || s > 3600) {
+    fprintf(stderr, "qes: SEAM_ACK_TIMEOUT_S=%s ignored (want whole seconds, 1..3600)\n", v);
+    return 30ull * 1000 * 1000 * 1000;
+  }
+  return (uint64_t)s * 1000ull * 1000ull * 1000ull;
+}
+const uint64_t WAIT_TIMEOUT_NS = env_ack_timeout_ns();
 /* How long a re-issue may wait for the server to acknowledge the slot's previous request before
  * the transport is declared stuck. The wait only happens when the caller has more requests in
  * flight than there are slots. */
@@ -410,7 +427,7 @@ __global__ void publish_kernel(uint64_t* seq, uint64_t* hdr_seq) {
  * "no response ... within 30 s". A dead seam must hand the caller NaN (isfinite() false), never
  * plausible rows. */
 __global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, uint32_t* fail,
-                            float* resp, int n_floats) {
+                            float* resp, int n_floats, uint64_t timeout_ns) {
   uint64_t want = *req_seq;
   uint64_t t0, now;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
@@ -419,7 +436,7 @@ __global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, u
     asm volatile("ld.acquire.sys.u64 %0, [%1];" : "=l"(got) : "l"(resp_seq) : "memory");
     if (got >= want) return;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-    if (now - t0 > WAIT_TIMEOUT_NS) {
+    if (now - t0 > timeout_ns) {
       asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(fail), "r"(1u) : "memory");
       const float nan = __int_as_float(0x7fc00000);
       for (int i = threadIdx.x; i < n_floats; i += blockDim.x) resp[i] = nan;
@@ -2467,7 +2484,7 @@ extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_
                                     (const uint64_t*)(h->slab + off_fresp(h, slot)),
                                     (uint32_t*)(h->slab + off_fail(h, slot)),
                                     (float*)(h->slab + off_resp(h, slot)),
-                                    (int)(h->resp_len / sizeof(float)));
+                                    (int)(h->resp_len / sizeof(float)), WAIT_TIMEOUT_NS);
   if (cudaMemcpyAsync(out_f32, h->slab + off_resp(h, slot), h->resp_len, cudaMemcpyHostToDevice,
                       stream))
     return -2;

@@ -184,7 +184,9 @@ class SeamServer:
             dropped = _drop_page_cache(self.pack_paths[layer]) if self.fadvise else False
             print(f"layer {layer}: {len(cold)} cold experts, "
                   f"{torch.cuda.memory_allocated(device) / 2**30:.2f} GiB "
-                  f"avail_mib={_avail_mib()} cached_dropped={int(dropped)}", flush=True)
+                  f"avail_mib={_avail_mib()} cached_mib={_cached_mib()} "
+                  f"rss_peak_mib={_rss_peak_mib()} swap_mib={_swap_used_mib()} "
+                  f"cached_dropped={int(dropped)}", flush=True)
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
@@ -300,11 +302,36 @@ class SeamServer:
         cx = self.__dict__.setdefault("_cx_layers", {})
         if layer in cx:
             return cx[layer]
-        from qmesh.exl3_moe_cuda import CudaExl3Moe
+        from qmesh.exl3_moe_cuda import (CudaExl3Moe, RestackBroken, _live_mib as _cx_cold_mib,
+                                         peak_mib as _cx_peak_mib)
+        # The restack cannot be done in place: a group's stacked tensors are allocated before any
+        # expert of that group is copied into them, so the peak is one layer's cold bytes plus up
+        # to one group's. On GB10 the pack and the device share one 121 GiB pool, and a
+        # cudaMalloc that cannot be satisfied does not fail cleanly there: it pages the pack out
+        # and wedges the whole host (GX1 2026-11-01 16:44: a 64-row request took >30 s, the client
+        # called the transport dead, sshd stopped answering - the layer-0 restack was the first
+        # thing to ask for ~4 GiB with 1.32 GiB available). Refuse the conversion up front when the
+        # peak does not fit, so the arm still runs on the module instead of taking the box down.
+        need = _cx_peak_mib(ffn)
+        avail = _avail_mib()
+        if avail >= 0 and need + CX_MARGIN_MIB > avail:
+            cx[layer] = None
+            print(f"SEAM_MOE_NOFIT layer={layer} need_mib={need} avail_mib={avail} "
+                  f"margin_mib={CX_MARGIN_MIB} cold_mib={_cx_cold_mib(ffn)} "
+                  f"- restack would page the pack out; serving this layer from the mixed-K module",
+                  flush=True)
+            return None
         t0 = time.perf_counter()
         avail0, swap0 = _avail_mib(), _swap_used_mib()
         try:
             hit = CudaExl3Moe(ffn, self.device)
+        except RestackBroken as e:
+            # The streaming restack frees each expert's source as it lands in the stack, so a
+            # failure after the first group leaves this layer with no per-expert copy to fall back
+            # on. Serving it from the mixed-K module would answer with stale or partial bytes, which
+            # is the failure mode this server is fail-stop about (see compute()): name it and die.
+            raise RuntimeError(f"cuda-exl3 restack of layer {layer} failed after source tensors "
+                               f"were released ({e}); the layer has no fallback copy") from e
         except Exception as e:
             cx[layer] = None
             print(f"SEAM_MOE_FALLBACK layer={layer} err={type(e).__name__}: {e} "
@@ -315,6 +342,7 @@ class SeamServer:
         print(f"SEAM_MOE_CX layer={layer} groups={hit.describe()} "
               f"stacked_mib={hit.nbytes() / 2**20:.0f} build_ms={1e3 * (time.perf_counter() - t0):.0f} "
               f"avail_mib={avail0}->{_avail_mib()} swap_mib={swap0}->{_swap_used_mib()} "
+              f"rss_peak_mib={_rss_peak_mib()} cached_mib={_cached_mib()} "
               f"alloc_gib={torch.cuda.memory_allocated(self.device) / 2**30:.2f}", flush=True)
         return hit
 
@@ -373,6 +401,13 @@ WS_KIB_PER_ROW = 147
 # a box that is already over its head before the first request.
 SWAP_WARN_MIB = 512
 
+# Floor the cuda-exl3 restack has to leave on the box besides its own peak (see _cx_moe). 1.5 GiB is
+# the headroom a loaded GX actually has left (slab + workspace + CUDA context); a conversion that
+# eats into it swaps the 113.65 GiB pack out page by page, and on GB10 that stalls the whole host,
+# not just this process (GX1, 2026-11-01 16:44). Set SEAM_CX_MARGIN_MIB=0 only to measure a restack
+# on a box you are willing to lose.
+CX_MARGIN_MIB = int(os.environ.get("SEAM_CX_MARGIN_MIB", "1536"))
+
 
 def ws_mib_for(rows: int, ws_rows: int = 0) -> float:
     """Transient device workspace the cold-expert forward needs for a request, MiB."""
@@ -385,6 +420,28 @@ def _avail_mib() -> int:
     try:
         for line in open("/proc/meminfo"):
             if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
+
+def _rss_peak_mib() -> int:
+    """VmHWM of this process, MiB: the peak the restack drove the resident pack to."""
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
+
+def _cached_mib() -> int:
+    """Cached (page cache) on this box, MiB: what a conversion can borrow before the pack swaps."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("Cached:"):
                 return int(line.split()[1]) // 1024
     except OSError:
         pass

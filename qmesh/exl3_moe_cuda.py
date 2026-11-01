@@ -94,6 +94,10 @@ def _inner(line):
     return inner
 
 
+class RestackBroken(RuntimeError):
+    """The streaming restack failed after source tensors were released (see CudaExl3Moe)."""
+
+
 class Group:
     """One bitrate: the stacked tensors of every expert that shares its tile width."""
 
@@ -109,7 +113,7 @@ class Group:
                    (self.trellis13, self.suh13, self.svh13, self.trellis2, self.suh2, self.svh2))
 
 
-def _stack_group(gates, ups, downs, device) -> Group:
+def _stack_group(gates, ups, downs, device, free_source: bool = False) -> Group:
     g0 = _inner(gates[0])
     d0 = _inner(downs[0])
     words = int(g0.trellis.shape[2])
@@ -137,7 +141,47 @@ def _stack_group(gates, ups, downs, device) -> Group:
         grp.trellis2[e] = di.trellis
         grp.suh2[e, 0] = di.suh
         grp.svh2[e] = di.svh
+        if free_source:
+            # Streaming: this expert's bytes are inside the stack now (every copy above is a
+            # synchronous device-to-device copy on the default stream, so nothing is in flight), and
+            # holding the source until the whole layer is stacked is what doubles the conversion's
+            # footprint. The locals go too, so the allocator can reuse the block immediately.
+            for inner in (gi, ui, di):
+                inner.trellis = inner.suh = inner.svh = None
+            del gi, ui, di
     return grp
+
+
+def _live_mib(ffn) -> float:
+    """Bytes of this layer's cold experts as they sit now, MiB."""
+    total = 0
+    for e in range(len(ffn.gates)):
+        for line in (ffn.gates[e], ffn.ups[e], ffn.downs[e]):
+            i = _inner(line)
+            for t in (i.trellis, i.suh, i.svh):
+                if t is not None:
+                    total += t.numel() * t.element_size()
+    return total / 2**20
+
+
+def peak_mib(ffn) -> float:
+    """Peak of the restack, MiB: the layer's live cold bytes plus its largest stacked group.
+
+    `_stack_group` allocates a group's six stacked tensors before copying any expert into them, so
+    the group's sources and its stack are both live at that point; the per-group sums here are
+    exactly what the stack costs, because gate and up are stored side by side at their live sizes.
+    """
+    by_key: dict[tuple[int, int, int], int] = {}
+    for e, g in enumerate(ffn.gates):
+        key = (int(_inner(g).trellis.shape[2]), int(_inner(ffn.downs[e]).trellis.shape[2]),
+               _codebook(g))
+        sz = 0
+        for line in (g, ffn.ups[e], ffn.downs[e]):
+            i = _inner(line)
+            sz += sum(t.numel() * t.element_size() for t in (i.trellis, i.suh, i.svh))
+        by_key[key] = by_key.get(key, 0) + sz
+    live = _live_mib(ffn) * 2**20
+    return (live + max(by_key.values(), default = 0)) / 2**20
 
 
 def align_block(local_ids: torch.Tensor, block_m: int, num_experts: int, m_valid: int):
@@ -201,8 +245,6 @@ class CudaExl3Moe:
 
     def __init__(self, ffn, device=None, drop_source: bool = True):
         self.device = device or next(iter(ffn.gates)).device
-        self.hidden = None
-        self.inter = None
         self.top_k = int(getattr(ffn, "num_experts_per_tok", 0) or 0)
         self.num_experts = int(len(ffn.gates))
         by_key: dict[tuple[int, int, int], list[int]] = {}
@@ -213,19 +255,44 @@ class CudaExl3Moe:
                 raise ValueError(f"expert {e}: gate/up tile widths differ "
                                  f"({key[0]} vs {ui.trellis.shape[2]})")
             by_key.setdefault(key, []).append(e)
-        self.groups: list[Group] = []
-        for key, idx in sorted(by_key.items()):
-            grp = _stack_group([ffn.gates[e] for e in idx], [ffn.ups[e] for e in idx],
-                               [ffn.downs[e] for e in idx], self.device)
-            grp.source = idx
-            self.groups.append(grp)
+        # Geometry has to be read before any source tensor goes away.
         g0 = _inner(ffn.gates[0])
         d0 = _inner(ffn.downs[0])
         self.hidden = 16 * int(g0.trellis.shape[0])
         self.inter = 16 * int(g0.trellis.shape[1])
+        del g0, d0
         if self.top_k == 0:
             self.top_k = int(getattr(ffn, "num_experts_per_tok", 6) or 6)
-        del g0, d0
+        if drop_source:
+            # The module-wide holders go first: BC_BlockSparseMLP keeps a shared_ptr per expert BC
+            # (block_sparse_mlp.py:771-773) and the multilinear bundles keep fusions built over the
+            # same experts, so nothing is freed while those are alive. Dropping them before the
+            # stack, and each expert's own BC_LinearEXL3 reference with them, is what makes the
+            # conversion cost "live cold bytes + one group" instead of twice the layer: `_stack_group`
+            # then frees every expert the moment its bytes are in the stack.
+            ffn.bc = None
+            for name in ("multi_gate", "multi_up", "multi_down"):
+                if getattr(ffn, name, None) is not None:
+                    setattr(ffn, name, None)
+            for e in range(self.num_experts):
+                for line in (ffn.gates[e], ffn.ups[e], ffn.downs[e]):
+                    _inner(line).bc = None
+        self.groups: list[Group] = []
+        for key, idx in sorted(by_key.items()):
+            try:
+                grp = _stack_group([ffn.gates[e] for e in idx], [ffn.ups[e] for e in idx],
+                                   [ffn.downs[e] for e in idx], self.device,
+                                   free_source = drop_source)
+            except Exception as e:
+                # Past the first group the sources of the groups already stacked are gone, so the
+                # layer can no longer run on the mixed-K module: say so instead of leaving a
+                # half-converted layer behind (worker_seam_server._cx_moe turns this into a fatal).
+                if self.groups and drop_source:
+                    raise RestackBroken(f"group {key} of layer with {self.num_experts} experts: "
+                                        f"{type(e).__name__}: {e}") from e
+                raise
+            grp.source = idx
+            self.groups.append(grp)
         # ids arrive as this layer's cold-expert indices; each group needs its own 0..E-1 labels,
         # with -1 marking the picks another group owns.
         for grp in self.groups:
@@ -233,21 +300,6 @@ class CudaExl3Moe:
             remap[torch.tensor(grp.source, dtype=torch.int64, device=self.device)] = torch.arange(
                 len(grp.source), dtype=torch.int64, device=self.device)
             grp.remap = remap
-        if drop_source:
-            # The per-expert copies are dead once stacked; the layer must not pay for both. Three
-            # things hold C++ references to those tensors and every one of them has to go or the
-            # drop frees nothing: the module-wide BC_BlockSparseMLP keeps a shared_ptr per expert
-            # BC (block_sparse_mlp.py:771-773), each BC_LinearEXL3 keeps its own three tensors,
-            # and the multilinear bundles keep the fusions built over the same experts.
-            ffn.bc = None
-            for name in ("multi_gate", "multi_up", "multi_down"):
-                if getattr(ffn, name, None) is not None:
-                    setattr(ffn, name, None)
-            for e in range(self.num_experts):
-                for line in (ffn.gates[e], ffn.ups[e], ffn.downs[e]):
-                    inner = _inner(line)
-                    inner.bc = None
-                    inner.trellis = inner.suh = inner.svh = None
 
     # -- geometry -------------------------------------------------------------------------------
     def nbytes(self) -> int:
