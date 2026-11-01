@@ -36,6 +36,12 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   [ -n "$line" ] || pair_die "pair '$p' is not in $conf"
   read -r PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH <<<"$line"
   PAIR_ROOT=${PAIR_ROOT_OVERRIDE:-$PAIR_ROOT}
+  # A relative root puts every release, log and stamp wherever the caller happened to stand: a
+  # stubbed harness once grew four full source trees inside that repository way.
+  case "$PAIR_ROOT" in
+    /*) ;;
+    *) pair_die "pair root must be absolute: '$PAIR_ROOT'" ;;
+  esac
   export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.

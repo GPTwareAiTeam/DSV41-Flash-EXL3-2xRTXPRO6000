@@ -158,6 +158,17 @@ check("nothing sets the slower wide-dispatch tier",
       not any("EXL3_MOE_FUSED_ROWS_WIDE" in l
               for f in ("pair_arm.sh", "pair_env.sh", "pair_smoke.sh", "pair_update_run.sh")
               for l in code_lines(src(f))), "")
+check("a pair root that is not absolute is refused",
+      "pair root must be absolute" in src("pair_lib.sh"), "")
+def _tracked_release_trees():
+    out = subprocess.run(["git", "-C", os.path.dirname(os.path.dirname(HERE)),
+                          "ls-tree", "-r", "--name-only", "HEAD", "--", "qmesh/release"],
+                         capture_output=True, text=True).stdout.split()
+    return [f for f in out if f.endswith("/RELEASE.json") or "/src/" in f]
+
+
+check("no extracted release tree is tracked inside the tooling tree",
+      not _tracked_release_trees(), ",".join(_tracked_release_trees()[:3]))
 check("a dry run cannot declare a free GPU for a real ticket",
       '[ "$PAIR_DRY" = 1 ] && [ -n "${PAIR_DRY_GPU:-}" ]' in src("pair_update_run.sh"), "")
 check("a rehearsed cut keeps its seeded release stand-in",

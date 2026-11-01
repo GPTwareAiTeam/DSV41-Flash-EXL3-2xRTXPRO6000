@@ -61,6 +61,8 @@ check "$([ "$rc3" != 0 ] && printf '%s' "$out3" | grep -q "does not describe thi
 check "$([ ! -d "$P7/releases/$SHA" ] && echo 1)" "a refused cut leaves no half release behind"
 
 # --force re-stamps both sides even when one already has the release
+# (the stamp has one-second resolution: a cut in the same second is the same stamp)
+sleep 1
 out4=$(run --force); rc4=$?
 build4=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' \
           "$P7/releases/$SHA/RELEASE.json" 2>/dev/null)
