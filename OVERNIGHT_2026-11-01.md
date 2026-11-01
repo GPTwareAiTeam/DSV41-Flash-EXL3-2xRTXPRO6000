@@ -100,3 +100,8 @@ on both pairs on the same build, anything that failed and what was done about it
   DUMP_IDS added. CPU tests 6 pass / 8 GPU-skipped; negative controls fail as expected. Merge order:
   port/v12-audit -> fix/graph-dspark-export-v2 (fast-forward on top of port) -> seam/session-multiclient
   (STATUS.md doc conflict only). Quant A ~1 h 59 m left (~04:45 EST), B ~4 h.
+- 03:25 EST Integrator: staging/overnight = port + graph fix + seam (e958efab), built for P7 (sm_120) and GX1/GX2
+  (sm_121). Found + fixed: containers created without --device /dev/infiniband see 0 RDMA devices (seam-gx1v2,
+  staging containers recreated). Gate ticket 4th on prod (~05:55 head); post_gate.sh fast-forwards v2 only on
+  GATE_PASS with no live user of the worktree. Seam real-mode battery armed by supervisor
+  (scripts/battery_after_quant.sh) to run once after FINALIZE_DONE on the dev pair.
