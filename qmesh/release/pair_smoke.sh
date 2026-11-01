@@ -76,7 +76,16 @@ srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT
           "$ENSURE" --fresh --buckets "$SMOKE_BUCKETS" 2>&1)
 srv_rc=$?
 [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$srv_out" >> "$PAIR_LOG"
-printf '%s\n' "$srv_out" | grep -E '^(SEAM_ENSURE|SEAM_SLACK)' | sed 's/^/SMOKE_SERVER /'
+printf '%s\n' "$srv_out" | grep -E '^(SEAM_ENSURE|SEAM_SLACK|SEAM_NO_MEMORY|SEAM_NO_PACK)' | sed 's/^/SMOKE_SERVER /'
+# The worker refuses to load a pack that does not fit in MemAvailable and exits 3 -- but the ensure
+# wrapper reports "died" (rc 2) for that too, so the verdict has to be read from the line, not from
+# rc alone. Otherwise a box that is merely full is reported as a bad release and rolled back.
+case "$srv_out" in
+  *SEAM_NO_MEMORY*)
+    fail "memory server_no_memory $(printf '%s' "$srv_out" | grep -m1 SEAM_NO_MEMORY)" ;;
+  *SEAM_NO_PACK*)
+    fail "no_pack $(printf '%s' "$srv_out" | grep -m1 SEAM_NO_PACK)" ;;
+esac
 case "$srv_rc" in
   0) ;;
   3) line=$(printf '%s' "$srv_out" | grep -m1 PREFLIGHT_FAIL)
