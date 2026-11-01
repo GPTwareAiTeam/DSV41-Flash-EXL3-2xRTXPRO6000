@@ -277,9 +277,30 @@ def cmd_apply(cfg, sha, ts, force=False):
     if not todo and not force:
         print(f"APPLY {cfg['pair']} no_recreate_needed")
         return 0
-    stop_our_server(cfg)
+    allow_recreate = os.environ.get("PAIR_ALLOW_RECREATE") == "1"
+    for side, _why in todo:
+        ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]
+        rc, _, _ = docker(cfg, side, ["inspect", "-f", "{{.Id}}", ct])
+        if rc == 0 and not allow_recreate:
+            # This rollout adds containers, it never swaps an existing one: the switch from an old
+            # container to its release-mounted replacement happens only inside a queued PairUpdate
+            # job that holds the pair's lock, after the owner has said when.
+            die(f"{ct} already exists but its spec differs; refusing to recreate an existing "
+                f"container (PAIR_ALLOW_RECREATE=1 does it inside a queued PairUpdate only)")
+    _rc, _out, _ = docker(cfg, "gx", ["inspect", "-f", "{{.State.Running}}", cfg["gxct"]])
+    if _rc == 0 and _out.strip() == "true":
+        stop_our_server(cfg)
     for side, why in todo:
         ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]
+        rc, _, _ = docker(cfg, side, ["inspect", "-f", "{{.Id}}", ct])
+        if rc != 0:
+            print(f"CREATE {cfg['pair']} {side} {ct} {' '.join(why)}")
+            argv = run_args(spec(cfg, side), ct)
+            rc, out, err = docker(cfg, side, argv)
+            if rc:
+                die(f"docker run failed for {ct}: {err.strip()[:400]}")
+            docker(cfg, side, ["start", ct])
+            continue
         print(f"RECREATE {cfg['pair']} {side} {ct} {' '.join(why)}")
         new = f"{ct}.new-{ts}"
         docker(cfg, side, ["rm", "-f", new])
@@ -294,6 +315,12 @@ def cmd_apply(cfg, sha, ts, force=False):
             docker(cfg, side, ["rename", f"{ct}.bak-{ts}", ct])
             die(f"rename {new} -> {ct} failed: {err.strip()[:400]}")
         docker(cfg, side, ["start", ct])
+    cur = os.path.join(cfg["root"], "current")
+    if not os.path.lexists(cur):
+        # A container may never be wired to a release root without a current: /src/exllamav3 would
+        # dangle and every client in it would fail to import (seen 2026-11-01).
+        print(f"LINK_BOOTSTRAP {cfg['pair']} current -> releases/{sha[:12]} (first release of this pair)")
+        cmd_link(cfg, sha)
     cmd_inner(cfg, sha, verify=False)
     left = [(s, w) for s, w in ((s, plan_side(cfg, s)) for s in ("p7", "gx")) if w]
     if left:
@@ -356,6 +383,8 @@ def cmd_inner(cfg, sha=None, verify=True):
     readlink -f resolves the whole chain, so the answer is /pair/releases/<sha>/src, not the
     intermediate /pair/current/src -- accept either, but it has to be THIS sha.
     """
+    if not os.path.lexists(os.path.join(cfg["root"], "current")):
+        die(f"{cfg['root']}/current is missing: refusing to wire a container to an unreleased tree")
     for side in ("p7", "gx"):
         ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]
         rc, out, err = docker(cfg, side, ["inspect", "-f", "{{.State.Running}}", ct])
