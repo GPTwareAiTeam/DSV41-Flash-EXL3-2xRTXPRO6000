@@ -221,6 +221,42 @@ bool xfer(int fd, void* buf, size_t n, bool send, const char** why) {
   return true;
 }
 
+/* Same as xfer(recv), but the whole read must finish within timeout_ms: a peer that dribbles
+ * its hello (or sends one byte and stops) must not hold the accept loop, which also watches the
+ * live session's control fd. Used for the control hello only. */
+bool xfer_deadline(int fd, void* buf, size_t n, int timeout_ms, const char** why) {
+  const int64_t t_end = now_ns() + (int64_t)timeout_ms * 1000000LL;
+  char* p = (char*)buf;
+  while (n) {
+    int64_t left_ms = (t_end - now_ns()) / 1000000LL;
+    if (left_ms <= 0) {
+      *why = "hello not complete in time";
+      return false;
+    }
+    pollfd pf{fd, POLLIN, 0};
+    int pr = poll(&pf, 1, (int)std::min<int64_t>(left_ms, 1000));
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      *why = strerror(errno);
+      return false;
+    }
+    if (pr == 0) continue;
+    ssize_t k = ::recv(fd, p, n, MSG_DONTWAIT);
+    if (k == 0) {
+      *why = "peer closed";
+      return false;
+    }
+    if (k < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+      *why = strerror(errno);
+      return false;
+    }
+    p += k;
+    n -= (size_t)k;
+  }
+  return true;
+}
+
 int tcp_listen(int port, const char** why) {
   int ls = socket(AF_INET, SOCK_STREAM, 0);
   if (ls < 0) {
@@ -1341,17 +1377,11 @@ void end_active(qes_server* s, const char* reason) {
 void handle_ctl_conn(qes_server* s, int fd, const char* ip) {
   sock_opts(fd, 2, SOCK_IO_TIMEOUT_S);
 
-  pollfd p{fd, POLLIN, 0};
-  int r = poll(&p, 1, CTL_HELLO_TIMEOUT_MS);
-  if (r <= 0) {
-    say("SEAM_REJECT ip=%s reason=control-hello-timeout (%d ms)", ip, CTL_HELLO_TIMEOUT_MS);
-    close(fd);
-    return;
-  }
   CtlHello hello{};
   const char* why = "";
-  if (!xfer(fd, &hello, sizeof(hello), false, &why)) {
-    say("SEAM_REJECT ip=%s reason=control-hello-incomplete (%s)", ip, why);
+  if (!xfer_deadline(fd, &hello, sizeof(hello), CTL_HELLO_TIMEOUT_MS, &why)) {
+    say("SEAM_REJECT ip=%s reason=control-hello-timeout (%s, limit %d ms); hello is %zu bytes",
+        ip, why, CTL_HELLO_TIMEOUT_MS, sizeof(CtlHello));
     close(fd);
     return;
   }
