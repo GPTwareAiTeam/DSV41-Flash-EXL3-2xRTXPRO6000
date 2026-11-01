@@ -600,6 +600,29 @@ class DeepseekV4MTPModel(Model):
         if self.auto_threshold is not None:
             self.auto_threshold.reset()
 
+    def gate_summary(self) -> dict:
+        """The length gate in effect, for the run log: the verify width it picks is a different numeric
+        path, so a run's numbers only compare against another run with the same gate and constants."""
+        out = {
+            "gate": _GATE,
+            "conf": self.draft_conf_threshold,
+            "markov_graph": _MARKOV_GRAPH,
+            "block_graph": _BLOCK_GRAPH,
+        }
+        if self.auto_threshold is not None:
+            out["auto_lo"] = _AUTO_LO
+            out["auto_switch"] = _AUTO_SWITCH
+            out["auto_hl"] = _AUTO_HL
+            out["auto_avg"] = round(self.auto_threshold.avg, 3)
+            out["auto_level"] = self.auto_threshold.level
+        if _GATE == "ev":
+            out["ev_cost"] = _EV_COST_RAW
+            out["ev_kmin"] = _EV_KMIN
+            out["ev_gamma"] = _EV_GAMMA
+            out["ev_scale"] = _EV_SCALE
+        return out
+
+
 
 
     def _sample_graphed(self, state: torch.Tensor, params: dict) -> torch.Tensor:

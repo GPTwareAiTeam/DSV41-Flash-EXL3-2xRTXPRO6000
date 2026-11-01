@@ -301,6 +301,12 @@ class Generator:
                 print(f" !! Warning: the MTP head has {depths} depth-specialized layers; draft positions past "
                       f"{depths} reuse the last one, with decreasing acceptance (num_draft_tokens = "
                       f"{self.num_draft_tokens})")
+            # The length gate fixes each round's verify width, and a different width is a different
+            # numeric path: log the gate and its constants with every run so results stay comparable
+            gate = getattr(draft_model, "gate_summary", None)
+            if gate is not None:
+                import json
+                print("DSPARK_GATE " + json.dumps(gate(), sort_keys = True), flush = True)
         elif ngram_match_min:
             self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         else:
@@ -1940,6 +1946,7 @@ class Generator:
                 job.verify_rounds += 1
                 rejected = 0
                 W = batch_logits.shape[1]
+                job.verify_widths[W] = job.verify_widths.get(W, 0) + 1
 
                 # Positions within a job are independent when no per-position constraint advances between
                 # them: no active filter (masks are rebuilt per accepted position), no sampling past IDs

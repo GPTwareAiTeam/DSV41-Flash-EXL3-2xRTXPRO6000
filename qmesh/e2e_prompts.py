@@ -225,6 +225,7 @@ def main():
             "accepted": acc, "rejected": rej, "verify_rounds": rounds,
             "accept_rate": round(acc / max(acc + rej, 1), 4) if (acc or rej) else None,
             "tokens_per_round": round(toks_per_round, 3) if toks_per_round else None,
+            "verify_widths": {str(k): v for k, v in sorted(getattr(job, "verify_widths", {}).items())},
             "gpu0_free_gib": round(free / 2**30, 2),
             "prefill_chunks": limiter.chunks if limiter else None,
             "prefill_shrunk": limiter.shrunk if limiter else None,
@@ -246,6 +247,11 @@ def main():
         vals = [r[key] for r in rows if r.get(key) is not None]
         return round(sum(vals) / len(vals), 3) if vals else None
 
+    hist = {}
+    for r in rows:
+        for k, v in r["verify_widths"].items():
+            hist[int(k)] = hist.get(int(k), 0) + v
+    n_rounds = sum(hist.values())
     summary = {
         "n": len(rows), "dspark": DSPARK, "num_draft": NUM_DRAFT if DSPARK else None,
         "max_new": MAX_NEW,
@@ -254,6 +260,11 @@ def main():
         "ttft_ms_mean": mean("ttft_ms"),
         "tokens_per_round_mean": mean("tokens_per_round"),
         "accept_rate_mean": mean("accept_rate"),
+        "verify_width_hist": {str(k): v for k, v in sorted(hist.items())},
+        "verify_width_mean": (round(sum(k * v for k, v in hist.items()) / n_rounds, 3)
+                              if n_rounds else None),
+        "gate": (draft_model.gate_summary() if draft_model is not None
+                 and hasattr(draft_model, "gate_summary") else None),
         "gpu0_free_gib_min": min((r["gpu0_free_gib"] for r in rows), default=None),
         "tokens": sum(r["new_tokens"] for r in rows),
         "wall_s": round(sum(r["wall_s"] for r in rows), 2),

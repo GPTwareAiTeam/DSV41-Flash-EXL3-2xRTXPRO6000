@@ -276,6 +276,10 @@ class Job:
         self.accepted_draft_tokens = rq_state.get("accepted_draft_tokens", 0)
         self.rejected_draft_tokens = rq_state.get("rejected_draft_tokens", 0)
         self.verify_rounds = rq_state.get("verify_rounds", 0)
+        # Verify rows dispatched per round (1 = plain step, 1 + draft length otherwise): the adaptive
+        # length gate is only worth judging per width, since a wider verify costs more per round on
+        # both sides of the seam
+        self.verify_widths = dict(rq_state.get("verify_widths") or {})
         self.rq_prompt_tokens = rq_state.get("prompt_tokens")
         self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
