@@ -267,3 +267,13 @@ The GX2 pack is ~113.5 GiB against a ~120 GiB box: loads sit at 860-960 MiB of h
 on that build. A smoke that fails there is a capacity failure, not a code mismatch: the release
 still reports `PAIR_UPDATED` with `smoke` marked failed and the memory lines attached. Shrinking the
 pack or gating on `dev_free_mib` is the owner's call, not the release's.
+
+So the ticket tells the two apart, and only capacity failures skip the rollback. `pair_smoke.sh`
+marks a refusal from the box (`PREFLIGHT_FAIL gx-mem`, `SEAM_SLACK` with the gate on) and a client
+the kernel or CUDA killed (`out of memory`, `Cannot allocate memory`, `unspecified launch failure`)
+as `SMOKE_FAIL memory …`; `pair_update_run.sh` then takes the `memory_fail` path instead of `fail`:
+the release stays installed and current, evidence says `ok=false, why=memory:…`, **no manifest is
+written**, and it prints `PAIR_UPDATED … smoke=FAILED_MEMORY rollback=none manifest=none` plus the
+`SMOKE_MEM_*` lines. That last part is the point: the pair fails closed -- the queue refuses jobs on
+an unverified release -- while the box, not the code, is named as the reason. A wire mismatch, a
+stamp mismatch or a crash still rolls back.

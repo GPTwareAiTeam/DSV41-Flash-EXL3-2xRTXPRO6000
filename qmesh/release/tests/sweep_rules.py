@@ -122,13 +122,20 @@ check("one definition of the canary gate",
 check("the script that flips checks the canary too",
       "pair_canary_gate" in ur, "")
 check("update_run needs the sha for prod", '[ "$PAIR" = prod ]' in ur, "")
+check("box memory refusals are classified, not blamed on the release",
+      ur.count("SMOKE_FAIL memory ") == 1 and "memory_fail" in ur, "")
+check("a memory failure keeps the code (no restore)",
+      "rollback=none" in ur and "restore\n}" not in ur.split("memory_fail()")[1].split("\n}")[0], "")
 check("smoke runs the arm with ids", "--ids" in sm, "")
 check("missing ids fail the smoke", "arm_no_ids" in sm, "")
 check("smoke totals the ids across arms", "SMOKE_ARM_IDS_TOTAL" in sm, "")
 check("update records the ids total, not one arm",
       "SMOKE_ARM_IDS_TOTAL n=" in ur, "")
+# the success line is the one that also claims the check; the memory-failure line above it says
+# rollback=none and must not be mistaken for it
+_ok = 'PAIR_UPDATED pair=$PAIR sha=$SHA build=$BUILD_ID check='
 check("update writes evidence before announcing",
-      ur.index("evidence ok") < ur.index('PAIR_UPDATED pair=$PAIR'), "")
+      ur.index("evidence ok") < ur.index(_ok), "")
 check("failed update writes failed evidence", 'evidence failed "$*"' in ur, "")
 
 check("release dir resolves a sha prefix", 'releases/"$1"*' in src("pair_lib.sh"), "")

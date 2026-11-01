@@ -174,6 +174,22 @@ fail() {
   restore
   exit 1
 }
+# memory_fail: the smoke could not load a server because the GX box had no room for the pack, which
+# says nothing about the release. The code stays installed (current stays moved), the evidence says
+# why, and the manifest is not written -- so the pair fails closed and its queue asks a human instead
+# of running jobs on an unverified release. Rolling the code back here would only re-hide the box.
+memory_fail() {
+  local why=$*
+  pair_step "PAIR_UPDATE_FAILED pair=$PAIR phase=$PHASE why=memory:$why"
+  printf '%s\n' "${smoke_out:-}" | grep -E '^SMOKE_MEM|^SMOKE_SERVER_(SLAB|SWAP_WARN|LOADED)' \
+    | sed 's/^/  /' | tee -a "$PAIR_LOG"
+  [ -n "${SHA:-}" ] && evidence failed "memory: $why"
+  status_write 0 "smoke failed (box memory); release stays installed, no manifest"
+  pair_step "PAIR_UPDATED pair=$PAIR sha=$SHA build=$BUILD_ID smoke=FAILED_MEMORY rollback=none manifest=none"
+  pair_step "PAIR_UPDATE_RECOURSE pair=$PAIR (release installed and current, server never loaded:" \
+    "free $GX, then scripts/pair_update.sh $PAIR $SHA --flip-only to re-smoke and write the manifest)"
+  exit 1
+}
 
 pair_step "UPDATE_START pair=$PAIR gpu=$GPU ct=$P7CT/$GXCT root=$PAIR_ROOT log=$PAIR_LOG"
 if ! gpu_free && [ "${PAIR_UPDATE_FORCE:-0}" != 1 ]; then
@@ -298,7 +314,12 @@ status_write 20 "server start + one decode row"
 smoke_out=$("$HERE/pair_smoke.sh" "$PAIR" "$SHA" 2>&1)
 smoke_rc=$?
 printf '%s\n' "$smoke_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
-[ "$smoke_rc" = 0 ] || fail "smoke rc=$smoke_rc $(printf '%s' "$smoke_out" | grep -m1 SMOKE_FAIL)"
+if [ "$smoke_rc" != 0 ]; then
+  case "$smoke_out" in
+    *"SMOKE_FAIL memory "*) memory_fail "$(printf '%s' "$smoke_out" | grep -m1 'SMOKE_FAIL memory')" ;;
+    *) fail "smoke rc=$smoke_rc $(printf '%s' "$smoke_out" | grep -m1 SMOKE_FAIL)" ;;
+  esac
+fi
 row=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ROW //p' | head -1)
 SMOKE_ROW=$row
 # n= and sha256= of the ids the arms generated (total across arms, and a commitment over every

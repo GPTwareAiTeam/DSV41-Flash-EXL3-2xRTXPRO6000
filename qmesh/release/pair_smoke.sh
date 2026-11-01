@@ -69,9 +69,14 @@ srv_rc=$?
 printf '%s\n' "$srv_out" | grep -E '^(SEAM_ENSURE|SEAM_SLACK)' | sed 's/^/SMOKE_SERVER /'
 case "$srv_rc" in
   0) ;;
-  3) fail "server_preflight_refused $(printf '%s' "$srv_out" | grep -m1 PREFLIGHT_FAIL)"
+  3) line=$(printf '%s' "$srv_out" | grep -m1 PREFLIGHT_FAIL)
+     case "$line" in
+       # the box, not the release, said no: the ticket keeps the code and says so (memory_fail)
+       *gx-mem*) fail "memory server_preflight $line" ;;
+       *)        fail "server_preflight_refused $line" ;;
+     esac
      ;;
-  4) fail "server_slack_refused $(printf '%s' "$srv_out" | grep -m1 SEAM_SLACK)"
+  4) fail "memory server_slack $(printf '%s' "$srv_out" | grep -m1 SEAM_SLACK)"
      ;;
   2) fail "server_timeout_or_died after<${SMOKE_SERVER_TIMEOUT}s $(printf '%s' "$srv_out" | grep -m1 SEAM_ENSURE)"
      ;;
@@ -114,6 +119,12 @@ server_tail() {
 if [ "$arm_rc" != 0 ]; then
   echo "SMOKE_ARM_LOG $ARM_LOG ($(wc -c < "$ARM_LOG" 2>/dev/null || echo 0) bytes)"
   server_tail
+  # A client killed for memory (the box swapped the pack out from under it) is a capacity failure:
+  # classify it so the ticket keeps the release instead of rolling good code back.
+  case "$(printf '%s\n' "$arm_out"; cat "$ARM_LOG" 2>/dev/null)" in
+    *"out of memory"*|*"OutOfMemory"*|*"Cannot allocate memory"*|*"unspecified launch failure"*)
+      fail "memory arm rc=$arm_rc $(printf '%s' "$arm_out" | grep -m1 -iE 'out of memory|OutOfMemory|Cannot allocate memory|unspecified launch failure' | cut -c1-200)" ;;
+  esac
   fail "arm rc=$arm_rc $(printf '%s' "$arm_out" | grep -m1 -E 'peer layout mismatch|remote invalid request|Traceback|Error|error' | cut -c1-300)"
 fi
 case "$arm_out" in
