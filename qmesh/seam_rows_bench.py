@@ -12,7 +12,11 @@ narrower verify width does to the GX1 kernel time. The client requests SEAM_BUCK
 subset the server grants, so one long-lived server serves every arm: no restart per run.
 
 Env: SEAM_DEV, SEAM_GID, SEAM_PEER, SEAM_PORT, SEAM_BUCKETS (requested), BENCH_REPS (default 5),
-     BENCH_LAYERS (default 0 = all layers in the placement), PLACEMENT
+     BENCH_LAYERS (default 0 = all layers in the placement), PLACEMENT,
+     BENCH_HOT_ROWS (default 0: that many rows of every request get an all-hot routing, id -1 in
+     every slot with a nonzero weight - the drafter verify's "this token's top-k is hot" row, which
+     must contribute nothing to the cold gather and must still come back as a finite row),
+     BENCH_HOT_SLOTS (default 0: how many leading slots of the remaining rows are hot).
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ REPS = int(os.environ.get("BENCH_REPS", "5"))
 MAX_LAYERS = int(os.environ.get("BENCH_LAYERS", "0"))
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 ROWS = [int(r) for r in os.environ.get("BENCH_ROWS", "1,2,3,4,5,6,7").split(",")]
+HOT_ROWS = int(os.environ.get("BENCH_HOT_ROWS", "0"))
+HOT_SLOTS = int(os.environ.get("BENCH_HOT_SLOTS", "0"))
 
 # Wire slab geometry, mirrored from qmesh/native/qmesh_expert_seam.cu:geometry() (protocol v3): one
 # pinned slab per row bucket *per side* (client cudaHostAlloc in qes_client_handle, server in
@@ -78,7 +84,8 @@ def main():
     print(f"SEAMROWS layers={len(layers)} cold_min={min(cold[l] for l in layers)} "
           f"cold_max={max(cold[l] for l in layers)} dev={DEV} peer={PEER} "
           f"requested={','.join(map(str, host.BUCKETS))} "
-          f"buckets={','.join(map(str, host.buckets))} reps={REPS} rows={ROWS}", flush=True)
+          f"buckets={','.join(map(str, host.buckets))} reps={REPS} rows={ROWS} "
+          f"hot_rows={HOT_ROWS} hot_slots={HOT_SLOTS}", flush=True)
     stream = torch.cuda.current_stream()
     torch.manual_seed(0)
     dev = torch.device("cuda:0")
@@ -112,6 +119,10 @@ def main():
         for L in layers:
             nc = cold[L]
             ids = torch.stack([torch.randperm(nc, device=dev)[:TOPK] for _ in range(n)]).to(torch.int32)
+            if HOT_SLOTS:
+                ids[:, :min(HOT_SLOTS, TOPK)] = -1
+            if HOT_ROWS:
+                ids[:min(HOT_ROWS, n)] = -1     # whole row hot: nothing for the cold gather
             best_d, best_h = None, None
             for _ in range(REPS):
                 ev0 = torch.cuda.Event(enable_timing=True)
