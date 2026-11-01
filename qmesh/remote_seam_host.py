@@ -39,6 +39,9 @@ TOPK = qes.TOPK
 _PROF = os.environ.get("EXL3_SEAM_PROF", "0") == "1"
 # Decode batches only by default: prefill chunks would land in the same bucket keys
 _PROF_MAX_ROWS = int(os.environ.get("EXL3_SEAM_PROF_ROWS", "6"))
+# Per-request stage trace: layer, bucket, cold count, stream and source pointers, printed host-side
+# only so it cannot change the ordering it is meant to observe.
+_ID_TRACE = os.environ.get("SEAM_ID_TRACE", "0") == "1"
 _prof_rows = {}     # (bucket, n) -> [(host_ns_0, host_ns_1, ev0, ev1)]
 
 
@@ -123,6 +126,10 @@ class RemoteSeamHost:
         # only device buffers qes_issue reads, and they are never freed, so the copies it enqueues
         # can never race an allocation that reuses the same block.
         self._stage_bufs = {}
+        # SEAM_ID_TRACE only: per-bucket (pre, caller, staged, event, layer, rows) of the last
+        # request staged into that bucket, printed one request late (see _trace_ids).
+        self._trace_prev = {}
+        self._trace_hooked = False
 
     def connect(self):
         """Negotiates the session with the GX server (idempotent). Raises RuntimeError with the
@@ -165,7 +172,7 @@ class RemoteSeamHost:
         self.layer_index[key] = idx
         return idx
 
-    def _stage(self, x, ids, w):
+    def _stage(self, layer_idx, x, ids, w):
         """Copies one piece into this host's persistent per-bucket staging tensors.
 
         qes_issue only *enqueues* the device->host copies of x/ids/w, so the tensors it reads must
@@ -192,19 +199,87 @@ class RemoteSeamHost:
                   torch.zeros(bucket, TOPK, dtype = torch.bfloat16, device = dev))
             self._stage_bufs[key] = st
         xp, idp, wp = st
+        trace = _ID_TRACE and not torch.cuda.is_current_stream_capturing()
+        pre = self._trace_pre(dev, idp, n) if trace else None
         xp[:n] = x
         idp[:n] = ids
         wp[:n] = w
         if n < bucket:
             idp[n:].fill_(-1)
             wp[n:].zero_()
+        if trace:
+            self._trace_ids(layer_idx, dev, key, ids, idp, n, pre)
         return bucket, xp, idp, wp
+
+    def _trace_pre(self, dev, idp, n):
+        """Diagnostic (SEAM_ID_TRACE): snapshot of the staging ids *before* this request's write.
+
+        Enqueued on the caller's stream ahead of the write, so the pair (pre, staged) brackets it: a
+        wire value equal to `pre` and not to `staged` means the transport's device-to-host copy ran
+        before this request's write, i.e. it read a previous request's bytes."""
+        if not self._trace_hooked:
+            # A run can end on the request being traced (a forward failure contains the exception,
+            # see Generator.reap_failed_job): the exit dump is the only hook left, and it may sync
+            # because nothing else will use the stream again.
+            self._trace_hooked = True
+            atexit.register(self._trace_final)
+        self._trace_flush()
+        pre = torch.empty(n * TOPK, dtype = torch.int32, pin_memory = True)
+        pre.copy_(idp[:n].reshape(-1), non_blocking = True)
+        return pre
+
+    def _trace_flush(self):
+        """Print the snapshots of every request whose event has completed, without waiting."""
+        for key, prev in list(self._trace_prev.items()):
+            if not prev[3].query():
+                continue
+            del self._trace_prev[key]
+            self._trace_print(prev)
+
+    def _trace_final(self):
+        """Diagnostic (SEAM_ID_TRACE): dump the snapshots still pending at exit."""
+        if not self._trace_prev:
+            return
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        for prev in list(self._trace_prev.values()):
+            self._trace_print(prev)
+        self._trace_prev.clear()
+
+    @staticmethod
+    def _trace_print(prev):
+        pre, caller, staged, _ev, layer_idx, rows = prev
+        print(f"SEAM_ID_PY layer={layer_idx} rows={rows} "
+              f"pre={pre[:rows * TOPK].tolist()} "
+              f"caller={caller[:rows * TOPK].tolist()} "
+              f"staged={staged[:rows * TOPK].tolist()}", file = sys.stderr, flush = True)
+
+    def _trace_ids(self, layer_idx, dev, key, ids, idp, n, pre):
+        """Diagnostic (SEAM_ID_TRACE): pins this request's caller ids and staged ids for a later
+        print, when the event recorded here has completed.
+
+        A readback on the issue path would sync the stream and hide the race it has to observe
+        (EXL3_MOE_SPLIT_ID_CHECK=1 makes the failing arm pass, measured 2026-11-01). Deferring
+        needs no wait: every flush only prints requests whose event has already signalled. The
+        three snapshots bracket the staging write -- `pre` before it, `staged` after it, `caller`
+        the module's tensor - so a wire value equal to `pre` and not to `staged` proves the
+        transport's copy ran ahead of the write, while `caller == staged` puts the value in the
+        module's own translate."""
+        caller = torch.empty(n * TOPK, dtype = torch.int32, pin_memory = True)
+        staged = torch.empty(n * TOPK, dtype = torch.int32, pin_memory = True)
+        caller.copy_(ids.reshape(-1), non_blocking = True)
+        staged.copy_(idp[:n].reshape(-1), non_blocking = True)
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(dev))
+        self._trace_prev[key] = (pre, caller, staged, ev, layer_idx, n)
 
     def _issue_chunk(self, layer_idx, x, ids, w, n_cold = None):
         """x [n,H], ids [n,K], w [n,K], n <= buckets[-1]. Stages to the smallest granted bucket >= n
         (pad rows: id -1, weight 0 -> exact zero contribution) and returns (seam, out)."""
         n = x.shape[0]
-        bucket, xp, idp, wp = self._stage(x, ids, w)
+        bucket, xp, idp, wp = self._stage(layer_idx, x, ids, w)
         dev = x.device
         seam = self._seam(bucket, dev.index or 0)
         stream = torch.cuda.current_stream(dev)
@@ -214,6 +289,18 @@ class RemoteSeamHost:
             ev0.record(stream)
             t0 = time.perf_counter_ns()
         try:
+            if _ID_TRACE:
+                # Host-side only: a readback of ids here would sync the stream and hide the very
+                # race this trace exists to see (measured 2026-11-01: EXL3_MOE_SPLIT_ID_CHECK=1
+                # turned the out-of-range id into a clean run). stream/capturing say whether two
+                # requests for the same bucket can be staged from different streams, which is the
+                # only way the transport's per-request device-to-host copy can read a newer
+                # request's bytes.
+                print(f"SEAM_ID_STAGE layer={layer_idx} rows={n} bucket={bucket} n_cold={n_cold} "
+                      f"stream=0x{stream.cuda_stream:x} "
+                      f"capturing={int(torch.cuda.is_current_stream_capturing())} "
+                      f"x=0x{x.data_ptr():x} ids=0x{ids.data_ptr():x} idp=0x{idp.data_ptr():x}",
+                      file = sys.stderr, flush = True)
             seam.issue(layer_idx, xp.data_ptr(), idp.data_ptr(), wp.data_ptr(),
                        stream.cuda_stream, n_cold or 0)
         except RuntimeError:
@@ -310,7 +397,7 @@ class RemoteSeamHost:
         for s, e, _ in plan:
             if len(inflight) >= ns:
                 self._collect_piece(layer_idx, inflight.pop(0), out, stream)
-            bucket, xp, idp, wp = self._stage(x[s:e], ids[s:e], w[s:e])
+            bucket, xp, idp, wp = self._stage(layer_idx, x[s:e], ids[s:e], w[s:e])
             seam = self._seam(bucket, dev_index)
             seam.issue(layer_idx, xp.data_ptr(), idp.data_ptr(), wp.data_ptr(),
                        stream.cuda_stream, n_cold or 0)

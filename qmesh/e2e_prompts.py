@@ -143,6 +143,13 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
                     chunks += 1
                 if result.get("eos"):
                     eos_result = result
+                if result.get("stage") == "error":
+                    # Generator.reap_failed_job contains a forward failure as an "error" result with
+                    # eos=True. Without this the arm reports 0 tokens with rc=0 and the exception
+                    # that killed the job never reaches the log (measured 2026-11-01: a seam arm
+                    # looked "empty" while the real failure was one layer-0 request).
+                    print(f"ARM_JOB_ERROR {spec} prompt={label} error={result.get('error')!r}",
+                          file = sys.stderr, flush = True)
         wall = time.time() - t0
         st = eos_result or {}
         new_tokens = st.get("new_tokens") or chunks
