@@ -337,15 +337,16 @@ def ws_check(server, rows):
     if not 0 < step < rows:
         print(f"SEAM_WS_CHECK rows={rows} skipped: needs 0 < --ws-rows < rows", flush = True)
         return
-    ncold = server.layers[0][1]
+    ncold = next(iter(server.layers.values()))[1]
     lane = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2) + rows * HIDDEN * 4
     stage = torch.zeros(lane, dtype = torch.uint8, pin_memory = True)
     base = stage.data_ptr()
     x_ptr, ids_ptr = base, base + rows * HIDDEN * 2
     w_ptr, out_ptr = ids_ptr + rows * TOPK * 4, ids_ptr + rows * TOPK * 4 + rows * TOPK * 2
-    # A deterministic ramp, not zeros: identical zeros would hide a piece that came back empty.
-    ramp = (np.arange(rows * HIDDEN, dtype = np.float32) % 97 / 97).astype(np.float32)
-    view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN)[:] = ramp.view(np.uint32) >> 16
+    # A deterministic ramp in [0,1), not zeros: identical zeros would hide a piece that came back
+    # empty. bf16 is the top half of an fp32, so the flat uint16 view takes the high 16 bits.
+    ramp = (np.arange(rows * HIDDEN, dtype = np.float32) % 97 / 97).view(np.uint32) >> 16
+    view(x_ptr, rows * HIDDEN * 2, np.uint16)[:] = ramp.astype(np.uint16)
     view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)[:] = \
         np.arange(rows * TOPK, dtype = np.int32).reshape(rows, TOPK) % max(ncold, 1)
     view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:] = 0x3f00   # 0.5 in bf16
