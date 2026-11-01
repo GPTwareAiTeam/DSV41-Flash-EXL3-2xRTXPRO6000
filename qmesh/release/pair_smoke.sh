@@ -160,7 +160,14 @@ ids_n=${ids_n:-0}
 if [ -n "$ids_lines" ]; then printf '%s\n' "$ids_lines"; else echo "SMOKE_ARM_IDS none"; fi
 echo "SMOKE_ARM_LOG $ARM_LOG"
 echo "SMOKE_ARM_IDS_OUT $ARM_IDS_OUT"
+# One line the ticket can record without guessing which arm came first: the total across arms and a
+# commitment over every ARM_IDS line (arm, count, per-arm hash), so two smokes of one release can be
+# told apart even when a single arm's hash coincides.
+if [ "$ids_n" -gt 0 ]; then
+  ids_commit=$(printf '%s\n' "$ids_lines" | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+  echo "SMOKE_ARM_IDS_TOTAL n=$ids_n sha256=$ids_commit"
+fi
 if [ "$ids_n" -le 0 ] && [ "${SMOKE_IDS_OPTIONAL:-0}" != 1 ]; then
-  fail "arm_no_ids (no ARM_IDS line; driver $ARM_IDS_OUT)"
+  fail "arm_no_ids (no ARM_IDS line from the driver; a release that cannot report ids cannot be promoted, SMOKE_IDS_OPTIONAL=1 skips this)"
 fi
 echo "SMOKE_OK $PAIR $SHA $BUILD_ID"

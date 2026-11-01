@@ -15,5 +15,5 @@ mkdir -p "$WORK/pair/releases/$SHA/src" "$WORK/pair/releases/$SHA/ext"
 echo '{"build_id":"dry-demo","seam":{"fingerprint":"fp:dry","proto":"3"}}' > "$WORK/pair/releases/$SHA/RELEASE.json"
 cd "$REL"
 PAIR_DRY=1 PAIR_DRY_SSH="$WORK/bin/stub_ssh" PAIR_ROOT_OVERRIDE="$WORK/pair" \
-  PAIR_QUEUE_ROOT="$WORK/noq" PAIR_STATE_OVERRIDE="$WORK/pairs" \
+  PAIR_QUEUE="$WORK/noq" PAIR_STATE_OVERRIDE="$WORK/pairs" \
   ./pair_update_run.sh "$PAIR" "$SHA"

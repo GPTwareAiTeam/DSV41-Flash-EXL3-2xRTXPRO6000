@@ -133,6 +133,10 @@ recorded with ids still compares against one recorded without. An arm that produ
 smoke with `arm_no_ids` (opt out with `SMOKE_IDS_OPTIONAL=1` for a release whose driver cannot report
 them -- such a release can not be promoted).
 
+One line per arm, plus `SMOKE_ARM_IDS_TOTAL n=<sum> sha256=<commitment over every ARM_IDS line>`;
+that total is what the ticket records in the evidence, so two arms of one smoke can never be
+confused with one arm that ran twice.
+
 Evidence is per sha, not per pair: dev's manifest moves on with the next release, a promotion may
 follow days later. A failed attempt writes the same file with `ok=false`, the phase it died in and
 the reason, so a later promotion says *why* rather than "no evidence".

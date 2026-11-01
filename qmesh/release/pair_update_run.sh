@@ -289,8 +289,11 @@ printf '%s\n' "$smoke_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
 [ "$smoke_rc" = 0 ] || fail "smoke rc=$smoke_rc $(printf '%s' "$smoke_out" | grep -m1 SMOKE_FAIL)"
 row=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ROW //p' | head -1)
 SMOKE_ROW=$row
-# n= and sha256= of the ids the arm generated; the promotion gate reads this, not the text
-SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS .* n=\([0-9]*\) sha256=\([0-9a-f]*\).*/n=\1 sha256=\2/p' | head -1)
+# n= and sha256= of the ids the arms generated (total across arms, and a commitment over every
+# ARM_IDS line); the promotion gate reads this, not the text. Fall back to the first arm's line for
+# a smoke that predates the total.
+SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS_TOTAL n=\([0-9]*\) sha256=\([0-9a-f]*\).*/n=\1 sha256=\2/p' | head -1)
+[ -n "$SMOKE_IDS" ] || SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS .* n=\([0-9]*\) sha256=\([0-9a-f]*\).*/n=\1 sha256=\2/p' | head -1)
 pair_step "UPDATE_SMOKE pair=$PAIR $row ${SMOKE_IDS:-ids=none}"
 
 # the smoke row is the release's reference row: same release must reproduce it (pair_ref.sh)
