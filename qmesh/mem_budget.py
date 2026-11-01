@@ -39,7 +39,7 @@ from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler,
 from exllamav3.util.memory import vram_accounting
 from qmesh.prefill_limit import PAGE_SIZE, PREFILL_ADAPTIVE, PrefillChunkLimiter
 
-CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
+CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 KV_BITS = int(os.environ.get("KV_BITS", "4"))

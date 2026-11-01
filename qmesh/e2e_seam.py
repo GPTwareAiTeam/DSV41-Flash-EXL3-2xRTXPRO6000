@@ -18,7 +18,7 @@ import torch
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
 
-CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
+CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 MAX_NEW = int(os.environ.get("MAX_NEW", "64"))
 PROMPTS = [

@@ -6,7 +6,7 @@ one prompt per record separated by a blank line), runs greedy decoding, and prin
 line per prompt plus a summary. Timing comes from the engine's own job accounting
 (time_enqueued / time_prefill / time_generate / new_tokens) and from wall clock.
 
-  CHECKPOINT   model dir (default /models/dsv41/exl3-serve-final)
+  CHECKPOINT   model dir (default /models/dsv41/exl3-2.8535-p7hot-hc1)
   DRAFT_CHECKPOINT  drafter (mtp) model dir (default: CHECKPOINT), e.g. the HC1 overlay
   PLACEMENT    placement json (default qmesh/placement.final.json)
   PROMPTS      path to prompt list (JSON array)  [default: built-in 3 prompts]
@@ -48,7 +48,7 @@ import torch
 from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
 
-CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
+CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 MAX_NEW = int(os.environ.get("MAX_NEW", "256"))

@@ -14,7 +14,7 @@ import torch
 
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
 
-CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
+CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 REMOTE_HOST = os.environ.get("REMOTE_HOST", "10.0.100.2")
 REMOTE_PORT = int(os.environ.get("REMOTE_PORT", "29517"))

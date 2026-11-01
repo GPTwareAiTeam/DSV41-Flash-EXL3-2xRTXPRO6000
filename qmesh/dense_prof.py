@@ -9,7 +9,7 @@ from torch.profiler import profile, ProfilerActivity
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from qmesh.null_remote import install
 
-CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
+CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 PLACEMENT = os.environ.get("PLACEMENT", "/src/exllamav3/qmesh/placement.final.json")
 
 def load(max_history=5):
