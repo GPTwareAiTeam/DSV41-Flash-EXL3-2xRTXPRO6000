@@ -97,8 +97,10 @@ pair_step "SMOKE_ARM pair=$PAIR rows=1 new=$SMOKE_NEW"
 # says nothing about why. Keep the bytes, and on failure the server's log tail next to them.
 ARM_LOG=${SMOKE_ARM_LOG:-$PAIR_STATE_DIR/logs/smoke-arm-$PAIR-$(date -u +%Y%m%dT%H%M%SZ).log}
 mkdir -p "$(dirname "$ARM_LOG")" 2>/dev/null || true
-arm_out=$("$HERE/pair_arm.sh" "$PAIR" --rows 1 --max-new "$SMOKE_NEW" --cache-tokens "$SMOKE_CACHE_TOKENS" \
-          --timeout "$SMOKE_ARM_TIMEOUT" 2>&1)
+ARM_IDS_OUT=${ARM_IDS_OUT:-${ARM_LOG%.log}.ids.json}
+arm_out=$(ARM_IDS_OUT="$ARM_IDS_OUT" \
+          "$HERE/pair_arm.sh" "$PAIR" --rows 1 --max-new "$SMOKE_NEW" --cache-tokens "$SMOKE_CACHE_TOKENS" \
+          --timeout "$SMOKE_ARM_TIMEOUT" --ids 2>&1)
 arm_rc=$?
 printf '%s\n' "$arm_out" > "$ARM_LOG" 2>/dev/null || true
 [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$arm_out" >> "$PAIR_LOG"
@@ -148,5 +150,17 @@ PY
 printf '%s\n' "$row" | sed -n 's/^i=/SMOKE_ROW /p'
 new_tokens=$(printf '%s\n' "$row" | sed -n 's/^NEW //p')
 [ "${new_tokens:-0}" -gt 0 ] || fail "arm_no_tokens $(printf '%s\n' "$row" | head -1)"
+# The ids are the promotion's proof that a decode really ran: a wrong build can still emit fluent
+# text, but not the same ids. Missing ids fail the smoke unless SMOKE_IDS_OPTIONAL=1 (a release
+# whose driver cannot report them), because prod may not be reached without them.
+ids_lines=$(printf '%s\n' "$arm_out" | sed -n 's/^ARM_IDS /SMOKE_ARM_IDS /p')
+ids_n=$(printf '%s\n' "$ids_lines" |
+        awk '{for (i = 1; i <= NF; i++) if ($i ~ /^n=/) s += substr($i, 3) + 0} END {print s + 0}')
+ids_n=${ids_n:-0}
+if [ -n "$ids_lines" ]; then printf '%s\n' "$ids_lines"; else echo "SMOKE_ARM_IDS none"; fi
 echo "SMOKE_ARM_LOG $ARM_LOG"
+echo "SMOKE_ARM_IDS_OUT $ARM_IDS_OUT"
+if [ "$ids_n" -le 0 ] && [ "${SMOKE_IDS_OPTIONAL:-0}" != 1 ]; then
+  fail "arm_no_ids (no ARM_IDS line; driver $ARM_IDS_OUT)"
+fi
 echo "SMOKE_OK $PAIR $SHA $BUILD_ID"

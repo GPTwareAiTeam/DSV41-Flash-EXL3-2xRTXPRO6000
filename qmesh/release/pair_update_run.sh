@@ -47,6 +47,55 @@ status_write() {  # <eta_min> <doing>
   [ -n "${GPU_RUN_STATUS:-}" ] && echo "eta_min=$1 doing=$2" > "$GPU_RUN_STATUS" 2>/dev/null
   return 0
 }
+# The release's evidence: what a promotion (pair_promote.sh, and the prod gate in pair_update.sh)
+# reads to decide whether this pair may be copied to the other one. It is written per sha, not per
+# pair, because the pair's manifest moves on with the next release while a promotion may come later.
+#   evidence <ok|failed> <why>
+evidence() {
+  local ok=$1 why=${2:-}
+  [ "${PAIR_DRY:-0}" = 1 ] && return 0
+  python3 - "$PAIR_STATE_DIR/evidence/${SHA:-none}.json" "$PAIR" "${SHA:-}" "${BUILD_ID:-}" \
+           "$ok" "$why" "$PHASE" "${PAIR_LOG:-}" "${SMOKE_ROW:-}" "${SMOKE_IDS:-}" \
+           "$P7CT" "$GXCT" "${REL:-}" <<'PY' 2>&1 | sed 's/^/  /' | tee -a "${PAIR_LOG:-/dev/null}"
+import datetime, json, os, sys
+path, pair, sha, build_id, ok, why, phase, log, row, ids, p7ct, gxct, rel = sys.argv[1:14]
+if not sha:
+    print("EVIDENCE_SKIP no release sha yet")
+    sys.exit(0)
+seam = ""
+try:
+    seam = json.load(open(os.path.join(rel, "RELEASE.json"))).get("seam", {}).get("fingerprint", "")
+except Exception:                                                       # noqa: BLE001
+    pass
+ids_doc = {}
+for tok in ids.split():
+    k, _, v = tok.partition("=")
+    if k == "n":
+        ids_doc["n"] = int(v)
+    elif k == "sha256":
+        ids_doc["sha256"] = v
+doc = {
+    "format": 1,
+    "pair": pair,
+    "release_sha": sha,
+    "build_id": build_id,
+    "seam": seam,
+    "ok": ok == "ok",
+    "failed_at_phase": "" if ok == "ok" else phase,
+    "why": why,
+    "smoke": {"row": row, "ids": ids_doc},
+    "containers": {"p7": p7ct, "gx": gxct},
+    "log": log,
+    "written_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = f"{path}.tmp.{os.getpid()}"
+json.dump(doc, open(tmp, "w"), indent=2, sort_keys=True)
+open(tmp, "a").write("\n")
+os.replace(tmp, path)
+print(f"EVIDENCE {path} pair={pair} sha={sha[:12]} ok={doc['ok']} ids={ids_doc.get('n', 0)}")
+PY
+}
 # Who else is on this pair: tickets in its queue (not our own) or a live client/server process in
 # either of its containers. Recreating a container SIGKILLs an arm someone else is running (2026-11-01
 # 09:39: an 12-minute prefill arm died with CLIENT_RC=137 and no traceback), so this refuses instead.
@@ -108,6 +157,8 @@ restore() {  # only on explicit failure, never from a trap
 fail() {
   pair_step "PAIR_UPDATE_FAILED pair=$PAIR phase=$PHASE why=$*"
   status_write 1 "rollback ($PHASE)"
+  # The failed attempt is evidence too: a later promotion of this sha must see it and say why.
+  [ -n "${SHA:-}" ] && evidence failed "$*"
   restore
   exit 1
 }
@@ -237,7 +288,10 @@ smoke_rc=$?
 printf '%s\n' "$smoke_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
 [ "$smoke_rc" = 0 ] || fail "smoke rc=$smoke_rc $(printf '%s' "$smoke_out" | grep -m1 SMOKE_FAIL)"
 row=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ROW //p' | head -1)
-pair_step "UPDATE_SMOKE pair=$PAIR $row"
+SMOKE_ROW=$row
+# n= and sha256= of the ids the arm generated; the promotion gate reads this, not the text
+SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS .* n=\([0-9]*\) sha256=\([0-9a-f]*\).*/n=\1 sha256=\2/p' | head -1)
+pair_step "UPDATE_SMOKE pair=$PAIR $row ${SMOKE_IDS:-ids=none}"
 
 # the smoke row is the release's reference row: same release must reproduce it (pair_ref.sh)
 python3 - "$PAIR_STATE_DIR/refs-$SHA.json" "$SHA" "$BUILD_ID" "$REL" "$row" <<'PY' | tee -a "$PAIR_LOG"
@@ -278,5 +332,7 @@ printf '%s\n' "$check_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
 VERIFIED=1
 status_write 1 "done"
 
-pair_step "PAIR_UPDATED pair=$PAIR sha=$SHA build=$BUILD_ID check=IN_SYNC"
+# Evidence last, so the file only exists once the pair is really on the release and verified.
+evidence ok
+pair_step "PAIR_UPDATED pair=$PAIR sha=$SHA build=$BUILD_ID check=IN_SYNC ${SMOKE_IDS:-ids=none}"
 echo "$SHA"

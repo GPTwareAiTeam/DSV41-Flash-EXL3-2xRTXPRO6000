@@ -105,6 +105,22 @@ ur = src("pair_update_run.sh")
 check("update records whether the pair was serving", "UPDATE_SERVER_BEFORE" in ur, "")
 check("restore skips a server that never served", "RESTORE_SERVER_SKIP" in ur, "")
 
+# The canary gate: prod is reachable only through pair_promote.sh, and only for a sha dev proved by
+# generating token ids. These are source invariants because the alternative -- trusting the flags at
+# run time -- is exactly the drift this tooling exists to stop.
+check("prod update refuses without the promote flag", 'PAIR_PROMOTE:-0' in src("pair_update.sh"), "")
+check("prod update names the only way in", "pair_promote.sh" in src("pair_update.sh"), "")
+check("promote passes the flag and nothing else does",
+      'PAIR_PROMOTE=1 "${cmd[@]}"' in src("pair_promote.sh")
+      and 'PAIR_PROMOTE=1' not in src("pair_update_run.sh"), "")
+check("promote requires per-sha dev evidence", "dev/evidence/$SHA.json" in src("pair_promote.sh"), "")
+check("promote wants decode ids, not just a row", "no_decode_ids" in src("pair_promote.sh"), "")
+check("smoke runs the arm with ids", "--ids" in sm, "")
+check("missing ids fail the smoke", "arm_no_ids" in sm, "")
+check("update writes evidence before announcing",
+      ur.index("evidence ok") < ur.index('PAIR_UPDATED pair=$PAIR'), "")
+check("failed update writes failed evidence", 'evidence failed "$*"' in ur, "")
+
 check("release dir resolves a sha prefix", 'releases/"$1"*' in src("pair_lib.sh"), "")
 
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

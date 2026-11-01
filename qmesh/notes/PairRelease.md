@@ -117,6 +117,30 @@ of "this stamp names this build").
 For prod, the prepare has to happen in a container that is **not serving**: create `seam-p7-prod` /
 `seam-gx1-prod` fresh and prepare there, while the arms that are running keep their own containers.
 
+## Dev is the canary, and the gate is code
+
+`pair_update.sh prod` only exists behind `pair_promote.sh`. Without `PAIR_PROMOTE=1` it exits 2 with
+the command to use, before it reads anything or touches the queue; `pair_promote.sh` is the only
+thing that sets that flag. The flag alone is not enough: for that exact sha there must be a
+`pairs/dev/evidence/<sha>.json` written by the dev ticket itself, and it must say
+`ok=true`, carry a smoke row, and carry **generated token ids** (`smoke.ids.n > 0`).
+
+Text is not proof. A wrong build can still emit fluent-looking output; the ids it actually generated
+are what a mismatched tree, a stale JIT cache or a half-flipped release cannot reproduce. The smoke
+arm therefore runs through `pair_arm_ids.py` (`pair_arm.sh --ids`), which wraps the release's own
+`run_arm` and prints `ARM_IDS arm=… n=… sha256=… first=…`; the rows are unchanged, so a reference row
+recorded with ids still compares against one recorded without. An arm that produces no ids fails the
+smoke with `arm_no_ids` (opt out with `SMOKE_IDS_OPTIONAL=1` for a release whose driver cannot report
+them -- such a release can not be promoted).
+
+Evidence is per sha, not per pair: dev's manifest moves on with the next release, a promotion may
+follow days later. A failed attempt writes the same file with `ok=false`, the phase it died in and
+the reason, so a later promotion says *why* rather than "no evidence".
+
+The order is therefore: `pair_prepare.sh dev <sha>` (out of band) → `pair_update.sh dev <sha>
+--flip-only` → wait for `PAIR_UPDATED … ids=n>` → `pair_prepare.sh prod <sha>` in the fresh,
+non-serving prod containers → `pair_promote.sh <sha>` (which re-checks dev, the seam fingerprint and
+the evidence, then queues the prod ticket).
 
 ## Incidents that shaped these guards
 

@@ -43,6 +43,34 @@ crc=$?
 printf '%s\n' "$dev_check"
 [ "$crc" = 0 ] || { [ "$FORCE" = 1 ] || pair_die "dev does not check out (rc=$crc); not promoting"; }
 
+# The manifest says what dev serves NOW; the evidence says the sha passed there. They are different
+# questions -- dev's manifest moves on with every release, while the promotion may come later -- and
+# prod refuses to move without the evidence anyway (pair_update.sh). Check it here first, so the
+# refusal names the missing piece instead of a gate deep inside the prod ticket.
+ev=$PAIR_STATE/dev/evidence/$SHA.json
+[ -f "$ev" ] || pair_die "no dev canary evidence for ${SHA:0:12}: $ev (dev must reach PAIR_UPDATED)"
+ev_gate=$(python3 - "$ev" "$SHA" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as exc:                                                # noqa: BLE001
+    print(f"unreadable {exc}"); sys.exit(0)
+bad = []
+if d.get("release_sha") != sys.argv[2]:
+    bad.append(f"sha={str(d.get('release_sha'))[:12]}")
+if d.get("pair") != "dev":
+    bad.append(f"pair={d.get('pair')}")
+if not d.get("ok"):
+    bad.append(f"ok=false at {d.get('failed_at_phase') or '?'} ({d.get('why') or 'no reason'})")
+ids = ((d.get("smoke") or {}).get("ids") or {})
+if int(ids.get("n") or 0) <= 0:
+    bad.append("no_decode_ids")
+print(" ".join(bad) if bad else "ok")
+PY
+)
+[ "$ev_gate" = ok ] || pair_die "dev evidence for ${SHA:0:12} does not qualify: $ev_gate ($ev)"
+pair_step "PROMOTE_EVIDENCE sha=${SHA:0:12} ids=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print((d.get("smoke") or {}).get("ids",{}).get("n",0))' "$ev") file=$ev"
+
 rel=$(pair_release_dir "$SHA")
 new_seam=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["seam"]["fingerprint"])' \
            "$rel/RELEASE.json" 2>/dev/null)
@@ -51,8 +79,10 @@ if [ "$new_seam" != "$dev_seam" ]; then
   echo "PROMOTE_WARN seam ${new_seam} differs from dev ${dev_seam}"
   [ "$FORCE" = 1 ] || pair_die "seam fingerprint changed; that is a different protocol, promote it deliberately (--force)"
 fi
-pair_step "PROMOTE_OK sha=${SHA:0:12} seam=$new_seam dev=IN_SYNC"
+pair_step "PROMOTE_OK sha=${SHA:0:12} seam=$new_seam dev=IN_SYNC evidence=$ev"
 
 pair_load prod
 cmd=("$HERE/pair_update.sh" prod "$SHA" ${MINS:+--max-min "$MINS"})
-"${cmd[@]}"
+# pair_update.sh prod refuses without this: the evidence check has already happened here, and the
+# flag is what says so. Nothing else sets it.
+PAIR_PROMOTE=1 "${cmd[@]}"

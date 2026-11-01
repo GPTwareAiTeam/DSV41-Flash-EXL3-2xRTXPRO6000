@@ -8,6 +8,10 @@
 # stderr) and returns the client's exit code, or 124 on timeout. The timeout is not politeness: a
 # client against a mismatched or dead seam server blocks forever instead of failing, and a smoke
 # step that can hang is worse than one that fails.
+#
+# `--ids` runs the same driver through pair_arm_ids.py, which additionally prints one
+# `ARM_IDS arm=… n=… sha256=… first=…` line per arm (the ids the engine generated) and writes them
+# to $ARM_IDS_OUT. Everything else is unchanged, so a row recorded with `--ids` compares equal.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=pair_lib.sh
@@ -15,7 +19,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 PAIR_ARG=${1:?usage: pair_arm.sh <pair> [--rows N] ...}
 shift
-ROWS=1; MAX_NEW=8; WARMUP=0; CACHE=4096; ARM_TIMEOUT=300; OUT=""
+ROWS=1; MAX_NEW=8; WARMUP=0; CACHE=4096; ARM_TIMEOUT=300; OUT=""; IDS=0
 PROMPTS=${PAIR_ARM_PROMPTS:-/artifacts/2x-rtx-tp2/dtrain/prompts_held.json}
 CHECKPOINT=${PAIR_ARM_CHECKPOINT:-/models/dsv41/exl3-2.8535-p7hot-hc1}
 while [ $# -gt 0 ]; do
@@ -28,6 +32,7 @@ while [ $# -gt 0 ]; do
     --checkpoint) CHECKPOINT=$2; shift ;;
     --timeout) ARM_TIMEOUT=$2; shift ;;
     --out) OUT=$2; shift ;;
+    --ids) IDS=1 ;;
     *) pair_die "unknown flag $1" ;;
   esac
   shift
@@ -43,10 +48,18 @@ envs=(
   -e "CACHE_TOKENS=$CACHE" -e "PROMPTS=$PROMPTS" -e "CHECKPOINT=$CHECKPOINT"
 )
 [ -n "$OUT" ] && envs+=(-e "OUT=$OUT")
+[ "$IDS" = 1 ] && envs+=(-e "ARM_IDS_OUT=${ARM_IDS_OUT:-}")
 
 if [ "$PAIR_DRY" = 1 ]; then
-  echo "DRY docker exec ${envs[*]} $P7CT bash -lc 'cd /src/exllamav3 && timeout $ARM_TIMEOUT python3 -u qmesh/e2e_prompts.py'"
+  if [ "$IDS" = 1 ]; then drv="python3 -u - < pair_arm_ids.py"; else drv="python3 -u qmesh/e2e_prompts.py"; fi
+  echo "DRY docker exec ${envs[*]} $P7CT bash -lc 'cd /src/exllamav3 && timeout $ARM_TIMEOUT $drv'"
   exit 0
 fi
-timeout "$ARM_TIMEOUT" docker exec "${envs[@]}" "$P7CT" \
-  bash -lc "cd /src/exllamav3 && python3 -u qmesh/e2e_prompts.py"
+if [ "$IDS" = 1 ]; then
+  # the driver is fed on stdin, so a bare `docker exec` would close it: -i is required
+  timeout "$ARM_TIMEOUT" docker exec -i "${envs[@]}" "$P7CT" \
+    bash -lc "cd /src/exllamav3 && python3 -u -" < "$HERE/pair_arm_ids.py"
+else
+  timeout "$ARM_TIMEOUT" docker exec "${envs[@]}" "$P7CT" \
+    bash -lc "cd /src/exllamav3 && python3 -u qmesh/e2e_prompts.py"
+fi
