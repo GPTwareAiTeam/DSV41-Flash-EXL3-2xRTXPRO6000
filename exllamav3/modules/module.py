@@ -65,6 +65,9 @@ class Module(ABC):
         return all(module.can_defer_load() for module in self.modules)
 
     def load(self, device: torch.Device, **kwargs):
+        # Model.load() accepts a "cuda:N" string; every device test downstream (DSA pool sharing,
+        # cache layer mirrors) compares against tensor.device, so normalize once here
+        device = torch.device(device) if device is not None else None
         self.device = device
         for module in self.modules:
             module.load(device, **kwargs)

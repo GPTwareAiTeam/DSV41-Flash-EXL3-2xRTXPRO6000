@@ -2688,7 +2688,10 @@ class DSV4Attention(Module):
                                          bt_row, pos0, None, m, seq, epp, True)
             pool_len = ec
         elif self.kv_source is not None:
-            assert kl.device == device, "DSV4Attention: shared pool on another device"
+            assert kl.device == device, \
+                f"DSV4Attention: shared pool on another device (layer {self.layer_idx}, " \
+                f"source {self.kv_source}, pool {kl.device}, attn {device}, " \
+                f"owner {self.kv_owner.layer_idx if self.kv_owner is not None else None})"
             dense_m, epp, pool_len = self.compress_rate, kl.epp, ec
 
         if topk_regime:

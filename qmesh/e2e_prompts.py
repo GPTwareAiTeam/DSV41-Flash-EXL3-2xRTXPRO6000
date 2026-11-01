@@ -17,7 +17,7 @@ Env:
   MAX_CHUNK    prefill chunk (default 2048)
   DSPARK       1 to enable the DSpark draft model
   NUM_DRAFT    draft width K (default 5)
-  WARMUP       number of prompts used as warm-up and excluded from the summary (default 0)
+  CACHE_TOKENS KV pool tokens, allocated before model.load (default 4096; >= prompt + MAX_NEW)
   OUT          jsonl output path (also echoed to stdout)
   MAX_PROMPTS  cap the prompt list (default 0 = all)
 """
@@ -42,7 +42,9 @@ MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 DSPARK = os.environ.get("DSPARK") == "1"
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 WARMUP = int(os.environ.get("WARMUP", "0"))
+CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 OUT = os.environ.get("OUT", "")
+DEBUG_RESULTS = os.environ.get("DEBUG_RESULTS") == "1"
 CORPUS_TOKENS = int(os.environ.get("CORPUS_TOKENS", "24000"))
 DEFAULT_PROMPTS = [
     "The capital of France is",
@@ -89,6 +91,8 @@ def main():
         "port": int(os.environ.get("SEAM_PORT", "47311")),
     }
     model = Model.from_config(config)
+    # Recipe A sizes its hybrid expert pools during load, so the cache has to exist first
+    cache = Cache(model, max_num_tokens=CACHE_TOKENS, max_history=5)
     t0 = time.time()
     model.load(device="cuda:0", progressbar=False)
     free, total = torch.cuda.mem_get_info(0)
@@ -98,12 +102,17 @@ def main():
 
     tokenizer = Tokenizer.from_config(config)
     draft_model = None
+    draft_cache = None
     if DSPARK:
         draft_config = Config.from_directory(CHECKPOINT)
         draft_model = Model.from_config(draft_config, component="mtp")
+        draft_cache = Cache(draft_model, max_num_tokens=CACHE_TOKENS, max_history=5)
         t1 = time.time()
         draft_model.load(device="cuda:0", progressbar=False)
         print(f"DSPARK_LOADED {time.time() - t1:.1f}s", flush=True)
+    generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=MAX_CHUNK,
+                          draft_model=draft_model, draft_cache=draft_cache,
+                          num_draft_tokens=NUM_DRAFT if DSPARK else None)
 
     prompts = load_prompts()[: int(os.environ.get("MAX_PROMPTS", "0")) or None]
     # Warm-up prompts are synthetic, excluded from the summary, and never touch the prompt list
@@ -113,12 +122,8 @@ def main():
     rows = []
     for idx, (label, prompt) in enumerate(prompts):
         ids = tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True)
-        cache = Cache(model, max_num_tokens=len(ids) + MAX_NEW + 64, max_history=2)
-        draft_cache = Cache(draft_model, max_num_tokens=len(ids) + MAX_NEW + 64, max_history=2) \
-            if draft_model is not None else None
-        generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=MAX_CHUNK,
-                              draft_model=draft_model, draft_cache=draft_cache,
-                              num_draft_tokens=NUM_DRAFT if DSPARK else None)
+        assert len(ids) + MAX_NEW <= CACHE_TOKENS, \
+            f"prompt {label}: {len(ids)} tokens + {MAX_NEW} new exceed CACHE_TOKENS={CACHE_TOKENS}"
         limiter = None
         if PREFILL_ADAPTIVE:
             generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(torch.device("cuda:0"))
@@ -130,6 +135,10 @@ def main():
         eos_result = None
         while generator.num_remaining_jobs():
             for result in generator.iterate():
+                if DEBUG_RESULTS:
+                    print("DBG " + json.dumps(
+                        {k: (list(v.shape) if isinstance(v, torch.Tensor) else v)
+                         for k, v in result.items() if k != "text"}, default=str), flush=True)
                 chunk = result.get("text", "")
                 if chunk:
                     text += chunk
@@ -148,7 +157,7 @@ def main():
         toks_per_round = (new_tokens / rounds) if rounds else None
         free, total = torch.cuda.mem_get_info(0)
         row = {
-            "i": idx, "label": label, "prompt_tokens": len(ids), "new_tokens": new_tokens,
+            "i": idx, "label": label, "prompt_tokens": int(ids.shape[-1]), "new_tokens": new_tokens,
             "ttft_ms": round(1000.0 * prefill_s, 1),
             "decode_ms_per_tok": round(decode_ms, 2),
             "wall_s": round(wall, 3),
@@ -166,8 +175,7 @@ def main():
             fh.flush()
         if idx >= WARMUP:
             rows.append(row)
-        del generator, job, cache, draft_cache
-        torch.cuda.empty_cache()
+        del job
 
     def med(key):
         vals = sorted(r[key] for r in rows if r.get(key) is not None)

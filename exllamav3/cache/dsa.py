@@ -113,6 +113,7 @@ class CacheLayer_dsa(CacheLayer):
         return self.k_bits > 0
 
     def alloc(self, device: torch.device):
+        device = torch.device(device)
         self.device = device
         self.mirrors = {}
         if self.kv_format == "fp4":
