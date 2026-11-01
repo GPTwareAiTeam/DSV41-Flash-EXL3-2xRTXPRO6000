@@ -58,7 +58,11 @@ Supervisor (main session) runs this without owner input. Team: max 3 GPU agents 
    GX calls first (first 64-row call was 2.5 s).
 5. sens/RESULTS.md write-up (per-matrix study); decide tp2/permatrix-k2 fix merge.
 6. Archive: GX2 `~/afd` (214 GB) move, rerun when GX2 idle; ARCHIVE_INDEX + journal.
-7. Cleanup: stopped containers `exl3-sens-1031`, `exl3-sens2-1031`; old seam-gx1b after v2 verified.
+7. Port audit v1.2 -> v2: the standalone rebase dropped kernels (dsa_compact_ent*, p2p_oneshot, prefill_ar:
+   restored df856721/3d1fde98). Diff recipe/2x-rtxpro6000-tp2 vs recipe/gpu0-gx1-v2 over exllamav3/ for every
+   commit missing from v2 (e.g. 532c5d77 configurable 48-row fused MoE tile, not in v2); port or record why not.
+   GPU kernel tests (tests/kernels/{dsa,moe}) through the queue after.
+8. Cleanup: stopped containers `exl3-sens-1031`, `exl3-sens2-1031`; old seam-gx1b after v2 verified.
 
 ## Morning report (supervisor, ready by owner wake-up)
 Memory table (Slot A), quant outputs (Slot B), seam robustness result (Slot C), speed numbers
@@ -72,3 +76,6 @@ on both pairs on the same build, anything that failed and what was done about it
   ~170 rows/s on both pairs = seam-bound (see backlog #4, now top priority after Slot C). rise==predicted exactly
   (3056 MiB) on every chunk: asked GxPort2 to verify it isn't circular and to report card-level peaks.
 - 01:05 Download complete: 83/83 files, sizes match HF; sha256 of 49 LFS files vs HF running.
+- 01:25 More rebase damage found by GxPort2: extension did not build from source (missing parallel/p2p_oneshot,
+  prefill_ar; 1,096 lines). Restored verbatim from v1.2 (verified byte-identical), 115 DSA kernel tests pass.
+  final_prod6 running on GPU0 (numbers ~01:50). QuantHC: measured 0.3 s/tensor, A+B done ~04:00, campaign ~05:00.
