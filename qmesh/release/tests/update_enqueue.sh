@@ -56,6 +56,21 @@ want "an empty ticket is refused" "no command given" "$out"
 [ "$rc" != 0 ] && echo "OK   empty ticket exit=$rc" || { echo "FAIL empty ticket exit=0"; fails=$((fails + 1)); }
 [ ! -s "$WORK/argv" ] && echo "OK   nothing was started" || { echo "FAIL the stub runner was called"; fails=$((fails + 1)); }
 
+# The runner names its ticket with its own $$, and setsid(1) may fork, so the pid in the ticket is
+# not the pid pair_enqueue got from $!. Matching on it reported ENQUEUE_FAILED for jobs that were
+# queued and did run (2026-11-01: a probe ran on dev while its caller was told nothing had).
+cat > "$WORK/queue/run_dev.sh" <<EOF2
+#!/usr/bin/env bash
+agent=\$1
+printf '%s\n' "\$@" > "$WORK/argv"
+: > "$WORK/queue/dev/gpu_queue/01-1-999999-\$agent"
+EOF2
+chmod +x "$WORK/queue/run_dev.sh"
+rm -f "$WORK/argv"
+out=$(./pair_update.sh dev "$SHA" --flip-only --max-min 240 2>&1); rc=$?
+want "a ticket carrying another pid is still reported as queued" "ENQUEUED dev agent=PairUpdate" "$out"
+want "the reported ticket is the file the runner wrote" "ticket=01-1-999999-PairUpdate" "$out"
+
 echo "RESULT $([ "$fails" = 0 ] && echo PASS || echo FAIL) fails=$fails"
 rm -rf "$WORK"
 [ "$fails" = 0 ]

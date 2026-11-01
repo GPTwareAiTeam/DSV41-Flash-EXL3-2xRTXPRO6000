@@ -196,22 +196,29 @@ pair_enqueue() {  # <agent> <max_minutes> <cmd...>
   # A ticket with no command would hold the GPU for zero seconds and report success; the queue
   # would look like it ran the update. Refuse instead -- and the caller must be the one that dies.
   [ "$#" -gt 0 ] || pair_die "pair_enqueue $agent: no command given (nothing would run)"
-  local run q logdir log pid t i
+  local run q logdir log pid t i before after
   run=$(pair_run_script)
   [ -x "$run" ] || pair_die "queue runner missing: $run"
   q=$PAIR_QUEUE/$PAIR/gpu_queue
   logdir=$PAIR_STATE_DIR/logs
   mkdir -p "$logdir" "$q"
   log=$logdir/enqueue-$PAIR-$agent-$(date -u +%Y%m%dT%H%M%SZ).log
+  # What is already queued, so the new ticket is found by difference and not by guessing its name.
+  before=$(ls "$q" 2>/dev/null)
   # setsid: the ticket wrapper and everything it starts form their own process group, so cancelling
   # the job kills the whole group (the queue does kill -- -<pgid>) and nothing outlives its window.
   setsid nohup "$run" "$agent" "$mins" "$@" >"$log" 2>&1 </dev/null &
   pid=$!
-  # The ticket is created by the runner as <rank>-<ns>-<pid>-<agent>; wait for it so the caller
-  # reports the ticket it actually got instead of assuming the launch worked.
+  # Wait for the ticket so the caller reports the one it actually got. Match on the agent suffix and
+  # on "not there before", never on $pid: the runner names the ticket with its own $$ and setsid(1)
+  # may fork, so the name's pid is not $! -- matching it reported ENQUEUE_FAILED for tickets that
+  # were queued and did run (2026-11-01, a probe ran while the caller was told nothing had).
   t=""
   for i in $(seq 1 40); do
-    t=$(ls "$q"/[0-9]*-*-"$pid"-"$agent" 2>/dev/null | head -1)
+    after=$(ls "$q" 2>/dev/null)
+    t=$(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort) 2>/dev/null \
+          | awk -v s="-$agent" 'length($0) > length(s) && substr($0, length($0) - length(s) + 1) == s' \
+          | head -1)
     [ -n "$t" ] && break
     sleep 0.25
   done
@@ -220,7 +227,7 @@ pair_enqueue() {  # <agent> <max_minutes> <cmd...>
     tail -5 "$log" 2>/dev/null
     return 1
   fi
-  echo "ENQUEUED $PAIR agent=$agent pid=$pid ticket=$(basename "$t") log=$log"
+  echo "ENQUEUED $PAIR agent=$agent pid=$pid ticket=$t log=$log"
 }
 # PairUpdate must land right after the job that is running now, ahead of every other waiter: the
 # queue ranks agents by their line in gpu_priority.txt, so line 1 is enough. Tickets already taken
