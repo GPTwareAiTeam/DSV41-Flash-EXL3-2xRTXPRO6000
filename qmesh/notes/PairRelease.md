@@ -412,7 +412,11 @@ GX boxes) together with its half-built ext cache and the torch `lock` baton a ki
 behind. No `current` link was ever moved: dev still points at `32923b9a`, prod has no link, no
 manifest exists, and nothing was queued, so neither pair changed state tonight.
 
-The merge stays in `tools/pair-release` history -- it is release 1 plus a lock that removes a real
-(if not *the*) hazard, and the fix that is coming will be merged on top of it -- but no release
-should be cut for a pair until the faulting frame is named and tested. Cutting an unreleased tree
-is free; flipping a pair onto one is not.
+The merge itself is **reverted** (`2e4eec4b`, `git revert -m 1 3c361e8f`), so the release line is
+release 1's server again: `qmesh/worker_seam_server.py` is `8eb4f792…`, the file release 1 shipped.
+That is the honest state -- a lock that does not fix the crash must not ride into a release on the
+strength of being harmless. The fix that is coming (the `SEAM_COMPUTE_TRACE` / `CUDA_LAUNCH_BLOCKING`
+work, `c011674d`) is merged as its own change; if it turns out to need the lock, the way back is
+`git revert 2e4eec4b` (a re-merge of the same branch would otherwise be a no-op, because git still
+counts `3c361e8f` as an ancestor). Cutting an unreleased tree is free; flipping a pair onto one is
+not.
