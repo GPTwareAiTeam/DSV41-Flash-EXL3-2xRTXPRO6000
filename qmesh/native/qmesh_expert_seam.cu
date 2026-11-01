@@ -319,9 +319,11 @@ extern "C" qes_handle* qes_create(int role, const char* dev_name, int gid_idx, c
 
   int sock = role == QES_ROLE_SERVER ? tcp_listen_accept(port) : tcp_connect(peer_ip, port);
   Hello peer{};
-  if (role == QES_ROLE_SERVER) { xfer(sock, &peer, sizeof(peer), false); xfer(sock, &mine, sizeof(mine), true); }
-  else { xfer(sock, &mine, sizeof(mine), true); xfer(sock, &peer, sizeof(peer), false); }
-  close(sock);
+  /* The server answers only after its QP is in RTS (below): the client starts writing as soon as it has
+   * our hello, and an RC write to a responder that is still in INIT/RTR is NAKed as "remote invalid
+   * request" and pushes our QP to ERROR (seen as qes: wc error ... opcode=1 on the client). */
+  if (role == QES_ROLE_SERVER) { xfer(sock, &peer, sizeof(peer), false); }
+  else { xfer(sock, &mine, sizeof(mine), true); xfer(sock, &peer, sizeof(peer), false); close(sock); }
   if (peer.layers != QES_NL || peer.rows != (uint32_t)rows) fail("peer layout mismatch");
 
   /* RTR: destination GID is the peer's RoCEv2 GID; sgid_index is our local index. */
@@ -344,6 +346,7 @@ extern "C" qes_handle* qes_create(int role, const char* dev_name, int gid_idx, c
   if (ibv_modify_qp(h->qp, &s, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                                 IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC))
     fail("qp rts");
+  if (role == QES_ROLE_SERVER) { xfer(sock, &mine, sizeof(mine), true); close(sock); }
 
   h->remote_base = peer.base;
   h->remote_rkey = peer.rkey;
