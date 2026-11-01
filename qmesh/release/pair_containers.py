@@ -184,6 +184,55 @@ def plan_side(cfg, side):
     return why
 
 
+QROOT = os.environ.get("PAIR_QUEUE_ROOT", "/home/treadall/recipe-artifacts/gpu0-gx1/queue")
+
+
+def _conf_rows():
+    """(pair, p7ct, gxct) for every row of pairs.conf."""
+    rows = []
+    with open(os.path.join(HERE, "pairs.conf")) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            f_ = line.split()
+            if len(f_) >= 8:
+                rows.append((f_[0], f_[1], f_[8]))
+    return rows
+
+
+def _live_ticket_uses(ct):
+    """True if a live queue runner in any pair's queue has `ct` on its command line."""
+    for q in sorted(os.listdir(QROOT)) if os.path.isdir(QROOT) else []:
+        qd = os.path.join(QROOT, q, "gpu_queue")
+        if not os.path.isdir(qd):
+            continue
+        for t in os.listdir(qd):
+            if not t[0].isdigit():
+                continue
+            pid = t.split("-")[2]
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    argv = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+            except OSError:
+                continue
+            if ct in argv:
+                return f"{q}/gpu_queue/{t} pid={pid}"
+    return ""
+
+
+def check_ownership(cfg):
+    """A container belongs to one pair and is never touched while another queue's job runs in it."""
+    for side in ("p7", "gx"):
+        ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]
+        for pair, p7ct, gxct in _conf_rows():
+            if pair != cfg["pair"] and ct in (p7ct, gxct):
+                die(f"{ct} belongs to pair {pair} (pairs.conf); {cfg['pair']} may not touch it")
+        who = _live_ticket_uses(ct)
+        if who:
+            die(f"{ct} is named by a live ticket ({who}); refusing to recreate it")
+
+
 def cmd_plan(cfg, quiet=False):
     rc = 0
     for side in ("p7", "gx"):
@@ -222,6 +271,7 @@ def cmd_apply(cfg, sha, ts, force=False):
         die("apply needs a release sha")
     if not os.path.isdir(os.path.join(cfg["root"], "releases", sha, "src")):
         die(f"release {sha[:8]} is not cut at {cfg['root']}")
+    check_ownership(cfg)
     todo = [(s, plan_side(cfg, s)) for s in ("p7", "gx")]
     todo = [(s, w) for s, w in todo if w]
     if not todo and not force:
@@ -254,6 +304,7 @@ def cmd_apply(cfg, sha, ts, force=False):
 
 
 def cmd_rollback(cfg, ts):
+    check_ownership(cfg)
     stop_our_server(cfg)
     for side in ("p7", "gx"):
         ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]

@@ -1,5 +1,5 @@
 {
-  "name": "seam-p7v2",
+  "name": "seam-p7-dev",
   "image": "vllm-moet:dsv41-213d5fa",
   "workdir": "/vllm-workspace",
   "entrypoint": "sleep",

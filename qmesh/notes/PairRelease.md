@@ -29,6 +29,22 @@ edit therefore reaches a container only through a release, and never reaches a h
 robust line (`seam-*-robust`) are deliberately outside the manifests: they are some other
 experiment's containers, and touching them would repeat the drift we are fixing.
 
+## One container per pair -- never shared
+
+Each pair owns its own client container on P7 and its own server container on the GX box, and the
+names in `pairs.conf` belong to exactly one pair. Sharing a client container between the two pairs
+is what let a dev update SIGKILL two prod arms on 2026-11-01: `dev` was configured with
+`p7ct = seam-p7v2`, which was the container GPU0 arms actually ran in, so re-creating it for dev
+killed them mid-prefill with `CLIENT_RC=137` and no traceback. Two guards now refuse that class of
+mistake before any docker call:
+
+* `pair_containers.py` refuses to touch a container that is another pair's `p7ct`/`gxct` in
+  `pairs.conf` (`die: belongs to pair <p>`), and refuses to recreate one whose name appears on the
+  command line of a live ticket runner in any queue (`die: named by a live ticket`). It applies to
+  `apply` and `rollback` alike.
+* `pair_update_run.sh` refuses to start when the pair's GPU has a compute app or when a client or
+  server process is alive in either of the pair's containers.
+
 ## Release identity
 
 * `sha` = the commit the source tree was cut from. The first release of the system is a commit on
