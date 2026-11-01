@@ -37,6 +37,7 @@ EXL3_WHOLE_GRAPH=0 and is not part of ARMS.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
 import sys
@@ -51,7 +52,27 @@ from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
-PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
+
+def _placement_from_pack(ckpt):
+    """The pack's own placement file, when it ships one.
+
+    PACK_MANIFEST.json names the exact placement the pack was cut against, and its sha256 is what the
+    GX seam server's Hello carries, so a client that reads it cannot disagree with the server about
+    which experts are cold. The repo default is the 2.8535 pack's; used against the 4620 packs it sent
+    cold ids up to 256 into a 248-expert table and the server fail-stopped on the first forward
+    (2026-11-01 17:46, GX2, arm A), which reads exactly like a transport fault and is not one.
+    """
+    try:
+        with open(os.path.join(ckpt, "PACK_MANIFEST.json")) as fh:
+            p = json.load(fh).get("placement")
+    except (OSError, ValueError):
+        return None
+    return p if isinstance(p, str) and os.path.exists(p) else None
+
+
+PLACEMENT = (os.environ.get("PLACEMENT") or _placement_from_pack(CHECKPOINT)
+             or os.path.join(os.path.dirname(__file__), "placement.final.json"))
+
 MAX_NEW = int(os.environ.get("MAX_NEW", "256"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 DSPARK = os.environ.get("DSPARK") == "1"
@@ -230,6 +251,12 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
 
 def main():
     placement = json.load(open(PLACEMENT))
+    # Printed before any model work: the server's Hello carries its own placement sha, and a client
+    # whose table came from another pack shows up here as a different number instead of as a dead
+    # handle on the first forward.
+    print(f"CLIENT_PLACEMENT path={PLACEMENT} "
+          f"sha={hashlib.sha256(open(PLACEMENT, 'rb').read()).hexdigest()[:16]} "
+          f"ckpt={CHECKPOINT}", flush=True)
     hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
