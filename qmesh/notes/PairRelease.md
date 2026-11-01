@@ -295,9 +295,62 @@ pack or gating on `dev_free_mib` is the owner's call, not the release's.
 So the ticket tells the two apart, and only capacity failures skip the rollback. `pair_smoke.sh`
 marks a refusal from the box (`PREFLIGHT_FAIL gx-mem`, `SEAM_SLACK` with the gate on) and a client
 the kernel or CUDA killed (`out of memory`, `Cannot allocate memory`, `unspecified launch failure`)
-as `SMOKE_FAIL memory …`; `pair_update_run.sh` then takes the `memory_fail` path instead of `fail`:
-the release stays installed and current, evidence says `ok=false, why=memory:…`, **no manifest is
+**in the client's own output** as `SMOKE_FAIL memory …`; `pair_update_run.sh` then takes the
+`memory_fail` path instead of `fail`: the release stays installed and current, evidence says
+`ok=false, why=memory:…`, **no manifest is
 written**, and it prints `PAIR_UPDATED … smoke=FAILED_MEMORY rollback=none manifest=none` plus the
 `SMOKE_MEM_*` lines. That last part is the point: the pair fails closed -- the queue refuses jobs on
 an unverified release -- while the box, not the code, is named as the reason. A wire mismatch, a
 stamp mismatch or a crash still rolls back.
+
+What is *not* in that list is the server's own `SEAM_COMPUTE_FAIL layer=N rows=1 err=AcceleratorError:
+CUDA error: unspecified launch failure ... exiting: a server that cannot compute must not answer`.
+It arrives in the server's tail, not in the client's output, so the pair treats it as a hard failure
+and rolls back (that is what the dev smoke did on 2026-11-01 at avail 560 MiB). Widening the memory
+verdict to cover a server-side line is a decision for the owner, not something a smoke script should
+quietly assume.
+
+
+## Measured, 2026-11-01: the margin, and what names a build
+
+The numbers above are one night's, and they are what the pair now encodes:
+
+| | GX2 (dev) | GX1 (prod) |
+| --- | --- | --- |
+| MemTotal | 124546 MiB | 124546 MiB |
+| clean `MemAvailable` | 120586 | 120311 |
+| pack load needs | 116362 | 116362 |
+| after the load | avail 1120-1183, swapped 3692-3890 | avail 1549 refused / 1633-1657 ok |
+| first compute dies at | avail 560 (`SEAM_COMPUTE_FAIL layer=19 rows=1`) | avail <= 1549 |
+
+The load costs the pack plus ~1100-1300 MiB (`exl3` module scratch, pinned slabs, the CUDA context)
+and one forward needs ~1600 MiB more. `SEAM_LOAD_MARGIN_MIB` (`qmesh/worker_seam_server.py:99`) is
+the only place that decides whether the box has that; its default is now 2048 (it was 1024) and that
+is a *floor*, not a promise. `pairs.conf` states the pair's own number -- prod 2560, dev 3072 --
+`pair_lib.sh` exports it as `LOAD_MARGIN`, and both places that start a server (`pair_smoke.sh`,
+the restore in `pair_update_run.sh`) pass `SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN` through `SEAM_ENV`.
+Nobody starts a server on the default any more, and the sweep rule keeps it that way.
+
+Be exact about what the margin can do: GX2 passes 3072 by ~1150 MiB and *still* lands on the wall,
+because the box is 120586 MiB clean and the pack is 116362. The margin refuses a box that something
+else has already made dirtier; it cannot make GX2 fit. The operator signal that the box is over its
+head before the first request is `SEAM_SERVER_SWAP_WARN` (512 MiB): GX2 prints it at ~3.7 GiB swapped
+on every start, margin or no margin.
+
+The second half of tonight's trap: a released tree carries no `.git`, so `qes.build_id()` (env ->
+`git rev-parse` -> `<tree>/qmesh/BUILD_ID`) answered `"unknown"` and
+`SEAM_SESSION_START ... build=unknown proto=3` was accepted -- the pair was mixed and nothing said
+so. `pair_cut.sh` now writes `<tree>/qmesh/BUILD_ID` into both halves when it builds a release and
+`pair_arm.sh` exports the same id as `SEAM_BUILD_ID` into the client container, so `build=` names
+one release on both sides and a mixed pair is visible in the first log line.
+
+Drift that is deliberate and therefore recorded rather than chased: `qmesh/native/*.so` is not
+tracked in git, so a release *rebuilds* the seam lib from the commit. Three builds of the same
+sources exist on the boxes (79048 B measured by GxPort2 in `exllamav3-fork`, 78712 B in
+`recipe-gpu0-gx1-v2`, 154936 B from this builder), so a release's lib is not byte-comparable with a
+hand-built one. Release stamps name the build; numbers measured against a hand-built lib are tied
+to that lib's sha and must be re-baselined when a release takes the tree over. In the same spirit,
+`seam-gx1b` was patched in place (`worker_seam_server.py` `242854c1` -> `da7e82c0`, the port of the
+compute lock) while it serves no release tree: `pair_check.sh` reporting `DRIFT` there is expected
+until a release owns that container.
+
