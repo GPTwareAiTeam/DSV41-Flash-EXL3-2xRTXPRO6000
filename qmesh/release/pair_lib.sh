@@ -29,12 +29,12 @@ pair_say() { echo "$(date '+%H:%M:%S') $*"; }
 # pair_step: timestamped line, also appended to $PAIR_LOG when set (every job sets it).
 pair_step() { say_line=$(printf '%s %s' "$(date '+%H:%M:%S')" "$*"); echo "$say_line"; [ -n "${PAIR_LOG:-}" ] && echo "$say_line" >> "$PAIR_LOG"; return 0; }
 
-pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH
+pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN
   local p=${1:?usage: pair_load <pair>} conf=${2:-$PAIR_CONF} line
   [ -r "$conf" ] || pair_die "config not readable: $conf"
   line=$(awk -v p="$p" '!/^#/ && NF && $1==p {print; exit}' "$conf")
   [ -n "$line" ] || pair_die "pair '$p' is not in $conf"
-  read -r PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH <<<"$line"
+  read -r PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN <<<"$line"
   PAIR_ROOT=${PAIR_ROOT_OVERRIDE:-$PAIR_ROOT}
   # A relative root puts every release, log and stamp wherever the caller happened to stand: a
   # stubbed harness once grew four full source trees inside that repository way.
@@ -42,7 +42,13 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
     /*) ;;
     *) pair_die "pair root must be absolute: '$PAIR_ROOT'" ;;
   esac
-  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH
+  # LOAD_MARGIN: what the pack load must leave behind, in MiB. Measured on both GX boxes, the load
+  # consumes the pack plus ~1200 MiB and compute needs ~1600 MiB more, so the worker's own default
+  # (2048) is a floor, not a promise -- the pair states its number here. GX2 has ~120585 MiB clean,
+  # so 3072 passes by ~1150 MiB and the box still lands at the wall: the margin can only refuse a
+  # dirtier box, it cannot make GX2 fit (qmesh/notes/PairRelease.md).
+  LOAD_MARGIN=${LOAD_MARGIN:-2048}
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
   PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}

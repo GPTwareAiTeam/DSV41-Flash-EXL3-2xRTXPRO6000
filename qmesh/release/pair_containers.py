@@ -41,7 +41,8 @@ def load_conf(pair):
         if f[0] != pair:
             continue
         keys = ["pair", "p7ct", "gpu", "seam_dev", "seam_gid", "gx_gid", "seam_peer", "gx_host",
-                "gxct", "root", "port", "buckets", "p7_arch", "gx_arch"]
+                "gxct", "root", "port", "buckets", "p7_arch", "gx_arch",
+                "load_margin"]
         d = dict(zip(keys, f))
         d["root"] = os.environ.get("PAIR_ROOT_OVERRIDE") or d["root"]
         return d

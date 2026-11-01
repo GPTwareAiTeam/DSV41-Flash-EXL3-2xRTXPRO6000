@@ -38,6 +38,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 pair_load "$PAIR_ARG"
+# The client half must name the release it is running, or the server's session handshake accepts a
+# mixed pair (`SEAM_SESSION_START ... build=unknown proto=3`, 2026-11-01). A released tree has no
+# .git, so qes.build_id() falls back to <tree>/qmesh/BUILD_ID (written by pair_cut.sh); exporting it
+# here makes the env the first answer on both halves, which is the pair-level check that matters.
+BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' \
+  "$PAIR_ROOT/current/RELEASE.json" 2>/dev/null) || BUILD_ID=""
 
 envs=(
   -e "CUDA_VISIBLE_DEVICES=$GPU"
@@ -48,6 +54,7 @@ envs=(
   -e "MAX_PROMPTS=$ROWS" -e "MAX_NEW=$MAX_NEW" -e "WARMUP=$WARMUP" -e "WARMUP_NEW=$MAX_NEW"
   -e "CACHE_TOKENS=$CACHE" -e "PROMPTS=$PROMPTS" -e "CHECKPOINT=$CHECKPOINT"
 )
+[ -n "$BUILD_ID" ] && envs+=(-e "SEAM_BUILD_ID=$BUILD_ID")
 [ -n "$OUT" ] && envs+=(-e "OUT=$(pair_ct_path "$OUT")")
 # The driver has to be a real file, not stdin: the client's CPU-host module starts its worker with
 # multiprocessing "spawn", which re-executes the parent's main file by path -- with `python3 -` that

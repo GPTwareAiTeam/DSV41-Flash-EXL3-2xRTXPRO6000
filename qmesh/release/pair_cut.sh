@@ -146,6 +146,11 @@ cut_side() {  # <p7|gx> <root>
   if [ "$side" = p7 ]; then
     rm -rf "$tmp"; mkdir -p "$tmp/src" || return 1
     git -C "$PAIR_REPO" archive --format=tar "$SHA" | tar -x -C "$tmp/src" || return 1
+    # The client half has no .git and no SEAM_BUILD_ID in its container, so without this file it
+    # reports build=unknown to the server's session handshake and a pair can be mixed without
+    # anybody noticing (2026-11-01: `SEAM_SESSION_START ... build=unknown proto=3`, accepted).
+    # qes.build_id() reads <tree>/qmesh/BUILD_ID as its last fallback; write it, never hand-copy.
+    printf '%s\n' "$BUILD_ID" > "$tmp/src/qmesh/BUILD_ID" || return 1
     printf '%s\n' "$RELEASE_JSON" > "$tmp/RELEASE.json"
     rm -rf "$rel"
     mv -T "$tmp" "$rel" || return 1
@@ -156,8 +161,10 @@ cut_side() {  # <p7|gx> <root>
                tar -x -C '$tmp/src'; echo EXTRACTED" \
           < <(git -C "$PAIR_REPO" archive --format=tar "$SHA")) || return 1
     case "$out" in *EXTRACTED*) ;; *) echo "EXTRACT_FAILED $PAIR gx: $out"; return 1 ;; esac
-    out=$(printf '%s\n' "$RELEASE_JSON" | pair_gxsh "set -e; cat > '$tmp/RELEASE.json'; \
-               rm -rf '$rel'; mv -T '$tmp' '$rel'; echo CUT_OK") || return 1
+    out=$(pair_gxsh "set -e; printf '%s\n' '$BUILD_ID' > '$tmp/src/qmesh/BUILD_ID'; \
+               cat > '$tmp/RELEASE.json'; \
+               rm -rf '$rel'; mv -T '$tmp' '$rel'; echo CUT_OK") \
+          < <(printf '%s\n' "$RELEASE_JSON") || return 1
     case "$out" in *CUT_OK*) ;; *) echo "CUT_FAILED $PAIR gx: $out"; return 1 ;; esac
   fi
   local n

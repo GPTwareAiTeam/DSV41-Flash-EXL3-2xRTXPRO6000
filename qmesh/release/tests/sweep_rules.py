@@ -207,5 +207,25 @@ check("a failed smoke stops the server it started",
       "RESTORE_SERVER_STOP" in src("pair_update_run.sh")
       and "pkill -f worker_seam_server.py" in src("pair_update_run.sh"), "")
 
+# A released tree carries no .git and its container carries no SEAM_BUILD_ID, so qes.build_id()
+# answered "unknown" and the session handshake accepted a mixed pair on proto alone (2026-11-01).
+# Both halves must name the same build: the cut writes <tree>/qmesh/BUILD_ID, the arm exports it.
+check("the cut writes the build id into the release tree",
+      src("pair_cut.sh").count('$tmp/src/qmesh/BUILD_ID') == 2, "")
+check("the client half is told which build it runs",
+      'envs+=(-e "SEAM_BUILD_ID=$BUILD_ID")' in src("pair_arm.sh")
+      and '"$PAIR_ROOT/current/RELEASE.json"' in src("pair_arm.sh"), "")
+
+# No load may run on the worker's own 2048 MiB default: the pair states what the pack load must
+# leave behind, and both places that start a server have to pass it (measured GX numbers).
+check("the load margin is the pair's number, not the worker's default",
+      pc.load_conf("dev")["load_margin"] == "3072"
+      and pc.load_conf("prod")["load_margin"] == "2560", "")
+check("every server start carries the margin",
+      src("pair_smoke.sh").count("SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN") == 1
+      and src("pair_update_run.sh").count("SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN") == 1, "")
+
+
+
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
 sys.exit(1 if fails else 0)
