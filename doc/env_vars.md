@@ -359,6 +359,17 @@ and synchronize after each probe and measurement launch, naming it first, so a l
 completes is identified instead of hanging silently. Autotune-only; it does not affect tuned
 launches.
 
+### `EXL3_ROUTER_INT8` (default: `0`)
+
+Route multi-row (prefill, verify) batches through the deterministic int8 tensor-core projection
+(`ext.routing_gemm_det`) instead of the half-gate router GEMV. By default every row count uses the
+half-gate GEMV, which runs one grid row per token with single-row accumulation order, so a token's
+experts and weights are identical whether it is decoded alone or inside a 2..6-row verify batch.
+The int8 path needs an extra (2, E, K) int8 copy of each layer's gate plus a quantisation pass at
+first use, and matches the half path only up to its own quantization; set it to `1` only to
+compare, or on devices where the GEMV is slower than the tensor-core projection at prefill widths.
+
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)

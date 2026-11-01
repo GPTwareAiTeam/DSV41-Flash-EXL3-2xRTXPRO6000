@@ -205,16 +205,16 @@ void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lan
 }
 
 
-// Single-token router gemv on a transposed gate copy: scores = x @ gate_t.T. One warp per
-// expert; cheaper than a cublas call at this size
+// Fixed-order router GEMV on a transposed gate copy, one warp per expert and
+// one grid row per token. Each token uses the same arithmetic as single-row routing.
 #define RGEMV_WARPS 8
 
 __global__ __launch_bounds__(RGEMV_WARPS * 32)
 void routing_gemv_kernel
 (
-    const half* __restrict__ x,         // (k)
+    const half* __restrict__ x,         // (m, k)
     const half* __restrict__ gate_t,    // (E, k)
-    half* __restrict__ scores,          // (E)
+    half* __restrict__ scores,          // (m, E)
     const int k,
     const int E
 )
@@ -224,7 +224,7 @@ void routing_gemv_kernel
     int row = blockIdx.x * RGEMV_WARPS + warp;
     if (row >= E) return;
 
-    const half2* x2 = (const half2*) x;
+    const half2* x2 = (const half2*) (x + (size_t) blockIdx.y * k);
     const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
 
     float sum = 0.0f;
@@ -240,7 +240,7 @@ void routing_gemv_kernel
         sum += __shfl_down_sync(0xffffffffu, sum, offset);
 
     if (lane == 0)
-        scores[row] = __float2half_rn(sum);
+        scores[(size_t) blockIdx.y * E + row] = __float2half_rn(sum);
 }
 
 void routing_gemv
@@ -254,19 +254,17 @@ void routing_gemv
     cudaStream_t stream
 )
 {
-    // Single rows take the fixed-order FMA GEMV (exact on every architecture, and the fastest);
-    // with the int8 gate available every other row count takes the deterministic int8
-    // tensor-core projection (routing_gemm.cu), so tensor-parallel ranks of any sm_80+
-    // architecture routing on identical streams select identical experts (the int8 kernels
-    // need cp.async and mma.m16n8k32, both sm_80+). Pre-Ampere devices fall back to cuBLAS,
-    // which is device-dependent — uniform per-arch fleets still agree with each other
+    // The half gate uses the single-row accumulation order for every token.
+    // When supplied, the optional int8 gate retains the deterministic tensor-core path.
     int k = hidden.size(-1);
     int E = scores.size(-1);
 
     // Empty hidden dim: the projection is an empty sum
     if (k == 0) { scores.zero_(); return; }
 
-    bool bsz1 = hidden.numel() == k;
+    int64_t rows = hidden.numel() / k;
+    if (rows == 0 || E == 0) return;
+    bool bsz1 = rows == 1;
 
 #if defined(USE_ROCM)
     // RDNA: the m = 1..8 router GEMV (rocm/routing_gemv_rdna.cuh). It reads the weights once per row block, so
@@ -281,15 +279,20 @@ void routing_gemv
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
     else
-    if (bsz1 && gate_t.has_value() && !(k & 1) && !(((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.value().data_ptr()) & 3))
+    if (gate_t.has_value() && hidden.is_contiguous() && scores.is_contiguous() && !(k & 1) && !(((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.value().data_ptr()) & 3))
     {
-        routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
-        (
-            (const half*) hidden.data_ptr(),
-            (const half*) gate_t.value().data_ptr(),
-            (half*) scores.data_ptr(),
-            k, E
-        );
+        // Tile the row dimension to stay within CUDA's grid.y limit.
+        for (int64_t start = 0; start < rows; start += 65535)
+        {
+            unsigned int count = (unsigned int) (rows - start < 65535 ? rows - start : 65535);
+            routing_gemv_kernel<<<dim3(CEIL_DIVIDE(E, RGEMV_WARPS), count), RGEMV_WARPS * 32, 0, stream>>>
+            (
+                (const half*) hidden.data_ptr() + start * k,
+                (const half*) gate_t.value().data_ptr(),
+                (half*) scores.data_ptr() + start * E,
+                k, E
+            );
+        }
     }
     else
     {

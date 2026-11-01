@@ -6,6 +6,7 @@ buffers live in the RoutingCFG (CUDA-graph paths bake their addresses).
 """
 from __future__ import annotations
 import torch
+import os
 import torch.nn.functional as F
 from dataclasses import dataclass
 from ..util.device_copy import to_device
@@ -13,6 +14,8 @@ from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 
+
+_ROUTER_INT8 = os.environ.get("EXL3_ROUTER_INT8") == "1"
 ROUTING_CACHE_ROWS = 128
 
 
@@ -69,7 +72,7 @@ class RoutingCFG:
     router_bias: torch.Tensor | None = None
     tid2eid: torch.Tensor | None = None
     e_score_bias_vl: torch.Tensor | None = None   # DeepSeek-V4 vision: selection bias for image rows
-    gate_i8: torch.Tensor | None = None     # (2, E, K) int8 hi/lo slices, lazy (see _gate_i8)
+    gate_i8: torch.Tensor | None = None     # (2, E, K) int8 hi/lo slices, lazy (see _gate_t)
     gate_sb: torch.Tensor | None = None     # (E) fp32 row scales
     gate_tensor_f32: torch.Tensor | None = None       # grouped DS3 router: fp32 gate for multi-row logits, lazy
     e_score_bias_f32: torch.Tensor | None = None      # grouped DS3 router: fp32 selection bias, lazy
@@ -77,13 +80,13 @@ class RoutingCFG:
 
 
 def _gate_t(cfg):
-    """Transposed (E, K) half gate for the single-row GEMV, plus the int8 hi/lo slices and row
-    scales for the deterministic multi-row projection (ext.routing_gemm_det), both built lazily
-    (weights may be deferred when the RoutingCFG is constructed). Builds without the deterministic
-    projection leave the int8 slices unset and route on the half gate."""
+    """Build the transposed (E, K) half gate and, when opted in (EXL3_ROUTER_INT8=1), the
+    deterministic int8 slices for the multi-row tensor-core projection (ext.routing_gemm_det).
+    The half gate serves every row count: the router GEMV runs one grid row per token with
+    single-row accumulation order, so multi-row decode matches 1-row decode bit for bit."""
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
+    if _ROUTER_INT8 and cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
         E, K = cfg.gate_tensor_t.shape
         cfg.gate_i8 = torch.empty((2, E, K), dtype = torch.int8, device = cfg.gate_tensor_t.device)
         cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)

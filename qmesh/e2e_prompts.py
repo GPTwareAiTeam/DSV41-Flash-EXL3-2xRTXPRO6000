@@ -20,9 +20,19 @@ line per prompt plus a summary. Timing comes from the engine's own job accountin
   MAX_CHUNK    prefill chunk (default 2048)
   DSPARK       1 to enable the DSpark draft model
   NUM_DRAFT    draft width K (default 5)
+  ARMS         comma-separated arms measured in ONE process after a single load
+               (default: 'dspark1' when DSPARK=1 else 'dspark0'). Arm names: 'dspark1' (draft at
+               NUM_DRAFT) and 'dspark0' (drafter resident but idle: num_draft_tokens = 0, so the
+               target-only arm costs no second load). Each arm runs the identical prompt list and
+               prints its own rows and `SUMMARY` line, tagged "arm". The drafter is loaded once if
+               any arm drafts.
   CACHE_TOKENS KV pool tokens, allocated before model.load (default 4096; >= prompt + MAX_NEW)
   OUT          jsonl output path (also echoed to stdout)
   MAX_PROMPTS  cap the prompt list (default 0 = all)
+
+The round-profiled arm (`EXL3_ROUND_PROF=1`) needs its own process: roundprof resolves its
+function bodies at import and the per-layer marks only fire in eager mode, so that run also sets
+EXL3_WHOLE_GRAPH=0 and is not part of ARMS.
 """
 from __future__ import annotations
 
@@ -55,6 +65,7 @@ CORPUS_TOKENS = int(os.environ.get("CORPUS_TOKENS", "24000"))
 CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
 LONG_TOKENS = int(os.environ.get("LONG_TOKENS", "0"))
 LONG_PROMPT_FILE = os.environ.get("LONG_PROMPT_FILE", "")
+ARMS = [a.strip() for a in os.environ.get("ARMS", "").split(",") if a.strip()]
 # KV_BITS=4 (default) is DeepSeek's trained FP4 layout for the compressed pools: whole 512-wide
 # latent rows plus indexer keys, as the model was trained; 8 packs the nope part with CacheLayer_quant;
 # 16 is the fp16 pool. The DSA pools take the same kwargs on target and draft caches
@@ -68,6 +79,7 @@ DEFAULT_PROMPTS = [
     "Write a Python function that returns the nth Fibonacci number.",
     "List three primary colors and explain why they matter in painting.",
 ]
+ARM_NAMES = ("dspark0", "dspark1")
 
 
 def load_prompts():
@@ -97,6 +109,107 @@ def load_prompts():
     return [(f"p{i}", p) for i, p in enumerate(DEFAULT_PROMPTS)]
 
 
+def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
+    """Runs the whole prompt list for one arm and returns its SUMMARY dict. Both arms run in the
+    same process after one load: 'dspark0' idles the drafter by zeroing the draft window, which
+    the generator reads per iteration, instead of unloading it."""
+    use_draft = spec != "dspark0"
+    generator.num_draft_tokens = NUM_DRAFT if use_draft else 0
+    rows = []
+    for idx, (label, prompt) in enumerate(prompts):
+        ids = (long_ids if prompt is None else
+               tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True))
+        mn = WARMUP_NEW if label.startswith("warm") else MAX_NEW
+        assert int(ids.shape[-1]) + mn <= CACHE_TOKENS, \
+            f"prompt {label}: {int(ids.shape[-1])} tokens + {mn} new exceed CACHE_TOKENS={CACHE_TOKENS}"
+        limiter = None
+        if PREFILL_ADAPTIVE:
+            generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(torch.device("cuda:0"))
+        job = Job(input_ids=ids, max_new_tokens=mn, sampler=GreedySampler())
+        generator.enqueue(job)
+        t0 = time.time()
+        text = ""
+        chunks = 0
+        eos_result = None
+        while generator.num_remaining_jobs():
+            for result in generator.iterate():
+                if DEBUG_RESULTS:
+                    print("DBG " + json.dumps(
+                        {k: (list(v.shape) if isinstance(v, torch.Tensor) else v)
+                         for k, v in result.items() if k != "text"}, default=str), flush=True)
+                chunk = result.get("text", "")
+                if chunk:
+                    text += chunk
+                    chunks += 1
+                if result.get("eos"):
+                    eos_result = result
+        wall = time.time() - t0
+        st = eos_result or {}
+        new_tokens = st.get("new_tokens") or chunks
+        prefill_s = (st.get("time_enqueued", 0.0) + st.get("time_prefill", 0.0)) or float("nan")
+        gen_s = st.get("time_generate", float("nan"))
+        decode_ms = 1000.0 * gen_s / max(new_tokens - 1, 1)
+        acc = st.get("accepted_draft_tokens", 0)
+        rej = st.get("rejected_draft_tokens", 0)
+        rounds = getattr(job, "verify_rounds", 0)
+        toks_per_round = (new_tokens / rounds) if rounds else None
+        free, total = torch.cuda.mem_get_info(0)
+        row = {
+            "i": idx, "label": label, "arm": spec,
+            "prompt_tokens": int(ids.shape[-1]), "new_tokens": new_tokens,
+            "ttft_ms": round(1000.0 * prefill_s, 1),
+            "decode_ms_per_tok": round(decode_ms, 2),
+            "wall_s": round(wall, 3),
+            "accepted": acc, "rejected": rej, "verify_rounds": rounds,
+            "accept_rate": round(acc / max(acc + rej, 1), 4) if (acc or rej) else None,
+            "tokens_per_round": round(toks_per_round, 3) if toks_per_round else None,
+            "verify_widths": {str(k): v for k, v in sorted(getattr(job, "verify_widths", {}).items())},
+            "gpu0_free_gib": round(free / 2**30, 2),
+            "prefill_chunks": limiter.chunks if limiter else None,
+            "prefill_shrunk": limiter.shrunk if limiter else None,
+            "text": text[:400],
+        }
+        print(json.dumps(row, ensure_ascii=False), flush=True)
+        if fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.flush()
+        if idx >= WARMUP:
+            rows.append(row)
+        del job
+
+    def med(key):
+        vals = sorted(r[key] for r in rows if r.get(key) is not None)
+        return vals[len(vals) // 2] if vals else None
+
+    def mean(key):
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        return round(sum(vals) / len(vals), 3) if vals else None
+
+    hist = {}
+    for r in rows:
+        for k, v in r["verify_widths"].items():
+            hist[int(k)] = hist.get(int(k), 0) + v
+    n_rounds = sum(hist.values())
+    return {
+        "arm": spec,
+        "n": len(rows), "dspark": use_draft, "num_draft": NUM_DRAFT if use_draft else None,
+        "max_new": MAX_NEW,
+        "decode_ms_per_tok_mean": mean("decode_ms_per_tok"),
+        "decode_ms_per_tok_median": med("decode_ms_per_tok"),
+        "ttft_ms_mean": mean("ttft_ms"),
+        "tokens_per_round_mean": mean("tokens_per_round"),
+        "accept_rate_mean": mean("accept_rate"),
+        "verify_width_hist": {str(k): v for k, v in sorted(hist.items())},
+        "verify_width_mean": (round(sum(k * v for k, v in hist.items()) / n_rounds, 3)
+                              if n_rounds else None),
+        "gate": (draft_model.gate_summary() if use_draft and draft_model is not None
+                 and hasattr(draft_model, "gate_summary") else None),
+        "gpu0_free_gib_min": min((r["gpu0_free_gib"] for r in rows), default=None),
+        "tokens": sum(r["new_tokens"] for r in rows),
+        "wall_s": round(sum(r["wall_s"] for r in rows), 2),
+    }
+
+
 def main():
     placement = json.load(open(PLACEMENT))
     hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
@@ -118,9 +231,15 @@ def main():
           f"free={free / 2**30:.2f}GiB total={total / 2**30:.2f}GiB", flush=True)
 
     tokenizer = Tokenizer.from_config(config)
+    arms = ARMS or [("dspark1" if DSPARK else "dspark0")]
+    for spec in arms:
+        assert spec in ARM_NAMES, f"unknown arm '{spec}' (known: {', '.join(ARM_NAMES)})"
+    # One drafter load serves every arm that drafts; a dspark0-only run still loads it only if a
+    # later arm needs it, so the process never pays two drafter loads
+    want_draft = any(spec != "dspark0" for spec in arms)
     draft_model = None
     draft_cache = None
-    if DSPARK:
+    if want_draft:
         draft_config = Config.from_directory(DRAFT_CHECKPOINT)
         draft_model = Model.from_config(draft_config, component="mtp")
         draft_cache = Cache(draft_model, max_num_tokens=CACHE_TOKENS, max_history=5, **KV_CACHE_KWARGS)
@@ -129,7 +248,7 @@ def main():
         print(f"DSPARK_LOADED {time.time() - t1:.1f}s", flush=True)
     generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=MAX_CHUNK,
                           draft_model=draft_model, draft_cache=draft_cache,
-                          num_draft_tokens=NUM_DRAFT if DSPARK else None)
+                          num_draft_tokens=NUM_DRAFT if want_draft else None)
     if MEM_BREAKDOWN:
         # Resident VRAM by owner after load (target + drafter + caches + generator statics),
         # before any job; then the peak since this reset is reported at the end
@@ -178,97 +297,15 @@ def main():
         print(f"LONG_PROMPT tokens={int(long_ids.shape[-1])} files={len(cat)}", flush=True)
         prompts = [("long", None)] + prompts[:WARMUP]
     fh = open(OUT, "a", encoding="utf-8") if OUT else None
-    rows = []
-    for idx, (label, prompt) in enumerate(prompts):
-        ids = (long_ids if prompt is None else
-               tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True))
-        mn = WARMUP_NEW if label.startswith("warm") else MAX_NEW
-        assert int(ids.shape[-1]) + mn <= CACHE_TOKENS, \
-            f"prompt {label}: {int(ids.shape[-1])} tokens + {mn} new exceed CACHE_TOKENS={CACHE_TOKENS}"
-        limiter = None
-        if PREFILL_ADAPTIVE:
-            generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(torch.device("cuda:0"))
-        job = Job(input_ids=ids, max_new_tokens=mn, sampler=GreedySampler())
-        generator.enqueue(job)
-        t0 = time.time()
-        text = ""
-        chunks = 0
-        eos_result = None
-        while generator.num_remaining_jobs():
-            for result in generator.iterate():
-                if DEBUG_RESULTS:
-                    print("DBG " + json.dumps(
-                        {k: (list(v.shape) if isinstance(v, torch.Tensor) else v)
-                         for k, v in result.items() if k != "text"}, default=str), flush=True)
-                chunk = result.get("text", "")
-                if chunk:
-                    text += chunk
-                    chunks += 1
-                if result.get("eos"):
-                    eos_result = result
-        wall = time.time() - t0
-        st = eos_result or {}
-        new_tokens = st.get("new_tokens") or chunks
-        prefill_s = (st.get("time_enqueued", 0.0) + st.get("time_prefill", 0.0)) or float("nan")
-        gen_s = st.get("time_generate", float("nan"))
-        decode_ms = 1000.0 * gen_s / max(new_tokens - 1, 1)
-        acc = st.get("accepted_draft_tokens", 0)
-        rej = st.get("rejected_draft_tokens", 0)
-        rounds = getattr(job, "verify_rounds", 0)
-        toks_per_round = (new_tokens / rounds) if rounds else None
-        free, total = torch.cuda.mem_get_info(0)
-        row = {
-            "i": idx, "label": label, "prompt_tokens": int(ids.shape[-1]), "new_tokens": new_tokens,
-            "ttft_ms": round(1000.0 * prefill_s, 1),
-            "decode_ms_per_tok": round(decode_ms, 2),
-            "wall_s": round(wall, 3),
-            "accepted": acc, "rejected": rej, "verify_rounds": rounds,
-            "accept_rate": round(acc / max(acc + rej, 1), 4) if (acc or rej) else None,
-            "tokens_per_round": round(toks_per_round, 3) if toks_per_round else None,
-            "verify_widths": {str(k): v for k, v in sorted(getattr(job, "verify_widths", {}).items())},
-            "gpu0_free_gib": round(free / 2**30, 2),
-            "prefill_chunks": limiter.chunks if limiter else None,
-            "prefill_shrunk": limiter.shrunk if limiter else None,
-            "text": text[:400],
-        }
-        print(json.dumps(row, ensure_ascii=False), flush=True)
+    for spec in arms:
+        print(f"ARM_START {spec} prompts={len(prompts)} max_new={MAX_NEW} "
+              f"num_draft={NUM_DRAFT if spec != 'dspark0' else 0}", flush=True)
+        summary = run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh)
+        print("SUMMARY " + json.dumps(summary), flush=True)
         if fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fh.write("SUMMARY " + json.dumps(summary) + "\n")
             fh.flush()
-        if idx >= WARMUP:
-            rows.append(row)
-        del job
-
-    def med(key):
-        vals = sorted(r[key] for r in rows if r.get(key) is not None)
-        return vals[len(vals) // 2] if vals else None
-
-    def mean(key):
-        vals = [r[key] for r in rows if r.get(key) is not None]
-        return round(sum(vals) / len(vals), 3) if vals else None
-
-    hist = {}
-    for r in rows:
-        for k, v in r["verify_widths"].items():
-            hist[int(k)] = hist.get(int(k), 0) + v
-    n_rounds = sum(hist.values())
-    summary = {
-        "n": len(rows), "dspark": DSPARK, "num_draft": NUM_DRAFT if DSPARK else None,
-        "max_new": MAX_NEW,
-        "decode_ms_per_tok_mean": mean("decode_ms_per_tok"),
-        "decode_ms_per_tok_median": med("decode_ms_per_tok"),
-        "ttft_ms_mean": mean("ttft_ms"),
-        "tokens_per_round_mean": mean("tokens_per_round"),
-        "accept_rate_mean": mean("accept_rate"),
-        "verify_width_hist": {str(k): v for k, v in sorted(hist.items())},
-        "verify_width_mean": (round(sum(k * v for k, v in hist.items()) / n_rounds, 3)
-                              if n_rounds else None),
-        "gate": (draft_model.gate_summary() if draft_model is not None
-                 and hasattr(draft_model, "gate_summary") else None),
-        "gpu0_free_gib_min": min((r["gpu0_free_gib"] for r in rows), default=None),
-        "tokens": sum(r["new_tokens"] for r in rows),
-        "wall_s": round(sum(r["wall_s"] for r in rows), 2),
-    }
+        print(f"ARM_END {spec}", flush=True)
     if MEM_BREAKDOWN:
         g = 2 ** 30
         device = torch.device("cuda:0")
@@ -276,9 +313,7 @@ def main():
         print(f"MEMB peak_since_load allocated={torch.cuda.max_memory_allocated(device) / g:.3f} "
               f"reserved={torch.cuda.max_memory_reserved(device) / g:.3f} "
               f"device_used_now={(total - free_now) / g:.3f} free_now={free_now / g:.3f}", flush=True)
-    print("SUMMARY " + json.dumps(summary), flush=True)
     if fh:
-        fh.write("SUMMARY " + json.dumps(summary) + "\n")
         fh.close()
 
 
