@@ -16,7 +16,12 @@ Env: SEAM_DEV, SEAM_GID, SEAM_PEER, SEAM_PORT, SEAM_BUCKETS (requested), BENCH_R
      BENCH_HOT_ROWS (default 0: that many rows of every request get an all-hot routing, id -1 in
      every slot with a nonzero weight - the drafter verify's "this token's top-k is hot" row, which
      must contribute nothing to the cold gather and must still come back as a finite row),
-     BENCH_HOT_SLOTS (default 0: how many leading slots of the remaining rows are hot).
+     BENCH_HOT_SLOTS (default 0: how many leading slots of the remaining rows are hot),
+     BENCH_INTERLEAVE (default 0 = sweep one width across all layers at a time; N = N cycles of
+     layer order with every width of BENCH_ROWS issued back to back on each layer, which is what a
+     real client does and the only way this bench sees a per-layer scratch/streaming bug),
+     BENCH_SYNC (default 1: host-synchronise after each call; 0 pipelines calls on the stream like
+     the client does, so several requests are in flight across buckets).
 """
 from __future__ import annotations
 
@@ -37,6 +42,8 @@ REPS = int(os.environ.get("BENCH_REPS", "5"))
 MAX_LAYERS = int(os.environ.get("BENCH_LAYERS", "0"))
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 ROWS = [int(r) for r in os.environ.get("BENCH_ROWS", "1,2,3,4,5,6,7").split(",")]
+INTERLEAVE = int(os.environ.get("BENCH_INTERLEAVE", "0"))
+SYNC = os.environ.get("BENCH_SYNC", "1") != "0"
 HOT_ROWS = int(os.environ.get("BENCH_HOT_ROWS", "0"))
 HOT_SLOTS = int(os.environ.get("BENCH_HOT_SLOTS", "0"))
 
@@ -107,6 +114,54 @@ def main():
                           torch.zeros(b, TOPK, dtype=torch.bfloat16, device=dev))
     torch.cuda.synchronize(dev)
     mem("warm", need, f"buckets={','.join(map(str, need))}")
+
+    # BENCH_INTERLEAVE: issue every row count of ROWS back to back *on the same layer*, in layer
+    # order - the pattern a real client produces (a 64-row prefill piece, then its 2..6-row
+    # remainder, then the next layer), and the only way this bench can show a per-layer scratch or
+    # stream-ordering bug. The width sweep below runs all layers at one width and then all layers at
+    # the next, so it never puts two widths through one module within a millisecond.
+    if INTERLEAVE:
+        widths = run_rows
+        xs, ws, idss = {}, {}, {}
+        for n in widths:
+            xs[n] = (torch.randn(n, HIDDEN, dtype=torch.bfloat16, device=dev) * 0.02)
+            w = torch.rand(n, TOPK, dtype=torch.bfloat16, device=dev)
+            ws[n] = (w / w.sum(dim=-1, keepdim=True)).contiguous()
+        torch.cuda.synchronize(dev)
+        t0 = time.time()
+        t_il = {}
+        ncalls = 0
+        for L in list(layers) * max(1, INTERLEAVE):
+            nc = cold[L]
+            for n in widths:
+                idss[n] = torch.stack([torch.randperm(nc, device=dev)[:TOPK]
+                                       for _ in range(n)]).to(torch.int32)
+                if HOT_SLOTS:
+                    idss[n][:, :min(HOT_SLOTS, TOPK)] = -1
+                if HOT_ROWS:
+                    idss[n][:min(HOT_ROWS, n)] = -1
+            for _ in range(REPS):
+                # sync only per layer (SYNC=0): the client pipelines its calls on the stream and
+                # never host-waits between the widths of one layer
+                if SYNC:
+                    torch.cuda.synchronize(dev)
+                for n in widths:
+                    s0 = time.perf_counter_ns()
+                    host.submit_issue(L, xs[n], idss[n], ws[n])
+                    if SYNC:
+                        torch.cuda.synchronize(dev)
+                        t_il.setdefault(n, []).append((time.perf_counter_ns() - s0) / 1e3)
+                    ncalls += 1
+            torch.cuda.synchronize(dev)
+        for n in widths:
+            v = t_il.get(n) or [0.0]
+            print(f"SEAMROWS_INTERLEAVE n={n} calls={ncalls} sync={SYNC} "
+                  f"host_us_median={statistics.median(v):.1f} host_us_max={max(v):.1f}", flush=True)
+        print(f"SEAMROWS_INTERLEAVE_DONE layers={len(layers)} cycles={max(1, INTERLEAVE)} "
+              f"widths={','.join(map(str, widths))} reps={REPS} calls={ncalls} "
+              f"wall_s={time.time() - t0:.1f}", flush=True)
+        mem("interleave", need, f"widths={','.join(map(str, widths))}")
+        return
 
     table = {}
     opened = []
