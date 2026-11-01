@@ -65,11 +65,13 @@ MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 # the wall time a probe may be predicted to take before it is skipped (the previous probe scales it).
 DEPTH_MAX_S = float(os.environ.get("DEPTH_MAX_S", "420"))
 # "depth:chunk,depth:chunk,..." prefills a fresh prompt of `depth` tokens at each chunk size in one load
-# (see the PREFILL_ARM phase below). SEAM_ROWS is the largest seam row bucket (the client splits a prefill
-# chunk into pieces of at most this many rows), used only for the round-trip count in the arm line.
+# (see the PREFILL_ARM phase below). SEAM_ROWS is the largest seam row bucket the client asks for (the
+# client splits a prefill chunk into pieces of at most this many rows), used only for the round-trip
+# count in the arm line; it defaults to the largest bucket in the request so the two cannot disagree.
 PREFILL_ARMS = [tuple(int(v) for v in a.split(":"))
                 for a in os.environ.get("PREFILL_ARMS", "").split(",") if a.strip()]
-SEAM_ROWS = int(os.environ.get("SEAM_ROWS", "64"))
+SEAM_BUCKETS = [int(b) for b in os.environ.get("SEAM_BUCKETS", "1,6,64").split(",") if b.strip()]
+SEAM_ROWS = int(os.environ.get("SEAM_ROWS") or max(SEAM_BUCKETS))
 # Wall-clock discipline for the arms: ARM_MAX_S caps one arm (the job is cancelled after the chunk
 # in flight and the arm is reported with aborted=1), ARM_TOTAL_S caps the whole arms phase, so deep
 # arms are skipped when the measured rate says they cannot finish.

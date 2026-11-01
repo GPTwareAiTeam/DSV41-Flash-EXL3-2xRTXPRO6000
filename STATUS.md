@@ -47,9 +47,33 @@ graph decode measured neutral on this pair (25.38 vs 25.97 ms/token) while the d
 
 ## Client transport switch (cost one night of failed arms)
 The qes seam is only used when the client sets `REMOTE_TRANSPORT=seam` (`block_sparse_mlp_cpu.py:891`);
-the default `tcp` sends the legacy pickle protocol to the seam server, which reads it as a hello,
-prints `qes: peer layout mismatch` and exits while the client reports `ConnectionResetError`.
-`mem_budget_run.sh` now passes `REMOTE_TRANSPORT=seam` and `SEAM_BUCKETS` explicitly.
+the default `tcp` sends the legacy pickle protocol to the control port, which is now rejected as
+`SEAM_REJECT reason=bad-control-magic` without touching the server. `mem_budget_run.sh` passes
+`REMOTE_TRANSPORT=seam` and `SEAM_BUCKETS` explicitly.
+
+## Multi-session seam (2026-11-01)
+One GX server process now serves any number of client lifetimes; a 150-220 s cold-pack reload per run is
+no longer part of the loop. The control port (e.g. 47311) negotiates a session (`qes.Control`), every data
+port is bound for the server's lifetime, and the next client either queues (`SEAM_QUEUED`, `--wait`) or
+starts when the previous session's control connection closes. `SEAM_BUCKETS` on the client is a request,
+not a contract: the server grants the intersection and reports it (`buckets=… ports=…`), so a decode-only
+client that opens just one of three granted buckets ends with `SEAM_SESSION_PARTIAL … up=1 of 3` instead of
+a failed session. An unexpected connection on a data port is validated by its hello and closed
+(`SEAM_REJECT … reason=stale-data-conn`) instead of aborting the process — the old `qes: peer layout
+mismatch` path killed the server and cost a reload. Any number of such connections is tolerated: they are
+closed and counted, never a reason to end the session (the session ends with its control connection).
+One server still runs one live session at a time (a second client queues or is refused as `busy`), so the two
+pairs doing different work at once means one server per pair — prod on GX1, dev on GX2 — each with its own
+`--buckets`, build and client config. See `qmesh/notes/E2ESeam.md`, `qmesh/qes.py`,
+`qmesh/worker_seam_server.py`, `qmesh/seam_status.py`.
+
+Verified on the dev pair's GX2 in stub mode (`seam-gx2-robust`, port 47351, clients in the same container, no
+GPU and no queue slot): 59 checks, 0 failures, one server pid through all 10 phases - two sessions back to
+back, a subset request, handles opened in reverse bucket order, a refused busy client, a queued client served
+19 s later, stray control connections, 15 strangers on the data ports (7 rejected as stale, the rest drained
+by the next session), a legacy pickle client, a SIGKILLed client served again after 2 s, and zero
+`SEAM_SESSION_REJECT` / `peer layout mismatch` in the whole server log.
+Log: `artifacts/seamrobust/battery-1101-010510/battery.log` (build=cb76845f on server and clients).
 
 ## Needle prompt format: the long-context arm was scoring a different prompt (2026-11-01)
 The 131k arm of `qmesh/mem_budget.py` read the needle fixture as raw text with `add_bos=True`. That is
@@ -73,6 +97,40 @@ with `${VAR-default}`, so `DEPTH_PROBES=""` really disables the 512k/1M probes.
 `qmesh/prefill_limit.py` predicted 3056 MiB for an 8192-row chunk and measured it on 15 of 16 chunks;
 the first chunk rose 3573 MiB. The extra ~517 MiB is one-time (uncompressed-pool staging window and
 indexer score slab: `statics` 0.000 GiB after load, 0.559 GiB at 131k) and stays allocated, so it is
-charged to the chunk that allocates it: `PREFILL_FIRST_MIB=560` is added to `prefill_rise` and removed
-from the room in `prefill_fit` only when `start == 0`. Later chunks keep the old prediction (3056
-measured / 3056 predicted) and an 8192-row first chunk still fits the measured 11403 MiB of room.
+charged to the chunk that allocates it, in proportion to its rows: the 3121-row single-chunk needle arm
+rose 1340 MiB against a row term of 1164 (+176) and the two fits give 63 and 56 KiB/row, so
+`PREFILL_FIRST_ROW_KIB=64` is added per row of the first chunk only (`start == 0`). 8192 rows now predict
+3568 MiB (measured 3573), 3121 rows 1359 (measured 1340); later chunks keep the 382 KiB/row term.
+
+## Seam session setup race: server sends its hello before its QP is live (2026-11-01)
+`session_handle_up` used to be *recv peer hello → send own hello → close(fd) → check_hello →
+qp_connect (RTR, then RTS)*. The client proceeds as soon as it has the server's hello, so its first payload
+WRITE could reach a responder QP that was still in INIT, or between RTR and RTS. The HCA answers that write
+with `remote invalid request` — `qes: wc error remote invalid request error opcode=1 port=47318 rows=64
+vend_err=0xdfffeca0 wr_id=0x0 off=0 kind=payload` — and the same packet moves the responder QP to ERROR, so
+the server's own `ibv_modify_qp(RTS)` fails and the session is rejected. A rejected session is survivable
+now, but the *client* side of it was not: the 30 s wait kernel called `__trap()`, which raised a sticky
+`CUDA error: unspecified launch failure` and killed the client process (rc 134).
+
+Proof it was ordering and not layout (`artifacts/seamrobust/trace-1101-082030/`): the server log has
+`qes: seam session 1: qp rts (port=47318 rows=64)` immediately followed by
+`SEAM_SESSION_REJECT … sid=1 reason=setup-failed`, a pair that only `qp_connect`'s failure path can print,
+on exactly the port whose client write NAKed; the client's `SEAM_TRACE_HANDLE` (port 47318, stride 1968512,
+slab 78740480, `remote_base`/`remote_rkey`) is byte-identical to the server's `SEAM_TRACE_EP`, and
+`check_hello` passed. Phase 0 (deployed build, trace on) reproduced it every time; phase 1 with the reorder
+was 7/7 `SEAM_CONNECT`, no `qes: wc error`, `CLIENT_RC=0`, `SEAM_SESSION_END … calls=3876`.
+
+Fix: *recv peer hello → check_hello → qp_connect (RTR, RTS) → print `SEAM_TRACE_RTS role=srv` → send own
+hello → close(fd)*. The peer cannot start WRITEs before the responder QP is live, and it costs no extra round
+trip. Every failure path still closes the fd and keeps the stale/non-stale distinction the session logic
+needs. A missing readiness gate on the server helper (client started ~15 s after `SEAM_SERVER_LOADED`, while
+the pinned slab was still being allocated) made that window enormous on one prod arm; that helper bug is
+fixed separately, and this reorder removes the residual few-hundred-µs window on a fully-ready server.
+
+Fail-stop instead of trap: `wait_kernel` no longer traps. After `WAIT_TIMEOUT_NS` it raises a fail word in
+bytes 8..11 of the slot's freq line (offset 0 is the request seq, the rest of the 64 B line is unused, so
+neither the slot geometry nor the wire layout changes) and returns; `client_proxy` sees the word, prints
+`qes: no response for layer slot N … the seam transport is dead`, and marks the handle dead the same way a
+CQ error does; `qes_issue`/`qes_collect` then fail with −5 and `last_error()` reaches Python as a
+`RuntimeError`. A lost handle now costs one session, not the process. Failed `ibv_modify_qp` calls print the
+state the HCA really reports (`qes: qp rts failed errno=… state=… qpn=… peer_qpn=… port=… rows=…`).

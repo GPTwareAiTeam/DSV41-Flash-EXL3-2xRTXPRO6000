@@ -24,13 +24,25 @@ the no-DSpark runs ran at 28-31 ms/tok. Mean acceptance ~0.8 means DSpark does n
 
 ## Commands
 
-GX1 server (restart before each P7 run; each handle accepts one client):
+One GX1 server serves every P7 run until it is killed: the control port negotiates a session, the client gets
+the data ports of the buckets it asked for, and the next client queues (`SEAM_QUEUED`) or starts as soon as the
+previous session's control connection closes. Buckets are data ports `ctl+1+i` in `--buckets` order; `SEAM_BUCKETS`
+on the client is only the request (the granted set is the intersection, printed as `buckets=… ports=…`).
 ```
 ssh 10.0.100.2 'docker exec -d seam-gx1 bash -lc "cd /src/exllamav3 && python3 -u qmesh/worker_seam_server.py \
-  --model-dir /cold --placement /cold/placement.exl3.json --dev rocep1s0f0 --gid 3 --port 47311 --buckets 1,6,64 \
+  --model-dir /cold --placement /cold/placement.exl3.json --dev rocep1s0f0 --gid 3 --port 47311 --buckets 1,6,256 \
   > /tmp/seam_server.log 2>&1"'
 ```
-Wait for `SEAM_SERVER_LOADED` (~225-237 s) and `SEAM_LISTEN` x3.
+Wait for `SEAM_SERVER_LOADED` (~225-237 s), the pinned-slab bill `SEAM_SERVER_SLAB buckets=… predicted_mib=…
+rows_max=… avail_mib=… fits=…` (allocated in `qes.Server` right after the load, so a list that does not fit
+swaps the pack out - `fits=0` plus `SEAM_SERVER_SLAB_WARN` says so), and `SEAM_SERVER_READY proto=2 ctl=47311
+buckets=…`. Do not restart it between clients; `python3 qmesh/seam_status.py --port 47311` (or
+`qes.status(host, port)`) reports `active=`, `waiting=` and the last session without disturbing anyone.
+
+The largest bucket is the client's per-call prefill row limit (`SEAM_SPLIT` in the client log), so the list is a
+memory decision: one pinned slab per bucket, 1.18 MiB per row, sized *after* the pack is resident. Measured on GX2
+(same box model and pack as GX1): after the 113.65 GiB cold pack loads, MemAvailable is 496 MiB, so 1,6,256
+(309 MiB) fits, 1,6,64,256 (384 MiB) is the ceiling, and 512 alone (600 MiB) does not.
 
 P7 client (pinned to host GPU1):
 ```
@@ -46,10 +58,18 @@ docker exec -e CUDA_VISIBLE_DEVICES=1 [-e DSPARK=1] -e SEAM_DEV=rocep142s0f0 -e 
    incoherent output (text was multilingual noise). Fixed by `.to(device).half()` on x. After the fix, output is coherent.
 2. **Device pinning**: `seam-p7` had no `CUDA_VISIBLE_DEVICES`, so `cuda:0` resolved to host GPU0 and collided with
    another agent's GPU0 work. All runs now set `CUDA_VISIBLE_DEVICES=1`.
-3. **Handle lifecycle**: a seam handle accepts one client. A rerun against an un-restarted server fails with
-   `qes: connect timeout (errno=111)`. Restart the server before each P7 run.
-4. **Bucket padding** (`remote_seam_host.py`): batches pad to 1/6/64 rows with `id=-1, w=0`, which contribute exact
-   zeros on GX1. Prefill chunks by 64 rows.
+3. **Session lifecycle**: a session is bounded by its control connection, not by a bucket. The client opens a
+   bucket's data handle on its first request of that size, so a decode-only run uses one of the three granted
+   buckets; the unopened ones are reported as `SEAM_SESSION_PARTIAL … up=1 of 3` and are not an error. A
+   connection on a data port that fails its hello (a stale client, a probe) is closed and logged as
+   `SEAM_REJECT … reason=stale-data-conn` instead of aborting the server; that used to kill the process with
+   `qes: peer layout mismatch` and cost a full cold-pack reload.
+4. **Bucket padding and prefill splits** (`remote_seam_host.py`): a request pads to the smallest granted bucket
+   that holds it with `id=-1, w=0`, which contribute exact zeros on GX1. Prefill is no longer cut at 64 rows:
+   `connect()` takes the largest granted bucket as `chunk_rows`, `_split()` cuts a chunk into
+   `floor(R/chunk_rows)` calls at that width plus one call for the remainder in the smallest granted bucket that
+   holds it, and each call is issued and collected before the next (one request slot per layer). The width is
+   therefore whatever the GX server granted - 64 on an old server, larger where the box has the pinned memory.
 5. **Placement check**: the router-order tail maps exactly to the `warm` list (checked for L0: 259/259), so the
    `e - cpu_split_first` tail offset is correct. A suspected id-translation bug was an error in my check, not in the code.
 6. **Native libraries**: GX1 uses the `aarch64` seam library and P7 uses `x86_64`. Earlier notes had this swapped.

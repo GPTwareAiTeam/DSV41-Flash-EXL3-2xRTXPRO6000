@@ -1,7 +1,11 @@
 /* qes_bench: drives qmesh_expert_seam over the P7 <-> GX1 link.
  *
- *   GX1 (server):  qes_bench server <dev> <gid_idx> <port> <rows>
+ *   GX1 (server):  qes_bench server <dev> <gid_idx> <port> [buckets=1,6,64]
+ *                  (stub compute: out = float(x) + (L + 1); serves sessions back to back)
  *   P7  (client):  qes_bench client <dev> <gid_idx> <peer_ip> <port> <rows> <iters> <dev_ordinal>
+ *
+ * The client negotiates one session on <port> asking for the single <rows> bucket, then opens
+ * that bucket's data handle on the port the server assigns.
  *
  * Client reports, all for 40 layers in sequence unless noted:
  *   eager_seq   : issue(L)+collect(L) per layer, host-timed, p50/p99 per layer
@@ -21,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -67,14 +72,30 @@ int main(int argc, char** argv) {
   const char* mode = argv[1];
 
   if (!strcmp(mode, "server")) {
-    if (argc < 6) return 1;
-    qes_handle* h = qes_create(QES_ROLE_SERVER, argv[2], atoi(argv[3]), nullptr, atoi(argv[4]), atoi(argv[5]), 0);
-    if (!h) { fprintf(stderr, "server create failed\n"); return 1; }
-    printf("server up\n"); fflush(stdout);
-    for (;;) std::this_thread::sleep_for(std::chrono::seconds(3600));
+    if (argc < 5) { fprintf(stderr, "usage: qes_bench server <dev> <gid> <port> [buckets=1,6,64]\n"); return 1; }
+    int buckets[QES_MAX_BUCKETS];
+    int n = 0;
+    const char* list = argc >= 6 ? argv[5] : "1,6,64";
+    for (const char* p = list; *p && n < QES_MAX_BUCKETS; ) {
+      char* end = nullptr;
+      long v = strtol(p, &end, 10);
+      if (end == p) break;
+      if (v > 0) buckets[n++] = (int)v;
+      p = *end == ',' ? end + 1 : end;
+    }
+    const char* sl = getenv("QES_SLOTS");
+    const int slots = sl ? atoi(sl) : 1;
+    qes_nego rep;
+    qes_server* s = qes_server_open(argv[2], atoi(argv[3]), atoi(argv[4]), 0, buckets, n,
+                                    "bench", "", 0, slots, &rep);
+    if (!s) { fprintf(stderr, "server open failed: %s\n", qes_last_error()); return 1; }
+    printf("server up: %s\n", rep.message); fflush(stdout);
+    int rc = qes_server_run(s);
+    qes_server_free(s);
+    return rc ? 1 : 0;
   }
 
-  if (strcmp(mode, "client") || argc < 9) { fprintf(stderr, "usage: qes_bench client <dev> <gid> <ip> <port> <rows> <iters> <ord>\n"); return 1; }
+  if (strcmp(mode, "client") || argc < 9) { fprintf(stderr, "usage: qes_bench client <dev> <gid> <ip> <port> <rows> <iters> <ord>  [SEAM_WAIT=1] [SEAM_BUCKETS=a,b,...]\n"); return 1; }
   const char* dev = argv[2];
   const int gid = atoi(argv[3]);
   const char* ip = argv[4];
@@ -83,9 +104,50 @@ int main(int argc, char** argv) {
   const int iters = atoi(argv[7]);
   const int ord = atoi(argv[8]);
 
+  /* SEAM_WAIT=1 queues behind a running session instead of failing with the server's busy text;
+   * SEAM_BUCKETS is the bucket list this client asks for (default: just <rows>). */
+  int wait = 0;
+  if (const char* w = getenv("SEAM_WAIT")) wait = atoi(w) != 0;
+  int want[64];
+  int nwant = 0;
+  want[nwant++] = rows;
+  if (const char* bl = getenv("SEAM_BUCKETS")) {
+    nwant = 0;
+    for (const char* q = bl; *q;) {
+      while (*q == ',' || *q == ' ') q++;
+      if (!*q) break;
+      char* end = nullptr;
+      long v = strtol(q, &end, 10);
+      if (end == q) break;
+      if (nwant < 64) want[nwant++] = (int)v;
+      q = end;
+    }
+    if (!nwant) want[nwant++] = rows;
+  }
+
   CK(cudaSetDevice(ord));
-  qes_handle* h = qes_create(QES_ROLE_CLIENT, dev, gid, ip, port, rows, ord);
-  if (!h) { fprintf(stderr, "client create failed\n"); return 1; }
+  qes_nego nego;
+  const double t_open0 = now_us();
+  qes_client_session* cs = qes_client_open(ip, port, "bench", want, nwant, QES_NL, wait, &nego);
+  const double open_ms = (now_us() - t_open0) / 1000.0;
+  if (!cs) {
+    fprintf(stderr, "session failed: status=%d %s (%s) after %.1f ms\n", nego.status, nego.message,
+            qes_last_error(), open_ms);
+    return 1;
+  }
+  {
+    std::string granted;
+    for (int i = 0; i < (int)nego.n_buckets; i++)
+      granted += (i ? "," : "") + std::to_string(nego.buckets[i]);
+    printf("session ok: open_ms=%.1f wait=%d requested=%d granted=%s port=%d server_build=%s\n",
+           open_ms, wait, nwant, granted.c_str(), nego.ports[0], nego.build);
+  }
+  qes_handle* h = qes_client_handle(cs, dev, gid, rows, ord);
+  if (!h) {
+    fprintf(stderr, "client handle failed: %s\n", qes_last_error());
+    qes_client_close(cs);
+    return 1;
+  }
 
   const size_t nx = (size_t)rows * QES_HIDDEN;
   std::vector<uint16_t> x_host(nx);
@@ -175,6 +237,6 @@ int main(int argc, char** argv) {
   stats("busy_pipe", busy, QES_NL);
 
   printf("correctness: %s\n", bad ? "FAIL" : "OK");
-  qes_destroy(h);
+  qes_client_close(cs);   /* destroys any handle the caller left open */
   return bad ? 3 : 0;
 }

@@ -22,3 +22,6 @@ tests/models.local.yaml
 # Phase A-F artifacts (jsonl/logs) and locally built seam binaries
 artifacts/
 qmesh/native/bin/
+# written by the seam battery/sync (git rev-parse of the sender) so a .git-less container tree still
+# reports a build id; it is per-worktree state, not source
+qmesh/BUILD_ID
