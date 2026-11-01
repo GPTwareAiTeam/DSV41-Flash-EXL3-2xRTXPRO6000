@@ -304,6 +304,10 @@ int accept_wait(int ls, int timeout_ms, const std::atomic<bool>* abort_flag, con
 /* Connects with retries so a client may race the server's listener start-up. */
 int tcp_connect_wait(const char* ip, int port, int timeout_ms, const char** why) {
   const int64_t t_end = now_ns() + (int64_t)timeout_ms * 1000000;
+  /* ECONNREFUSED means the host answered and nothing is listening: worth a few seconds in case the
+   * server is between bind and accept, but never worth the whole budget - a dead server should be
+   * reported, not waited out. Anything else (blackhole, unreachable) keeps the full budget. */
+  const int64_t t_refused = now_ns() + 5LL * 1000 * 1000 * 1000;
   const char* last = "no attempt";
   for (;;) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -320,9 +324,11 @@ int tcp_connect_wait(const char* ip, int port, int timeout_ms, const char** why)
       return -1;
     }
     if (connect(s, (sockaddr*)&a, sizeof(a)) == 0) return s;
-    last = strerror(errno);
+    const int err = errno;
+    last = strerror(err);
     close(s);
-    if (now_ns() >= t_end) {
+    const int64_t now = now_ns();
+    if (now >= t_end || (err == ECONNREFUSED && now >= t_refused)) {
       *why = last;
       return -1;
     }
