@@ -151,6 +151,10 @@ check("the client does not pin buckets",
 check("the server is asked for the wide grant",
       all(int(pc.load_conf(q)["buckets"].split(",")[-1]) >= 2048 for q in ("prod", "dev")),
       str([pc.load_conf(q)["buckets"] for q in ("prod", "dev")]))
+check("an update ticket carries a command",
+      'cmd=("$HERE/pair_update_run.sh"' in src("pair_update.sh"), "")
+check("an empty ticket is refused, not queued",
+      "no command given" in src("pair_lib.sh"), "")
 check("the smoke grants no wider than it exercises",
       "SMOKE_BUCKETS=${SMOKE_BUCKETS:-1,6,64}" in src("pair_smoke.sh")
       and "--buckets $SMOKE_BUCKETS" in src("pair_smoke.sh"), "")

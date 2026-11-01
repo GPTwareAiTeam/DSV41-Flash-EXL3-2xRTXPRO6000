@@ -58,4 +58,6 @@ if [ "$PAIR" = prod ]; then
 fi
 
 pair_ensure_priority PairUpdate
+cmd=("$HERE/pair_update_run.sh" "$PAIR" "$SHA")
+[ "$FLIP_ONLY" = 1 ] && export PAIR_FLIP_ONLY=1
 pair_enqueue PairUpdate "$MINS" "${cmd[@]}"

@@ -175,6 +175,9 @@ pair_run_script() { echo "$PAIR_QUEUE/run_$PAIR.sh"; }
 # job that is running now, ahead of every other waiter.
 pair_enqueue() {  # <agent> <max_minutes> <cmd...>
   local agent=${1:?agent} mins=${2:?minutes}; shift 2
+  # A ticket with no command would hold the GPU for zero seconds and report success; the queue
+  # would look like it ran the update. Refuse instead -- and the caller must be the one that dies.
+  [ "$#" -gt 0 ] || pair_die "pair_enqueue $agent: no command given (nothing would run)"
   local run q logdir log pid t i
   run=$(pair_run_script)
   [ -x "$run" ] || pair_die "queue runner missing: $run"
