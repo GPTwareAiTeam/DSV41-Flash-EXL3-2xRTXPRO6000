@@ -48,6 +48,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -205,7 +206,9 @@ struct SlotHdr {
    * payload: the proxy then checked the old ids against the new layer's cold set and refused a
    * request the caller never sent (2026-11-01, "id 268 past a cold count of 254"). Both proxies now
    * require this word to equal the seq they are handling, which turns that mix into a named
-   * failure instead of a wrong answer. */
+   * failure instead of a wrong answer. publish_kernel rewrites it on the device to the value it
+   * puts in F_REQ, so a captured graph replays with a matching seq instead of the capture-time one
+   * (a replayed layer publishes F_REQ = 2, 3, ... while its baked header would still say 1). */
   uint64_t seq;
   uint64_t pad2[5]; /* keep the header one 64 B line */
 };
@@ -382,9 +385,16 @@ int tcp_connect_wait(const char* ip, int port, int timeout_ms, const char** why)
 /* ---- device kernels ---- */
 
 /* Bump the request seq. Single writer, GPU side. release.sys orders it after the
- * request copies for the CPU proxy. */
-__global__ void publish_kernel(uint64_t* seq) {
+ * request copies for the CPU proxy.
+ *
+ * The header's seq field is written first, from the same value: a captured graph replays this kernel
+ * but not the host code that filled the header, so a baked header would keep the capture-time seq
+ * while F_REQ climbs on every replay and both proxies would refuse a correct request. `hdr_seq`
+ * points at SlotHdr::seq in the slot's header line; the release store to F_REQ below is the doorbell,
+ * so the field is visible to the proxy before it reads the payload. */
+__global__ void publish_kernel(uint64_t* seq, uint64_t* hdr_seq) {
   uint64_t v = *seq + 1;
+  asm volatile("st.release.sys.u64 [%0], %1;" :: "l"(hdr_seq), "l"(v) : "memory");
   asm volatile("st.release.sys.u64 [%0], %1;" :: "l"(seq), "l"(v) : "memory");
 }
 
@@ -429,6 +439,10 @@ struct qes_handle {
   ibv_mr* mr = nullptr;
   ibv_port_attr port_attr{};
   uint8_t* slab = nullptr; /* pinned, mapped host */
+  /* One pinned header line per layer (QES_NL lines). qes_issue copies the header into the slot from
+   * here instead of writing it, so a captured graph's replay carries the header of the layer it is
+   * replaying rather than the last layer that wrote that slot on the host. */
+  uint8_t* hdr_stage = nullptr;
   int slots = 1;           /* payload slots in this slab (in-flight requests per handle) */
   size_t slab_bytes = 0, stride = 0, req_len = 0, resp_len = 0, resp_off = 0;
   size_t ids_off = 0, w_off = 0;
@@ -1133,6 +1147,10 @@ void stop_handle(qes_handle* h) {
     cudaFreeHost(h->slab);
     h->slab = nullptr;
   }
+  if (h->hdr_stage) {
+    cudaFreeHost(h->hdr_stage);
+    h->hdr_stage = nullptr;
+  }
   if (h->dump_src) {
     cudaFreeHost(h->dump_src);
     h->dump_src = nullptr;
@@ -1319,6 +1337,14 @@ extern "C" qes_handle* qes_client_handle(qes_client_session* s, const char* dev_
     return nullptr;
   }
   memset(h->slab, 0, h->slab_bytes);
+  if (cudaHostAlloc(&h->hdr_stage, (size_t)QES_NL * sizeof(SlotHdr),
+                    cudaHostAllocPortable) != cudaSuccess) {
+    set_err("qes_client_handle: cudaHostAlloc %zu bytes for the header stage failed",
+            (size_t)QES_NL * sizeof(SlotHdr));
+    stop_handle(h);
+    return nullptr;
+  }
+  memset(h->hdr_stage, 0, (size_t)QES_NL * sizeof(SlotHdr));
   if (dump_ids() && h->rows <= 8) {
     /* Small pinned mirror, one slice per slot, so the dump can show the ids argument itself next
      * to the slab bytes the proxy forwards (see qes_handle::dump_src). */
@@ -2330,6 +2356,18 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
    * `issued`, not the slab's F_REQ: F_REQ is bumped by a kernel on the caller's stream, so it still
    * reads 0 for a request the GPU has not reached yet, and the slot was then reused under a request
    * that had never been forwarded at all. */
+  /* Under graph capture this host code runs once per layer and its result is baked: on every replay
+   * the baked slot, the baked copies and the baked publish run again, but nothing here does. The
+   * ack test therefore cannot be part of the decision -- nothing has executed yet, so F_RESP still
+   * reads 0 and after `slots` layers every slot would look busy (a capture with `slots`=4 stopped at
+   * layer 4 and would have waited out SLOT_ACK_TIMEOUT_NS). What stays valid is the rest of the rule:
+   * `pending` is host state, and at replay the captured requests are stream-ordered, so a slot that
+   * the capture had already closed cannot be reused by an earlier replayed layer. */
+  int cap_status = 0;
+  const bool capturing =
+      stream &&
+      cudaStreamIsCapturing(stream, (cudaStreamCaptureStatus*)&cap_status) == cudaSuccess &&
+      cap_status == (int)cudaStreamCaptureStatusActive;
   int slot = -1;
   const int64_t t0 = now_ns();
   for (;;) {
@@ -2340,7 +2378,7 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
         if (h->pending[p].slot == cand) used = true;
       if (used) continue;
       const uint64_t mine = h->issued[cand];
-      if (mine && load_acq(h->slab, off_fresp(h, cand)) < mine) continue;
+      if (!capturing && mine && load_acq(h->slab, off_fresp(h, cand)) < mine) continue;
       slot = cand;
     }
     if (slot >= 0) break;
@@ -2361,12 +2399,20 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
   hdr.n_cold = n_cold > 0 ? (uint32_t)n_cold : 0u;
   /* The seq publish_kernel is about to produce for this slot (it does `*F_REQ + 1`). Both proxies
    * compare it against the seq they are handling, so a header that does not belong to the payload
-   * is caught here instead of being computed with the wrong layer's ids. */
+   * is caught here instead of being computed with the wrong layer's ids. The value here only has to
+   * be right for the eager path; publish_kernel rewrites the field on the device (see SlotHdr::seq),
+   * which is what a replayed graph needs. */
   hdr.seq = load_acq(h->slab, off_freq(h, slot)) + 1;
-  memcpy(h->slab + off_hdr(h, slot), &hdr, sizeof(hdr));
-  /* The header is a CPU write; order it before the GPU-side publish that lets the proxy forward
-   * the payload (the NIC only sends it once the whole payload, header included, is visible). */
-  std::atomic_thread_fence(std::memory_order_release);
+  /* Copied to the slot instead of memcpy'd into it: the destination is the wire, and under graph
+   * capture a host memcpy here happens once at capture time, so the slot would carry whatever layer
+   * last wrote it while the replay's payloads belong to the layer being replayed (measured
+   * 2026-11-01: "layer=19 slot=3 ... 268" -- layer 19's header over a layer 4/5 request, 268 being
+   * that layer's cold count). One pinned stage line per layer keeps the replayed copy this layer's
+   * own bytes, and the copy is stream-ordered ahead of the publish below. */
+  memcpy(h->hdr_stage + (size_t)layer * sizeof(SlotHdr), &hdr, sizeof(hdr));
+  if (cudaMemcpyAsync(h->slab + off_hdr(h, slot), h->hdr_stage + (size_t)layer * sizeof(SlotHdr),
+                      sizeof(SlotHdr), cudaMemcpyHostToDevice, stream))
+    return -2;
   uint8_t* req = h->slab + off_req(h, slot);
   if (cudaMemcpyAsync(req, x_bf16, (size_t)h->rows * QES_HIDDEN * 2, cudaMemcpyDeviceToHost, stream))
     return -2;
@@ -2388,10 +2434,14 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
             "req_len=%zu slab=%zu\n",
             h->tcp_port, h->rows, layer, slot, off_hdr(h, slot), off_req(h, slot), h->req_len,
             h->slab_bytes);
-  publish_kernel<<<1, 1, 0, stream>>>((uint64_t*)(h->slab + off_freq(h, slot)));
+  publish_kernel<<<1, 1, 0, stream>>>(
+      (uint64_t*)(h->slab + off_freq(h, slot)),
+      (uint64_t*)(h->slab + off_hdr(h, slot) + offsetof(SlotHdr, seq)));
   if (cudaGetLastError() != cudaSuccess) return -3;
-  /* Only after the publish is queued: this is what a later issue reads to decide the slot is free. */
-  h->issued[slot] = hdr.seq;
+  /* Only after the publish is queued: this is what a later issue reads to decide the slot is free.
+   * A captured issue leaves it alone: its baked seq is not the one the replay will publish, and the
+   * slot's real state is read from F_RESP once the graph runs. */
+  if (!capturing) h->issued[slot] = hdr.seq;
   h->pending[h->n_pending].layer = layer;
   h->pending[h->n_pending].slot = slot;
   h->n_pending++;
