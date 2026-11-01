@@ -42,33 +42,6 @@ HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
 NL = qes.NL
 
-# Swap in use above this and the resident pack is paging. A few hundred MiB is noise on these
-# boxes; GiBs mean the box is over its head before the first request.
-SWAP_WARN_MIB = 512
-
-
-def _meminfo_kib(key: str) -> int:
-    try:
-        with open("/proc/meminfo") as fh:
-            for line in fh:
-                if line.startswith(key + ":"):
-                    return int(line.split()[1])
-    except OSError:
-        pass
-    return -1
-
-
-def _avail_mib() -> int:
-    kib = _meminfo_kib("MemAvailable")
-    return -1 if kib < 0 else kib // 1024
-
-
-def _swap_used_mib() -> int:
-    total, free = _meminfo_kib("SwapTotal"), _meminfo_kib("SwapFree")
-    if total < 0 or free < 0:
-        return -1
-    return (total - free) // 1024
-
 
 def build_layer(base, cold_ids, device):
     """Subset the layer's routed-expert module to `cold_ids` (checkpoint expert ids, ordered).
@@ -456,8 +429,11 @@ def main():
     t0 = time.time()
     server = SeamServer(args.model_dir, args.placement, device, stub = args.stub,
                         ws_rows = args.ws_rows, fail_after = args.fail_after)
+    # build= is the release that started this process (SEAM_BUILD_ID from the pair release system),
+    # so a release check can tell which build the *running* server came from; "-" = env not passed.
     print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)} "
-          f"fail_after={args.fail_after}", flush=True)
+          f"fail_after={args.fail_after} build={os.environ.get('SEAM_BUILD_ID') or '-'} "
+          f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()}", flush=True)
     if args.ws_probe or args.ws_check:
         # Both modes share one pack load: the ladder first (it resets the peak counters), then the
         # equivalence check, whose own peak does not matter.
