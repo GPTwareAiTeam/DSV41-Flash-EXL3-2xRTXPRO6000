@@ -28,6 +28,12 @@ PREFILL_ROW_BYTES = float(os.environ.get("PREFILL_ROW_KIB", "382")) * 2 ** 10   
 PREFILL_DEPTH_BASE = float(os.environ.get("PREFILL_DEPTH_BASE_MIB", "461")) * 2 ** 20
 PREFILL_DEPTH_BYTES = float(os.environ.get("PREFILL_DEPTH_BYTES", "1280"))         # per context token
 PREFILL_DEPTH_ROWS = 2048                                                          # rows the depth term was fit at
+# One-time transient of a prompt's FIRST chunk: the uncompressed-pool staging window and the indexer score
+# slab are allocated on first use and stay (they are the `statics` in the memory report: 0.000 GiB after
+# load, 0.559 GiB at 131k). Production pair, 8192-row chunks: chunk 1 measured 3573 MiB against a row term
+# of 3056 MiB (+517), while chunks 2..16 measured 3056 MiB against the same prediction. A first-chunk term
+# of 560 MiB covers that with 8 % headroom and leaves every later chunk's prediction unchanged.
+PREFILL_FIRST_BYTES = float(os.environ.get("PREFILL_FIRST_MIB", "560")) * 2 ** 20
 # Cushion left free on the card at the predicted peak. Torch's held-but-free memory counts as usable
 # (expandable segments let any freed block serve any later shape); PREFILL_FRAG > 0 discounts that share of it
 PREFILL_MARGIN_MIB = float(os.environ.get("PREFILL_MARGIN_MIB", "1024"))
@@ -43,11 +49,13 @@ def prefill_rise(start, rows):
     """Predicted transient bytes over the steady allocation for a chunk of `rows` starting at `start`."""
     deep = PREFILL_DEPTH_BASE + PREFILL_DEPTH_BYTES * (start + rows) \
         + PREFILL_ROW_BYTES * max(0, rows - PREFILL_DEPTH_ROWS)
-    return max(PREFILL_ROW_BYTES * rows, deep)
+    rise = max(PREFILL_ROW_BYTES * rows, deep)
+    return rise + (PREFILL_FIRST_BYTES if start == 0 else 0)
 
 
 def prefill_fit(start, room):
     """Largest row count whose prefill_rise at `start` is <= room: the minimum of each term solved for rows."""
+    room -= PREFILL_FIRST_BYTES if start == 0 else 0
     by_rows = room / PREFILL_ROW_BYTES
     by_depth_lo = (room - PREFILL_DEPTH_BASE - PREFILL_DEPTH_BYTES * start) / PREFILL_DEPTH_BYTES   # rows <= 2048
     by_depth = by_depth_lo if by_depth_lo <= PREFILL_DEPTH_ROWS else \
