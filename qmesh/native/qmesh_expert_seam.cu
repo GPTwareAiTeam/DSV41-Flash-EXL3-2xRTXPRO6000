@@ -590,8 +590,18 @@ bool post_payload(qes_handle* h, size_t off, uint32_t len) {
             role_name(h->role), h->tcp_port, h->rows, off, len,
             (unsigned long long)(h->remote_base + off), h->remote_rkey, h->slab_bytes);
   ibv_send_wr* bad = nullptr;
-  if (ibv_post_send(h->qp, &wr, &bad)) {
-    set_err("ibv_post_send payload failed (port=%d rows=%d)", h->tcp_port, h->rows);
+  const int rc = ibv_post_send(h->qp, &wr, &bad);
+  if (rc) {
+    /* The errno is the diagnosis: ENOMEM is a full SQ (the proxy posted more than the queue
+     * drains), EINVAL an sge the driver refused (lkey or addr+len outside the registered slab),
+     * and ENOTSUP an opcode the QP was not built for. Name the sge too, so a log says which. */
+    fprintf(stderr,
+            "qes: ibv_post_send payload failed (port=%d rows=%d off=%zu len=%u slab=%zu): %s "
+            "(%d)\n",
+            h->tcp_port, h->rows, off, len, h->slab_bytes, strerror(rc), rc);
+    fflush(stderr);
+    set_err("ibv_post_send payload failed (port=%d rows=%d off=%zu len=%u slab=%zu): %s",
+            h->tcp_port, h->rows, off, len, h->slab_bytes, strerror(rc));
     return false;
   }
   return true;
@@ -617,8 +627,13 @@ bool post_flag(qes_handle* h, size_t remote_off, uint64_t seq) {
             role_name(h->role), h->tcp_port, h->rows, remote_off, (unsigned long long)seq,
             (unsigned long long)(h->remote_base + remote_off), h->remote_rkey, h->slab_bytes);
   ibv_send_wr* bad = nullptr;
-  if (ibv_post_send(h->qp, &wr, &bad)) {
-    set_err("ibv_post_send flag failed (port=%d rows=%d)", h->tcp_port, h->rows);
+  const int rc = ibv_post_send(h->qp, &wr, &bad);
+  if (rc) {
+    fprintf(stderr, "qes: ibv_post_send flag failed (port=%d rows=%d off=%zu seq=%llu): %s (%d)\n",
+            h->tcp_port, h->rows, remote_off, (unsigned long long)seq, strerror(rc), rc);
+    fflush(stderr);
+    set_err("ibv_post_send flag failed (port=%d rows=%d off=%zu seq=%llu): %s", h->tcp_port,
+            h->rows, remote_off, (unsigned long long)seq, strerror(rc));
     return false;
   }
   return true;
@@ -759,8 +774,21 @@ void client_proxy(qes_handle* h) {
       if (r > h->handled[i]) {
         dump_wire_ids(h, i, r);
         if (!client_check_ids(h, i)) return;
-        if (!post_payload(h, off_hdr(h, i), (uint32_t)(LINE + h->req_len))) return;
-        if (!post_flag(h, off_freq(h, i), r)) return;
+        if (!post_payload(h, off_hdr(h, i), (uint32_t)(LINE + h->req_len)) ||
+            !post_flag(h, off_freq(h, i), r)) {
+          /* A WR the verbs layer rejects (SQ full, lkey or length outside this handle's registered
+           * slab) leaves the request unsent and unretried, so this slot would spin its fail word
+           * for WAIT_TIMEOUT_NS and every later issue would wait SLOT_ACK_TIMEOUT_NS for an ack
+           * that can never come. Fail the handle here, like a CQ error: the next qes_issue or
+           * qes_collect raises instead of stalling the GPU behind an ack gate. */
+          h->dead.store(true);
+          h->running.store(false);
+          return;
+        }
+        /* Forwarded exactly once: `handled` is the last seq this proxy put on the wire, so the
+         * next iteration cannot post the same slot again. Re-posting it until the SQ fills is how
+         * one lost request became "ibv_post_send payload failed" on prod, measured 2026-11-01. */
+        h->handled[i] = r;
         h->calls.fetch_add(1, std::memory_order_relaxed);
       }
     }
@@ -801,8 +829,15 @@ void server_proxy(qes_handle* h) {
                 "off_resp=%zu req_len=%zu resp_len=%zu slab=%zu\n",
                 h->tcp_port, h->rows, L, i, (unsigned long long)r, off_req(h, i), off_resp(h, i),
                 h->req_len, h->resp_len, h->slab_bytes);
-      if (!post_payload(h, off_resp(h, i), (uint32_t)h->resp_len)) return;
-      if (!post_flag(h, off_fresp(h, i), r)) return;
+      if (!post_payload(h, off_resp(h, i), (uint32_t)h->resp_len) ||
+          !post_flag(h, off_fresp(h, i), r)) {
+        /* One client's slot could not be answered: take this handle down so the session thread
+         * ends it (SEAM_SESSION_END reason=qp-error) and the server goes back to accepting the
+         * next client, instead of leaving a proxy that will never answer again. */
+        h->dead.store(true);
+        h->running.store(false);
+        return;
+      }
       h->handled[i] = r;
       h->calls.fetch_add(1, std::memory_order_relaxed);
     }
