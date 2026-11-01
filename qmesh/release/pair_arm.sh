@@ -48,19 +48,22 @@ envs=(
   -e "MAX_PROMPTS=$ROWS" -e "MAX_NEW=$MAX_NEW" -e "WARMUP=$WARMUP" -e "WARMUP_NEW=$MAX_NEW"
   -e "CACHE_TOKENS=$CACHE" -e "PROMPTS=$PROMPTS" -e "CHECKPOINT=$CHECKPOINT"
 )
-[ -n "$OUT" ] && envs+=(-e "OUT=$OUT")
-[ "$IDS" = 1 ] && envs+=(-e "ARM_IDS_OUT=${ARM_IDS_OUT:-}")
+[ -n "$OUT" ] && envs+=(-e "OUT=$(pair_ct_path "$OUT")")
+# The driver has to be a real file, not stdin: the client's CPU-host module starts its worker with
+# multiprocessing "spawn", which re-executes the parent's main file by path -- with `python3 -` that
+# path is "<stdin>", the child dies on FileNotFoundError and the parent sees only EOFError. The
+# artifact tree is mounted in the container, so the driver is written there and run by path.
+if [ "$IDS" = 1 ]; then
+  drv_host=$PAIR_STATE_DIR/arm/pair_arm_ids.py
+  mkdir -p "$(dirname "$drv_host")"
+  cp "$HERE/pair_arm_ids.py" "$drv_host"
+  drv=$(pair_ct_path "$drv_host")
+  [ -n "${ARM_IDS_OUT:-}" ] && envs+=(-e "ARM_IDS_OUT=$(pair_ct_path "$ARM_IDS_OUT")")
+fi
 
 if [ "$PAIR_DRY" = 1 ]; then
-  if [ "$IDS" = 1 ]; then drv="python3 -u - < pair_arm_ids.py"; else drv="python3 -u qmesh/e2e_prompts.py"; fi
-  echo "DRY docker exec ${envs[*]} $P7CT bash -lc 'cd /src/exllamav3 && timeout $ARM_TIMEOUT $drv'"
+  echo "DRY docker exec ${envs[*]} $P7CT bash -lc 'cd /src/exllamav3 && timeout $ARM_TIMEOUT python3 -u ${drv:-qmesh/e2e_prompts.py}'"
   exit 0
 fi
-if [ "$IDS" = 1 ]; then
-  # the driver is fed on stdin, so a bare `docker exec` would close it: -i is required
-  timeout "$ARM_TIMEOUT" docker exec -i "${envs[@]}" "$P7CT" \
-    bash -lc "cd /src/exllamav3 && python3 -u -" < "$HERE/pair_arm_ids.py"
-else
-  timeout "$ARM_TIMEOUT" docker exec "${envs[@]}" "$P7CT" \
-    bash -lc "cd /src/exllamav3 && python3 -u qmesh/e2e_prompts.py"
-fi
+timeout "$ARM_TIMEOUT" docker exec "${envs[@]}" "$P7CT" \
+  bash -lc "cd /src/exllamav3 && python3 -u ${drv:-qmesh/e2e_prompts.py}"

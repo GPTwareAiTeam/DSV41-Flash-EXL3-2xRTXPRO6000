@@ -188,5 +188,20 @@ check("a release is stamped once for both sides",
       "CUT_ADOPT" in src("pair_cut.sh") and "does not describe this commit" in src("pair_cut.sh"), "")
 check("release dir resolves a sha prefix", 'releases/"$1"*' in src("pair_lib.sh"), "")
 
+# The client's CPU-host worker is started with multiprocessing "spawn", which re-executes the arm
+# driver by path. Fed on stdin the driver's main file is "<stdin>": the child dies on
+# FileNotFoundError and the parent only ever sees EOFError, which is not a release fault.
+check("the arm driver is run by path, not fed on stdin",
+      "python3 -u -" not in code_lines(src("pair_arm.sh"))
+      and "pair_ct_path" in src("pair_arm.sh"), "")
+check("the ids driver runs only as the main module",
+      'if __name__ == "__main__":' in src("pair_arm_ids.py"), "")
+check("a path handed to the containers is translated to their mount",
+      'echo "/pair/${p#"$PAIR_ROOT"/}"' in src("pair_lib.sh")
+      and 'echo "/artifacts/${p#"$PAIR_ART"/}"' in src("pair_lib.sh"), "")
+check("the smoke reads the worker's own refusal, not the wrapper's rc",
+      "*SEAM_NO_MEMORY*" in src("pair_smoke.sh")
+      and 'fail "memory server_no_memory' in src("pair_smoke.sh"), "")
+
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
 sys.exit(1 if fails else 0)

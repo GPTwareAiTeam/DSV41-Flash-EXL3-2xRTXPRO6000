@@ -61,6 +61,17 @@ pair_cuda_arch_for() {  # <sm_120|sm_121> -> torch arch list entry
 # ---- remote access ------------------------------------------------------------------------------
 # Every GX command goes through pair_gxsh so a dry run can swap the transport (PAIR_DRY_SSH) and so
 # no script ever hand-rolls ssh flags. stdin passes through untouched.
+# Paths the containers can see. The P7 container mounts the pair root at /pair and the artifacts
+# tree at /artifacts (containers/*.json); a host path handed to `docker exec -e` must be
+# translated or the file a driver writes "does not exist" from inside.
+pair_ct_path() {  # <host path> -> path inside the pair containers
+  local p=$1
+  case "$p" in
+    "$PAIR_ROOT"/*) echo "/pair/${p#"$PAIR_ROOT"/}" ;;
+    "$PAIR_ART"/*)  echo "/artifacts/${p#"$PAIR_ART"/}" ;;
+    *) echo "$p" ;;
+  esac
+}
 pair_gxsh() {
   if [ "$PAIR_DRY" = 1 ] && [ -n "$PAIR_DRY_SSH" ]; then
     "$PAIR_DRY_SSH" "${PAIR_SSH_OPTS[@]}" "$GX" "$1"

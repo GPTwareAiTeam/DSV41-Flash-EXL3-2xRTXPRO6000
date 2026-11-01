@@ -75,19 +75,27 @@ def run_arm(spec, generator, *a, **k):
 
 E.run_arm = run_arm
 
-rc = 0
-try:
-    E.main()
-except SystemExit as exc:
-    rc = int(exc.code or 0)
-finally:
-    out_path = os.environ.get("ARM_IDS_OUT")
-    if out_path:
-        try:
-            with open(out_path, "w") as fh:
-                json.dump({"format": 1, "arms": {k: v for k, v in CAPTURED.items()},
-                           "n": sum(len(v) for v in CAPTURED.values())}, fh, sort_keys=True)
-                fh.write("\n")
-        except OSError as exc:
-            print(f"ARM_IDS_NOTE cannot write {out_path}: {exc}", file=sys.stderr, flush=True)
-sys.exit(rc)
+def main():
+    rc = 0
+    try:
+        E.main()
+    except SystemExit as exc:
+        rc = int(exc.code or 0)
+    finally:
+        out_path = os.environ.get("ARM_IDS_OUT")
+        if out_path:
+            try:
+                with open(out_path, "w") as fh:
+                    json.dump({"format": 1, "arms": {k: v for k, v in CAPTURED.items()},
+                               "n": sum(len(v) for v in CAPTURED.values())}, fh, sort_keys=True)
+                    fh.write("\n")
+            except OSError as exc:
+                print(f"ARM_IDS_NOTE cannot write {out_path}: {exc}", file=sys.stderr, flush=True)
+    return rc
+
+
+# The client's CPU-host module starts its worker with multiprocessing "spawn", which re-executes
+# this file under __mp_main__ in the child. The wrapper therefore does nothing at module level that
+# the child must not repeat: main() only runs in the parent.
+if __name__ == "__main__":
+    sys.exit(main())

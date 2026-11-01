@@ -74,6 +74,41 @@ run() {  # <label> <expect-rc> <env...>
 run "passing arm" 0
 run "arm that exits nonzero" 3 FAKE_EXIT=3
 
+# The client starts its CPU-host worker with multiprocessing "spawn", which re-executes this file in
+# the child under __mp_main__. Nothing may run there: a second main() would load the model twice,
+# and a child that cannot find its main file at all is what turned tonight's smoke into EOFError.
+out=$(env PYTHONPATH="$WORK/pkg" ARM_IDS_OUT="$WORK/child.json" python3 -c \
+        'import runpy,sys; runpy.run_path(sys.argv[1], run_name="__mp_main__")' \
+        "$REL/pair_arm_ids.py" 2>&1); rc=$?
+[ "$rc" = 0 ] && echo "OK   re-executed as __mp_main__ exits 0" \
+  || { echo "FAIL re-executed as __mp_main__ rc=$rc"; printf '%s\n' "$out" | tail -4 | sed 's/^/     /'; fails=$((fails + 1)); }
+if printf '%s' "$out" | grep -q "^ARM_IDS \|^ROW "; then
+  echo "FAIL the spawn child ran the arm again"; fails=$((fails + 1))
+else echo "OK   the spawn child runs no arm"; fi
+[ -e "$WORK/child.json" ] && { echo "FAIL the spawn child wrote the ids file"; fails=$((fails + 1)); } \
+  || echo "OK   the spawn child writes nothing"
+
+# ... and because the child re-executes *by path*, the arm has to be launched by path too: `python3 -`
+# makes the child's main file "<stdin>", which does not exist.
+out=$(env PYTHONPATH="$WORK/pkg" ARM_IDS_OUT="$WORK/path.json" python3 -u "$REL/pair_arm_ids.py" 2>&1); rc=$?
+[ "$rc" = 0 ] && echo "OK   run by path exits 0" \
+  || { echo "FAIL run by path rc=$rc"; printf '%s\n' "$out" | tail -4 | sed 's/^/     /'; fails=$((fails + 1)); }
+if printf '%s' "$out" | grep -q "^ARM_IDS arm=dspark1 n=4 "; then echo "OK   run by path records ids"
+else echo "FAIL run by path records no ids"; fails=$((fails + 1)); fi
+
+# pair_arm.sh --ids must hand the container a path, and the artifacts mount, not a host path and not
+# a pipe.
+dry=$(PAIR_DRY=1 PAIR_ROOT_OVERRIDE=/tmp/pairdry/pair PAIR_STATE_OVERRIDE=/tmp/pairdry/pair/state \
+      "$REL/pair_arm.sh" dev --ids 2>&1)
+if printf '%s' "$dry" | grep -q "python3 -u /pair/state/dev/arm/pair_arm_ids.py"; then
+  echo "OK   the driver is run by path inside the pair root"
+else
+  echo "FAIL dry arm does not run the driver by path"; printf '%s\n' "$dry" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+if printf '%s' "$dry" | grep -q "python3 -u -"; then
+  echo "FAIL the driver is still fed on stdin"; fails=$((fails + 1))
+else echo "OK   no stdin driver"; fi
+
 echo
 if [ "$fails" = 0 ]; then echo "RESULT PASS fails=0"; else echo "RESULT FAIL fails=$fails"; fi
 exit $((fails != 0))
