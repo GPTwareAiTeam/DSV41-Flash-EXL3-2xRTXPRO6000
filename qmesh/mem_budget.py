@@ -734,7 +734,17 @@ def main():
               f"events={rows} total_wall_s={wall:.2f}", flush = True)
         if gen_text or gen_ids:
             text = "".join(gen_text)
-            flat = [int(v) for t in gen_ids for v in (t.tolist() if hasattr(t, "tolist") else list(t))]
+            # A result's ids arrive as a tensor ([ids]) or a python list, and depending on the build the
+            # outer dim is present: the first short run crashed on int() of a list. Flatten to scalars.
+            def _flat(seq):
+                for t in seq:
+                    if hasattr(t, "tolist"):
+                        t = t.tolist()
+                    if isinstance(t, (list, tuple)):
+                        yield from _flat(t)
+                    else:
+                        yield int(t)
+            flat = list(_flat(gen_ids))
             print(f"LONG_TEXT chars={len(text)} tokens={len(flat)} "
                   f"text={text!r}", flush = True)
             print(f"LONG_TEXT_IDS {flat}", flush = True)
