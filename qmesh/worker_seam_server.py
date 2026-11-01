@@ -17,6 +17,7 @@ import argparse
 import copy
 import json
 import os
+import sys
 import threading
 import time
 
@@ -29,6 +30,33 @@ from qmesh.native import qes
 HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
 NL = qes.NL
+
+# Swap in use above this and the resident pack is paging. A few hundred MiB is noise on these
+# boxes; GiBs mean the box is over its head before the first request.
+SWAP_WARN_MIB = 512
+
+
+def _meminfo_kib(key: str) -> int:
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith(key + ":"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return -1
+
+
+def _avail_mib() -> int:
+    kib = _meminfo_kib("MemAvailable")
+    return -1 if kib < 0 else kib // 1024
+
+
+def _swap_used_mib() -> int:
+    total, free = _meminfo_kib("SwapTotal"), _meminfo_kib("SwapFree")
+    if total < 0 or free < 0:
+        return -1
+    return (total - free) // 1024
 
 
 def build_layer(base, cold_ids, device):
@@ -57,7 +85,10 @@ def build_layer(base, cold_ids, device):
 
 
 class SeamServer:
-    def __init__(self, model_dir, placement_path, device, stub = False):
+    def __init__(self, model_dir, placement_path, device, stub = False, fail_after = 0):
+        # fail_after: test hook for the fail-stop in compute() - raise on call N+1. 0 = never.
+        self.fail_after = int(fail_after or 0)
+        self.seen = 0
         placement = json.load(open(placement_path))
         self.device = device
         self.stub = stub
@@ -78,16 +109,34 @@ class SeamServer:
                   f"{torch.cuda.memory_allocated(device) / 2**30:.2f} GiB", flush=True)
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
-        """Pinned-slab pointers in; fp32 output written into the pinned response region."""
+        """Pinned-slab pointers in; fp32 output written into the pinned response region.
+
+        Fail-stop, not fail-soft. The C proxy posts the response only *after* this hook returns,
+        so an exception that escapes here is swallowed by ctypes (it prints "Exception ignored")
+        and the previous call's bytes in the pinned response region are posted as this call's
+        answer. Any failure therefore kills the process: the RC QP goes away, the client's proxy
+        sees the CQ error or a 30 s timeout, marks the handle dead and raises - an error, never
+        stale numbers. A GX that cannot compute must not answer.
+        """
         # Per-call device time, reported every minute as SEAM_COMPUTE (median/mean/max us per row
         # bucket). Paired with the client's round-trip timing this splits the seam into GX1 compute
         # and wire: wire = round trip - compute.
         t0 = time.perf_counter_ns()
+        self.seen += 1
         try:
+            if self.fail_after and self.seen > self.fail_after:
+                raise RuntimeError(f"injected compute failure on call {self.seen} "
+                                   f"(--fail-after {self.fail_after})")
             self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
-        finally:
-            with _lock:
-                _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
+        except Exception as e:  # noqa: BLE001 - see the docstring: no safe local recovery
+            print(f"SEAM_COMPUTE_FAIL layer={layer} rows={rows} err={type(e).__name__}: {e} "
+                  f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()} "
+                  f"calls={sum(len(v) for v in _times.values())} "
+                  f"- exiting: a server that cannot compute must not answer", flush=True)
+            sys.stderr.flush()
+            os._exit(70)
+        with _lock:
+            _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
 
     def _forward(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         if self.stub:
@@ -148,12 +197,28 @@ def main():
                     help="answer every request with zeros (wire/protocol baseline, no expert compute)")
     ap.add_argument("--buckets", default="1,6,64",
                     help="row buckets; one seam handle per bucket on consecutive ports from --port")
+    ap.add_argument("--fail-after", type = int, default = int(os.environ.get("SEAM_FAIL_AFTER", "0")),
+                    metavar = "N",
+                    help="test hook: raise in compute() on call N+1, proving the fail-stop "
+                         "(the server must exit, not answer). 0 = off")
     args = ap.parse_args()
 
     device = torch.device("cuda:0")
     t0 = time.time()
-    server = SeamServer(args.model_dir, args.placement, device, stub = args.stub)
-    print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)}", flush=True)
+    server = SeamServer(args.model_dir, args.placement, device, stub = args.stub,
+                        fail_after = args.fail_after)
+    avail_mib, swapped_mib = _avail_mib(), _swap_used_mib()
+    # build= is whatever release started this process (SEAM_BUILD_ID from the pair release system).
+    # The v2 wire has no status verb, so this line is how a release check learns which build the
+    # *running* server came from; "-" means the release env was not passed.
+    build_id = os.environ.get("SEAM_BUILD_ID", "-") or "-"
+    print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)} "
+          f"fail_after={args.fail_after} build={build_id} "
+          f"avail_mib={avail_mib} swapped_mib={swapped_mib}", flush=True)
+    # What is left after the pack is the crash budget for every forward's transient buffers.
+    if swapped_mib > SWAP_WARN_MIB:
+        print(f"SEAM_SERVER_SWAP_WARN swapped_mib={swapped_mib} avail_mib={avail_mib}: the pack is "
+              f"paging; expect multi-second outliers or launch failures", flush=True)
     threading.Thread(target = _reporter, daemon = True).start()
 
     # One handle per row bucket, on consecutive ports; the client uses the same mapping.
