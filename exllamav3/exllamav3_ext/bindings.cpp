@@ -56,6 +56,8 @@
 #include "parallel/barrier.cuh"
 #include "parallel/gather.cuh"
 #include "parallel/all_reduce.cuh"
+#include "parallel/p2p_oneshot.cuh"
+#include "parallel/prefill_ar.cuh"
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
@@ -137,6 +139,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
+    m.def("dsa_compact_ent", &dsa_compact_ent, "dsa_compact_ent");
+    m.def("dsa_compact_ent_rows", &dsa_compact_ent_rows, "dsa_compact_ent_rows");
+    m.def("dsa_compact_ent_rows_map", &dsa_compact_ent_rows_map, "dsa_compact_ent_rows_map");
     m.def("hc_mix", &hc_mix, "hc_mix");
     m.def("hc_mix_carry", &hc_mix_carry, "hc_mix_carry");
     m.def("ple_gate", &ple_gate, "ple_gate");
@@ -170,6 +175,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
+    m.def("p2p_arena_maxb", &p2p_arena_maxb, "Compiled payload capacity per parity slot in bytes");
+    m.def("p2p_shm_arena", &p2p_shm_arena, "p2p_shm_arena");
+    m.def("p2p_dev_arena_alloc", &p2p_dev_arena_alloc, "p2p_dev_arena_alloc");
+    m.def("p2p_dev_arena_handle", &p2p_dev_arena_handle, "p2p_dev_arena_handle");
+    m.def("p2p_dev_arena_open", &p2p_dev_arena_open, "p2p_dev_arena_open");
+#if !defined(USE_ROCM)
+    m.def("prefill_ar_layout", &p2p_prefill_ar_layout);
+    m.def("prefill_ar_occupancy", &p2p_prefill_ar_occupancy);
+    m.def("prefill_ar_alloc", &p2p_prefill_ar_alloc);
+    m.def("prefill_ar_launch", &p2p_prefill_ar_launch);
+#endif
+    m.def("p2p_all_reduce_f32", &p2p_all_reduce_f32, "p2p_all_reduce_f32", py::arg("x"), py::arg("rank"),
+          py::arg("local"), py::arg("peer"), py::arg("nblk"), py::arg("stats") = false);
+    m.def("p2p_all_gather_f32", &p2p_all_gather_f32, "p2p_all_gather_f32", py::arg("x"), py::arg("out"),
+          py::arg("rank"), py::arg("local"), py::arg("peer"), py::arg("nblk"), py::arg("stats") = false);
+    m.def("p2p_bcast_i64", &p2p_bcast_i64, "p2p_bcast_i64", py::arg("x"), py::arg("out"), py::arg("rank"),
+          py::arg("root"), py::arg("local"), py::arg("peer"), py::arg("nblk"), py::arg("stats") = false);
+    m.def("p2p_stats_read", &p2p_stats_read, "p2p_stats_read", py::arg("local"), py::arg("device"));
+    m.def("p2p_stats_reset", &p2p_stats_reset, "p2p_stats_reset", py::arg("local"), py::arg("device"));
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
