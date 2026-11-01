@@ -6,14 +6,12 @@ time issue -> collect with CUDA events. Ids are cold-local (the server's id spac
 every row fills all TOPK slots with distinct cold experts: the gather set, and with it the GX1
 kernel time, is the worst case for that width.
 
-The server pads to the smallest bucket >= n, so with the shipped --buckets 1,6,64 rows 2..5 ride
-the 6-row bucket: this table shows whether a narrower verify width can save anything on GX1 at
-all. The same table after --buckets 1,2,3,4,5,6,64 shows what the bucket change buys.
+The server pads to the smallest bucket it serves that is >= n, so the server's bucket list decides
+which widths share a slab (default 1,2,3,4,5,6,64 -> one bucket per width); this table shows what a
+narrower verify width does to the GX1 kernel time. The client requests SEAM_BUCKETS and adopts the
+subset the server grants, so one long-lived server serves every arm: no restart per run.
 
-The client must use the same bucket list as the server (SEAM_BUCKETS). One server instance serves
-one client lifetime: restart it before each run.
-
-Env: SEAM_DEV, SEAM_GID, SEAM_PEER, SEAM_PORT, SEAM_BUCKETS, BENCH_REPS (default 5),
+Env: SEAM_DEV, SEAM_GID, SEAM_PEER, SEAM_PORT, SEAM_BUCKETS (requested), BENCH_REPS (default 5),
      BENCH_LAYERS (default 0 = all layers in the placement), PLACEMENT
 """
 from __future__ import annotations
@@ -42,17 +40,17 @@ def main():
     layers = sorted(cold)
     if MAX_LAYERS:
         layers = layers[:MAX_LAYERS]
+    host = RemoteSeamHost(PEER, PORT).connect()
     print(f"SEAMROWS layers={len(layers)} cold_min={min(cold[l] for l in layers)} "
           f"cold_max={max(cold[l] for l in layers)} dev={DEV} peer={PEER} "
-          f"buckets={os.environ.get('SEAM_BUCKETS', '1,6,64')} reps={REPS} rows={ROWS}", flush=True)
-
-    host = RemoteSeamHost(PEER, PORT)
+          f"requested={','.join(map(str, host.BUCKETS))} "
+          f"buckets={','.join(map(str, host.buckets))} reps={REPS} rows={ROWS}", flush=True)
     stream = torch.cuda.current_stream()
     torch.manual_seed(0)
     dev = torch.device("cuda:0")
 
-    # Warm-up: connect the per-bucket handles (in bucket order), settle kernels and the slab copies
-    for b in host.BUCKETS:
+    # Warm-up: connect one data handle per granted bucket, settle kernels and the slab copies
+    for b in host.buckets:
         host.register_layer(f"layers.{layers[0]}", None)
         host.submit_issue(layers[0], torch.zeros(b, HIDDEN, dtype=torch.bfloat16, device=dev),
                           torch.zeros(b, TOPK, dtype=torch.int32, device=dev),
@@ -87,12 +85,12 @@ def main():
             host_us.append(best_h)
         md, mh = statistics.median(dev_us), statistics.median(host_us)
         table[n] = (md, mh)
-        print(f"SEAMROWS n={n} bucket={next(b for b in host.BUCKETS if b >= n)} layers={len(layers)} "
+        print(f"SEAMROWS n={n} bucket={next(b for b in host.buckets if b >= n)} layers={len(layers)} "
               f"dev_us_median={md:.1f} host_us_median={mh:.1f} dev_us_per_row={md / n:.1f} "
               f"dev_ms_all_layers={md * len(layers) / 1e3:.2f}", flush=True)
     print("SEAMROWS_TABLE rows bucket dev_us_median dev_us_per_row host_us_median", flush=True)
     for n, (md, mh) in table.items():
-        b = next(b for b in host.BUCKETS if b >= n)
+        b = next(b for b in host.buckets if b >= n)
         print(f"SEAMROWS_TABLE {n} {b} {md:.1f} {md / n:.1f} {mh:.1f}", flush=True)
     print(f"SEAMROWS_DONE wall_s={time.time() - t_start:.1f}", flush=True)
 

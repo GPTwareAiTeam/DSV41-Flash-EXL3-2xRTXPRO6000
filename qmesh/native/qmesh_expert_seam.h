@@ -1,23 +1,39 @@
 /* qmesh_expert_seam: P7 <-> GX1 expert-offload seam over host-staged RC RDMA.
  *
- * Client (role 0, P7) issues per-layer requests from CUDA streams/graphs:
- *   qes_issue(h, L, x, ids, w, stream)
- *       x:   bf16 [rows,5120] device ptr
- *       ids: int32 [rows,6]  device ptr (cold-local expert ids)
- *       w:   bf16 [rows,6]   device ptr (routing weights)
- *   qes_collect(h, L, out, stream)
- *       out: fp32 [rows,5120] device ptr (partial result from the server)
- * Both are kernel launches; sequence counters live in mapped host memory, so
- * the calls are capturable in CUDA graphs. Each layer L owns one slot.
+ * Session model (protocol v2)
+ * --------------------------
+ * The GX server loads the cold experts once and then serves client sessions forever. One TCP
+ * control port (default 47311) carries the versioned hello/negotiation; the per-bucket data
+ * handles (one RC QP per bucket, as before) live on ports assigned by the server and returned in
+ * the negotiation reply. A session ends when the client closes the control socket (clean exit,
+ * ctrl-c or kill -9 all close it), at which point the server destroys that session's QPs and
+ * serves the next client with no reload. Handshake/protocol errors reject one connection with a
+ * logged reason and never abort the process.
  *
- * Server (role 1, GX1) runs a proxy thread that answers requests. The compute
- * stub is out = float(x) + 1 (verifiable). Real expert compute replaces it.
+ * Client (P7):
+ *   qes_client_session* cs = qes_client_open(peer, 47311, build, buckets, n, QES_NL, wait, &nego);
+ *   qes_handle* h = qes_client_handle(cs, dev_name, gid_idx, rows, device_ordinal);
+ *       qes_issue(h, L, x, ids, w, stream)  /  qes_collect(h, L, out, stream)
+ *   qes_client_close(cs);
  *
- * Wire, per layer and direction: RC RDMA WRITE of the payload, then an 8-byte
- * RDMA WRITE of the sequence flag on the same QP. RC delivers in order, so a
- * flag observed by the peer implies its payload is visible.
- * Memory: pinned host memory (cudaHostAllocMapped). No GPUDirect RDMA: it is
- * blocked on both hosts (nvidia-peermem absent on P7, ibv_reg_mr EFAULT on GX1).
+ * Server (GX1):
+ *   qes_server* s = qes_server_open(dev, gid, 47311, 0, buckets, n, build, placement_sha,
+ *                                   allow_wait, &err);
+ *   qes_server_set_fn(s, fn, ctx);          // optional compute hook, called from proxy threads
+ *   qes_server_run(s);                      // serves sessions until qes_server_shutdown(s)
+ *
+ * Per-call wire (unchanged): per layer and direction an RC RDMA WRITE of the payload followed by
+ * an 8-byte RDMA WRITE of the sequence flag on the same QP. RC delivers in order, so a flag
+ * observed by the peer implies its payload is visible.
+ *
+ * Client (P7) role 0 issues per-layer requests from CUDA streams/graphs:
+ *   x:   bf16 [rows,5120] device ptr, ids: int32 [rows,6] device ptr (cold-local ids, -1 = hot),
+ *   w:   bf16 [rows,6] device ptr, out: fp32 [rows,5120] device ptr.
+ * Both calls are kernel launches; sequence counters live in mapped host memory, so the calls are
+ * capturable in CUDA graphs. Each layer L owns one slot.
+ *
+ * Memory: pinned host memory (cudaHostAllocMapped). No GPUDirect RDMA: it is blocked on both hosts
+ * (nvidia-peermem absent on P7, ibv_reg_mr EFAULT on GX1).
  */
 #ifndef QMESH_EXPERT_SEAM_H
 #define QMESH_EXPERT_SEAM_H
@@ -29,33 +45,118 @@
 #define QES_HIDDEN 5120
 #define QES_TOPK 6
 
+/* Control protocol version. Both sides must agree; a mismatch is reported on the client with
+ * both versions and build ids as the message text. */
+#define QES_PROTO_VERSION 2
+#define QES_MAX_BUCKETS 12
+#define QES_BUILD_LEN 40
+#define QES_MSG_LEN 192
+
+#if defined(_WIN32)
+#define QES_API __declspec(dllexport)
+#else
+#define QES_API __attribute__((visibility("default")))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct qes_handle qes_handle;
+typedef struct qes_client_session qes_client_session;
+typedef struct qes_server qes_server;
 
 #define QES_ROLE_CLIENT 0
 #define QES_ROLE_SERVER 1
 
-/* Client connects to peer_ip:port. Server listens on port (peer_ip ignored).
- * rows is fixed per handle and sizes the wire payload. */
-qes_handle* qes_create(int role, const char* dev_name, int gid_idx,
-                       const char* peer_ip, int port, int rows, int device_ordinal);
+/* Negotiation outcome (client) / error detail (server). */
+#define QES_ST_OK 0         /* session granted */
+#define QES_ST_BUSY 1       /* another session is active and wait was not requested */
+#define QES_ST_QUEUED 2     /* wait requested, session queued behind the active one */
+#define QES_ST_INCOMPAT 3   /* protocol version or layer count mismatch */
+#define QES_ST_BADREQUEST 4 /* no common row bucket, or a malformed hello */
+#define QES_ST_ERROR 5      /* internal server-side failure while admitting the session */
+#define QES_ST_STATUS 6     /* reply to a status query: no session was started */
 
-/* Optional server-side compute hook. When set on a server handle, the proxy thread calls it
- * instead of the built-in stub. Pointers are into the pinned slab for layer L: x bf16
- * [rows,QES_HIDDEN], ids int32 [rows,QES_TOPK] (cold-local, -1 = not on this host),
- * w bf16 [rows,QES_TOPK], out f32 [rows,QES_HIDDEN] (must be fully written on return). */
+typedef struct {
+  int32_t status;      /* QES_ST_* */
+  int32_t version;     /* server protocol version */
+  int32_t layers;      /* server QES_NL */
+  int32_t n_buckets;   /* buckets the client may use in this session */
+  int32_t n_requested; /* buckets the client asked for */
+  int32_t buckets[QES_MAX_BUCKETS];
+  int32_t ports[QES_MAX_BUCKETS]; /* data port for buckets[i] */
+  int32_t requested[QES_MAX_BUCKETS];
+  char build[QES_BUILD_LEN];         /* server build/commit id */
+  char placement_sha[QES_BUILD_LEN]; /* server placement fingerprint */
+  char message[QES_MSG_LEN];         /* human-readable detail; set on every non-OK status */
+} qes_nego;
+
+/* Human-readable detail for the last failed call on this thread. */
+QES_API const char* qes_last_error(void);
+
+/* ---- client ---------------------------------------------------------------------------- */
+
+/* Negotiates a session with a running server. `buckets` are the row buckets the client would like
+ * to use; the server answers with the intersection it can serve (adopted by the caller).
+ * wait != 0 asks the server to queue this client behind the active session instead of failing.
+ * Returns NULL on any failure with the reason in `out->message` (and qes_last_error()). */
+QES_API qes_client_session* qes_client_open(const char* peer_ip, int ctl_port, const char* build_id,
+                                           const int* buckets, int n_buckets, int layers, int wait,
+                                           qes_nego* out);
+
+/* Data handle for one negotiated bucket on `peer_ip:nego.ports[i]`. NULL on failure, with the
+ * reason in qes_last_error() (the server keeps serving). */
+QES_API qes_handle* qes_client_handle(qes_client_session* s, const char* dev_name, int gid_idx,
+                                      int bucket, int device_ordinal);
+
+/* Ends the session (server frees that session's QPs and takes the next client). Destroys any
+ * handles the caller did not destroy. */
+QES_API void qes_client_close(qes_client_session* s);
+
+/* ---- server ---------------------------------------------------------------------------- */
+
+/* Opens the RDMA device and the control listener, and pins one staging slab per bucket (the
+ * slabs and their MRs are reused by every session). buckets must be ascending and unique.
+ * Returns NULL on a local failure (reason in qes_last_error(), details in `err`). */
+QES_API qes_server* qes_server_open(const char* dev_name, int gid_idx, int ctl_port,
+                                    int device_ordinal, const int* buckets, int n_buckets,
+                                    const char* build_id, const char* placement_sha, int allow_wait,
+                                    qes_nego* err);
+
+/* Optional server-side compute hook, used by every session handle the server creates. Pointers
+ * are into the pinned slab for layer L: x bf16 [rows,QES_HIDDEN], ids int32 [rows,QES_TOPK]
+ * (cold-local, -1 = not on this host), w bf16 [rows,QES_TOPK], out f32 [rows,QES_HIDDEN] (must be
+ * fully written on return). Set before qes_server_run. */
 typedef void (*qes_server_fn)(void* ctx, int layer, int rows, const void* x_bf16,
                               const int32_t* ids, const void* w_bf16, float* out_f32);
-void qes_set_server_fn(qes_handle* h, qes_server_fn fn, void* ctx);
+QES_API void qes_server_set_fn(qes_server* s, qes_server_fn fn, void* ctx);
 
-int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int32_t* ids,
-              const void* w_bf16, cudaStream_t stream);
-int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream);
+/* Serves sessions until qes_server_shutdown. Returns 0 on clean shutdown, -1 on a fatal local
+ * error (listener gone); session-level problems never return here. */
+QES_API int qes_server_run(qes_server* s);
 
-void qes_destroy(qes_handle* h);
+/* Asks qes_server_run to return: tears down the active session and closes the listener.
+ * Safe to call from another thread. */
+QES_API void qes_server_shutdown(qes_server* s);
+
+/* Releases the RDMA context, slabs and listener. qes_server_run must have returned. */
+QES_API void qes_server_free(qes_server* s);
+
+/* ---- status ---------------------------------------------------------------------------- */
+
+/* Queries the control port without starting (or disturbing) a session. Returns 0 and fills `out`
+ * when the server answered, -1 with qes_last_error() otherwise. out->status is QES_ST_STATUS;
+ * out->message describes the server state ("idle" or the busy session). */
+QES_API int qes_status(const char* host, int ctl_port, qes_nego* out);
+
+/* ---- data path ------------------------------------------------------------------------- */
+
+QES_API int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int32_t* ids,
+                      const void* w_bf16, cudaStream_t stream);
+QES_API int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream);
+
+QES_API void qes_destroy(qes_handle* h);
 
 #ifdef __cplusplus
 }

@@ -8,13 +8,21 @@ seam's proxy thread: it copies the request out of the pinned slab, runs the modu
 `external_selected`/`external_weights` on a dedicated CUDA stream, and writes fp32 output
 back into the pinned response region.
 
+The experts are loaded once and the server then serves client sessions back to back: the
+control port (--port) answers a versioned hello with the row buckets it can serve and the
+data port of each, and a session lives as long as its control connection. Client exit
+(clean, ctrl-c, kill -9) tears down that session's QPs only, so benchmark arms can run one
+after another - or one per pair - without reloading the cold pack.
+
 -1 picks are mapped to local expert 0 with weight 0, so they contribute exact zeros
 (the module's own range check stays satisfied).
 """
+
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -195,12 +203,13 @@ def main():
     ap.add_argument("--port", type=int, default=47311)
     ap.add_argument("--stub", action="store_true",
                     help="answer every request with zeros (wire/protocol baseline, no expert compute)")
-    ap.add_argument("--buckets", default="1,6,64",
-                    help="row buckets; one seam handle per bucket on consecutive ports from --port")
-    ap.add_argument("--fail-after", type = int, default = int(os.environ.get("SEAM_FAIL_AFTER", "0")),
-                    metavar = "N",
-                    help="test hook: raise in compute() on call N+1, proving the fail-stop "
-                         "(the server must exit, not answer). 0 = off")
+    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,2,3,4,5,6,64"),
+                    help="row buckets this server can serve (ascending, one port per bucket from "
+                         "--port+1). Clients request a subset; the superset default means one "
+                         "long-lived server serves every benchmark arm without a reload.")
+    ap.add_argument("--wait", action="store_true",
+                    help="queue a second client behind the active session instead of rejecting it "
+                         "(also settable per client with SEAM_WAIT=1)")
     args = ap.parse_args()
 
     device = torch.device("cuda:0")
@@ -221,16 +230,20 @@ def main():
               f"paging; expect multi-second outliers or launch failures", flush=True)
     threading.Thread(target = _reporter, daemon = True).start()
 
-    # One handle per row bucket, on consecutive ports; the client uses the same mapping.
-    seams = []
-    for i, rows in enumerate(int(r) for r in args.buckets.split(",")):
-        port = args.port + i
-        seam = qes.Seam(qes.ROLE_SERVER, args.dev, args.gid, None, port, rows, 0)
-        seam.set_server_fn(lambda L, R, x, ids, w, o: server.compute(L, R, x, ids, w, o))
-        seams.append(seam)  # keep alive: the proxy thread owns the handle
-        print(f"SEAM_LISTEN port={port} rows={rows}", flush=True)
-    while True:
-        time.sleep(3600)
+    # One pinned slab per row bucket, registered once; each client session gets fresh QPs on
+    # them and the server answers the control hello with the bucket -> port mapping.
+    buckets = sorted({int(r) for r in args.buckets.split(",") if r.strip()})
+    placement_sha = hashlib.sha256(open(args.placement, "rb").read()).hexdigest()[:12]
+    srv = qes.Server(args.dev, args.gid, args.port, 0, buckets, build = qes.build_id(),
+                     placement_sha = placement_sha, wait = args.wait)
+    srv.set_fn(lambda L, R, x, ids, w, o: server.compute(L, R, x, ids, w, o))
+    try:
+        srv.run()   # serves client sessions until SIGINT/SIGTERM
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.shutdown()
+        srv.close()
 
 
 if __name__ == "__main__":
