@@ -31,6 +31,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 pair_load "$PAIR_ARG"
+# The stamp names the commit, so compare commits: a caller may pass a prefix ("4f299c3a")
+# while the build recorded the full sha, and a false mismatch stops the flip.
+SHA=$(git -C "$PAIR_REPO" rev-parse --verify "$SHA^{commit}" 2>/dev/null || printf '%s' "$SHA")
 REL=$(pair_release_dir "$SHA")
 [ -d "$REL/src" ] || pair_die "release ${SHA:0:8} is not cut at $REL"
 BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' "$REL/RELEASE.json")

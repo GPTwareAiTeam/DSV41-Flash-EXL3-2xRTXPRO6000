@@ -151,6 +151,10 @@ check("the client does not pin buckets",
 check("the server is asked for the wide grant",
       all(int(pc.load_conf(q)["buckets"].split(",")[-1]) >= 2048 for q in ("prod", "dev")),
       str([pc.load_conf(q)["buckets"] for q in ("prod", "dev")]))
+check("a release prefix resolves to the commit before it is compared",
+      'rev-parse --verify "$SHA_ARG^{commit}"' in src("pair_update_run.sh")
+      and sum('rev-parse --verify "$SHA^{commit}"' in src(f)
+              for f in ("pair_build_lib.sh", "pair_build_ext.sh")) == 2, "")
 check("an update ticket carries a command",
       'cmd=("$HERE/pair_update_run.sh"' in src("pair_update.sh"), "")
 check("an empty ticket is refused, not queued",

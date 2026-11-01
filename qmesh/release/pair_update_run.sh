@@ -233,7 +233,10 @@ status_write 120 "cutting release"
 if [ "${PAIR_FLIP_ONLY:-0}" = 1 ]; then
   phase prepared
   [ -n "$SHA_ARG" ] || fail "PAIR_FLIP_ONLY needs an explicit sha (nothing would be prepared)"
-  SHA=$SHA_ARG
+  # A flip ticket may name the release by a prefix (that is what the operator typed); the
+  # stamps were written with the full sha by prepare, so resolve before comparing them.
+  SHA=$(git -C "$PAIR_REPO" rev-parse --verify "$SHA_ARG^{commit}" 2>/dev/null) \
+    || fail "no such commit: $SHA_ARG"
   REL=$(pair_release_dir "$SHA")
   [ -d "$REL/src" ] || fail "release ${SHA:0:12} is not cut at $REL (run scripts/pair_prepare.sh $PAIR $SHA)"
   BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' "$REL/RELEASE.json") \
