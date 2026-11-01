@@ -392,6 +392,18 @@ class DiskTensorHandle:
         return out
 
 
+class PrefixIndex:
+    """Stand-in for marisa_trie.Trie: only the lexicographic .keys(prefix) lookup is used here, and
+    marisa_trie is not installed in the conversion images."""
+
+    def __init__(self, keys):
+        self.keys_ = sorted(keys)
+
+    def keys(self, prefix = ""):
+        n = len(prefix)
+        return [k for k in self.keys_ if k[:n] == prefix]
+
+
 class SafetensorsCollection:
 
     def __init__(
@@ -555,7 +567,10 @@ class SafetensorsCollection:
 
     @cached_property
     def _get_tensor_file_map_trie(self):
-        import marisa_trie
+        try:
+            import marisa_trie
+        except ModuleNotFoundError:
+            return PrefixIndex(self.tensor_file_map.keys())
         trie = marisa_trie.Trie(self.tensor_file_map.keys())
         return trie
     def get_tensor_file_map_trie(self):

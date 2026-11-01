@@ -31,3 +31,22 @@ GX1 cold-expert compute: ~358 µs/layer at rows=1 vs a bandwidth floor of roughl
 ## Artifacts outside git
 - `/home/treadall/recipe-artifacts/gpu0-gx1/densefuse_trace.json`
 - Seam binaries: rebuild with `qmesh/native/build.sh` (P7 x86_64, GX1 aarch64).
+
+## Known incompatibility (2026-11-01)
+`EXL3_WHOLE_GRAPH=1` and the MTP drafter (`DSPARK=1`) cannot be combined. The piecewise decode
+graphs replay the blocks, so the module-level export taps (`exllamav3/modules/transformer.py:253`,
+`rmsnorm.py:169`) never run and `params["export_states"]` is never filled. The drafter then hits
+`deepseek_v4_mtp.py:490 T = target_hidden[0].shape[1]` with `target_hidden = None` and raises
+`TypeError: 'NoneType' object is not subscriptable` on the first drafted step (observed as the
+warm-up failure of `final_prod3`). Until the graph path exports the collapsed hidden state of the
+last trunk block (or drafting is skipped while the export is missing), run either
+`WHOLE_GRAPH=0 DSPARK=1` or `WHOLE_GRAPH=1 DSPARK=0`. Memory is identical either way; eager vs
+graph decode measured neutral on this pair (25.38 vs 25.97 ms/token) while the drafter is worth
+~1.20x. `scripts/mem_budget_run.sh` takes `WHOLE_GRAPH` (default 1); the production arms run
+`WHOLE_GRAPH=0 DSPARK=1`.
+
+## Client transport switch (cost one night of failed arms)
+The qes seam is only used when the client sets `REMOTE_TRANSPORT=seam` (`block_sparse_mlp_cpu.py:891`);
+the default `tcp` sends the legacy pickle protocol to the seam server, which reads it as a hello,
+prints `qes: peer layout mismatch` and exits while the client reports `ConnectionResetError`.
+`mem_budget_run.sh` now passes `REMOTE_TRANSPORT=seam` and `SEAM_BUCKETS` explicitly.
