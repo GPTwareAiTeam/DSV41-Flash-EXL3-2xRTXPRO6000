@@ -49,14 +49,31 @@ LONG_TOKENS = int(os.environ.get("LONG_TOKENS", "0"))
 LONG_NEW = int(os.environ.get("LONG_NEW", "16"))
 CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
+LOAD_ONLY = os.environ.get("LOAD_ONLY") == "1"
 DEVICE = torch.device("cuda:0")
 G = 2 ** 30
 
 assert KV_BITS in (4, 8, 16), "KV_BITS must be 4, 8 or 16"
+
 KV_CACHE_KWARGS = ({} if KV_BITS == 16 else
                    {"kv_format": "fp4"} if KV_BITS == 4 else
                    {"layer_type": CacheLayer_quant, "k_bits": 8, "v_bits": 8})
 
+
+def _io_counters() -> dict:
+    """This process's byte counters (/proc/self/io), for separating disk reads from CPU work."""
+    out = {}
+    try:
+        with open("/proc/self/io") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                try:
+                    out[k.strip()] = int(v)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
 
 def gib(n) -> float:
     return n / G
@@ -201,11 +218,20 @@ def main():
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens=CACHE_TOKENS, max_history=5, **KV_CACHE_KWARGS)
     t0 = time.time()
+    io0 = _io_counters()
     model.load(device="cuda:0", progressbar=False)
+    load_s = time.time() - t0
     free, total = torch.cuda.mem_get_info(DEVICE)
-    print(f"P7_LOAD_OK {time.time() - t0:.1f}s vram={gib(torch.cuda.memory_allocated(DEVICE)):.2f}GiB "
+    print(f"P7_LOAD_OK {load_s:.1f}s vram={gib(torch.cuda.memory_allocated(DEVICE)):.2f}GiB "
           f"free={gib(free):.2f}GiB total={gib(total):.2f}GiB kv_bits={KV_BITS} "
           f"cache_tokens={CACHE_TOKENS} dspark={int(DSPARK)}", flush = True)
+    io1 = _io_counters()
+    print(f"LOADIO seconds={load_s:.1f} read_gib={gib(io1['read_bytes'] - io0['read_bytes']):.2f} "
+          f"rchar_gib={gib(io1['rchar'] - io0['rchar']):.2f} "
+          f"mib_per_s={gib(io1['read_bytes'] - io0['read_bytes']) * 1024 / max(load_s, 1e-9):.1f} "
+          f"cpu_s={time.process_time():.1f}", flush = True)
+    if LOAD_ONLY:
+        return 0
 
     tokenizer = Tokenizer.from_config(config)
     draft_model = None
