@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# pair_cut.sh -- materialise a release from a git commit on P7 and on the pair's GX box.
+#
+#   pair_cut.sh <pair> [sha] [--no-gx] [--force]
+#
+# A release is a directory, not a checkout: <root>/releases/<sha>/src is `git archive <sha>` and
+# <root>/releases/<sha>/RELEASE.json says which commit, which branch, which seam fingerprint and
+# which build id it is. Nothing is ever copied into it by hand; the boxes have no git, so this is
+# the only way a box can name the commit it runs (see qmesh/notes/PairRelease.md).
+#
+# The release root is the same path on P7 and on the GX box, so the containers can mount it at /pair
+# and the two halves of a pair read the same layout. Cutting does not change what runs: `current`
+# only moves in pair_update_run.sh, under the pair's queue lock.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=pair_lib.sh
+. "$HERE/pair_lib.sh"
+
+PAIR_ARG=${1:?usage: pair_cut.sh <pair> [sha] [--no-gx] [--force]}
+shift
+SHA_ARG=""; DO_GX=1; FORCE=0
+for a in "$@"; do
+  case "$a" in
+    --no-gx) DO_GX=0 ;;
+    --force) FORCE=1 ;;
+    -*) pair_die "unknown flag $a" ;;
+    *) SHA_ARG=$a ;;
+  esac
+done
+pair_load "$PAIR_ARG"
+
+# ---- resolve the commit ---------------------------------------------------------------------------
+# every tree here is a git worktree, so .git is a file, not a directory: ask git, don't stat
+git -C "$PAIR_REPO" rev-parse --git-dir >/dev/null 2>&1 || pair_die "no repo at $PAIR_REPO"
+if [ -z "$SHA_ARG" ]; then
+  SHA=$(git -C "$PAIR_REPO" rev-parse --verify "$PAIR_BRANCH^{commit}" 2>/dev/null) \
+    || pair_die "branch $PAIR_BRANCH not in $PAIR_REPO"
+else
+  SHA=$(git -C "$PAIR_REPO" rev-parse --verify "$SHA_ARG^{commit}" 2>/dev/null) \
+    || pair_die "no such commit: $SHA_ARG"
+fi
+git -C "$PAIR_REPO" merge-base --is-ancestor "$SHA" "$PAIR_BRANCH" 2>/dev/null \
+  || pair_die "$SHA is not on $PAIR_BRANCH; releases may only come from that branch"
+
+BRANCH_TIP=$(git -C "$PAIR_REPO" rev-parse "$PAIR_BRANCH")
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+BUILD_ID="$PAIR-$(printf %s "$SHA" | cut -c1-12)-$STAMP"
+TMPNAME=".$SHA.cut-$STAMP"
+REL=$(pair_release_dir "$SHA")
+
+# ---- seam identity + tree digest, read straight from the commit -------------------------------------
+seam_of_commit() {  # <path>
+  git -C "$PAIR_REPO" cat-file blob "$SHA:$1" 2>/dev/null
+}
+SEAM_FP=$(for f in "${PAIR_SEAM_FILES[@]}"; do printf '%s\0' "$f"; seam_of_commit "$f"; done | sha256sum | cut -c1-16)
+[ -n "$SEAM_FP" ] && [ "$SEAM_FP" != "$(printf 'x' | sha256sum | cut -c1-16)" ] || pair_die "cannot read seam sources at $SHA"
+SEAM_VER=$(seam_of_commit qmesh/native/qes.py | sed -n 's/^PROTO_VERSION *= *\([0-9][0-9]*\).*/\1/p' | head -1)
+[ -z "$SEAM_VER" ] && SEAM_VER=$(seam_of_commit qmesh/native/qmesh_expert_seam.h \
+  | sed -n 's/^#define QES_PROTO_VERSION *\([0-9][0-9]*\).*/\1/p' | head -1)
+SEAM_VER=${SEAM_VER:--}
+DIGEST=$(git -C "$PAIR_REPO" ls-tree -r "$SHA" -- "${PAIR_VERIFY_PATHS[@]}" | python3 -c '
+import hashlib, sys
+rows = []
+for line in sys.stdin:
+    meta, _, path = line.rstrip("\n").partition("\t")
+    mode, _typ, blob = meta.split()
+    rows.append("%s %s %s" % (mode, blob, path))
+print(hashlib.sha256("\n".join(sorted(rows)).encode()).hexdigest())
+')
+FILES=$(git -C "$PAIR_REPO" ls-tree -r "$SHA" -- "${PAIR_VERIFY_PATHS[@]}" | wc -l)
+[ "$FILES" -gt 0 ] || pair_die "commit $SHA tracks none of ${PAIR_VERIFY_PATHS[*]}"
+
+RELEASE_JSON=$(
+  python3 - "$SHA" "$BRANCH_TIP" "$BUILD_ID" "$DIGEST" "$SEAM_FP" "$SEAM_VER" "$FILES" "$PAIR" "$STAMP" <<'PY'
+import json, sys
+sha, tip, bid, digest, fp, ver, files, pair, stamp = sys.argv[1:]
+print(json.dumps({
+    "format": 1,
+    "sha": sha,
+    "branch": "tools/pair-release",
+    "branch_tip_at_cut": tip,
+    "build_id": bid,
+    "digest": digest,
+    "files": int(files),
+    "seam": {"fingerprint": fp, "version": None if ver == "-" else int(ver)},
+    "pair": pair,
+    "cut_at": stamp,
+    "cut_from": "git archive",
+}, indent=2, sort_keys=True))
+PY
+)
+[ -n "$RELEASE_JSON" ] || pair_die "failed to render RELEASE.json"
+
+pair_step "CUT $PAIR sha=${SHA:0:8} build_id=$BUILD_ID seam=fp:$SEAM_FP/proto:$SEAM_VER files=$FILES"
+
+cut_side() {  # <p7|gx> <root>
+  local side=$1 root=$2 rel="$2/releases/$SHA" tmp="$2/releases/$TMPNAME" log
+  # the existence probe has to run on the side that owns the tree: both boxes use the same path,
+  # so a local test would see the other side's copy
+  local have=0
+  if [ "$side" = p7 ]; then
+    [ -d "$rel" ] && have=1
+  else
+    [ -n "$(pair_gxsh "[ -d '$rel' ] && echo yes")" ] && have=1
+  fi
+  if [ "$have" = 1 ] && [ ! "$FORCE" = 1 ]; then
+    echo "EXISTS $PAIR $side $rel"
+    return 0
+  fi
+  if [ "$side" = p7 ]; then
+    rm -rf "$tmp"; mkdir -p "$tmp/src" || return 1
+    git -C "$PAIR_REPO" archive --format=tar "$SHA" | tar -x -C "$tmp/src" || return 1
+    printf '%s\n' "$RELEASE_JSON" > "$tmp/RELEASE.json"
+    rm -rf "$rel"
+    mv -T "$tmp" "$rel" || return 1
+  else
+    # one round trip for the extraction, one for the stamp; `tar -x` reads the archive from stdin
+    local out
+    out=$(pair_gxsh "set -e; mkdir -p '$root/releases'; rm -rf '$tmp'; mkdir -p '$tmp/src'; \
+               tar -x -C '$tmp/src'; echo EXTRACTED" \
+          < <(git -C "$PAIR_REPO" archive --format=tar "$SHA")) || return 1
+    case "$out" in *EXTRACTED*) ;; *) echo "EXTRACT_FAILED $PAIR gx: $out"; return 1 ;; esac
+    out=$(printf '%s\n' "$RELEASE_JSON" | pair_gxsh "set -e; cat > '$tmp/RELEASE.json'; \
+               rm -rf '$rel'; mv -T '$tmp' '$rel'; echo CUT_OK") || return 1
+    case "$out" in *CUT_OK*) ;; *) echo "CUT_FAILED $PAIR gx: $out"; return 1 ;; esac
+  fi
+  local n
+  if [ "$side" = p7 ]; then
+    n=$(find "$rel/src" -type f | wc -l)
+  else
+    n=$(pair_gxsh "find '$rel/src' -type f | wc -l")
+  fi
+  [ "${n:-0}" -ge "$FILES" ] || { echo "CUT_SHORT $PAIR $side files=$n want>=$FILES"; return 1; }
+  echo "CUT $PAIR $side $rel files=$n"
+}
+
+rc=0
+cut_side p7 "$PAIR_ROOT" || rc=1
+if [ "$DO_GX" = 1 ] && [ "$rc" = 0 ]; then
+  cut_side gx "$PAIR_ROOT" || rc=1
+fi
+if [ "$rc" != 0 ]; then
+  pair_step "CUT_FAILED $PAIR sha=${SHA:0:8}"
+  exit 1
+fi
+pair_step "CUT_OK $PAIR sha=$SHA build_id=$BUILD_ID"
+echo "$SHA"

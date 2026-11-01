@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# pair_lib.sh -- shared helpers for the pair release/update system (see qmesh/notes/PairRelease.md).
+# Sourced, never executed. Every script in qmesh/release sources it so that the pair layout, the ssh
+# and docker quoting and the release identity live in exactly one place.
+#
+# Nothing here is allowed to guess: a missing pair, a missing manifest or an unreachable box is an
+# error, never a default.
+
+PAIR_HOME=${PAIR_HOME:-/home/treadall}
+PAIR_REPO=${PAIR_REPO:-$PAIR_HOME/recipe-gpu0-gx1-v2}
+PAIR_ART=${PAIR_ART:-$PAIR_HOME/recipe-artifacts/gpu0-gx1}
+PAIR_SCRIPTS=${PAIR_SCRIPTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+PAIR_STATE=${PAIR_STATE:-$PAIR_ART/pairs}
+PAIR_QUEUE=${PAIR_QUEUE:-$PAIR_ART/queue}
+PAIR_CONF=${PAIR_CONF:-$PAIR_SCRIPTS/pairs.conf}
+PAIR_BRANCH=${PAIR_BRANCH:-tools/pair-release}
+PAIR_SSH=${PAIR_SSH:-ssh}
+PAIR_DRY=${PAIR_DRY:-0}
+PAIR_DRY_SSH=${PAIR_DRY_SSH:-}
+PAIR_MOUNT=${PAIR_MOUNT:-/pair}                 # container path of the pair root
+PAIR_SRC_LINK=${PAIR_SRC_LINK:-/src/exllamav3}  # container symlink -> /pair/current/src
+PAIR_LIB=libqmesh_expert_seam                   # qmesh/native/bin/<this>.<arch>.so
+PAIR_SEAM_FILES=(qmesh/native/qmesh_expert_seam.cu qmesh/native/qmesh_expert_seam.h qmesh/native/qes.py)
+PAIR_VERIFY_PATHS=(qmesh exllamav3)             # what "the tree is the commit" covers
+PAIR_SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
+
+pair_die() { echo "pair: $*" >&2; exit 2; }
+pair_say() { echo "$(date '+%H:%M:%S') $*"; }
+# pair_step: timestamped line, also appended to $PAIR_LOG when set (every job sets it).
+pair_step() { say_line=$(printf '%s %s' "$(date '+%H:%M:%S')" "$*"); echo "$say_line"; [ -n "${PAIR_LOG:-}" ] && echo "$say_line" >> "$PAIR_LOG"; return 0; }
+
+pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH
+  local p=${1:?usage: pair_load <pair>} conf=${2:-$PAIR_CONF} line
+  [ -r "$conf" ] || pair_die "config not readable: $conf"
+  line=$(awk -v p="$p" '!/^#/ && NF && $1==p {print; exit}' "$conf")
+  [ -n "$line" ] || pair_die "pair '$p' is not in $conf"
+  read -r PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH <<<"$line"
+  PAIR_ROOT=${PAIR_ROOT_OVERRIDE:-$PAIR_ROOT}
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH
+  PAIR_STATE_DIR=$PAIR_STATE/$PAIR
+  PAIR_MANIFEST=$PAIR_STATE/$PAIR.json
+  export PAIR_STATE_DIR PAIR_MANIFEST
+}
+
+pair_arch_for() {  # <sm_120|sm_121> -> x86_64|aarch64  (lib name per side)
+  case "$1" in sm_120) echo x86_64 ;; sm_121) echo aarch64 ;; *) echo "unknown" ;; esac
+}
+pair_cuda_arch_for() {  # <sm_120|sm_121> -> torch arch list entry
+  case "$1" in sm_120) echo 12.0 ;; sm_121) echo 12.1 ;; *) echo "?" ;; esac
+}
+
+# ---- remote access ------------------------------------------------------------------------------
+# Every GX command goes through pair_gxsh so a dry run can swap the transport (PAIR_DRY_SSH) and so
+# no script ever hand-rolls ssh flags. stdin passes through untouched.
+pair_gxsh() {
+  if [ "$PAIR_DRY" = 1 ] && [ -n "$PAIR_DRY_SSH" ]; then
+    "$PAIR_DRY_SSH" "${PAIR_SSH_OPTS[@]}" "$GX" "$1"
+  else
+    "$PAIR_SSH" "${PAIR_SSH_OPTS[@]}" "$GX" "$1"
+  fi
+}
+pair_gxstdin() {
+  if [ "$PAIR_DRY" = 1 ] && [ -n "$PAIR_DRY_SSH" ]; then
+    "$PAIR_DRY_SSH" "${PAIR_SSH_OPTS[@]}" "$GX" bash -s
+  else
+    "$PAIR_SSH" "${PAIR_SSH_OPTS[@]}" "$GX" bash -s
+  fi
+}
+
+# ---- release identity ---------------------------------------------------------------------------
+pair_release_dir() { echo "$PAIR_ROOT/releases/$1"; }
+pair_current_sha() {  # <root> [remote 1] -> sha the `current` symlink points at ("" when absent)
+  local root=$1 remote=${2:-0} t
+  if [ "$remote" = 1 ]; then
+    t=$(pair_gxsh "readlink -f $root/current 2>/dev/null || true")
+  else
+    t=$(readlink -f "$root/current" 2>/dev/null || true)
+  fi
+  # readlink -f echoes a missing path unchanged: only a real releases/<sha> counts as current
+  case "$t" in "$root"/releases/*) basename "$t" ;; *) return 0 ;; esac
+}
+# Seam identity: the three files that define the wire. A release that changes any byte of them is a
+# different protocol, whatever a constant says, so the fingerprint is the sha256 over their names and
+# contents (same on P7 and GX for the same release).
+pair_seam_fingerprint() {  # <tree>
+  local tree=$1 f
+  for f in "${PAIR_SEAM_FILES[@]}"; do
+    [ -r "$tree/$f" ] || { echo missing; return 1; }
+    printf '%s\0' "$f"; cat "$tree/$f"
+  done | sha256sum | cut -c1-16
+}
+pair_seam_version() {  # <tree> -> PROTO_VERSION / QES_PROTO_VERSION when the tree carries one, else "-"
+  local tree=$1 v=""
+  v=$(sed -n 's/^PROTO_VERSION *= *\([0-9][0-9]*\).*/\1/p' "$tree/qmesh/native/qes.py" 2>/dev/null | head -1)
+  [ -z "$v" ] && v=$(sed -n 's/^#define QES_PROTO_VERSION *\([0-9][0-9]*\).*/\1/p' "$tree/qmesh/native/qmesh_expert_seam.h" 2>/dev/null | head -1)
+  echo "${v:--}"
+}
+
+# ---- manifests ----------------------------------------------------------------------------------
+pair_manifest_get() {  # <field.path...> -> value on stdout ("" when absent); reads $PAIR_MANIFEST
+  python3 - "$PAIR_MANIFEST" "$@" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+for key in sys.argv[2:]:
+    if not isinstance(d, dict):
+        d = None
+        break
+    d = d.get(key)
+    if d is None:
+        break
+if isinstance(d, (dict, list)):
+    print(json.dumps(d))
+elif d is not None:
+    print(d)
+PY
+}
+
+# ---- queue --------------------------------------------------------------------------------------
+pair_run_script() { echo "$PAIR_QUEUE/run_$PAIR.sh"; }
+# Enqueue one job on the pair's queue with the given agent name. The queue ranks agents by
+# gpu_priority.txt in that pair's QBASE; PairUpdate is ranked so an update lands right after the
+# job that is running now, ahead of every other waiter.
+pair_enqueue() {  # <agent> <max_minutes> <cmd...>
+  local agent=${1:?agent} mins=${2:?minutes}; shift 2
+  local run q logdir log pid t i
+  run=$(pair_run_script)
+  [ -x "$run" ] || pair_die "queue runner missing: $run"
+  q=$PAIR_QUEUE/$PAIR/gpu_queue
+  logdir=$PAIR_STATE_DIR/logs
+  mkdir -p "$logdir" "$q"
+  log=$logdir/enqueue-$PAIR-$agent-$(date -u +%Y%m%dT%H%M%SZ).log
+  # setsid: the ticket wrapper and everything it starts form their own process group, so cancelling
+  # the job kills the whole group (the queue does kill -- -<pgid>) and nothing outlives its window.
+  setsid nohup "$run" "$agent" "$mins" "$@" >"$log" 2>&1 </dev/null &
+  pid=$!
+  # The ticket is created by the runner as <rank>-<ns>-<pid>-<agent>; wait for it so the caller
+  # reports the ticket it actually got instead of assuming the launch worked.
+  t=""
+  for i in $(seq 1 40); do
+    t=$(ls "$q"/[0-9]*-*-"$pid"-"$agent" 2>/dev/null | head -1)
+    [ -n "$t" ] && break
+    sleep 0.25
+  done
+  if [ -z "$t" ]; then
+    echo "ENQUEUE_FAILED $PAIR agent=$agent pid=$pid log=$log"
+    tail -5 "$log" 2>/dev/null
+    return 1
+  fi
+  echo "ENQUEUED $PAIR agent=$agent pid=$pid ticket=$(basename "$t") log=$log"
+}
+# PairUpdate must land right after the job that is running now, ahead of every other waiter: the
+# queue ranks agents by their line in gpu_priority.txt, so line 1 is enough. Tickets already taken
+# keep the rank they were created with, so existing waiters are not reordered.
+pair_ensure_priority() {  # <agent>
+  local agent=${1:?agent} prio=$PAIR_QUEUE/$PAIR/gpu_priority.txt tmp
+  mkdir -p "$(dirname "$prio")"
+  tmp=$(mktemp "${prio}.XXXXXX") || pair_die "cannot write $prio"
+  { echo "$agent"; [ -r "$prio" ] && grep -vx "$agent" "$prio" | grep -v '^$'; } > "$tmp"
+  mv -f "$tmp" "$prio"
+}

@@ -1,0 +1,30 @@
+{
+  "name": "seam-p7v2",
+  "image": "vllm-moet:dsv41-213d5fa",
+  "workdir": "/vllm-workspace",
+  "entrypoint": "sleep",
+  "cmd": ["infinity"],
+  "mounts": [
+    ["__PAIR_ROOT__", "/pair"],
+    ["/mnt/data12/models/exl3", "/mnt/data12/models/exl3"],
+    ["/models", "/models"],
+    ["/usr/local/cuda", "/opt/cuda"],
+    ["/home/treadall/recipe-artifacts", "/artifacts"]
+  ],
+  "env": {
+    "CUDA_HOME": "/opt/cuda",
+    "TORCH_CUDA_ARCH_LIST": "12.0",
+    "PYTHONPATH": "/src/exllamav3",
+    "TORCH_EXTENSIONS_DIR": "/pair/extcache",
+    "LD_LIBRARY_PATH": "/opt/cuda/lib64:/usr/lib/x86_64-linux-gnu",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "MAX_JOBS": "8",
+    "NINJAFLAGS": "-j8",
+    "MAKEFLAGS": "-j8",
+    "NVARCH": "x86_64"
+  },
+  "args": ["--gpus", "all", "--network", "host", "--ipc", "host", "--shm-size", "68719476736",
+           "--ulimit", "memlock=-1", "--ulimit", "stack=67108864",
+           "--security-opt", "label=disable",
+           "--device", "/dev/infiniband:/dev/infiniband:rwm", "--restart", "no"]
+}

@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""pair_sync_check.py -- is a pair's release actually the release it claims to be?
+
+Two modes.
+
+1) Manifest mode (the pair release system, see qmesh/notes/PairRelease.md) -- read-only:
+
+       pair_sync_check.py --manifest /home/treadall/recipe-artifacts/gpu0-gx1/pairs/dev.json
+       pair_sync_check.py --manifest ... --quiet          # only the verdict lines
+       pair_sync_check.py --manifest ... --no-server      # ignore the running server
+       pair_sync_check.py --manifest ... --no-container   # ignore docker state
+
+   For the P7 side (local) and the GX side (ssh to the manifest's gx host) it checks, in one shot:
+     * the `current` symlink points at releases/<sha> and `extcache` at releases/<sha>/ext
+     * every path of <sha> in `qmesh/` and `exllamav3/` hashes to the commit's blob (the box must
+       serve the commit; it is not a git checkout, so this is the only way to know)
+     * RELEASE.json agrees with the manifest (sha, build id, tree digest)
+     * the native seam lib carries a build stamp for THIS release and its .so hash matches it
+     * the torch extension cache is the per-container, per-release cache and carries a stamp for
+       THIS release (source sha + arch list), i.e. it was not built from stale sources
+     * the container mounts the pair root at /pair, /src/exllamav3 -> /pair/current/src,
+       TORCH_EXTENSIONS_DIR=/pair/extcache, PYTHONPATH=/src/exllamav3
+     * a running seam server reports the release's build id in its SEAM_SERVER_LOADED line
+   Exit 0 = IN_SYNC, 1 = DRIFT, 2 = usage/setup error.
+
+2) Legacy tree mode (drift survey): compare a container's host tree with a reference worktree at a
+   given commit for a fixed pair list. Flags --v2/--stg/--pair, same as before.
+
+Why sources and stamps instead of .so hashes: the same C++ does not build byte-identically on
+aarch64 and x86_64 (or across toolchains), so a .so hash says nothing across boxes. What must match
+is the *source* every piece was built from, plus a stamp that says so; the .so hash is only compared
+on the box that built it (against the stamp recorded there).
+"""
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+REPO = os.environ.get("PAIR_REPO", "/home/treadall/recipe-gpu0-gx1-v2")
+PATHS = ["qmesh", "exllamav3"]
+
+# ---- legacy tree mode tables --------------------------------------------------------------------
+WORKTREES = {
+    "v2": "/home/treadall/recipe-gpu0-gx1-v2",
+    "stg": "/home/treadall/recipe-seam-commit",
+}
+PAIRS = [
+    ("prod", "10.0.100.2", "GX1", "seam-gx1v2", "/home/treadall/recipe-gpu0-gx1-v2", "v2"),
+    ("dev", "10.0.101.2", "GX2", "seam-gx2", "/home/treadall/recipe-gpu0-gx1-v2", "v2"),
+]
+
+
+def ssh_argv():
+    """PAIR_DRY_SSH swaps the transport in the stub-ssh dry run; nothing else changes here."""
+    if os.environ.get("PAIR_DRY") == "1" and os.environ.get("PAIR_DRY_SSH"):
+        return [os.environ["PAIR_DRY_SSH"]]
+    return ["ssh"]
+
+
+def run(cmd, host=None, stdin=None, timeout=600, binary=False):
+    if host:
+        if isinstance(cmd, list):
+            cmd = " ".join(shlex.quote(c) for c in cmd)
+        cmd = ssh_argv() + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, cmd]
+    p = subprocess.run(cmd, input=(stdin.encode() if isinstance(stdin, str) else stdin),
+                       capture_output=True, timeout=timeout)
+    if binary:
+        return p.returncode, p.stdout, p.stderr.decode(errors="replace")
+    return p.returncode, p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
+
+
+def md5map(text):
+    out = {}
+    for line in text.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and len(parts[0]) == 32:
+            out[parts[1].strip()] = parts[0]
+    return out
+
+
+def ref_md5(repo, commit, paths=None):
+    """{path: md5(blob)} for the commit, straight out of git (the box must match the commit)."""
+    paths = paths or PATHS
+    rc, out, err = run(["git", "-C", repo, "ls-tree", "-r", commit, "--"] + paths)
+    if rc:
+        raise RuntimeError(f"git ls-tree {commit} in {repo}: {err.strip()}")
+    blobs = {}
+    for line in out.splitlines():
+        meta, _, path = line.partition("\t")
+        blobs[path] = meta.split()[2]
+    if not blobs:
+        raise RuntimeError(f"commit {commit} in {repo} tracks none of {paths}")
+    batch = "".join(b + "\n" for b in blobs.values())
+    rc, outb, err = run(["git", "-C", repo, "cat-file", "--batch"], stdin=batch, binary=True)
+    if rc:
+        raise RuntimeError(f"git cat-file: {err.strip()}")
+    digest, pos = {}, 0
+    for path, blob in blobs.items():
+        nl = outb.index(b"\n", pos)
+        size = int(outb[pos:nl].split()[2])
+        digest[path] = hashlib.md5(outb[nl + 1: nl + 1 + size]).hexdigest()
+        pos = nl + 1 + size + 1
+    return digest
+
+
+# ---- manifest mode ------------------------------------------------------------------------------
+SIDE_SCRIPT = r"""root=%(root)s; sha=%(sha)s; ct=%(ct)s; rel="$root/releases/$sha"; tree="$rel/src"
+probe_ct=%(ct_probe)s; probe_srv=%(srv_probe)s
+echo "LIVE $(readlink -f "$root/current" 2>/dev/null)"
+echo "EXT_LIVE $(readlink -f "$root/extcache" 2>/dev/null)"
+echo "RELJSON $(tr -d '\n' < "$rel/RELEASE.json" 2>/dev/null)"
+echo "LIBSTAMP $(tr -d '\n' < "$tree/qmesh/native/bin/%(lib)s.%(arch)s.so.stamp" 2>/dev/null)"
+echo "LIBSHA $(sha256sum "$tree/qmesh/native/bin/%(lib)s.%(arch)s.so" 2>/dev/null | cut -d' ' -f1)"
+echo "EXTSTAMP $(tr -d '\n' < "$rel/ext/BUILD_STAMP.json" 2>/dev/null)"
+if [ "$probe_ct" = 1 ]; then
+echo "CT_STATE $(docker inspect -f '{{.State.Running}}' "$ct" 2>/dev/null)"
+echo "CT_ENV $(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$ct" 2>/dev/null | grep -E '^(TORCH_EXTENSIONS_DIR|PYTHONPATH|TORCH_CUDA_ARCH_LIST)=' | sort | tr '\n' ' ')"
+echo "CT_CTROOT $(docker exec "$ct" readlink -f /pair/current 2>/dev/null)"
+echo "CT_SRC $(docker exec "$ct" readlink -f /src/exllamav3 2>/dev/null)"
+echo "CT_PAIRMOUNT $(docker exec "$ct" sh -c 'grep -c " /pair " /proc/mounts' 2>/dev/null)"
+fi
+if [ "$probe_srv" = 1 ]; then
+echo "SRV_PIDS $(docker exec "$ct" pgrep -fc worker_seam_server.py 2>/dev/null)"
+echo "SRV_LOADED $(docker exec "$ct" sh -c "grep -m1 '^SEAM_SERVER_LOADED' /tmp/seam_server.log" 2>/dev/null)"
+fi
+echo "TREEMD5"
+cd "$tree" 2>/dev/null && printf '%%s\n' %(paths)s | xargs -d '\n' -r md5sum 2>&1
+echo "END"
+"""
+
+
+def side_state(manifest, side, remote, skip_ct=False, skip_srv=False):
+    """Run the single state script on one side; return {key: value} plus the md5 map."""
+    root = manifest[side]["root"]
+    cfg = dict(root=root, sha=manifest["release_sha"], ct=manifest[side]["container"],
+               lib="libqmesh_expert_seam", arch=manifest[side]["arch"],
+               ct_probe=0 if skip_ct else 1,
+               srv_probe=0 if (skip_ct or skip_srv) else 1,
+               paths=" ".join(shlex.quote(p) for p in manifest["_paths"]))
+    script = SIDE_SCRIPT % cfg
+    if remote:
+        rc, out, err = run(["bash", "-s"], host=manifest["gx"]["host"], stdin=script)
+    else:
+        p = subprocess.run(["bash", "-s"], input=script.encode(), capture_output=True)
+        rc, out, err = p.returncode, p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
+    if "END" not in out:
+        raise RuntimeError(f"{side}: state script did not finish (rc={rc}): "
+                           f"{(err or out).strip()[:300]}")
+    state, md5, in_tree = {}, {}, False
+    for line in out.splitlines():
+        if line == "TREEMD5":
+            in_tree = True
+            continue
+        if line == "END":
+            break
+        if in_tree:
+            md5.update(md5map(line))
+            continue
+        key, _, val = line.partition(" ")
+        state[key] = val
+    return state, md5, err
+
+
+def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
+    label = manifest[side].get("label") or side
+    ct = manifest[side]["container"]
+    arch = manifest[side]["arch"]
+    sha = manifest["release_sha"]
+    build_id = manifest["build_id"]
+    root = manifest[side]["root"]
+    try:
+        state, md5, err = side_state(manifest, side, remote=(side == "gx"),
+                                     skip_ct=skip_ct, skip_srv=skip_srv)
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"PAIR {manifest['pair']} {label} {ct}: ERROR unreachable or unreadable: {exc}")
+        return False
+    rel_dir = f"{root}/releases/{sha}"
+    tree = f"{rel_dir}/src"
+    problems = []
+
+    # 1. tree == commit
+    files = manifest["_paths"]
+    diff = sorted(f for f in files if f in md5 and md5[f] != ref[f])
+    missing = sorted(f for f in files if f not in md5)
+    ok_tree = not diff and not missing
+    print(f"PAIR {manifest['pair']} {label} {ct} tree={tree} ref={sha[:8]} files={len(files)} "
+          f"{'SYNC' if ok_tree else 'DRIFT'} diff={len(diff)} missing={len(missing)}")
+    for f in diff:
+        print(f"    DIFF {f} box={md5[f]} ref={ref[f]}")
+    for f in missing:
+        print(f"    MISSING {f}")
+    if not ok_tree:
+        problems.append(f"tree_diff={len(diff)} tree_missing={len(missing)}")
+
+    # 2. symlinks: the pair root must be the live one, and the ext cache must be this release's
+    if state.get("LIVE") != rel_dir:
+        problems.append(f"current={os.path.basename(state.get('LIVE', '')) or '-'} want={sha[:8]}")
+    if state.get("EXT_LIVE") != f"{rel_dir}/ext":
+        problems.append(f"extcache={state.get('EXT_LIVE') or '-'} want={rel_dir}/ext")
+
+    # 3. RELEASE.json must agree with the manifest
+    rj = state.get("RELJSON") or ""
+    try:
+        rj = json.loads(rj) if rj else {}
+    except ValueError:
+        rj = {}
+    if not rj:
+        problems.append("release_json=missing")
+    else:
+        if rj.get("sha") != sha:
+            problems.append(f"release_json_sha={str(rj.get('sha'))[:8]} want={sha[:8]}")
+        if rj.get("build_id") != build_id:
+            problems.append(f"release_json_build={rj.get('build_id')} want={build_id}")
+        if manifest.get("tree_digest") and rj.get("digest") != manifest["tree_digest"]:
+            problems.append("release_json_digest_mismatch")
+
+    # 4. native seam lib: built from THIS source, stamped with THIS release
+    lib = state.get("LIBSTAMP") or ""
+    try:
+        lib = json.loads(lib) if lib else {}
+    except ValueError:
+        lib = {}
+    if not lib:
+        problems.append("lib_stamp=missing")
+    else:
+        if lib.get("build_id") != build_id:
+            problems.append(f"lib_build_id={lib.get('build_id')} want={build_id}")
+        if lib.get("source_sha") != sha:
+            problems.append(f"lib_source={str(lib.get('source_sha'))[:8]} want={sha[:8]}")
+        if manifest.get("seam", {}).get("fingerprint") and \
+                lib.get("seam") != manifest["seam"]["fingerprint"]:
+            problems.append(f"lib_seam={lib.get('seam')} want={manifest['seam']['fingerprint']}")
+        libsha = state.get("LIBSHA", "")
+        if lib.get("sha256") and libsha and lib["sha256"] != libsha:
+            problems.append("lib_so_hash_vs_stamp")
+        want = manifest.get("lib", {}).get(arch, {}).get("sha256")
+        if want and libsha and want != libsha:
+            problems.append("lib_so_hash_vs_manifest")
+
+    # 5. torch ext cache: per release, per container, built from THIS source, for THIS arch
+    ext = state.get("EXTSTAMP") or ""
+    try:
+        ext = json.loads(ext) if ext else {}
+    except ValueError:
+        ext = {}
+    sm = manifest[side]["sm"]
+    if not ext:
+        problems.append("ext_stamp=missing")
+    else:
+        if ext.get("build_id") != build_id:
+            problems.append(f"ext_build_id={ext.get('build_id')} want={build_id}")
+        if ext.get("source_sha") != sha:
+            problems.append(f"ext_source={str(ext.get('source_sha'))[:8]} want={sha[:8]}")
+        if ext.get("arch_list") != manifest[side]["cuda_arch"]:
+            problems.append(f"ext_arch={ext.get('arch_list')} want={manifest[side]['cuda_arch']}")
+
+    # 6. the container must be wired to the pair root, not to some tree somebody copied into it
+    if skip_ct:
+        pass                                              # --no-container: wiring not probed
+    elif state.get("CT_STATE") != "true":
+        problems.append("container=not_running")
+    else:
+        if (state.get("CT_PAIRMOUNT") or "0") == "0":
+            problems.append("container=missing_/pair_mount")
+        ctr = state.get("CT_CTROOT") or ""
+        if os.path.basename(ctr) != sha:
+            problems.append(f"container_current={os.path.basename(ctr) or '-'} want={sha[:8]}")
+        csrc = state.get("CT_SRC") or ""
+        # readlink -f prints the fully resolved chain; /pair/current/src is the same tree
+        if csrc not in (f"/pair/releases/{sha}/src", "/pair/current/src"):
+            problems.append(f"container_src={csrc or '-'} want=/pair/releases/{sha[:8]}/src")
+        env = state.get("CT_ENV") or ""
+        for want_kv in ("TORCH_EXTENSIONS_DIR=/pair/extcache", "PYTHONPATH=/src/exllamav3",
+                        f"TORCH_CUDA_ARCH_LIST={manifest[side]['cuda_arch']}"):
+            if want_kv not in env:
+                problems.append(f"container_env_missing={want_kv}")
+
+    # 7. a server that is up must be running THIS release
+    if side == "gx" and not skip_srv:
+        pids = state.get("SRV_PIDS") or "0"
+        try:
+            npids = int(pids)
+        except ValueError:
+            npids = -1
+        if npids > 0:
+            loaded = state.get("SRV_LOADED") or ""
+            got = ""
+            for tok in loaded.split():
+                if tok.startswith("build="):
+                    got = tok.split("=", 1)[1]
+            if not loaded:
+                problems.append("server_loading")           # no SEAM_SERVER_LOADED line yet
+            elif got != build_id:
+                problems.append(f"server_build={got} want={build_id}")
+        elif npids < 0:
+            problems.append("server_state=unknown")
+
+    if problems:
+        for p in problems:
+            print(f"    DRIFT {p}")
+        print(f"RESULT {manifest['pair']} {label} DRIFT {' '.join(problems)}")
+        return False
+    if not quiet:
+        print(f"STAMP {manifest['pair']} {label} lib={arch} ext={sm} build_id={build_id} OK")
+    print(f"RESULT {manifest['pair']} {label} IN_SYNC")
+    return True
+
+
+def manifest_mode(args):
+    try:
+        manifest = json.load(open(args.manifest))
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"pair_sync_check: cannot read manifest {args.manifest}: {exc}", file=sys.stderr)
+        return 2
+    if manifest.get("format") != 1:
+        print(f"pair_sync_check: manifest {args.manifest} has unsupported format "
+              f"{manifest.get('format')!r}", file=sys.stderr)
+        return 2
+    sha = manifest["release_sha"]
+    try:
+        ref = ref_md5(REPO, sha + "^{commit}" if not sha.endswith("^{commit}") else sha)
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"pair_sync_check: reference commit {sha[:8]} not in {REPO}: {exc}", file=sys.stderr)
+        return 2
+    manifest["_paths"] = sorted(ref)
+    sides = [s for s in ("p7", "gx")
+             if not (args.p7_only and s != "p7") and not (args.gx_only and s != "gx")]
+    ok = True
+    for side in sides:
+        ok = check_side(manifest, side, ref, args.quiet,
+                        skip_ct=args.no_container,
+                        skip_srv=args.no_container or args.no_server) and ok
+    if args.quiet and ok:
+        print(f"RESULT {manifest['pair']} IN_SYNC")
+    return 0 if ok else 1
+
+
+# ---- legacy tree mode ---------------------------------------------------------------------------
+def reference(worktree, commit):
+    rc, _, err = run(["git", "-C", worktree, "cat-file", "-e", commit + "^{commit}"])
+    if rc:
+        sys.exit(f"pair_sync_check: {worktree} has no commit {commit}: {err.strip()}")
+    rc, out, err = run(["git", "-C", worktree, "ls-tree", "-r", "--name-only", commit, "--"] + PATHS)
+    if rc:
+        sys.exit(f"pair_sync_check: ls-tree failed in {worktree}: {err.strip()}")
+    files = [f for f in out.splitlines() if f]
+    if not files:
+        sys.exit(f"pair_sync_check: commit {commit} in {worktree} tracks none of {PATHS}")
+    return commit, files, ref_md5(worktree, commit)
+
+
+def check(pair, args):
+    name, host, box, container, tree, refkey = pair
+    worktree = WORKTREES[refkey]
+    commit = getattr(args, refkey)
+    commit, files, refmd5 = reference(worktree, commit)
+    rc, out, err = run("cd %s && xargs -d '\\n' md5sum 2>&1" % tree, host=host,
+                       stdin="\n".join(files) + "\n")
+    if rc and not out:
+        print(f"PAIR {name} {box} {container}: ERROR unreachable host or tree: {err.strip()[:200]}")
+        return False, None
+    boxmd5 = md5map(out)
+    diff = sorted(f for f in files if f in boxmd5 and boxmd5[f] != refmd5[f])
+    missing = sorted(f for f in files if f not in boxmd5)
+    ok = not diff and not missing
+    print(f"PAIR {name} {box} {container} tree={tree} ref={commit[:8]} files={len(files)} "
+          f"{'SYNC' if ok else 'DRIFT'} diff={len(diff)} missing={len(missing)}")
+    for f in diff:
+        print(f"    DIFF {f} box={boxmd5[f]} ref={refmd5[f]}")
+    for f in missing:
+        print(f"    MISSING {f}")
+    return ok, (name, commit, diff, missing)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", default=None, help="manifest mode: pairs/<pair>.json")
+    ap.add_argument("--quiet", action="store_true", help="one RESULT line per pair when in sync")
+    ap.add_argument("--p7-only", action="store_true")
+    ap.add_argument("--gx-only", action="store_true")
+    ap.add_argument("--no-container", action="store_true")
+    ap.add_argument("--no-server", action="store_true")
+    ap.add_argument("--v2", default=None, help="legacy mode: commit the prod v2 pair must serve")
+    ap.add_argument("--stg", default=None, help="legacy mode: commit the staging trees must serve")
+    ap.add_argument("--pair", default="all", choices=["all", "prod", "dev"], help="legacy mode")
+    args = ap.parse_args()
+    if args.manifest:
+        return manifest_mode(args)
+    for key, wt in WORKTREES.items():
+        if getattr(args, key) is None:
+            rc, out, _ = run(["git", "-C", wt, "rev-parse", "HEAD"])
+            if rc:
+                sys.exit(f"pair_sync_check: no worktree at {wt}")
+            setattr(args, key, out.strip())
+    allok = True
+    for pair in PAIRS:
+        if args.pair not in ("all", pair[0]):
+            continue
+        ok, _ = check(pair, args)
+        allok = allok and ok
+    print("RESULT " + ("ALL_SYNC" if allok else "DRIFT"))
+    return 0 if allok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
