@@ -736,14 +736,16 @@ bool client_check_ids(qes_handle* h, int slot) {
           h->rows, h->tcp_port, hdr->layer, slot, (unsigned long long)h->handled[slot], bad, n,
           n_cold, first_at, first_id);
   fflush(stderr);
-  /* Unblock the GPU waiter and NaN the response the caller is about to copy out, so a dropped
-   * request cannot be mistaken for a computed one: the handle is dead, so the next seam call on it
-   * raises through seam_dead_check with the message above. */
-  __atomic_store_n((uint64_t*)(h->slab + off_fresp(h, slot)), load_acq(h->slab, off_freq(h, slot)),
-                   __ATOMIC_RELEASE);
-  __atomic_store_n((uint32_t*)(h->slab + off_fail(h, slot)), 2u, __ATOMIC_RELEASE);
+  /* A dropped request must not be mistaken for a computed one, and the caller copies the response
+   * as soon as the ack lands: poison the response and raise the fail word *before* releasing the
+   * ack, or the GPU thread races the NaN loop and hands the caller the slot's stale (zero) bytes.
+   * The handle is dead either way, so the next seam call raises through seam_dead_check. */
   float* resp = (float*)(h->slab + off_resp(h, slot));
   for (size_t k = 0; k < h->resp_len / sizeof(float); k++) resp[k] = __builtin_nanf("");
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n((uint32_t*)(h->slab + off_fail(h, slot)), 2u, __ATOMIC_RELEASE);
+  __atomic_store_n((uint64_t*)(h->slab + off_fresp(h, slot)), load_acq(h->slab, off_freq(h, slot)),
+                   __ATOMIC_RELEASE);
   h->dead.store(true);
   h->running.store(false);
   return false;
@@ -1515,6 +1517,17 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   const uint32_t my_psn = (uint32_t)(lrand48() & 0xffffff);
   Hello mine = make_hello(h, ss->id, my_psn);
   Hello peer{};
+  /* A rejected or unreadable hello closes the connection, so say why before we do. A bare close
+   * leaves the peer in recv() until its own timeout, and that is how an unexpected client's knock
+   * showed up as "data handshake failed: Resource temporarily unavailable" instead of as the real
+   * difference: our hello carries our session id, rows, slots and port, so the peer's check_hello
+   * turns the mismatch into one line ("peer session mismatch sid=... peer_sid=..."). Best effort -
+   * the knocker may already be gone, and sending 96 bytes into a socket nobody reads cannot block
+   * (the fd also carries SO_SNDTIMEO = DATA_HELLO_TIMEOUT_S). */
+  auto say_goodbye = [&]() {
+    const char* ignored = "";
+    xfer(fd, &mine, sizeof(mine), true, &ignored);
+  };
   /* Order matters here: read the client's hello, reach RTR+RTS, and only then answer with ours.
    * The client posts its first payload write as soon as our hello arrives and its own RTR+RTS is
    * done, so our QP must already be past INIT at that moment. A request that reaches a QP still in
@@ -1526,6 +1539,7 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   if (!ok) {
     set_err_quiet("seam session %u: data handshake on port %d (rows=%d) failed: %s", ss->id, port,
                   ep.rows, why);
+    say_goodbye();
     close(fd);
     stop_handle(h);
     if (stale) *stale = true;
@@ -1535,6 +1549,7 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   if (!check_hello(peer, ep.rows, s->slots, port, ss->id, why2, sizeof(why2))) {
     set_err_quiet("seam session %u from %s: rejected data connection on port %d: %s", ss->id,
                   ss->ip, port, why2);
+    say_goodbye();
     close(fd);
     stop_handle(h);
     if (stale) *stale = true;
@@ -1542,6 +1557,7 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   }
   if (!qp_connect(h, peer, my_psn, &why)) {
     set_err("seam session %u: %s (port=%d rows=%d)", ss->id, why, port, ep.rows);
+    say_goodbye();
     close(fd);
     stop_handle(h);
     return nullptr;
