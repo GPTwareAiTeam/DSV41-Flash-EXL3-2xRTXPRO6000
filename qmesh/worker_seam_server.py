@@ -126,12 +126,14 @@ class SeamServer:
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
 
-        Fail-stop, not fail-soft. The C proxy posts the response only *after* this hook returns,
-        so an exception that escapes here is swallowed by ctypes (it prints "Exception ignored")
-        and the previous call's bytes in the pinned response region are posted as this call's
-        answer. Any failure therefore kills the process: the RC QP goes away, the client's proxy
-        sees the CQ error or a 30 s timeout, marks the handle dead and raises - an error, never
-        stale numbers. A GX that cannot compute must not answer.
+        Fail-stop, not fail-soft: the C proxy posts the response only after this hook returns, so
+        an exception allowed to escape here is swallowed by ctypes (it prints "Exception ignored")
+        and the *previous* call's bytes in the pinned response region get posted as this call's
+        answer. That is exactly what happened on GX2 on 2026-11-01 08:57: a CUDA launch failure
+        inside _forward_piece left the context permanently broken, 170k callbacks raised, the
+        server kept accepting sessions for 20 min and the client decoded garbage ("magnetic
+        magnetic ..."). So any failure here kills the process: the RC QP goes away, the client's
+        proxy sees the CQ error, marks the handle dead and raises - an error, never stale numbers.
         """
         # Per-call device time, reported every minute as SEAM_COMPUTE (median/mean/max us per row
         # bucket). Paired with the client's round-trip timing this splits the seam into GX1 compute
@@ -150,8 +152,9 @@ class SeamServer:
                   f"- exiting: a server that cannot compute must not answer", flush=True)
             sys.stderr.flush()
             os._exit(70)
-        with _lock:
-            _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
+        else:
+            with _lock:
+                _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
 
     def _forward(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Serve one request of `rows` rows, in internal pieces of at most ws_rows.
@@ -245,6 +248,11 @@ def slab_mib(buckets, slots = 1) -> float:
 # ws_rows, not for the bucket, so a big bucket is a wire/call-count decision, not a workspace one.
 WS_KIB_PER_ROW = 147
 
+# Swap in use above this and the resident pack is paging; see _swap_used_mib and
+# SEAM_SERVER_SWAP_WARN in main(). A few hundred MiB is normal noise on these boxes, a few GiB is
+# a box that is already over its head before the first request.
+SWAP_WARN_MIB = 512
+
 
 def ws_mib_for(rows: int, ws_rows: int = 0) -> float:
     """Transient device workspace the cold-expert forward needs for a request, MiB."""
@@ -261,6 +269,22 @@ def _avail_mib() -> int:
     except OSError:
         pass
     return -1
+
+
+def _swap_used_mib() -> int:
+    """Swap currently in use, MiB. On a GX this is the early warning that matters: the pack is
+    113.5 GiB of a 121.6 GiB unified pool, so a few GiB swapped out means every expert call takes
+    page faults (seen as 4 s outliers in SEAM_COMPUTE) and a launch can fail outright."""
+    total = free = 0
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("SwapTotal:"):
+                total = int(line.split()[1])
+            elif line.startswith("SwapFree:"):
+                free = int(line.split()[1])
+    except OSError:
+        return -1
+    return (total - free) // 1024
 
 
 def ws_probe(server, spec, min_avail_mib):
@@ -443,10 +467,11 @@ def main():
     want_mib = slab_mib(buckets, args.slab_slots)
     ws_mib = ws_mib_for(buckets[-1], args.ws_rows)
     avail_mib = _avail_mib()
+    swapped_mib = _swap_used_mib()
     fits = int(avail_mib < 0 or want_mib + ws_mib <= avail_mib - 64)
     print(f"SEAM_SERVER_SLAB buckets={','.join(map(str, buckets))} slots={args.slab_slots} "
           f"slab_mib={want_mib} ws_rows={args.ws_rows} ws_mib={ws_mib} rows_max={buckets[-1]} "
-          f"avail_mib={avail_mib} fits={fits}", flush = True)
+          f"avail_mib={avail_mib} swapped_mib={swapped_mib} fits={fits}", flush = True)
     if not fits:
         # The pack is already resident, so memory that does not fit is paid by swapping the pack
         # out page by page: every expert call then faults, and the box looks alive while crawling.
@@ -454,6 +479,13 @@ def main():
               f"avail_mib={avail_mib} over_mib={want_mib + ws_mib - avail_mib + 64}: lower "
               f"--buckets, set --ws-rows, or expect the pack to be swapped out (see "
               f"seam_server_ensure.sh --buckets auto)", flush = True)
+    if swapped_mib > SWAP_WARN_MIB:
+        # Not fatal to start (the pages fault back in), but every call pays for it and the box can
+        # fail a launch outright: GX2 2026-11-01 ran with 4.4 GiB swapped, hit p50 47 ms / max
+        # 4.15 s at rows=64 and then an "unspecified launch failure" in the decode arm.
+        print(f"SEAM_SERVER_SWAP_WARN swapped_mib={swapped_mib} avail_mib={avail_mib}: the pack is "
+              f"paging; expect multi-second SEAM_COMPUTE outliers and possible launch failures - "
+              f"restart the box's server with a smaller --buckets/--slab-slots", flush = True)
     placement_sha = hashlib.sha256(open(args.placement, "rb").read()).hexdigest()[:12]
     srv = qes.Server(args.dev, args.gid, args.port, 0, buckets, build = qes.build_id(),
                      placement_sha = placement_sha, wait = args.wait, slots = args.slab_slots)
