@@ -151,6 +151,9 @@ check("the client does not pin buckets",
 check("the server is asked for the wide grant",
       all(int(pc.load_conf(q)["buckets"].split(",")[-1]) >= 2048 for q in ("prod", "dev")),
       str([pc.load_conf(q)["buckets"] for q in ("prod", "dev")]))
+check("the smoke grants no wider than it exercises",
+      "SMOKE_BUCKETS=${SMOKE_BUCKETS:-1,6,64}" in src("pair_smoke.sh")
+      and "--buckets $SMOKE_BUCKETS" in src("pair_smoke.sh"), "")
 check("smoke asks for two payload slots", "SMOKE_SLAB_SLOTS:-2" in sm, "")
 check("smoke passes the slot count to the ensure", "SEAM_SLAB_SLOTS=$SMOKE_SLAB_SLOTS" in sm, "")
 check("the rollback serves the same slots", "SEAM_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-2}" in ur, "")

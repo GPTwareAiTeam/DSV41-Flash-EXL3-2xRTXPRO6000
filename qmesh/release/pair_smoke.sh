@@ -39,6 +39,12 @@ SMOKE_SLACK_GATE=${SMOKE_SLACK_GATE:-0}          # 1 = a thin slack refuses the 
 # second slot to pipeline into, and seam_server_ensure.sh only passes --slab-slots to a release whose
 # worker knows the flag (proto 3). One slot still works on an old release, just without pipelining.
 SMOKE_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-2}
+# The grant the smoke server is given. The server reserves workspace for its widest bucket even
+# when nobody asks for it -- 294 MiB at 2048 rows against ~9 MiB at 64 -- and on a box whose pack
+# leaves ~1 GiB free that reservation is the difference between a smoke and a paging wall. The
+# smoke never asks for more than 64 rows, so it does not grant more. Prod still serves the wide
+# list from pairs.conf.
+SMOKE_BUCKETS=${SMOKE_BUCKETS:-1,6,64}
 ENSURE=${SEAM_ENSURE:-}
 if [ -z "$ENSURE" ]; then
   for c in "$PAIR_SCRIPTS/seam_server_ensure.sh" "$HERE/seam_server_ensure.sh"; do
@@ -55,7 +61,7 @@ gx_mem() {  # prints "avail_mib=<n> swap_free_mib=<n> swap_total_mib=<n>"
 }
 
 if [ "$PAIR_DRY" = 1 ]; then
-  echo "DRY ensure: ${ENSURE:-<not found>} GX=$GX CT=$GXCT GX_GID=$GX_GID PORT=$PORT SEAM_BUILD_ID=$BUILD_ID SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT $ENSURE --fresh --buckets $BUCKETS"
+  echo "DRY ensure: ${ENSURE:-<not found>} GX=$GX CT=$GXCT GX_GID=$GX_GID PORT=$PORT SEAM_BUILD_ID=$BUILD_ID SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT $ENSURE --fresh --buckets $SMOKE_BUCKETS"
   echo "DRY arm: $HERE/pair_arm.sh $PAIR --rows 1 --max-new $SMOKE_NEW --cache-tokens $SMOKE_CACHE_TOKENS"
   echo "SMOKE_ROW i=0 new_tokens=$SMOKE_NEW text_sha256=dry"
   echo "SMOKE_OK"
@@ -63,11 +69,11 @@ if [ "$PAIR_DRY" = 1 ]; then
 fi
 
 echo "SMOKE_MEM_BEFORE $(gx_mem)"
-pair_step "SMOKE_SERVER_START pair=$PAIR ct=$GXCT build=$BUILD_ID buckets=$BUCKETS timeout=${SMOKE_SERVER_TIMEOUT}s"
+pair_step "SMOKE_SERVER_START pair=$PAIR ct=$GXCT build=$BUILD_ID buckets=$SMOKE_BUCKETS timeout=${SMOKE_SERVER_TIMEOUT}s"
 srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT \
-          SERVER_BUCKETS=$BUCKETS SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT \
+          SERVER_BUCKETS=$SMOKE_BUCKETS SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT \
           SEAM_SLACK_GATE=$SMOKE_SLACK_GATE SEAM_SLAB_SLOTS=$SMOKE_SLAB_SLOTS SEAM_ENV="SEAM_BUILD_ID=$BUILD_ID" \
-          "$ENSURE" --fresh --buckets "$BUCKETS" 2>&1)
+          "$ENSURE" --fresh --buckets "$SMOKE_BUCKETS" 2>&1)
 srv_rc=$?
 [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$srv_out" >> "$PAIR_LOG"
 printf '%s\n' "$srv_out" | grep -E '^(SEAM_ENSURE|SEAM_SLACK)' | sed 's/^/SMOKE_SERVER /'
