@@ -18,8 +18,11 @@ Env:
   KV_BITS (4|8|16, default 4), CACHE_TOKENS (default 1048576),
   DSPARK (1 loads the drafter), NUM_DRAFT (default 5), WARMUP_NEW (decode tokens of the warm-up
   prompt, default 24), LONG_PROMPT_FILE or CORPUS+LONG_TOKENS, LONG_NEW (decode tokens after the
-  long prompt, default 16), MAX_CHUNK (default 2048), PREFILL_ADAPTIVE, EXL3_WHOLE_GRAPH
-"""
+  long prompt, default 16), MAX_CHUNK (default 2048), PREFILL_ADAPTIVE, PREFILL_ADAPTIVE_LOG,
+  EXL3_WHOLE_GRAPH, PREFILL_ARMS ("depth:chunk,..." prefill arms in one load), SEAM_ROWS (largest
+  seam bucket, only used to count a chunk's round trips), BYNAME_MIN_MIB (drafter MEM_BYNAME floor),
+  DEPTH_PROBES / DEPTH_MAX_S, LOAD_ONLY
+ """
 from __future__ import annotations
 
 import json
@@ -34,7 +37,7 @@ import torch
 
 from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from exllamav3.util.memory import vram_accounting
-from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
+from qmesh.prefill_limit import PAGE_SIZE, PREFILL_ADAPTIVE, PrefillChunkLimiter
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
 DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
@@ -52,6 +55,17 @@ MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 # Deep-context probes for the statics (dsv4_attn_out and friends): tokens from a tiled corpus, and
 # the wall time a probe may be predicted to take before it is skipped (the previous probe scales it).
 DEPTH_MAX_S = float(os.environ.get("DEPTH_MAX_S", "420"))
+# "depth:chunk,depth:chunk,..." prefills a fresh prompt of `depth` tokens at each chunk size in one load
+# (see the PREFILL_ARM phase below). SEAM_ROWS is the largest seam row bucket (the client splits a prefill
+# chunk into pieces of at most this many rows), used only for the round-trip count in the arm line.
+PREFILL_ARMS = [tuple(int(v) for v in a.split(":"))
+                for a in os.environ.get("PREFILL_ARMS", "").split(",") if a.strip()]
+SEAM_ROWS = int(os.environ.get("SEAM_ROWS", "64"))
+# Wall-clock discipline for the arms: ARM_MAX_S caps one arm (the job is cancelled after the chunk
+# in flight and the arm is reported with aborted=1), ARM_TOTAL_S caps the whole arms phase, so deep
+# arms are skipped when the measured rate says they cannot finish.
+ARM_MAX_S = float(os.environ.get("ARM_MAX_S", "0"))
+ARM_TOTAL_S = float(os.environ.get("ARM_TOTAL_S", "0"))
 LOAD_ONLY = os.environ.get("LOAD_ONLY") == "1"
 DEVICE = torch.device("cuda:0")
 G = 2 ** 30
@@ -285,6 +299,32 @@ def itemize(root, title: str, classify, skip_ids = frozenset(), engine_gib = Non
     return by
 
 
+def dump_byname(root, title: str, skip_ids = frozenset(), min_mib: float = 0.0, top: int = 400):
+    """Print MEM_BYNAME: every CUDA tensor reachable from root, deduplicated by storage pointer, with
+    dtype and shape, plus a rollup by module suffix. Answers 'which tensors make up 6.703 GiB' when the
+    checkpoint file on disk only accounts for 5.4 of it (stacked/padded copies, fp32 heads, private
+    embed/head, arena tail)."""
+    rows = walk_named(root, skip_ids)
+    items = []
+    for _key, (path, t) in rows.items():
+        n = t.numel() * t.element_size()
+        if gib(n) < min_mib:
+            continue
+        items.append((n, path, str(t.dtype).replace("torch.", ""), tuple(t.shape)))
+    items.sort(reverse = True)
+    tot = sum(n for n, *_ in items)
+    print(f"MEM_BYNAME {title} n={len(rows)} listed={len(items)} shown={min(top, len(items))} "
+          f"total_gib={gib(tot):.3f} min_mib={min_mib}", flush = True)
+    roll: dict = {}
+    for n, path, dt, shape in items:
+        leaf = path.rsplit(".", 1)[-1]
+        roll[(leaf, dt)] = roll.get((leaf, dt), 0) + n
+    for (leaf, dt), n in sorted(roll.items(), key = lambda kv: -kv[1])[:40]:
+        print(f"MEM_BYNAME_ROLL {title} {gib(n):8.3f} {dt:10s} {leaf}", flush = True)
+    for n, path, dt, shape in items[:top]:
+        print(f"MEM_BYNAME_ITEM {title} {gib(n):8.3f} {dt:10s} {str(shape):28s} {path}", flush = True)
+
+
 def classify_generator(path: str) -> str:
     p = _norm_path(path)
     # first attribute under the walk root is the generator's own slot; keep two levels of detail
@@ -404,6 +444,13 @@ def main():
         itemize(draft_model, "drafter", classify_drafter,
                 {id(draft_model.config), id(getattr(draft_model.config, "stc", None)),
                  id(draft_cache), id(generator), id(model), id(cache)})
+        # Every CUDA tensor the drafter owns, by name, deduplicated by storage pointer: the resident total
+        # (6.7 GiB) is well above the checkpoint's tensor bytes (5.4 GiB), which is either a stacked copy,
+        # an upcast head or a private embed/head, and the rollup names which.
+        dump_byname(draft_model, "drafter",
+                    {id(draft_model.config), id(getattr(draft_model.config, "stc", None)),
+                     id(draft_cache), id(generator), id(model), id(cache)},
+                    min_mib = float(os.environ.get("BYNAME_MIN_MIB", "0.5")))
     itemize(generator, "generator", classify_generator,
             {id(model), id(cache), id(draft_model), id(draft_cache), id(tokenizer),
              id(model.config), id(getattr(model.config, "stc", None))})
@@ -445,23 +492,57 @@ def main():
                 down.take(f"drafter_other {key or name}", m)
         report(down, "drafter")
     # --- warm-up: capture graphs, then account for statics --------------------------------
-    def run(ids, max_new, chunk_label):
+    def run(ids, max_new, chunk_label, max_s = None):
         limiter = None
         if PREFILL_ADAPTIVE:
             generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(DEVICE)
         job = Job(input_ids = ids, max_new_tokens = max_new, sampler = GreedySampler())
         generator.enqueue(job)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(DEVICE)
+        base_alloc = torch.cuda.memory_allocated(DEVICE)
         t = time.time()
         first_t = None
-        n = 0
+        prefill_t = None
+        prefill_peak = None
+        out = None
+        aborted = False
         while generator.num_remaining_jobs():
-            for _ in generator.iterate():
+            # Per-arm wall limit: a prefill arm that runs past it is cancelled after the chunk in
+            # flight (generator.cancel releases the pages, so the loop then drains and returns).
+            if max_s and not aborted and time.time() - t > max_s:
+                generator.cancel(job)
+                aborted = True
+                print(f"MEM_ABORT {chunk_label} elapsed_s={time.time() - t:.1f} max_s={max_s}",
+                      flush = True)
+                break
+            for r in generator.iterate():
+                if r.get("stage") == "error":
+                    print(f"MEM_ERROR {chunk_label} error={r.get('error')!r}", flush = True)
+                    err = r.get("error")
+                    raise err if isinstance(err, BaseException) else RuntimeError(f"job error: {err!r}")
                 if first_t is None:
                     first_t = time.time() - t
+                if prefill_t is None and (r.get("text") or r.get("stage") == "streaming"
+                                          or job.is_prefill_done()):
+                    prefill_t = time.time() - t
+                    prefill_peak = torch.cuda.max_memory_allocated(DEVICE)
+                    torch.cuda.reset_peak_memory_stats(DEVICE)
+                if r.get("eos"):
+                    out = r
                 n += 1
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated(DEVICE)
+        prefill_peak = peak if prefill_peak is None else prefill_peak
+        out = out or {}
         return {"wall_s": time.time() - t, "ttft_s": first_t, "steps": n,
                 "chunks": limiter.chunks if limiter else None,
-                "shrunk": limiter.shrunk if limiter else None}
+                "shrunk": limiter.shrunk if limiter else None,
+                "prefill_s": prefill_t or 0.0,
+                "aborted": aborted,
+                "peak_rise_mib": (prefill_peak - base_alloc) / 2 ** 20,
+                "decode_peak_rise_mib": (peak - base_alloc) / 2 ** 20,
+                "decide_us_median": limiter.summary()["decide_us_median"] if limiter else None}
 
     warm_ids = tokenizer.encode("Write a paragraph about the history of sailing ships.",
                                 add_bos = True, encode_special_tokens = True)
@@ -470,6 +551,69 @@ def main():
     print(f"MEM_WARM {json.dumps(w)}", flush = True)
     engine_report(model, cache, generator, "after_warm")
 
+    # --- prefill chunk arms (chunk size x context depth, one load) -------------------------
+    # PREFILL_ARMS="depth:chunk,depth:chunk,..." walks a fresh prompt of `depth` tokens through prefill at
+    # each chunk size and prints one PREFILL_ARM line per arm (host-timed prefill, engine tok/s, chunk count,
+    # allocator peak rise) plus the limiter's own PREFILL_CHUNK_PEAK/PREFILL_CHUNK_ADAPT lines for the refit
+    # of PREFILL_ROW_KIB / PREFILL_DEPTH_BASE_MIB / PREFILL_DEPTH_BYTES. Each arm's prompt is distinct (the
+    # corpus is rolled by the running total), so no arm is served out of the prompt cache.
+    if PREFILL_ARMS:
+        sources = ([open(LONG_PROMPT_FILE).read()] if LONG_PROMPT_FILE else []) + \
+                  [open(p).read() for p in CORPUS_FILES]
+        src = torch.cat([tokenizer.encode(t, add_bos = False, encode_special_tokens = True)[0]
+                         for t in sources])
+        bos = tokenizer.encode("a", add_bos = True, encode_special_tokens = True)[0, :1]
+        print(f"PREFILL_ARMS source_tokens={int(src.shape[-1])} arms={PREFILL_ARMS}", flush = True)
+        # Every layer with warm (GX1) experts issues seam calls, so a prefill piece costs one round
+        # trip per such layer; the count comes from the same placement the model is loaded with.
+        COLD_LAYERS = sum(1 for v in placement.get("layers", {}).values() if v.get("warm"))
+        print(f"PREFILL_ARMS seam_layers={COLD_LAYERS} seam_rows={SEAM_ROWS}", flush = True)
+        consumed = 0
+        tok_s_seen = []  # (depth, chunk, tok/s) of arms that completed prefill, for the estimate below
+        arms_t0 = time.time()
+        for depth, chunk in PREFILL_ARMS:
+            if depth + 2 * PAGE_SIZE > CACHE_TOKENS:
+                print(f"PREFILL_ARM depth={depth} chunk={chunk} skipped=page_limit "
+                      f"cache_tokens={CACHE_TOKENS}", flush = True)
+                continue
+            # Budget: an arm is skipped when the fastest rate seen so far predicts it cannot finish
+            # inside what is left of ARM_TOTAL_S (the deepest arm is last, so this only prunes it).
+            left_s = ARM_TOTAL_S - (time.time() - arms_t0) if ARM_TOTAL_S else None
+            rate_hint = max((t for _, _, t in tok_s_seen), default = None)
+            if left_s is not None and rate_hint:
+                need_s = depth / rate_hint * 1.25
+                if need_s > left_s:
+                    print(f"PREFILL_ARM depth={depth} chunk={chunk} skipped=budget "
+                          f"left_s={left_s:.0f} need_s={need_s:.0f} rate={rate_hint:.1f}", flush = True)
+                    continue
+            reps = depth // int(src.shape[-1]) + 1
+            ids_a = torch.cat([bos, src.roll(consumed).repeat(reps)[: depth - 1]]).unsqueeze(0)
+            consumed = (consumed + 7919) % int(src.shape[-1])
+            generator.max_chunk_size = chunk
+            max_s = min(ARM_MAX_S, left_s) if left_s is not None else ARM_MAX_S
+            r = run(ids_a, 1, f"arm_{depth}_{chunk}", max_s = max_s or None)
+            tps = None if r["aborted"] or not r["prefill_s"] else depth / r["prefill_s"]
+            if tps:
+                tok_s_seen.append((depth, chunk, tps))
+            print(f"PREFILL_ARM depth={depth} chunk={chunk} tokens={int(ids_a.shape[-1])} "
+                  f"prefill_s={r['prefill_s']:.2f} "
+                  f"tok_per_s={'none' if not tps else f'{tps:.1f}'} "
+                  f"chunks={r['chunks']} shrunk={r['shrunk']} aborted={int(r['aborted'])} "
+                  f"wall_s={r['wall_s']:.2f} peak_rise_mib={r['peak_rise_mib']:.0f} "
+                  f"pieces={None if r['chunks'] is None else int(depth / SEAM_ROWS)} "
+                  f"round_trips={None if r['chunks'] is None else int(depth / SEAM_ROWS) * COLD_LAYERS} "
+                  f"decide_us_median={r['decide_us_median']}", flush = True)
+            free_now, _total_now = torch.cuda.mem_get_info(DEVICE)
+            print(f"PREFILL_ARM_PEAK depth={depth} chunk={chunk} "
+                  f"peak_rise_mib={r['peak_rise_mib']:.0f} "
+                  f"decode_peak_rise_mib={r['decode_peak_rise_mib']:.0f} "
+                  f"free_now_gib={free_now / G:.3f}", flush = True)
+            engine_report(model, cache, generator, f"after_arm_{depth}_{chunk}")
+
+        generator.max_chunk_size = MAX_CHUNK
+        print(f"PREFILL_ARMS_DONE arms_s={time.time() - arms_t0:.0f} "
+              f"rates={tok_s_seen}", flush = True)
+        return
     # --- long-context prefill + decode peaks ----------------------------------------------
     if LONG_PROMPT_FILE:
         ids = tokenizer.encode(open(LONG_PROMPT_FILE).read(), add_bos = True,
@@ -502,16 +646,24 @@ def main():
         t = time.time()
         st = None
         prefill_done = False
+        prefill_wall = 0.0
         rows = 0
-        # The first yielded event is stage "started", long before any prompt token is ingested, so the
-        # split below uses the job's own counters (time_enqueued / time_prefill / time_generate) and the
-        # peak is taken after synchronise() once the whole job has drained.
+        # The first yielded event is stage "started", long before any prompt token is ingested, and a job
+        # that dies inside prefill() reports zeros in its own counters, so the split below is timed on the
+        # host as well: prefill ends when the job reports prefill done (or streams its first token), and a
+        # "stage": "error" result (generator.reap_failed_job) is re-raised instead of being read as an eos.
         while generator.num_remaining_jobs():
             for r in generator.iterate():
+                if r.get("stage") == "error":
+                    print(f"MEM_ERROR long_prompt error={r.get('error')!r}", flush = True)
+                    err = r.get("error")
+                    raise err if isinstance(err, BaseException) else RuntimeError(f"job error: {err!r}")
                 if r.get("eos"):
                     st = r
-                if not prefill_done and (r.get("text") or r.get("stage") == "streaming"):
+                if not prefill_done and (r.get("text") or r.get("stage") == "streaming"
+                                         or job.is_prefill_done()):
                     prefill_done = True
+                    prefill_wall = time.time() - t
                     peaks("prefill", base_alloc)
                     torch.cuda.reset_peak_memory_stats(DEVICE)
                     base_alloc = torch.cuda.memory_allocated(DEVICE)
@@ -520,11 +672,14 @@ def main():
         wall = time.time() - t
         st = st or {}
         pf = float(st.get("time_enqueued", 0.0)) + float(st.get("time_prefill", 0.0))
+        pf_wall = prefill_wall if prefill_wall else pf
         gen = float(st.get("time_generate", 0.0))
         print(f"MEM_PREFILL tokens={int(ids.shape[-1])} prefill_s={pf:.2f} "
-              f"tok_per_s={int(ids.shape[-1]) / max(pf, 1e-9):.1f} "
+              f"prefill_wall_s={pf_wall:.2f} "
+              f"tok_per_s={int(ids.shape[-1]) / max(pf_wall, 1e-9):.1f} "
               f"chunks={limiter.chunks if limiter else None} "
               f"shrunk={limiter.shrunk if limiter else None}", flush = True)
+
         print(f"MEM_DECODE steps={int(st.get('new_tokens', 0))} wall_s={gen:.2f} "
               f"events={rows} total_wall_s={wall:.2f}", flush = True)
         peaks("decode", base_alloc)
@@ -544,8 +699,11 @@ def main():
             print(f"MEM_DEPTH source_tokens={int(base.shape[-1])} probes={probes}", flush = True)
             prev_want, prev_s = 0, 0.0
             for want in probes:
-                if want + 1 > CACHE_TOKENS:
-                    print(f"MEM_DEPTH tokens={want} skipped=exceeds-cache", flush = True)
+                # A job needs ceil((tokens + max_new) / PAGE_SIZE) pages, and enqueue() asserts when that
+                # exceeds the pool: reserve one page for the generated token and one of slack.
+                if want + 2 * PAGE_SIZE > CACHE_TOKENS:
+                    print(f"MEM_DEPTH tokens={want} skipped=page_limit cache_tokens={CACHE_TOKENS} "
+                          f"pages={want // PAGE_SIZE + 2}/{CACHE_TOKENS // PAGE_SIZE}", flush = True)
                     continue
                 if prev_want and prev_s:
                     pred = prev_s * want / prev_want
@@ -554,7 +712,9 @@ def main():
                               f"limit={DEPTH_MAX_S}", flush = True)
                         continue
                 reps = want // int(base.shape[-1]) + 1
-                pids = torch.cat([bos, base.repeat(reps)[: want - 1]]).unsqueeze(0)
+                # Distinct content per probe, so page hashes from the previous probe cannot turn the
+                # prefill into a cache hit (which would time nothing and measure nothing)
+                pids = torch.cat([bos, base.roll(prev_want).repeat(reps)[: want - 1]]).unsqueeze(0)
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats(DEVICE)
                 pbase = torch.cuda.memory_allocated(DEVICE)
@@ -566,19 +726,24 @@ def main():
                 t = time.time()
                 while generator.num_remaining_jobs():
                     for r in generator.iterate():
+                        if r.get("stage") == "error":
+                            print(f"MEM_ERROR depth_{want} error={r.get('error')!r}", flush = True)
+                            err = r.get("error")
+                            raise err if isinstance(err, BaseException) else \
+                                RuntimeError(f"job error: {err!r}")
                         if r.get("eos"):
                             pst = r
                 torch.cuda.synchronize()
                 pst = pst or {}
                 ps = float(pst.get("time_enqueued", 0.0)) + float(pst.get("time_prefill", 0.0))
+                wall = time.time() - t
+                ps = ps if ps else wall
                 prev_want, prev_s = want, ps
                 print(f"MEM_DEPTH tokens={int(pids.shape[-1])} prefill_s={ps:.2f} "
                       f"tok_per_s={int(pids.shape[-1]) / max(ps, 1e-9):.1f} "
                       f"chunks={limiter.chunks if limiter else None} "
                       f"shrunk={limiter.shrunk if limiter else None} "
-                      f"total_wall_s={time.time() - t:.2f}", flush = True)
-                peaks(f"depth_{want}", pbase)
-                engine_report(model, cache, generator, f"after_{want}")
+                      f"total_wall_s={wall:.2f}", flush = True)
 
 
 if __name__ == "__main__":

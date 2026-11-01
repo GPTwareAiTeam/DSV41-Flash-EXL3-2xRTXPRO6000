@@ -1183,6 +1183,19 @@ class SafetensorsCollection:
         if snapshot is not None:
             # Every slab slice handed out since the bracket opened belongs to the aborted module
             self.arena = {d: [self._arena_entry(b, off) for b, off in saved] for d, saved in snapshot.items()}
+            if self.arena_track:
+                # Re-point the audit list at the restored entries (by block identity: list.remove would
+                # compare the entries' tensors), keeping the tensors each block already carries
+                for d, blocks in self.arena.items():
+                    lst = self.arena_all.setdefault(d, [])
+                    for e in blocks:
+                        for i, prev in enumerate(lst):
+                            if prev[0] is e[0]:
+                                e[4] = prev[4]
+                                lst[i] = e
+                                break
+                        else:
+                            lst.append(e)
             self.arena_snapshot = None
 
 
