@@ -48,7 +48,13 @@ _IDS_LOG_MAX = int(os.environ.get("SEAM_IDS_LOG_MAX_ROWS", "6"))
 
 # Printed ids for a rejected request: the whole array for small calls (the values are the
 # diagnosis), capped for big ones.
-_IDS_BAD_MAX = int(os.environ.get("SEAM_IDS_BAD_MAX_ROWS", "64"))
+# Cold-expert kernel (see _forward_piece). "cudaexl3" runs a layer through cuda-exl3's MoE gemm
+# (vendor/cuda-exl3), "mixedk" through exllamav3's mixed-K module. cuda-exl3 is the default: it is
+# faster in every bucket measured on GX2 (layer 5, 268 cold experts) -- 16.9 / 30.2 / 54.9 / 103.6
+# ms at 512 / 2048 / 4096 / 8192 rows against 30.3 / 41.3 / - / 145.3 for the module -- but it needs
+# one restack per layer into per-bitrate trellis stacks on first use, which also drops the
+# per-expert copies. A layer whose restack raises is served by the module from then on.
+MOE_KERNEL = os.environ.get("SEAM_MOE_KERNEL", "cudaexl3")
 
 
 def _check_ids(layer, rows, ids, num_experts):
@@ -269,12 +275,48 @@ class SeamServer:
         miss = ids < 0
         sel = ids.clamp_min(0).to(self.device)
         gw = torch.where(miss, torch.zeros_like(w), w).to(self.device).half()
+        # Cold-expert kernel switch (MOE_KERNEL). cuda-exl3 wants a layer's experts of one bitrate
+        # stacked into one trellis instead of one module per expert; the restack happens on the
+        # first call for the layer and drops the per-expert copies, so the resident cost is one
+        # copy of the cold pack and not two. A layer that cannot restack stays on the module.
+        cx = self._cx_moe(layer, ffn) if MOE_KERNEL == "cudaexl3" else None
         with torch.cuda.stream(self.stream):
-            part = ffn.forward(x.view(1, rows, HIDDEN),
-                               {"external_selected": sel, "external_weights": gw})
+            if cx is not None:
+                part = cx.forward(x, sel, gw)
+            else:
+                part = ffn.forward(x.view(1, rows, HIDDEN),
+                                   {"external_selected": sel, "external_weights": gw})
         self.stream.synchronize()
         view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = \
             part.view(rows, HIDDEN).float().cpu().numpy()
+
+    def _cx_moe(self, layer, ffn):
+        """The layer's cuda-exl3 adapter, built on first use (see _forward_piece).
+
+        None means "this layer stays on the mixed-K module", and it is cached as such: a restack
+        that failed once (an unstackable bitrate/frac mix, a broken extension) would fail on every
+        call, and the client must not pay that exception per request.
+        """
+        cx = self.__dict__.setdefault("_cx_layers", {})
+        if layer in cx:
+            return cx[layer]
+        from qmesh.exl3_moe_cuda import CudaExl3Moe
+        t0 = time.perf_counter()
+        avail0, swap0 = _avail_mib(), _swap_used_mib()
+        try:
+            hit = CudaExl3Moe(ffn, self.device)
+        except Exception as e:
+            cx[layer] = None
+            print(f"SEAM_MOE_FALLBACK layer={layer} err={type(e).__name__}: {e} "
+                  f"- serving this layer from the mixed-K module", flush=True)
+            return None
+        torch.cuda.empty_cache()
+        cx[layer] = hit
+        print(f"SEAM_MOE_CX layer={layer} groups={hit.describe()} "
+              f"stacked_mib={hit.nbytes() / 2**20:.0f} build_ms={1e3 * (time.perf_counter() - t0):.0f} "
+              f"avail_mib={avail0}->{_avail_mib()} swap_mib={swap0}->{_swap_used_mib()} "
+              f"alloc_gib={torch.cuda.memory_allocated(self.device) / 2**30:.2f}", flush=True)
+        return hit
 
 
 _times: dict = {}
@@ -649,6 +691,7 @@ def ws_tier_check(server, rows, tiers):
 
 
 def main():
+    global MOE_KERNEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default="/cold")
     ap.add_argument("--placement", default="/cold/placement.exl3.json")
@@ -717,7 +760,15 @@ def main():
                     help = "test hook: raise inside the compute hook on call N+1 (stub servers "
                            "included), to prove that a failing compute fails the client instead of "
                            "handing it the previous call's bytes. 0 = never.")
+    ap.add_argument("--moe-kernel", default = MOE_KERNEL, choices = ("cudaexl3", "mixedk"),
+                    help = "cold-expert kernel: cudaexl3 (default) runs each layer on "
+                           "vendor/cuda-exl3's MoE gemm after a one-off restack into per-bitrate "
+                           "trellis stacks; mixedk keeps exllamav3's mixed-K module. Per-layer "
+                           "fallback to mixedk if the restack raises.")
     args = ap.parse_args()
+    # Set before the pack loads: the switch is read per call, but a bad value must fail the
+    # launch, not the first request.
+    MOE_KERNEL = args.moe_kernel
 
     device = torch.device("cuda:0")
     t0 = time.time()

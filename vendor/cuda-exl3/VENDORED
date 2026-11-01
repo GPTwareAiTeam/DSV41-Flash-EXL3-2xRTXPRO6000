@@ -1,0 +1,25 @@
+Upstream: https://github.com/Zeuss5/cuda-exl3 commit 6a1ffc3, vendored as plain files (the nested
+.git was removed so this tree belongs to the parent repository). LICENSE and NOTICE are upstream's,
+unmodified; the vendored code is MIT.
+
+Local change on top of upstream -- fractional-bitrate ("frac") tiles, which this checkpoint needs:
+80 of layer 5's 268 cold experts, and 20-30% of every other layer's, are 2- or 3-bit with a
+half-tile last k-group (trellis.size(3) % 16 != 0). Upstream asserts that shape away, so without
+this patch those experts cannot run on cuda-exl3 at all.
+
+  src/cuda_exl3/csrc/exl3_dq.cuh  + template<int KA, int cb> dq8_half(), a half-tile dequant step
+                                 with its own 8+4 int4/u32 tile, and dq_dispatch<bits, cb, half_k>.
+  src/cuda_exl3/csrc/gemm.cu     TILE_U32 = 8*BITS + (HALF ? 4 : 0), TILE_I4 = 2*BITS + (HALF ? 1 : 0)
+                                 in GemmCfg, the extra bool threaded through exl3_gemm_m_kernel,
+                                 launch/launch_bm/dispatch_gemm and the VE3_CASE table, plus
+                                 VE3_CASE(1,2,true) VE3_CASE(2,2,true) VE3_CASE(3,2,true). The host
+                                 entries derive half_k = trellis.size(3) % 16 != 0 (the pybind arg
+                                 that used to be named `half` is now `half_k`).
+
+Verified against the mixed-K module on widths 32/40/48: max abs 9.77e-4 / 4.88e-4 / 4.88e-4.
+
+Build (see qmesh/build_cudaexl3.sh): from this directory,
+  TORCH_CUDA_ARCH_LIST=12.1 MAX_JOBS=8 nice -n 10 python3 setup.py build_ext --inplace
+It also builds for sm_120 (TORCH_CUDA_ARCH_LIST=12.0) with no source change -- three cubins, no
+arch guards in csrc/ (the kernels use mma.sync/cp.async and query shared-memory limits per
+device) -- that part was compiled but not executed, since no sm_120 part is in this allotment.
