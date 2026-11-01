@@ -74,3 +74,30 @@ back, a subset request, handles opened in reverse bucket order, a refused busy c
 by the next session), a legacy pickle client, a SIGKILLed client served again after 2 s, and zero
 `SEAM_SESSION_REJECT` / `peer layout mismatch` in the whole server log.
 Log: `artifacts/seamrobust/battery-1101-010510/battery.log` (build=cb76845f on server and clients).
+
+## Needle prompt format: the long-context arm was scoring a different prompt (2026-11-01)
+The 131k arm of `qmesh/mem_budget.py` read the needle fixture as raw text with `add_bos=True`. That is
+not the prompt v1.2 scored 5/5 on. The reference harness (`artifacts/2x-rtx-tp2/fp4kv/needle.sh`,
+`PROMPT_IDS=8`) builds `PROMPTS[8] + "\n\n" + transcript` (`tp2/run_tp2.py:189`) and wraps it in the
+checkpoint's own chat template, `encoding.encode_messages([{"role": "user", "content": prompt}],
+thinking_mode="chat")`, then encodes with `add_bos=False, encode_special_tokens=True`
+(`qmesh/tp2_bench.py:66-71`). Without the template the base model continues the prose instead of
+answering the request block, which is what `final_prod7` produced.
+
+`LONG_CHAT=1` now takes the reference path (`ENC_DIR` defaults to
+`/models/dsv41/DeepSeek-V4.1-Flash-1017-orig/encoding`, pure python, no torch), prints
+`LONG_CHAT lead=... chars=...`, `LONG_PROMPT tokens=...` and `LONG_PROMPT_TAIL`, and `IGNORE_EOS=1`
+mirrors `tp2_bench.run_prompt` (`min_new_tokens=max_new`, no stop conditions). Generated ids are read
+from `token_ids` (the key the generator reports, and the one `tp2_bench` reads) with `ids` as fallback;
+the earlier arm printed `LONG_TEXT_IDS []` because only `ids` was read. Token counts with the template:
+short fixture 3122, 131k fixture 131 233 (raw 131 222). `mem_budget_run.sh` now defaults `DEPTH_PROBES`
+with `${VAR-default}`, so `DEPTH_PROBES=""` really disables the 512k/1M probes.
+
+## Prefill chunk limiter: first-chunk term (2026-11-01)
+`qmesh/prefill_limit.py` predicted 3056 MiB for an 8192-row chunk and measured it on 15 of 16 chunks;
+the first chunk rose 3573 MiB. The extra ~517 MiB is one-time (uncompressed-pool staging window and
+indexer score slab: `statics` 0.000 GiB after load, 0.559 GiB at 131k) and stays allocated, so it is
+charged to the chunk that allocates it, in proportion to its rows: the 3121-row single-chunk needle arm
+rose 1340 MiB against a row term of 1164 (+176) and the two fits give 63 and 56 KiB/row, so
+`PREFILL_FIRST_ROW_KIB=64` is added per row of the first chunk only (`start == 0`). 8192 rows now predict
+3568 MiB (measured 3573), 3121 rows 1359 (measured 1340); later chunks keep the 382 KiB/row term.
