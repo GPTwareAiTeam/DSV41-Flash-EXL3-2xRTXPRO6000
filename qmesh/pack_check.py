@@ -36,18 +36,42 @@ def shard_sizes(path: str, shards) -> list:
     return out
 
 
-def classify(names):
-    """Group omitted tensor names by what the loader can substitute for."""
-    hot = re.compile(r"^model\.layers\.\d+\.(mlp\.experts|ffn)\.(gate|up|down)")
-    small = re.compile(r"(mul1|suh|svh|trellis_rate|bias|scale)")
-    out = {"hot_experts": [], "cold_small": [], "other": []}
+EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(\w+)$")
+
+
+def classify(names, cold_counts):
+    """Group omitted tensor names by whether a hot-only pack may legitimately drop them.
+
+    The shipped pack keeps every expert's mul1/suh/svh and drops only trunk routed-expert
+    `trellis` for the cold experts (plus the first cold expert's, which the loader probes for
+    shape). So `trellis` omissions are expected up to the layer's cold count; anything else is a
+    hard failure for load_cpu_split or for the hot slice.
+    """
+    out = {"cold_trellis": [], "hot_trellis": [], "expert_other": [], "nonexpert": []}
     for n in names:
-        if hot.search(n):
-            out["hot_experts"].append(n)
-        elif small.search(n):
-            out["cold_small"].append(n)
+        m = EXPERT.match(n)
+        if not m:
+            out["nonexpert"].append(n)
+            continue
+        layer, _eid, _w, kind = m.groups()
+        cold = cold_counts.get(int(layer))
+        if kind == "trellis":
+            out["cold_trellis"].append((int(layer), n))
+        elif kind in ("mul1", "suh", "svh"):
+            out["expert_other"].append(n)
         else:
-            out["other"].append(n)
+            out["expert_other"].append(n)
+    # Per-layer trellis budget: at most the layer's cold count (one is kept for the probe)
+    per_layer = {}
+    for layer, _n in out["cold_trellis"]:
+        per_layer[layer] = per_layer.get(layer, 0) + 1
+    over = []
+    for layer, cnt in sorted(per_layer.items()):
+        cold = cold_counts.get(layer)
+        # 384 experts x 3 projections = the per-expert tensor triple count
+        if cold is None or cnt > 3 * cold:
+            over.append((layer, cnt, cold))
+    out["over_budget"] = over
     return out
 
 
@@ -79,21 +103,32 @@ def main():
     ridx = index_of(ref)
     missing = sorted(set(ridx) - set(pidx))
     added = sorted(set(pidx) - set(ridx))
-    groups = classify(missing)
+    pl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "placement.final.json")
+    cold_counts = {}
+    if os.path.exists(pl_path):
+        pl = json.load(open(pl_path))
+        for layer, entry in pl["layers"].items():
+            cold_counts[int(layer)] = len(entry.get("warm") or [])
+    else:
+        print(f"PACK_WARN no_placement={pl_path}")
+    groups = classify(missing, cold_counts)
     print(f"PACK vs {ref}: ref_tensors={len(ridx)} omitted={len(missing)} added={len(added)}")
-    for key, names in groups.items():
-        print(f"PACK omitted_{key}={len(names)}")
-        if os.environ.get("PACK_WIDE") == "1":
-            for n in names[:200]:
-                print(f"  {key} {n}")
-    if groups["other"]:
-        print("PACK_UNEXPECTED_OMISSIONS")
-        for n in groups["other"][:20]:
-            print(f"  other {n}")
+    for key in ("cold_trellis", "hot_trellis", "expert_other", "nonexpert"):
+        val = groups[key]
+        print(f"PACK omitted_{key}={len(val)}")
+    for layer, cnt, cold in groups["over_budget"]:
+        print(f"PACK_TRELLIS_OVER_BUDGET layer={layer} omitted={cnt} cold={cold}")
+    cold_total = sum(cold_counts.values())
+    print(f"PACK cold_experts_expected={cold_total} trellis_omitted={len(groups['cold_trellis'])}"
+          f" (expected about {3 * cold_total} names, one kept per layer for the probe)")
+    for n in groups["expert_other"][:20] + groups["nonexpert"][:20]:
+        print(f"PACK_UNEXPECTED_OMISSION {n}")
     for n in added[:10]:
         print(f"PACK_EXTRA {n}")
-    print("PACK_OK" if not bad and not groups["other"] else "PACK_NOT_READY")
-    return 0 if (not bad and not groups["other"]) else 1
+    ok = not bad and not groups["expert_other"] and not groups["nonexpert"] \
+        and not groups["over_budget"]
+    print("PACK_OK" if ok else "PACK_NOT_READY")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
