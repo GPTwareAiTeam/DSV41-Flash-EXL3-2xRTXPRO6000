@@ -92,11 +92,26 @@ esac
 echo "SMOKE_MEM_SERVER $(gx_mem)"
 
 pair_step "SMOKE_ARM pair=$PAIR rows=1 new=$SMOKE_NEW"
+# The arm's own log: a client that hangs (a silent JIT rebuild, a stale lock baton, a seam handshake
+# that never answers) produces no output at all by the time timeout(1) kills it, and "rc=124" then
+# says nothing about why. Keep the bytes, and on failure the server's log tail next to them.
+ARM_LOG=${SMOKE_ARM_LOG:-$PAIR_STATE_DIR/logs/smoke-arm-$PAIR-$(date -u +%Y%m%dT%H%M%SZ).log}
+mkdir -p "$(dirname "$ARM_LOG")" 2>/dev/null || true
 arm_out=$("$HERE/pair_arm.sh" "$PAIR" --rows 1 --max-new "$SMOKE_NEW" --cache-tokens "$SMOKE_CACHE_TOKENS" \
           --timeout "$SMOKE_ARM_TIMEOUT" 2>&1)
 arm_rc=$?
+printf '%s\n' "$arm_out" > "$ARM_LOG" 2>/dev/null || true
 [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$arm_out" >> "$PAIR_LOG"
+server_tail() {
+  local log=${SEAM_LOG:-/tmp/seam_server.log}
+  echo "SMOKE_SERVER_TAIL ct=$GXCT log=$log"
+  pair_gxsh "docker exec $GXCT sh -c 'tail -40 $log 2>/dev/null; echo ---; grep -c . $log 2>/dev/null'" 2>&1 | tail -45
+  echo "SMOKE_EXT_CACHE $(pair_gxsh "docker exec $GXCT sh -c 'ls -l /pair/extcache/exllamav3_ext/lock /pair/extcache/exllamav3_ext/*.so 2>/dev/null'" 2>&1 | head -3)"
+  echo "SMOKE_P7_EXT_CACHE $(docker exec "$P7CT" sh -c 'ls -l /pair/extcache/exllamav3_ext/lock /pair/extcache/exllamav3_ext/*.so 2>/dev/null' 2>&1 | head -3)"
+}
 if [ "$arm_rc" != 0 ]; then
+  echo "SMOKE_ARM_LOG $ARM_LOG ($(wc -c < "$ARM_LOG" 2>/dev/null || echo 0) bytes)"
+  server_tail
   fail "arm rc=$arm_rc $(printf '%s' "$arm_out" | grep -m1 -E 'peer layout mismatch|remote invalid request|Traceback|Error|error' | cut -c1-300)"
 fi
 case "$arm_out" in
@@ -133,4 +148,5 @@ PY
 printf '%s\n' "$row" | sed -n 's/^i=/SMOKE_ROW /p'
 new_tokens=$(printf '%s\n' "$row" | sed -n 's/^NEW //p')
 [ "${new_tokens:-0}" -gt 0 ] || fail "arm_no_tokens $(printf '%s\n' "$row" | head -1)"
+echo "SMOKE_ARM_LOG $ARM_LOG"
 echo "SMOKE_OK $PAIR $SHA $BUILD_ID"

@@ -69,9 +69,11 @@ queue (rank 1, agent `PairUpdate`), so an update can never run concurrently with
 3. **containers** — `pair_containers.py apply` re-creates each side from `containers/<pair>-<side>.json`
    only when the live container differs (image, mounts, env, ulimits, devices), keeping the old one
    as `<name>.bak-<ts>`, wiring `/src/exllamav3`, then `plan` must be clean.
-4. **build** — native lib (`--side both`, `nice -n 15`, `MAX_JOBS<=8`) and the torch extension, by
-   absolute path into `releases/<sha>`, so `current` still points at the old release while the new
-   one is being built. Native libs are not byte-reproducible across containers: compare the source
+4. **build** — native lib (`--side both`, `nice -n 15`, `MAX_JOBS<=8`) and the torch extension into
+   `releases/<sha>`, so `current` still points at the old release while the new one is being built.
+   The extension is built *through* `/src/exllamav3` (the link is repointed to the new release for
+   the length of the build and put back afterwards) because that path is part of the ninja command
+   line; see the JIT incident below. Native libs are not byte-reproducible across containers: compare the source
    sha and build stamp written beside each lib, never a `.so` hash across boxes.
 5. **flip** — `current` and `extcache` move; then `inner` verifies each container really resolves
    `/src/exllamav3` to `/pair/releases/<sha>/src`.
@@ -83,9 +85,71 @@ queue (rank 1, agent `PairUpdate`), so an update can never run concurrently with
    `pair_check.sh <pair>` must return 0 before `PAIR_UPDATED` is printed.
 
 Any failure after the flip calls `fail()`, which prints `PAIR_UPDATE_FAILED phase=… why=…` and then
-restores: `current` back to the old sha, containers back from `.bak-<ts>`, old server restarted. The
+restores: `current` back to the old sha, containers back from `.bak-<ts>`, and the old server
+restarted -- but only if this pair was serving before the update (`UPDATE_SERVER_BEFORE serving=0`
+leads to `RESTORE_SERVER_SKIP`): a pair the ticket found idle must be left idle, because reloading a
+113 GiB pack on GX2 costs minutes and is exactly the memory-tight state the smoke just failed on. The
 process group is `setsid`ed and the TERM/INT handler flips `current` back and exits 143; cancel with
 `kill -- -<pgid>`, never a bare `kill`.
+
+## Prepare, then flip: an update is two steps now
+
+Building a release costs 5-13 minutes per side inside the pair's containers, and doing that inside
+the ticket kept the pair's GPU idle the whole time. So the work is split:
+
+1. `pair_prepare.sh <pair> [sha] [--side p7|gx|both]` -- **outside** the queue, while the pair keeps
+   running whatever it is running. It runs the same cut / containers / lib / ext phases, niced, into
+   `releases/<sha>` only, and ends with `PREPARED <pair> sha=… build=…`. It never moves `current`
+   (the one exception stays the first-release bootstrap that container wiring needs) and never
+   starts, stops or re-creates a serving container: a serving container, or a live ticket naming one
+   of the pair's containers, refuses the prepare outright.
+2. `pair_update.sh <pair> <sha> --flip-only` -- enqueues a ticket that builds nothing. It verifies
+   what the prepare left (`pair_build_lib.sh verify`, `pair_build_ext.sh verify`, and `plan` must
+   show no `RECREATE`), then flips, smokes, writes refs, the manifest and runs `pair_check.sh`. A
+   missing or foreign stamp stops it at `phase=prepared`, with "run pair_prepare.sh <pair> <sha>",
+   before anything is flipped.
+
+Verify is read-only and runs before the build guards in both builders: a flip-only ticket verifies
+while GX is still loading a server and while other builds own the box, and neither has anything to
+do with reading a stamp. `pair_build_ext.sh verify` needs `pair_ext_stamp_check.py` (one definition
+of "this stamp names this build").
+
+For prod, the prepare has to happen in a container that is **not serving**: create `seam-p7-prod` /
+`seam-gx1-prod` fresh and prepare there, while the arms that are running keep their own containers.
+
+
+## Incidents that shaped these guards
+
+* **Stale compiler storm** -- `exl3-tp2-moe` left 349 `nvcc`/`cc1plus` processes alive for days and
+  the "wait for the box to be free" loops waited on them forever. `compilers()` counts only
+  processes younger than `PAIR_BUILD_STALE_SECS` (1800 s) and prints `stale_ignored=<n>`: an older
+  compile is a corpse, not a build.
+* **Root-owned `bin/`** -- the container built the `.so` as root and the stamp write then failed with
+  `Permission denied` on the host. Builds `chown` the artifact back to the invoking uid/gid before
+  the stamp is written.
+* **Absolute `current`** -- `current -> /home/treadall/pairs/<pair>/releases/<sha>` resolves, inside
+  the container, to a path that does not exist there, so `/pair/current/src` dangled. The links are
+  created relative to the pair root (`ln -sfn releases/<sha> …`), so one tree works on the host and
+  at `/pair` alike.
+* **`seam_server_ensure.sh` not executable** -- `pair_smoke.sh` requires `-x` before it starts a
+  server; a non-executable copy made every smoke die with `SMOKE_FAIL no_seam_server_ensure`.
+* **Killed JIT build, then silence forever** -- the extension cache was built with
+  `PYTHONPATH=<release>/src` while every client imports `exllamav3` through `/src/exllamav3`; the
+  include path is part of the ninja command line, so the client's first import recompiled all 157
+  edges. torch runs ninja with stdout captured and `verbose=False`, so the smoke's arm printed
+  *nothing* for 300 s and died `rc=124` -- indistinguishable from a seam mismatch. Worse, ninja
+  writes `.ninja_log` only when it exits: a build killed by a timeout leaves no log entries, and the
+  next run recompiles everything again, so a killed rebuild repeats forever. The builder now builds
+  through the same `/src/exllamav3` path a client uses (temporarily repointing the link for the
+  length of the build, restoring it afterwards) and ends with a plain client import (`EXT_CLIENT_HIT`,
+  capped by `EXT_CLIENT_TIMEOUT`) that must be a cache hit; a miss fails the build with
+  `EXT_FAIL … EXT_CLIENT_MISS` instead of shipping a cache every run rebuilds. `pair_smoke.sh` keeps
+  the arm's bytes in `<state>/logs/smoke-arm-<pair>-<stamp>.log` and prints `SMOKE_ARM_LOG`, the GX
+  server log tail (`SMOKE_SERVER_TAIL`) and both containers' `extcache` listings on failure.
+* **Smoke arm killed silently under swap** -- on a GX box that is paging (avail < 1 GiB, 3-4 GiB
+  swapped) the first token of the smoke row can outlast the arm timeout, which then returns 124 with
+  no output at all. That is a capacity failure: report the memory lines, do not read it as a
+  protocol mismatch, and raise `SMOKE_ARM_TIMEOUT` rather than shrinking the smoke.
 
 ## The guard the queue uses
 
@@ -106,7 +170,10 @@ process group is `setsid`ed and the TERM/INT handler flips `current` back and ex
 pair_cut.sh <pair> [sha]              # cut a release tree on both sides, print sha/build_id
 pair_containers.py plan|apply|rollback <pair> [sha|ts]
 pair_build_lib.sh <pair> <sha> [--side both|p7|gx]
+pair_build_lib.sh verify <pair> <sha> [--side both|p7|gx]   # stamps only, builds nothing
 pair_build_ext.sh <pair> <sha> [--side both|p7|gx]
+pair_build_ext.sh verify <pair> <sha> [--side both|p7|gx]   # stamps only, builds nothing
+pair_prepare.sh <pair> [sha] [--side both|p7|gx]            # cut+wire+build, outside the queue
 pair_env.sh <pair>                    # the env a job should run with (CUDA_VISIBLE_DEVICES etc.)
 pair_arm.sh <pair> [--rows N]         # one client arm through the release
 pair_smoke.sh <pair>                  # server + 1-row arm, SMOKE_OK / SMOKE_FAIL
@@ -114,21 +181,25 @@ pair_ref.sh <pair> [--compare]        # record / compare the decode reference
 pair_check.sh <pair> [--quiet]        # guard: 0 IN_SYNC, 4 PAIR_DRIFT, 5 error
 pair_status.sh <pair>                 # human summary of both sides
 pair_manifest.py write|show <pair> <sha>
-pair_update.sh <pair> [sha]           # queue an update (rank 1)
+pair_update.sh <pair> [sha] [--flip-only]   # queue an update (rank 1); --flip-only builds nothing
 pair_promote.sh <sha> [--force]       # dev-passed sha -> prod, queued behind prod's job
 ```
 
-Roll-out order is always dev first: `pair_update.sh dev`, then `pair_check.sh dev` must be
-`IN_SYNC`, then `pair_promote.sh <sha>` (it refuses unless dev's manifest carries that sha and the
-seam fingerprint matches; `--force` is for a deliberate protocol change).
+Roll-out order is always dev first: `pair_prepare.sh dev <sha>` (or `pair_update.sh dev <sha>`
+for the one-shot form), then the flip-only ticket, then `pair_check.sh dev` must be `IN_SYNC`, then
+`pair_promote.sh <sha>` (it refuses unless dev's manifest carries that sha and the seam fingerprint
+matches; `--force` is for a deliberate protocol change).
 
 ## Dry runs
 
 `PAIR_DRY=1` plus `PAIR_DRY_SSH=<stub>` runs any of the above against a fake transport: builders
 print `DRY LIB_BUILD`/`DRY EXT_BUILD` and write nothing, `pair_containers.py` refuses to call docker
 without `PAIR_DRY_SSH`, and `pair_update_run.sh` ends with `PAIR_UPDATED_DRY`. `PAIR_DRY_FAIL_AT=<phase>`
-forces a failure at a named phase to exercise the restore path. A dry run can therefore never
-produce production evidence, and it can never touch a real container.
+forces a failure at a named phase to exercise the restore path. `PAIR_STATE_OVERRIDE=<dir>` keeps
+the dry run's logs, refs and restore notes out of the real `pairs/` tree. The sweeps are
+`tests/dry_run.sh` (whole update) and `tests/flip_only.sh` (the prepare/flip split: no sha, unwired
+containers, a foreign ext stamp, then a prepared release that flips without building). A dry run can
+therefore never produce production evidence, and it can never touch a real container.
 
 ## Memory is a separate question from drift
 

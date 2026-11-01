@@ -83,5 +83,29 @@ pc2 = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(pc2)
 m = die_msg(pc2.cmd_inner, cfg2, "abc123")
 check("inner refuses a release root without current", "current is missing" in m, m)
 
+# The ext cache is only reusable by a client if the builder spells the include path the way the
+# client does; these greps keep the two halves of that invariant from drifting apart again.
+def src(name):
+    return open(os.path.join(HERE, name)).read()
+
+be = src("pair_build_ext.sh")
+check("ext built through the client path (/src/exllamav3)",
+      "ln -sfn $rel_c/src $link" in be and "PYTHONPATH=$link" in be, "")
+check("ext build restores the link afterwards", "trap 'ln -sfn $back $link' EXIT" in be, "")
+check("client import is proven, not assumed",
+      "EXT_CLIENT_HIT" in be and "EXT_CLIENT_MISS" in be and "EXT_CLIENT_TIMEOUT" in be, "")
+check("client check uses the release's own cache",
+      "cd $link && TORCH_EXTENSIONS_DIR=$rel_c/ext" in be, "")
+
+sm = src("pair_smoke.sh")
+check("smoke keeps the arm's bytes", "SMOKE_ARM_LOG" in sm, "")
+check("smoke prints the server log tail", "SMOKE_SERVER_TAIL" in sm, "")
+
+ur = src("pair_update_run.sh")
+check("update records whether the pair was serving", "UPDATE_SERVER_BEFORE" in ur, "")
+check("restore skips a server that never served", "RESTORE_SERVER_SKIP" in ur, "")
+
+check("release dir resolves a sha prefix", 'releases/"$1"*' in src("pair_lib.sh"), "")
+
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
 sys.exit(1 if fails else 0)

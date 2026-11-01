@@ -102,11 +102,36 @@ build_side() {
     || { pair_step "EXT_FAIL $side lock_clear"; return 1; }
 
   pair_step "EXT_BUILD $side $ct arch=$archlist jobs=$JOBS build=$BUILD_ID"
-  # PYTHONPATH points at the release tree itself, not at /src/exllamav3 (= /pair/current/src):
-  # the cache must be built from this release even before `current` is flipped to it.
-  local inner="cd $rel_c/src && nice -n 15 env MAX_JOBS=$JOBS NINJAFLAGS=-j$JOBS MAKEFLAGS=-j$JOBS \
+  # Build through the path the clients import through. torch's JIT version hash covers the include
+  # paths, so a cache built from /pair/releases/<sha>/src is a miss for every client -- they import
+  # /src/exllamav3 (= /pair/current/src) and would silently rebuild the extension for 10-13 minutes,
+  # inside their own run, with the server already loaded (the SIGBUS case). So /src/exllamav3 is
+  # pointed at this release for the length of the build and put back afterwards; nothing else runs in
+  # the container (the server and compiler guards above saw to that).
+  local link=/src/exllamav3 back build_src=$rel_c/src
+  back=$(side_docker "$side" exec "$ct" sh -c "readlink $link" 2>/dev/null)
+  if [ -n "$back" ]; then
+    inner="ln -sfn $rel_c/src $link
+trap 'ln -sfn $back $link' EXIT
+cd $link && nice -n 15 env MAX_JOBS=$JOBS NINJAFLAGS=-j$JOBS MAKEFLAGS=-j$JOBS \
+PYTHONPATH=$link TORCH_CUDA_ARCH_LIST=$archlist TORCH_EXTENSIONS_DIR=$rel_c/ext \
+EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -
+rc=\$?
+# A plain client import -- no find_spec shim, env exactly as the image sets it -- must reuse what we
+# just built. If it recompiles, torch's version hash disagrees with the client's (build flags or the
+# include path spelling), and every real client pays that rebuild silently inside its own run.
+if [ \$rc = 0 ]; then
+  cd $link && TORCH_EXTENSIONS_DIR=$rel_c/ext TORCH_CUDA_ARCH_LIST=$archlist \
+    timeout \${EXT_CLIENT_TIMEOUT:-120} python3 -c 'import exllamav3.ext as e; print(\"EXT_CLIENT_HIT\", e.exllamav3_ext.__file__)'
+  rc=\$?
+fi
+exit \$rc"
+  else
+    pair_step "EXT_LINK $side $link missing (building through $rel_c/src)"
+    inner="cd $rel_c/src && nice -n 15 env MAX_JOBS=$JOBS NINJAFLAGS=-j$JOBS MAKEFLAGS=-j$JOBS \
 PYTHONPATH=$rel_c/src TORCH_CUDA_ARCH_LIST=$archlist TORCH_EXTENSIONS_DIR=$rel_c/ext \
 EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
+  fi
   if [ "$side" = p7 ]; then
     out=$(docker exec -i "$ct" bash -lc "$inner" < "$HERE/pair_ext_probe.py" 2>&1); rc=$?
   else
@@ -114,10 +139,16 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
           < "$HERE/pair_ext_probe.py" 2>&1); rc=$?
   fi
   [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$out" >> "$PAIR_LOG"
+  # rc=124 from the client check means it started compiling: the cache is not what a client asks for.
+  if [ "$rc" = 124 ] && printf '%s' "$out" | grep -q '^EXT_BUILD_OK '; then
+    pair_step "EXT_FAIL $side EXT_CLIENT_MISS client_import_rebuilds cache=$rel_c/ext (include path or flags differ from the image's client env)"
+    return 1
+  fi
   if [ "$rc" != 0 ] || ! printf '%s' "$out" | grep -q '^EXT_BUILD_OK '; then
     pair_step "EXT_FAIL $side rc=$rc $(printf '%s' "$out" | grep -E 'Error|error:|FAILED|EXT_' | tail -4 | tr '\n' ' ')"
     return 1
   fi
+  printf '%s\n' "$out" | grep -m1 '^EXT_CLIENT_HIT ' | sed 's/^/  /' | tee -a "${PAIR_LOG:-/dev/null}"
   # The cache dir was created by the container as root; hand it to the host user, which writes the
   # stamp next to it (and cleans old caches later).
   local uid gid; uid=$(id -u); gid=$(id -g)

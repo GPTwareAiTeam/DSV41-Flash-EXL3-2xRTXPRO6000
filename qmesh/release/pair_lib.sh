@@ -71,7 +71,15 @@ pair_gxstdin() {
 }
 
 # ---- release identity ---------------------------------------------------------------------------
-pair_release_dir() { echo "$PAIR_ROOT/releases/$1"; }
+pair_release_dir() {  # <sha|sha-prefix> -> release dir; a prefix resolves only when it is unambiguous
+  local d=$PAIR_ROOT/releases/$1 m
+  if [ ! -d "$d" ]; then
+    # A 12-char sha from a log is what humans type; the directory is named by the full one.
+    m=$(ls -d "$PAIR_ROOT"/releases/"$1"* 2>/dev/null | head -2)
+    if [ -n "$m" ] && [ "$(printf '%s\n' "$m" | wc -l)" = 1 ] && [ -d "$m" ]; then d=$m; fi
+  fi
+  echo "$d"
+}
 pair_current_sha() {  # <root> [remote 1] -> sha the `current` symlink points at ("" when absent)
   local root=$1 remote=${2:-0} t
   if [ "$remote" = 1 ]; then

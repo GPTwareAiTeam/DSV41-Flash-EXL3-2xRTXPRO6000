@@ -90,7 +90,9 @@ restore() {  # only on explicit failure, never from a trap
     python3 "$HERE/pair_containers.py" rollback "$PAIR" "$TS" 2>&1 | sed 's/^/  /' | tee -a "$PAIR_LOG"
     pair_step "RESTORE_CONTAINERS pair=$PAIR ts=$TS"
   fi
-  if [ -n "$OLD_SHA" ] && [ -d "$(pair_release_dir "$OLD_SHA")" ]; then
+  if [ "${SERVER_BEFORE:-0}" = 0 ]; then
+    pair_step "RESTORE_SERVER_SKIP pair=$PAIR (no server was serving before this update)"
+  elif [ -n "$OLD_SHA" ] && [ -d "$(pair_release_dir "$OLD_SHA")" ]; then
     local old_build
     old_build=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("build_id",""))' \
                 "$(pair_release_dir "$OLD_SHA")/RELEASE.json" 2>/dev/null)
@@ -127,6 +129,13 @@ if [ -n "$others" ] && [ "${PAIR_UPDATE_FORCE:-0}" != 1 ]; then
   exit 3
 fi
 [ -n "$others" ] && pair_step "UPDATE_FORCED pair=$PAIR pair_busy $others (PAIR_UPDATE_FORCE=1)"
+# Whether this pair was actually serving before the update decides what the restore has to put back.
+# A pair that was idle (the normal case: the busy check above refuses a serving one) must be left
+# idle on failure -- restarting a server for a release that never served costs a full 113 GiB pack
+# load on GX2, i.e. minutes of the very box the smoke just proved is memory-tight.
+SERVER_BEFORE=$(pair_gxsh "docker exec $GXCT pgrep -fc worker_seam_server.py 2>/dev/null" | tail -1)
+SERVER_BEFORE=${SERVER_BEFORE:-0}
+pair_step "UPDATE_SERVER_BEFORE pair=$PAIR serving=$SERVER_BEFORE"
 status_write 120 "cutting release"
 
 # ---- 1..4: release, containers, libs, ext --------------------------------------------------------
