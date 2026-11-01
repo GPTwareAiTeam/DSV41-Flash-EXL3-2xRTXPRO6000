@@ -203,5 +203,9 @@ check("the smoke reads the worker's own refusal, not the wrapper's rc",
       "*SEAM_NO_MEMORY*" in src("pair_smoke.sh")
       and 'fail "memory server_no_memory' in src("pair_smoke.sh"), "")
 
+check("a failed smoke stops the server it started",
+      "RESTORE_SERVER_STOP" in src("pair_update_run.sh")
+      and "pkill -f worker_seam_server.py" in src("pair_update_run.sh"), "")
+
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
 sys.exit(1 if fails else 0)

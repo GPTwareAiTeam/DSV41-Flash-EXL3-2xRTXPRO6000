@@ -159,7 +159,15 @@ restore() {  # only on explicit failure, never from a trap
     pair_step "RESTORE_CONTAINERS pair=$PAIR ts=$TS"
   fi
   if [ "${SERVER_BEFORE:-0}" = 0 ]; then
-    pair_step "RESTORE_SERVER_SKIP pair=$PAIR (no server was serving before this update)"
+    # Nothing was serving before this update, so the box goes back the way it was found. The smoke
+    # started a server from the release under test; leaving it loaded holds the pack (116 GiB) and
+    # blocks the next attempt exactly like a leak would. On success the server stays up: there it is
+    # the update's own result, not leftover state.
+    if pair_gxsh "docker exec $GXCT pkill -f worker_seam_server.py" >/dev/null 2>&1; then
+      pair_step "RESTORE_SERVER_STOP pair=$PAIR (the failed smoke's server stopped; none was serving before)"
+    else
+      pair_step "RESTORE_SERVER_SKIP pair=$PAIR (no server was serving before this update)"
+    fi
   elif [ -n "$OLD_SHA" ] && [ -d "$(pair_release_dir "$OLD_SHA")" ]; then
     local old_build
     old_build=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("build_id",""))' \
