@@ -447,6 +447,8 @@ def main():
         return cmd_apply(cfg, args[0] if args else "", ts, force="--force" in args)
     if what == "rollback":
         return cmd_rollback(cfg, args[0] if args else "")
+    if what == "guard":
+        return check_ownership(cfg)
     if what == "link":
         return cmd_link(cfg, args[0] if args else "")
     if what == "inner":

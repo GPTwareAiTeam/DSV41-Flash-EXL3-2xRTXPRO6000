@@ -1,0 +1,77 @@
+#!/bin/bash
+# flip_only.sh -- the split between preparing a release and flipping onto it, swept with stubs only.
+#
+#   ./tests/flip_only.sh [pair]
+#
+# What a flip-only ticket must never do: build anything, create or recreate a container, or flip onto
+# a release whose stamps are missing/foreign. Each case below fails (or passes) without touching a
+# container, the queue or a GPU.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd); REL=$(dirname "$HERE")
+PAIR=${1:-dev}
+SHA=${2:-$(git -C "$(dirname "$(dirname "$(dirname "$HERE")")")" rev-parse HEAD)}
+WORK=$(mktemp -d /tmp/pairflip.XXXXXX); export PATH="$WORK/bin:$PATH"
+mkdir -p "$WORK/bin" "$WORK/state"
+cp "$HERE/stub_docker.py" "$WORK/bin/docker"; chmod +x "$WORK/bin/docker"
+cp "$HERE/stub_ssh.sh" "$WORK/bin/stub_ssh"; chmod +x "$WORK/bin/stub_ssh"
+sed -i "s#/tmp/stub/state.json#$WORK/state/state.json#; s#/tmp/stub/exec.log#$WORK/state/exec.log#" "$WORK/bin/docker"
+REL_DIR="$WORK/pair/releases/$SHA"
+mkdir -p "$REL_DIR/src" "$REL_DIR/ext" "$REL_DIR/src/qmesh/native/bin"
+BID="flip-demo"
+printf '{"build_id":"%s","seam":{"fingerprint":"fp:dry","proto":"3"}}' "$BID" > "$REL_DIR/RELEASE.json"
+for arch in x86_64 aarch64; do
+  so="$REL_DIR/src/qmesh/native/bin/libqmesh_expert_seam.$arch.so"
+  printf 'so-%s\n' "$arch" > "$so"
+  sha=$(sha256sum "$so" | cut -d' ' -f1)
+  printf '{"build_id":"%s","source_sha":"%s","arch":"%s","sha256":"%s"}' "$BID" "$SHA" "$arch" "$sha" \
+    > "$so.stamp"
+done
+printf 'ext\n' > "$REL_DIR/ext/exllamav3_ext.so"
+printf '{"build_id":"%s","source_sha":"%s","sha256":"%s"}' "$BID" "$SHA" \
+  "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" > "$REL_DIR/ext/BUILD_STAMP.json"
+cd "$REL"
+export PAIR_DRY=1 PAIR_DRY_SSH="$WORK/bin/stub_ssh" PAIR_ROOT_OVERRIDE="$WORK/pair" \
+       PAIR_QUEUE_ROOT="$WORK/noq" PAIR_STATE_OVERRIDE="$WORK/pairs"
+run() { ./pair_update_run.sh "$PAIR" "$@" 2>&1; }
+fails=0
+want() {  # <case> <expected-substring> <log>
+  if printf '%s' "$3" | grep -q -- "$2"; then echo "OK   $1"
+  else echo "FAIL $1 (wanted '$2')"; printf '%s\n' "$3" | tail -6 | sed 's/^/     /'; fails=$((fails + 1)); fi
+}
+want_not() {  # <case> <forbidden-substring> <log>
+  if printf '%s' "$3" | grep -q -- "$2"; then echo "FAIL $1 (found '$2')"; fails=$((fails + 1))
+  else echo "OK   $1"; fi
+}
+
+built=$(grep -cE '^(  )?(LIB_BUILD|EXT_BUILD)' "$WORK/state/exec.log" 2>/dev/null || true)
+
+# 1. a flip-only ticket with no sha has nothing prepared to flip to
+out=$(PAIR_FLIP_ONLY=1 run); rc=$?
+want "no sha refused" "PAIR_UPDATE_FAILED pair=$PAIR phase=prepared why=PAIR_FLIP_ONLY needs an explicit sha" "$out"
+[ "$rc" != 0 ] && echo "OK   no sha exit=$rc" || { echo "FAIL no sha exited 0"; fails=$((fails + 1)); }
+
+# 2. containers that are not wired yet: prepare's job, never the ticket's
+out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
+want "unwired containers refused" "containers are not prepared" "$out"
+want_not "no container created by the ticket" "CREATE $PAIR" "$out"
+
+# 3. wired containers, but the ext stamp of another build
+python3 pair_containers.py apply "$PAIR" "$SHA" --ts T >/dev/null 2>&1
+printf '{"build_id":"other","source_sha":"%s","sha256":"x"}' "$SHA" > "$REL_DIR/ext/BUILD_STAMP.json"
+out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
+want "foreign ext stamp refused" "EXT_STAMP_MISMATCH" "$out"
+want "foreign ext stamp fails before the flip" "PAIR_UPDATE_FAILED pair=$PAIR phase=prepared" "$out"
+
+# 4. prepared: stamps of this build, nothing to build, flip and smoke happen
+printf '{"build_id":"%s","source_sha":"%s","sha256":"%s"}' "$BID" "$SHA" \
+  "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" > "$REL_DIR/ext/BUILD_STAMP.json"
+out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
+want "prepared release flips" "PAIR_UPDATED_DRY pair=$PAIR sha=$SHA build=$BID" "$out"
+want "stamp verify reported" "LIB_OK p7 x86_64" "$out"
+want_not "flip-only builds nothing" "LIB_BUILD" "$out"
+want_not "flip-only builds no ext" "EXT_BUILD" "$out"
+[ "$rc" = 0 ] && echo "OK   prepared exit=0" || { echo "FAIL prepared exit=$rc"; fails=$((fails + 1)); }
+
+echo "RESULT $([ "$fails" = 0 ] && echo PASS || echo FAIL) fails=$fails"
+rm -rf "$WORK"
+[ "$fails" = 0 ]

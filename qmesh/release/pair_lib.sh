@@ -37,6 +37,9 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   read -r PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH <<<"$line"
   PAIR_ROOT=${PAIR_ROOT_OVERRIDE:-$PAIR_ROOT}
   export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH
+  # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
+  # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
+  PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}
   PAIR_STATE_DIR=$PAIR_STATE/$PAIR
   PAIR_MANIFEST=$PAIR_STATE/$PAIR.json
   export PAIR_STATE_DIR PAIR_MANIFEST

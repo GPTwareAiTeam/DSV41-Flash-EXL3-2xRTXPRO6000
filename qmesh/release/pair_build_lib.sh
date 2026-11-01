@@ -41,18 +41,6 @@ BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build
   || pair_die "no RELEASE.json in $REL"
 SEAM_FP=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["seam"]["fingerprint"])' "$REL/RELEASE.json")
 GX_BUILD_AVAIL_GIB=${GX_BUILD_AVAIL_GIB:-60}
-# Dry run (stub-ssh harness only): say what would be built, write nothing. A manifest is refused
-# without real stamps, so a PAIR_DRY run can never leave a pair looking updated.
-if [ "$PAIR_DRY" = 1 ]; then
-  for side in p7 gx; do
-    [ "$SIDES" = both ] || [ "$SIDES" = "$side" ] || continue
-    ct=$([ "$side" = p7 ] && echo "$P7CT" || echo "$GXCT")
-    sm=$([ "$side" = p7 ] && echo "$P7_ARCH" || echo "$GX_ARCH")
-    pair_step "DRY LIB_BUILD $side $ct arch=$(pair_arch_for "$sm") sm=$sm build=$BUILD_ID"
-  done
-  exit 0
-fi
-
 side_ct() { [ "$1" = p7 ] && echo "$P7CT" || echo "$GXCT"; }
 side_sm() { [ "$1" = p7 ] && echo "$P7_ARCH" || echo "$GX_ARCH"; }
 side_libdir() { [ "$1" = p7 ] && echo /usr/lib/x86_64-linux-gnu || echo /usr/lib/aarch64-linux-gnu; }
@@ -70,11 +58,63 @@ side_hostsh() {  # <side> <shell-string>
   if [ "$side" = p7 ]; then bash -c "$2"; else pair_gxsh "$2"; fi
 }
 
+# Verify is read-only: it reads the stamp and hashes the .so, so it needs no build guard -- a
+# flip-only ticket verifies while a server loads on GX and while other builds own the box.
+verify_side() {
+  local side=$1 arch sm lib
+  sm=$(side_sm "$side"); arch=$(pair_arch_for "$sm"); lib="src/qmesh/native/bin/$PAIR_LIB.$arch.so"
+
+    local stamp="src/qmesh/native/bin/$PAIR_LIB.$arch.so.stamp" got want
+    if [ "$side" = p7 ]; then
+      got=$(cat "$REL/$stamp" 2>/dev/null)
+      want=$(sha256sum "$REL/$lib" 2>/dev/null | cut -d' ' -f1)
+    else
+      got=$(pair_gxsh "cat '$REL/$stamp' 2>/dev/null")
+      want=$(pair_gxsh "sha256sum '$REL/$lib' 2>/dev/null" | cut -d' ' -f1)
+    fi
+    python3 - "$got" "$want" "$BUILD_ID" "$SHA" "$arch" "$side" <<'PY' || return 1
+import json, sys
+got, want, bid, sha, arch, side = sys.argv[1:7]
+try:
+    d = json.loads(got)
+except Exception:
+    print(f"LIB_STAMP_MISSING {side} {arch}"); sys.exit(1)
+bad = [k for k, v in (("build_id", bid), ("source_sha", sha), ("arch", arch)) if d.get(k) != v]
+if bad:
+    print(f"LIB_STAMP_MISMATCH {side} {' '.join(f'{k}={d.get(k)}' for k in bad)}"); sys.exit(1)
+if want and d.get("sha256") != want:
+    print(f"LIB_SHA_MISMATCH {side} on_disk={want} stamp={d.get('sha256')}"); sys.exit(1)
+print(f"LIB_OK {side} {arch} sha256={d.get('sha256')} build={d.get('build_id')}")
+PY
+    return $?
+}
+
+if [ "$MODE" = verify ]; then
+  for side in p7 gx; do
+    [ "$SIDES" = both ] || [ "$SIDES" = "$side" ] || continue
+    verify_side "$side" || exit 1
+  done
+  exit 0
+fi
+
+# Dry run (stub-ssh harness only): say what would be built, write nothing. A manifest is refused
+# without real stamps, so a PAIR_DRY run can never leave a pair looking updated.
+if [ "$PAIR_DRY" = 1 ]; then
+  for side in p7 gx; do
+    [ "$SIDES" = both ] || [ "$SIDES" = "$side" ] || continue
+    ct=$([ "$side" = p7 ] && echo "$P7CT" || echo "$GXCT")
+    sm=$([ "$side" = p7 ] && echo "$P7_ARCH" || echo "$GX_ARCH")
+    pair_step "DRY LIB_BUILD $side $ct arch=$(pair_arch_for "$sm") sm=$sm build=$BUILD_ID"
+  done
+  exit 0
+fi
+
 build_side() {
   local side=$1 ct arch sm libdir inner out
   ct=$(side_ct "$side"); sm=$(side_sm "$side")
   arch=$(pair_arch_for "$sm"); libdir=$(side_libdir "$side")
   local lib="src/qmesh/native/bin/$PAIR_LIB.$arch.so"
+
 
   # ---- guards ------------------------------------------------------------------------------------
   local running
@@ -104,31 +144,6 @@ build_side() {
       || { pair_step "LIB_REFUSE gx mem_avail=${avail:-?}GiB need=$GX_BUILD_AVAIL_GIB (a server is loading)"; return 1; }
   fi
 
-  if [ "$MODE" = verify ]; then
-    local stamp="src/qmesh/native/bin/$PAIR_LIB.$arch.so.stamp" got want
-    if [ "$side" = p7 ]; then
-      got=$(cat "$REL/$stamp" 2>/dev/null)
-      want=$(sha256sum "$REL/$lib" 2>/dev/null | cut -d' ' -f1)
-    else
-      got=$(pair_gxsh "cat '$REL/$stamp' 2>/dev/null")
-      want=$(pair_gxsh "sha256sum '$REL/$lib' 2>/dev/null" | cut -d' ' -f1)
-    fi
-    python3 - "$got" "$want" "$BUILD_ID" "$SHA" "$arch" "$side" <<'PY' || return 1
-import json, sys
-got, want, bid, sha, arch, side = sys.argv[1:7]
-try:
-    d = json.loads(got)
-except Exception:
-    print(f"LIB_STAMP_MISSING {side} {arch}"); sys.exit(1)
-bad = [k for k, v in (("build_id", bid), ("source_sha", sha), ("arch", arch)) if d.get(k) != v]
-if bad:
-    print(f"LIB_STAMP_MISMATCH {side} {' '.join(f'{k}={d.get(k)}' for k in bad)}"); sys.exit(1)
-if want and d.get("sha256") != want:
-    print(f"LIB_SHA_MISMATCH {side} on_disk={want} stamp={d.get('sha256')}"); sys.exit(1)
-print(f"LIB_OK {side} {arch} sha256={d.get('sha256')} build={d.get('build_id')}")
-PY
-    return $?
-  fi
 
   # ---- build -------------------------------------------------------------------------------------
   local tmp="/pair/releases/$SHA/.lib-$arch-$$"

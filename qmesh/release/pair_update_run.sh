@@ -129,6 +129,33 @@ fi
 [ -n "$others" ] && pair_step "UPDATE_FORCED pair=$PAIR pair_busy $others (PAIR_UPDATE_FORCE=1)"
 status_write 120 "cutting release"
 
+# ---- 1..4: release, containers, libs, ext --------------------------------------------------------
+# A flip-only ticket is what pair_update.sh enqueues after `pair_prepare.sh <pair> <sha>` has already
+# cut, wired and built the release outside the queue. Nothing is built here: the stamps must already
+# name this exact sha and build, and the containers must already be wired -- otherwise the ticket
+# stops before the flip and says which prepare to run, instead of holding the GPU for an hour of JIT.
+if [ "${PAIR_FLIP_ONLY:-0}" = 1 ]; then
+  phase prepared
+  [ -n "$SHA_ARG" ] || fail "PAIR_FLIP_ONLY needs an explicit sha (nothing would be prepared)"
+  SHA=$SHA_ARG
+  REL=$(pair_release_dir "$SHA")
+  [ -d "$REL/src" ] || fail "release ${SHA:0:12} is not cut at $REL (run scripts/pair_prepare.sh $PAIR $SHA)"
+  BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' "$REL/RELEASE.json") \
+    || fail "release ${SHA:0:12} has no build_id (run scripts/pair_prepare.sh $PAIR $SHA)"
+  pair_step "UPDATE_RELEASE pair=$PAIR sha=${SHA:0:12} build=$BUILD_ID (prepared out of band)"
+  plan_out=$(python3 "$HERE/pair_containers.py" plan "$PAIR" 2>&1)
+  printf '%s\n' "$plan_out" | sed 's/^/  /' | tee -a "$PAIR_LOG" >/dev/null
+  case "$plan_out" in
+    *RECREATE*) fail "containers are not prepared: run scripts/pair_prepare.sh $PAIR $SHA first" ;;
+  esac
+  pair_step "UPDATE_CONTAINERS pair=$PAIR unchanged (prepared)"
+  lib_out=$("$HERE/pair_build_lib.sh" verify "$PAIR" "$SHA" --side both 2>&1); lib_rc=$?
+  printf '%s\n' "$lib_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
+  [ "$lib_rc" = 0 ] || fail "lib verify rc=$lib_rc (run scripts/pair_prepare.sh $PAIR $SHA)"
+  ext_out=$("$HERE/pair_build_ext.sh" verify "$PAIR" "$SHA" --side both 2>&1); ext_rc=$?
+  printf '%s\n' "$ext_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
+  [ "$ext_rc" = 0 ] || fail "ext verify rc=$ext_rc (run scripts/pair_prepare.sh $PAIR $SHA)"
+else
 # ---- 1. cut -------------------------------------------------------------------------------------
 phase cut
 cut_out=$("$HERE/pair_cut.sh" "$PAIR" $SHA_ARG 2>&1)
@@ -175,6 +202,8 @@ status_write 60 "building torch ext (P7, then GX)"
 "$HERE/pair_build_ext.sh" "$PAIR" "$SHA" --side both 2>&1 | sed 's/^/  /' | tee -a "$PAIR_LOG"
 rc=${PIPESTATUS[0]}
 [ "$rc" = 0 ] || fail "ext build rc=$rc"
+
+fi
 
 # ---- 5. flip ------------------------------------------------------------------------------------
 phase flip

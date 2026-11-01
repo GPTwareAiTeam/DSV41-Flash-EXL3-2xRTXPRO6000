@@ -12,8 +12,8 @@ cp "$HERE/stub_docker.py" "$WORK/bin/docker"; chmod +x "$WORK/bin/docker"
 cp "$HERE/stub_ssh.sh" "$WORK/bin/stub_ssh"; chmod +x "$WORK/bin/stub_ssh"
 sed -i "s#/tmp/stub/state.json#$WORK/state/state.json#; s#/tmp/stub/exec.log#$WORK/state/exec.log#" "$WORK/bin/docker"
 mkdir -p "$WORK/pair/releases/$SHA/src" "$WORK/pair/releases/$SHA/ext"
-echo '{"build_id":"dry-demo"}' > "$WORK/pair/releases/$SHA/RELEASE.json"
+echo '{"build_id":"dry-demo","seam":{"fingerprint":"fp:dry","proto":"3"}}' > "$WORK/pair/releases/$SHA/RELEASE.json"
 cd "$REL"
 PAIR_DRY=1 PAIR_DRY_SSH="$WORK/bin/stub_ssh" PAIR_ROOT_OVERRIDE="$WORK/pair" \
-  PAIR_QUEUE_ROOT="$WORK/noq" PAIR_LOG_ROOT="$WORK/logs" \
+  PAIR_QUEUE_ROOT="$WORK/noq" PAIR_STATE_OVERRIDE="$WORK/pairs" \
   ./pair_update_run.sh "$PAIR" "$SHA"

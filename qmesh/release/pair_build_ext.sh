@@ -2,6 +2,7 @@
 # pair_build_ext.sh -- build the exllamav3 torch extension for one release, per container.
 #
 #   pair_build_ext.sh <pair> <sha> [--side p7|gx|both]
+#   pair_build_ext.sh verify <pair> <sha> [--side p7|gx|both]   (stamp check only, builds nothing)
 #
 # The cache is per release (releases/<sha>/ext) and per container image (P7 torch 2.14, GX torch 2.11,
 # and 12.0 vs 12.1 arch), so each side builds its own: a cache shared between containers is how one
@@ -16,8 +17,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=pair_lib.sh
 . "$HERE/pair_lib.sh"
 
-PAIR_ARG=${1:?usage: pair_build_ext.sh <pair> <sha> [--side p7|gx|both]}
-SHA=${2:?usage: pair_build_ext.sh <pair> <sha> [--side p7|gx|both]}
+MODE=build
+if [ "${1:-}" = verify ]; then MODE=verify; shift; fi
+PAIR_ARG=${1:?usage: pair_build_ext.sh [verify] <pair> <sha> [--side p7|gx|both]}
+SHA=${2:?usage: pair_build_ext.sh [verify] <pair> <sha> [--side p7|gx|both]}
 shift 2
 SIDES=both
 while [ $# -gt 0 ]; do
@@ -35,6 +38,17 @@ JOBS=${MAX_JOBS:-8}; [ "$JOBS" -le 8 ] || JOBS=8
 EXT_TIMEOUT=${EXT_TIMEOUT:-1800}
 GX_BUILD_AVAIL_GIB=${GX_BUILD_AVAIL_GIB:-60}
 MOUNT=${PAIR_MOUNT:-/pair}
+# ---- verify: the stamp pair_manifest.py will publish must already be there and be this build -------
+if [ "$MODE" = verify ]; then
+  for side in p7 gx; do
+    [ "$SIDES" = both ] || [ "$SIDES" = "$side" ] || continue
+    if [ "$side" = p7 ]; then got=$(cat "$REL/ext/BUILD_STAMP.json" 2>/dev/null)
+    else got=$(pair_gxsh "cat '$REL/ext/BUILD_STAMP.json'" 2>/dev/null); fi
+    printf '%s' "$got" | python3 "$HERE/pair_ext_stamp_check.py" "$side" "$BUILD_ID" "$SHA" || exit 1
+  done
+  exit 0
+fi
+
 # Dry run (stub-ssh harness only): say what would be built, write nothing (see pair_build_lib.sh).
 if [ "$PAIR_DRY" = 1 ]; then
   for side in p7 gx; do
