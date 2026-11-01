@@ -52,8 +52,10 @@ Supervisor (main session) runs this without owner input. Team: max 3 GPU agents 
 2. Adaptive K retune for this pair: feed measured per-row round cost (seam_rows table) into
    EXL3_DSPARK_EV_COST; fixed K=5 vs auto vs ev on 40 held prompts with CI.
 3. WHOLE_GRAPH + DSPARK compatibility (export the last trunk block's hidden state from the graph path).
-4. Prefill with 8192-row chunks: seam call count per chunk (bucket 64 → 128 calls/layer/chunk);
-   test a 256/512 bucket; first 64-row call measured 2.5 s (JIT?), measure warm.
+4. (PROMOTED to #1 after Slot C) Prefill is GX-call-bound: measured ~170 tok/s, 48 s per 8192-row chunk =
+   128 bucket-64 seam calls x 40 layers x ~8.9 ms. Large-row seam calls (one call per chunk-layer, cold experts
+   read once) via the negotiated buckets from Slot C; target prefill tok/s x10+. Measure warm 64/256/1024/8192-row
+   GX calls first (first 64-row call was 2.5 s).
 5. sens/RESULTS.md write-up (per-matrix study); decide tp2/permatrix-k2 fix merge.
 6. Archive: GX2 `~/afd` (214 GB) move, rerun when GX2 idle; ARCHIVE_INDEX + journal.
 7. Cleanup: stopped containers `exl3-sens-1031`, `exl3-sens2-1031`; old seam-gx1b after v2 verified.
@@ -66,3 +68,7 @@ on both pairs on the same build, anything that failed and what was done about it
 - 00:50 final_prod4/final_dev4 died at load: an uncommitted QuantHC edit put class PrefixIndex inside
   SafetensorsCollection. Fixed (module level) and committed a9adf627; rule broadcast: no uncommitted
   edits in the v2 tree. Final runs relaunching.
+- 01:05 final_prod5/final_dev5 running clean through the 131k prefill: 8192-row chunks, no shrink (room 11.4 GiB),
+  ~170 rows/s on both pairs = seam-bound (see backlog #4, now top priority after Slot C). rise==predicted exactly
+  (3056 MiB) on every chunk: asked GxPort2 to verify it isn't circular and to report card-level peaks.
+- 01:05 Download complete: 83/83 files, sizes match HF; sha256 of 49 LFS files vs HF running.
