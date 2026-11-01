@@ -24,13 +24,18 @@ the no-DSpark runs ran at 28-31 ms/tok. Mean acceptance ~0.8 means DSpark does n
 
 ## Commands
 
-GX1 server (restart before each P7 run; each handle accepts one client):
+One GX1 server serves every P7 run until it is killed: the control port negotiates a session, the client gets
+the data ports of the buckets it asked for, and the next client queues (`SEAM_QUEUED`) or starts as soon as the
+previous session's control connection closes. Buckets are data ports `ctl+1+i` in `--buckets` order; `SEAM_BUCKETS`
+on the client is only the request (the granted set is the intersection, printed as `buckets=… ports=…`).
 ```
 ssh 10.0.100.2 'docker exec -d seam-gx1 bash -lc "cd /src/exllamav3 && python3 -u qmesh/worker_seam_server.py \
   --model-dir /cold --placement /cold/placement.exl3.json --dev rocep1s0f0 --gid 3 --port 47311 --buckets 1,6,64 \
   > /tmp/seam_server.log 2>&1"'
 ```
-Wait for `SEAM_SERVER_LOADED` (~225-237 s) and `SEAM_LISTEN` x3.
+Wait for `SEAM_SERVER_LOADED` (~225-237 s) and `SEAM_LISTEN ctl=47311 buckets=1,6,64 ports=47312..47314`. Do not
+restart it between clients; `python3 qmesh/seam_status.py --port 47311` (or `qes.status(host, port)`) reports
+`active=`, `waiting=` and the last session without disturbing anyone.
 
 P7 client (pinned to host GPU1):
 ```
@@ -46,8 +51,12 @@ docker exec -e CUDA_VISIBLE_DEVICES=1 [-e DSPARK=1] -e SEAM_DEV=rocep142s0f0 -e 
    incoherent output (text was multilingual noise). Fixed by `.to(device).half()` on x. After the fix, output is coherent.
 2. **Device pinning**: `seam-p7` had no `CUDA_VISIBLE_DEVICES`, so `cuda:0` resolved to host GPU0 and collided with
    another agent's GPU0 work. All runs now set `CUDA_VISIBLE_DEVICES=1`.
-3. **Handle lifecycle**: a seam handle accepts one client. A rerun against an un-restarted server fails with
-   `qes: connect timeout (errno=111)`. Restart the server before each P7 run.
+3. **Session lifecycle**: a session is bounded by its control connection, not by a bucket. The client opens a
+   bucket's data handle on its first request of that size, so a decode-only run uses one of the three granted
+   buckets; the unopened ones are reported as `SEAM_SESSION_PARTIAL … up=1 of 3` and are not an error. A
+   connection on a data port that fails its hello (a stale client, a probe) is closed and logged as
+   `SEAM_REJECT … reason=stale-data-conn` instead of aborting the server; that used to kill the process with
+   `qes: peer layout mismatch` and cost a full cold-pack reload.
 4. **Bucket padding** (`remote_seam_host.py`): batches pad to 1/6/64 rows with `id=-1, w=0`, which contribute exact
    zeros on GX1. Prefill chunks by 64 rows.
 5. **Placement check**: the router-order tail maps exactly to the `warm` list (checked for L0: 259/259), so the

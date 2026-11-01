@@ -145,7 +145,12 @@ _BUILD = None
 
 
 def build_id() -> str:
-    """Build id sent to the peer: SEAM_BUILD_ID, else the worktree's short commit (+-dirty)."""
+    """Build id sent to the peer: SEAM_BUILD_ID, else the worktree's short commit (+-dirty).
+
+    Container trees are rsynced without .git, so a shipped qmesh/BUILD_ID written by the sync
+    script is the fallback - without it a GX server reports build=unknown, which is exactly the
+    field needed to tell two builds apart when both pairs are busy.
+    """
     global _BUILD
     if _BUILD is None:
         b = os.environ.get("SEAM_BUILD_ID", "").strip()
@@ -161,7 +166,16 @@ def build_id() -> str:
                 if dirty:
                     b += "-dirty"
             except Exception:
-                b = "unknown"
+                b = ""
+        if not b:
+            try:
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                                       "BUILD_ID"), "r") as fh:
+                    b = fh.read().strip()
+            except OSError:
+                b = ""
+        if not b:
+            b = "unknown"
         _BUILD = b[:BUILD_LEN - 1]
     return _BUILD
 

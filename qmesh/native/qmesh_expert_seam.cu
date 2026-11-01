@@ -72,7 +72,7 @@ constexpr uint32_t CTL_MAGIC = 0x32534551u;        /* "QES2" */
 constexpr uint32_t CTL_REPLY_MAGIC = 0x32525351u;  /* "QSR2" */
 constexpr uint32_t DATA_MAGIC = 0x53454851u;      /* "QHES" */
 constexpr int CTL_HELLO_TIMEOUT_MS = 2000;        /* a silent TCP peer must not stall the server */
-constexpr int DATA_ACCEPT_TIMEOUT_MS = 15000;     /* client must reach its data ports after OK */
+constexpr int DATA_HELLO_TIMEOUT_S = 5;          /* a dead data peer must not stall the accept loop */
 constexpr int SOCK_IO_TIMEOUT_S = 15;
 constexpr int CTL_REPLY_TIMEOUT_S = 60;   /* non-waiting client: the server answers at once */
 constexpr int QUEUE_WAIT_S = 7200;        /* waiting client: a whole session lifetime */
@@ -89,6 +89,15 @@ void set_err(const char* fmt, ...) {
   va_end(ap);
   fprintf(stderr, "qes: %s\n", g_err);
   fflush(stderr);
+}
+
+/* Records the reason without printing it: for per-connection errors that the caller turns into a
+ * SEAM_REJECT line with the detail attached, so the log does not read as if the server failed. */
+void set_err_quiet(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(g_err, sizeof(g_err), fmt, ap);
+  va_end(ap);
 }
 
 /* One line to stdout, shared with the Python server's own prints (single line, flushed). */
@@ -275,30 +284,6 @@ int tcp_listen(int port, const char** why) {
     return -1;
   }
   return ls;
-}
-
-/* Waits for a connection on `ls` for at most `timeout_ms`; `abort_flag` (optional) cancels the
- * wait early. Returns the connection fd, -2 when aborted, -3 on timeout, -1 on error. */
-int accept_wait(int ls, int timeout_ms, const std::atomic<bool>* abort_flag, const char** why) {
-  const int64_t t_end = now_ns() + (int64_t)timeout_ms * 1000000;
-  for (;;) {
-    if (abort_flag && abort_flag->load()) return -2;
-    int64_t left_ms = (t_end - now_ns()) / 1000000;
-    if (left_ms <= 0) return -3;
-    pollfd p{ls, POLLIN, 0};
-    int r = poll(&p, 1, (int)std::min<int64_t>(left_ms, 200));
-    if (r > 0) {
-      int c = accept(ls, nullptr, nullptr);
-      if (c >= 0) return c;
-      if (errno == EINTR) continue;
-      *why = strerror(errno);
-      return -1;
-    }
-    if (r < 0 && errno != EINTR) {
-      *why = strerror(errno);
-      return -1;
-    }
-  }
 }
 
 /* Connects with retries so a client may race the server's listener start-up. */
@@ -1003,6 +988,12 @@ namespace {
 /* One pinned slab + MR per row bucket, registered once and reused by every session. */
 struct BucketEp {
   int rows = 0, port = 0;
+  /* Listening socket for this bucket's data port, bound for the whole server lifetime. A
+   * per-session listen() leaves a window in which the client - which is told every port in the
+   * negotiation reply - connects to a later bucket before the server gets there and sees
+   * ECONNREFUSED. Bound once, the connection queues in the backlog and the session that asks for
+   * that bucket accepts it whenever it arrives. */
+  int ls = -1;
   uint8_t* slab = nullptr;
   size_t slab_bytes = 0, stride = 0, req_len = 0, resp_len = 0, ids_off = 0, w_off = 0;
   ibv_mr* mr = nullptr;
@@ -1116,8 +1107,14 @@ int intersect(const qes_server* s, const CtlHello& hello, CtlReply* r) {
   return n;
 }
 
-/* Brings up one bucket's data handle for `ss`: listen, accept, data hello, QP connect, proxy. */
-qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k) {
+/* Brings up one bucket's data handle for `ss` from an already accepted data connection `fd`:
+ * data hello, QP connect, proxy. The listener stays open for the server's lifetime (BucketEp::ls),
+ * so a connection that arrives early simply waits in its backlog.
+ *
+ * `*stale` is set when the connection turns out not to belong to this session (dead hello or a
+ * hello naming another session, port or row count). That is routine - the data ports are open for
+ * the whole server lifetime - so the caller closes the connection and keeps accepting. */
+qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, bool* stale) {
   const BucketEp& ep = s->eps[ss->bucket_idx[k]];
   const int port = ep.port;
   const char* why = "";
@@ -1149,33 +1146,14 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k) {
 
   if (!qp_create(h, &why)) {
     set_err("seam session %u: %s failed (port=%d rows=%d)", ss->id, why, port, ep.rows);
+    close(fd);
     stop_handle(h);
     return nullptr;
   }
 
-  int ls = tcp_listen(port, &why);
-  if (ls < 0) {
-    set_err("seam session %u: listen on data port %d (rows=%d) failed: %s", ss->id, port, ep.rows,
-            why);
-    stop_handle(h);
-    return nullptr;
-  }
-  int fd = accept_wait(ls, DATA_ACCEPT_TIMEOUT_MS, &ss->ending, &why);
-  close(ls);
-  if (fd < 0) {
-    if (fd == -2)
-      set_err("seam session %u: session ended before the client reached port %d (rows=%d)", ss->id,
-              port, ep.rows);
-    else if (fd == -3)
-      set_err("seam session %u: timeout waiting for the client on data port %d (rows=%d)", ss->id,
-              port, ep.rows);
-    else
-      set_err("seam session %u: accept on data port %d (rows=%d) failed: %s", ss->id, port, ep.rows,
-              why);
-    stop_handle(h);
-    return nullptr;
-  }
-  sock_opts(fd, SOCK_IO_TIMEOUT_S, SOCK_IO_TIMEOUT_S);
+  /* The data hello is the only thing separating this session's client from a connection left by an
+   * earlier one, so bound the read tightly: a dead peer must not stall the accept loop. */
+  sock_opts(fd, DATA_HELLO_TIMEOUT_S, DATA_HELLO_TIMEOUT_S);
 
   const uint32_t my_psn = (uint32_t)(lrand48() & 0xffffff);
   Hello mine = make_hello(h, ss->id, my_psn);
@@ -1184,16 +1162,18 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k) {
   if (ok) ok = xfer(fd, &mine, sizeof(mine), true, &why);
   close(fd);
   if (!ok) {
-    set_err("seam session %u: data handshake on port %d (rows=%d) failed: %s", ss->id, port,
-            ep.rows, why);
+    set_err_quiet("seam session %u: data handshake on port %d (rows=%d) failed: %s", ss->id,
+                  port, ep.rows, why);
     stop_handle(h);
+    if (stale) *stale = true;
     return nullptr;
   }
   char why2[256];
   if (!check_hello(peer, ep.rows, port, ss->id, why2, sizeof(why2))) {
-    set_err("seam session %u from %s: rejected data connection on port %d: %s", ss->id, ss->ip,
-            port, why2);
+    set_err_quiet("seam session %u from %s: rejected data connection on port %d: %s", ss->id,
+                  ss->ip, port, why2);
     stop_handle(h);
+    if (stale) *stale = true;
     return nullptr;
   }
   if (!qp_connect(h, peer, my_psn, &why)) {
@@ -1213,20 +1193,77 @@ void session_teardown(ServerSession* ss) {
 
 void session_thread(ServerSession* ss) {
   qes_server* s = ss->srv;
-  bool ok = true;
-  for (int k = 0; k < ss->n; k++) {
-    if (ss->ending.load()) {
-      ok = false;
-      break;
-    }
-    qes_handle* h = session_handle_up(s, ss, k);
-    if (!h) {
-      ok = false;
-      break;
-    }
-    ss->handles.push_back(h);
-  }
   std::string bucket_list = csv(ss->buckets, ss->n);
+  std::string port_list = csv(ss->ports, ss->n);
+  say("SEAM_SESSION_START ip=%s build=%s proto=%d buckets=%s ports=%s sid=%u", ss->ip, ss->build,
+      QES_PROTO_VERSION, bucket_list.c_str(), port_list.c_str(), ss->id);
+  /* Data handles come up lazily: the client opens a bucket's handle on its first request of that
+   * size, and may never touch some of the buckets it asked for (a decode client requests
+   * 1,6,64 and only ever uses 6). So accept in *arrival* order, one connection per bucket, for as
+   * long as the session lives - the control connection is what ends it, not a bucket that stays
+   * quiet. Every granted bucket's listener is polled; the listening socket identifies the bucket
+   * and the data hello re-checks session, port and rows.
+   *
+   * A connection that fails those checks belongs to someone else (an earlier session's reconnect,
+   * a probe) and is closed and counted, not treated as a failed session: the data ports are open
+   * for the whole server lifetime, so knockers are expected. */
+  std::vector<char> up((size_t)ss->n, 0);
+  int nup = 0, stale_total = 0;
+  bool ok = true;
+  while (nup < ss->n && !ss->ending.load()) {
+    pollfd fds[QES_MAX_BUCKETS];
+    int map[QES_MAX_BUCKETS];
+    int nf = 0;
+    for (int k = 0; k < ss->n; k++) {
+      if (up[(size_t)k]) continue;
+      const int ls = s->eps[ss->bucket_idx[k]].ls;
+      if (ls < 0) continue;
+      fds[nf] = {ls, POLLIN, 0};
+      map[nf] = k;
+      nf++;
+    }
+    if (nf == 0) {
+      set_err("seam session %u: no data listener left for %d bucket(s)", ss->id, ss->n - nup);
+      ok = false;
+      break;
+    }
+    const int r = poll(fds, (nfds_t)nf, 250);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      set_err("seam session %u: poll on data ports failed: %s", ss->id, strerror(errno));
+      ok = false;
+      break;
+    }
+    if (r == 0) continue;
+    for (int i = 0; i < nf; i++) {
+      if (!(fds[i].revents & POLLIN)) continue;
+      sockaddr_in peer{};
+      socklen_t plen = sizeof(peer);
+      const int fd = accept(fds[i].fd, (sockaddr*)&peer, &plen);
+      if (fd < 0) continue;
+      const int k = map[i];
+      bool stale = false;
+      qes_handle* h = session_handle_up(s, ss, k, fd, &stale);
+      if (!h) {
+        if (!stale) {
+          ok = false;
+          break;
+        }
+        char ip[64] = "?";
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+        say("SEAM_REJECT ip=%s reason=stale-data-conn port=%d rows=%d sid=%u detail=%s", ip,
+            s->eps[ss->bucket_idx[k]].port, s->eps[ss->bucket_idx[k]].rows, ss->id, g_err);
+        /* Never fatal: the session is bounded by its control connection, so the only thing a flood
+         * of strangers can do is keep this loop busy while the real client is idle - which is
+         * exactly what it would be doing anyway. */
+        stale_total++;
+        continue;
+      }
+      ss->handles.push_back(h);
+      up[(size_t)k] = 1;
+      nup++;
+    }
+  }
   if (!ok) {
     say("SEAM_SESSION_REJECT ip=%s build=%s buckets=%s sid=%u reason=setup-failed", ss->ip,
         ss->build, bucket_list.c_str(), ss->id);
@@ -1239,10 +1276,12 @@ void session_thread(ServerSession* ss) {
     ss->th_done.store(true);
     return;
   }
+  if (nup < ss->n)
+    /* Not an error: the client used fewer buckets than it negotiated, or closed while a handle was
+     * still being set up. Informational only - it must never tear the session down early. */
+    say("SEAM_SESSION_PARTIAL ip=%s buckets=%s sid=%u up=%d of %d stale=%d", ss->ip,
+        bucket_list.c_str(), ss->id, nup, ss->n, stale_total);
 
-  std::string port_list = csv(ss->ports, ss->n);
-  say("SEAM_SESSION_START ip=%s build=%s proto=%d buckets=%s ports=%s sid=%u", ss->ip, ss->build,
-      QES_PROTO_VERSION, bucket_list.c_str(), port_list.c_str(), ss->id);
 
   while (!ss->ending.load()) {
     bool dead = false;
@@ -1583,6 +1622,19 @@ extern "C" qes_server* qes_server_open(const char* dev_name, int gid_idx, int ct
     return nullptr;
   }
 
+  /* Every bucket's data port is bound now, not when a session asks for it: the negotiation reply
+   * hands the client all of them at once and it connects to them in request order, so a port that
+   * is only bound later refuses that connection. */
+  for (int i = 0; i < n_buckets; i++) {
+    s->eps[i].ls = tcp_listen(s->eps[i].port, &why);
+    if (s->eps[i].ls < 0) {
+      set_err("qes_server_open: data listen on %d (rows=%d) failed: %s", s->eps[i].port,
+              s->eps[i].rows, why);
+      qes_server_free(s);
+      return nullptr;
+    }
+  }
+
   say("SEAM_LISTEN ctl=%d buckets=%s ports=%d..%d build=%s placement_sha=%s", s->ctl_port,
       csv(s->buckets, s->n_buckets).c_str(), s->ctl_port + 1, s->ctl_port + s->n_buckets, s->build,
       s->placement_sha);
@@ -1662,6 +1714,10 @@ extern "C" void qes_server_free(qes_server* s) {
     s->listen_fd = -1;
   }
   for (int i = 0; i < s->n_buckets; i++) {
+    if (s->eps[i].ls >= 0) {
+      close(s->eps[i].ls);
+      s->eps[i].ls = -1;
+    }
     if (s->eps[i].mr) ibv_dereg_mr(s->eps[i].mr);
     if (s->eps[i].slab) cudaFreeHost(s->eps[i].slab);
     s->eps[i].mr = nullptr;
