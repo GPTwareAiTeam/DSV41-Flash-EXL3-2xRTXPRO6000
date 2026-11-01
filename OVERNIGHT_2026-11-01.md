@@ -79,3 +79,8 @@ on both pairs on the same build, anything that failed and what was done about it
 - 01:25 More rebase damage found by GxPort2: extension did not build from source (missing parallel/p2p_oneshot,
   prefill_ar; 1,096 lines). Restored verbatim from v1.2 (verified byte-identical), 115 DSA kernel tests pass.
   final_prod6 running on GPU0 (numbers ~01:50). QuantHC: measured 0.3 s/tensor, A+B done ~04:00, campaign ~05:00.
+- 01:10 EST SeamRobust: stub-mode battery PASS (58/0, battery-1101-010510, one server pid through all phases,
+  build id recorded) on branch seam/session-multiclient @ bf2ac22e; merge into v2 is conflict-free (merge-tree).
+  NOT merged yet: real-mode decode/rows identity needs a GPU slot (after QuantHC B, ~07:15 EST), then GX1 battery.
+- 01:05 EST QuantHC: no rebalance (per-layer cost ~500 s fixed, calibration chain sequential). A ~05:50, B ~07:15,
+  campaign ~08:20 EST. Layer gates pass (A 0-1, B 0-2).
