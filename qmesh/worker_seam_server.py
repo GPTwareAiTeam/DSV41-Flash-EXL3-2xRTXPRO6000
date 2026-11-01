@@ -229,6 +229,64 @@ def _avail_mib() -> int:
     return -1
 
 
+def ws_probe(server, spec, min_avail_mib):
+    """Measure the GX-side workspace of the real cold-expert forward, one row count at a time.
+
+    The slab (slab_mib) is only the pinned staging bill. What a bigger row bucket really costs on
+    the GX is the device memory today's mixed-K forward allocates for that many rows, and that has
+    to be measured on the box with the pack already resident, not predicted: this runs the same
+    _forward the server runs, at each row count, and prints the peak and the MemAvailable around
+    it. An OOM or a nearly empty box is reported as such and the ladder continues, so one run maps
+    the whole 2048/4096/8192 decision.
+    """
+    if server.stub:
+        print("SEAM_WS stub=1: nothing to measure without the cold experts", flush = True)
+        return
+    dev = server.device
+    ncold = server.layers[0][1]
+    for rows in [int(x) for x in spec.split(",") if x.strip()]:
+        avail0 = _avail_mib()
+        if 0 <= avail0 < min_avail_mib:
+            print(f"SEAM_WS rows={rows} SKIP avail_mib={avail0} min_avail_mib={min_avail_mib}: "
+                  f"the pack is resident and the box has no room left to measure in", flush = True)
+            continue
+        lane = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2) + rows * HIDDEN * 4
+        stage = torch.zeros(lane, dtype = torch.uint8, pin_memory = True)
+        base = stage.data_ptr()
+        x_ptr = base
+        ids_ptr = base + rows * HIDDEN * 2
+        w_ptr = ids_ptr + rows * TOPK * 4
+        out_ptr = w_ptr + rows * TOPK * 2
+        # In-range expert ids (the module only has `ncold` experts) and a finite 1.0 in bf16, so the
+        # probe exercises the same routing/fused path a real chunk does.
+        view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN)[:] = 0x3c00
+        view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)[:] = \
+            np.arange(rows * TOPK, dtype = np.int32).reshape(rows, TOPK) % max(ncold, 1)
+        view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:] = 0x3c00
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(dev)
+        t0 = time.perf_counter_ns()
+        try:
+            server._forward(0, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+            torch.cuda.synchronize(dev)
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            print(f"SEAM_WS rows={rows} OOM avail_mib={avail0} err={str(e).splitlines()[0][:200]}",
+                  flush = True)
+            del stage
+            torch.cuda.empty_cache()
+            continue
+        us = (time.perf_counter_ns() - t0) / 1e3
+        print(f"SEAM_WS rows={rows} alloc_mib={torch.cuda.memory_allocated(dev) / 2**20:.1f} "
+              f"reserved_mib={torch.cuda.memory_reserved(dev) / 2**20:.1f} "
+              f"peak_alloc_mib={torch.cuda.max_memory_allocated(dev) / 2**20:.1f} "
+              f"peak_reserved_mib={torch.cuda.max_memory_reserved(dev) / 2**20:.1f} "
+              f"avail_before_mib={avail0} avail_after_mib={_avail_mib()} us={us:.0f} "
+              f"us_per_row={us / max(rows, 1):.2f} fin={bool(np.isfinite(view(out_ptr, rows * HIDDEN * 4, np.float32)).all())}",
+              flush = True)
+        del stage
+        torch.cuda.empty_cache()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default="/cold")
@@ -255,24 +313,23 @@ def main():
     ap.add_argument("--wait", action="store_true",
                     help="queue a second client behind the active session instead of rejecting it "
                          "(also settable per client with SEAM_WAIT=1)")
+    ap.add_argument("--ws-probe", default = "",
+                    help = "measure the GX workspace of the real forward at these row counts "
+                           "(comma separated, ascending) and exit without listening: prints one "
+                           "SEAM_WS line per row count with peak memory and MemAvailable")
+    ap.add_argument("--ws-probe-min-avail", type = int, default = 96,
+                    help = "skip a --ws-probe row count when MemAvailable is below this many MiB "
+                           "(a full pack plus a nearly full box would swap, not fail, and the "
+                           "number would be meaningless)")
     args = ap.parse_args()
 
     device = torch.device("cuda:0")
     t0 = time.time()
-    server = SeamServer(args.model_dir, args.placement, device, stub = args.stub,
-                        fail_after = args.fail_after)
-    avail_mib, swapped_mib = _avail_mib(), _swap_used_mib()
-    # build= is whatever release started this process (SEAM_BUILD_ID from the pair release system).
-    # The v2 wire has no status verb, so this line is how a release check learns which build the
-    # *running* server came from; "-" means the release env was not passed.
-    build_id = os.environ.get("SEAM_BUILD_ID", "-") or "-"
-    print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)} "
-          f"fail_after={args.fail_after} build={build_id} "
-          f"avail_mib={avail_mib} swapped_mib={swapped_mib}", flush=True)
-    # What is left after the pack is the crash budget for every forward's transient buffers.
-    if swapped_mib > SWAP_WARN_MIB:
-        print(f"SEAM_SERVER_SWAP_WARN swapped_mib={swapped_mib} avail_mib={avail_mib}: the pack is "
-              f"paging; expect multi-second outliers or launch failures", flush=True)
+    server = SeamServer(args.model_dir, args.placement, device, stub = args.stub)
+    print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)}", flush=True)
+    if args.ws_probe:
+        ws_probe(server, args.ws_probe, args.ws_probe_min_avail)
+        return
     threading.Thread(target = _reporter, daemon = True).start()
 
     # One pinned slab per row bucket, registered once; each client session gets fresh QPs on
