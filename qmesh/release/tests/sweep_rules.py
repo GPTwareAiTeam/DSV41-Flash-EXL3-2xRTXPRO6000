@@ -140,6 +140,24 @@ check("update writes evidence before announcing",
       ur.index("evidence ok") < ur.index(_ok), "")
 check("failed update writes failed evidence", 'evidence failed "$*"' in ur, "")
 
+def code_lines(text):
+    return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+# The client must ask for its own superset and let the server narrow it. Handing the client the
+# server's list is what capped every prefill chunk at 64 rows.
+check("the client does not pin buckets",
+      not any("SEAM_BUCKETS" in l for l in code_lines(src("pair_arm.sh")) + code_lines(src("pair_env.sh"))),
+      "")
+check("the server is asked for the wide grant",
+      all(int(pc.load_conf(q)["buckets"].split(",")[-1]) >= 2048 for q in ("prod", "dev")),
+      str([pc.load_conf(q)["buckets"] for q in ("prod", "dev")]))
+check("smoke asks for two payload slots", "SMOKE_SLAB_SLOTS:-2" in sm, "")
+check("smoke passes the slot count to the ensure", "SEAM_SLAB_SLOTS=$SMOKE_SLAB_SLOTS" in sm, "")
+check("the rollback serves the same slots", "SEAM_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-2}" in ur, "")
+check("nothing sets the slower wide-dispatch tier",
+      not any("EXL3_MOE_FUSED_ROWS_WIDE" in l
+              for f in ("pair_arm.sh", "pair_env.sh", "pair_smoke.sh", "pair_update_run.sh")
+              for l in code_lines(src(f))), "")
 check("release dir resolves a sha prefix", 'releases/"$1"*' in src("pair_lib.sh"), "")
 
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
