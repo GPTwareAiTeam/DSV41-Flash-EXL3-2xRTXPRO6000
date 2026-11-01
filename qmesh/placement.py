@@ -1,136 +1,83 @@
-#!/usr/bin/env python3
-"""Build the P7/GX1 whole-expert placement for an EXL3 checkpoint.
+"""The one cold-expert placement resolver: every loader and the seam client read it here.
 
-P7 owns the 4,100 hottest 4.0-bpw experts. GX1 owns every other expert.
-Sizes are read from the checkpoint's safetensors headers, not estimated.
+A pack ships `PACK_MANIFEST.json`, whose `placement` names the file the pack was cut against, and that
+file's sha256 is the `placement_sha` the GX seam server puts in its Hello. So the file a client loads
+must be the pack's, not a repo default: the repo default is the 2.8535 pack's table, and against the
+4620 packs it makes the client translate picks with the wrong per-layer cold count (layer 0: 259 cold
+there, 248 here), which the server correctly refuses as "cold ids out of range" and then fail-stops on
+(2026-11-01 18:03, GX2 arm A prefill: 2 of 384 picks at 251 for 248 cold -- exactly the old table's
+range, while the same run's identity phase, which resolved through qmesh/e2e_prompts.py, was clean).
+
+Order: an explicit PLACEMENT wins (operators overriding a pack on purpose), then the pack's manifest,
+then the repo default. `load()` also publishes its sha through `current_sha()`, so a client can refuse
+a server whose Hello advertises a different table *before* it sends the first request.
 """
 from __future__ import annotations
 
-import argparse
-import collections
-import csv
+import hashlib
 import json
 import os
-import re
-import struct
 
-EXPERT_KEY = re.compile(
-    r"layers\.(\d+)\.ffn\.experts\.(\d+)\.w[123]\.(?:suh|svh|mul1|trellis)$"
-)
-GIB = 2**30
+DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "placement.final.json")
+MANIFEST = "PACK_MANIFEST.json"
+
+_last = {"path": None, "sha": None}
 
 
-def tensor_sizes(checkpoint: str) -> dict[str, int]:
-    index_path = os.path.join(checkpoint, "model.safetensors.index.json")
-    index = json.load(open(index_path, encoding="utf8"))
-    files = collections.defaultdict(list)
-    for key, filename in index["weight_map"].items():
-        files[filename].append(key)
-    sizes: dict[str, int] = {}
-    for filename, keys in files.items():
-        path = os.path.join(checkpoint, filename)
-        if not os.path.isfile(path):
-            continue
-        with open(path, "rb") as f:
-            header_len = struct.unpack("<Q", f.read(8))[0]
-            header = json.loads(f.read(header_len))
-        for key in keys:
-            meta = header.get(key)
-            if meta is not None:
-                start, end = meta["data_offsets"]
-                sizes[key] = end - start
-    return sizes
+def _manifest_placement(ckpt):
+    """The placement path named by the pack's manifest, absolute, or None when the pack ships none."""
+    mpath = os.path.join(ckpt, MANIFEST)
+    try:
+        with open(mpath) as fh:
+            p = json.load(fh).get("placement")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(p, str) or not p:
+        return None
+    # Packs record it absolute; a relative entry is relative to the pack root, then to the manifest.
+    for cand in (p, os.path.join(ckpt, p), os.path.join(os.path.dirname(mpath), p)):
+        if os.path.exists(cand):
+            return os.path.abspath(cand)
+    return None
 
 
-def build(checkpoint: str, ranking_csv: str, hot_experts: int, p7_gib: float,
-          kv_gib: float, runtime_gib: float, gx1_gib: float) -> dict:
-    sizes = tensor_sizes(checkpoint)
-    expert_bytes: dict[tuple[int, int], int] = collections.defaultdict(int)
-    dense_bytes = 0
-    non_layer_bytes = 0
-    for key, size in sizes.items():
-        match = EXPERT_KEY.match(key)
-        if match:
-            expert_bytes[(int(match.group(1)), int(match.group(2)))] += size
-        elif key.startswith("layers."):
-            dense_bytes += size
-        else:
-            non_layer_bytes += size
-
-    ranking = []
-    rates = {}
-    with open(ranking_csv, newline="", encoding="utf8") as f:
-        for row in csv.DictReader(f):
-            layer = int(row["layer"])
-            expert = int(row["expert_id"])
-            ranking.append((layer, expert, int(row["rank"])))
-    if len(ranking) != len(expert_bytes):
-        raise SystemExit(f"ranking has {len(ranking)} experts, checkpoint has {len(expert_bytes)}")
-    if len(ranking) < hot_experts:
-        raise SystemExit("hot_experts exceeds ranking size")
-
-    hot = ranking[:hot_experts]
-    warm = ranking[hot_experts:]
-    hot_bytes = sum(expert_bytes[(layer, expert)] for layer, expert, _ in hot)
-    warm_bytes = sum(expert_bytes[(layer, expert)] for layer, expert, _ in warm)
-    non_expert = (dense_bytes + non_layer_bytes) / GIB
-    p7_total = non_expert + kv_gib + runtime_gib + hot_bytes / GIB
-    gx1_total = warm_bytes / GIB
-
-    if p7_total > p7_gib:
-        raise SystemExit(f"P7 does not fit: {p7_total:.3f} > {p7_gib:.3f} GiB")
-    if gx1_total > gx1_gib:
-        raise SystemExit(f"GX1 does not fit: {gx1_total:.3f} > {gx1_gib:.3f} GiB")
-
-    hot_set = {(layer, expert) for layer, expert, _ in hot}
-    by_layer: dict[int, dict[str, list]] = {}
-    for layer in range(40):
-        hot_layer = sorted(e for (l, e) in hot_set if l == layer)
-        cold_layer = sorted(e for (l, e) in expert_bytes if l == layer and (l, e) not in hot_set)
-        by_layer[str(layer)] = {
-            "hot": hot_layer,
-            "warm": cold_layer,
-            "hot_bytes": sum(expert_bytes[(layer, e)] for e in hot_layer),
-            "warm_bytes": sum(expert_bytes[(layer, e)] for e in cold_layer),
-        }
-
-    return {
-        "schema": "qmesh.exl3-expert-placement/v1",
-        "checkpoint": os.path.abspath(checkpoint),
-        "ranking": os.path.abspath(ranking_csv),
-        "hot_experts": hot_experts,
-        "warm_experts": len(warm),
-        "hot_bytes": hot_bytes,
-        "warm_bytes": warm_bytes,
-        "hot_gib": hot_bytes / GIB,
-        "warm_gib": warm_bytes / GIB,
-        "dense_layer_gib": dense_bytes / GIB,
-        "non_layer_gib": non_layer_bytes / GIB,
-        "p7_budget_gib": p7_gib,
-        "p7_total_gib": p7_total,
-        "gx1_budget_gib": gx1_gib,
-        "gx1_total_gib": gx1_total,
-        "layers": by_layer,
-    }
+def resolve(ckpt = None):
+    """Path of the placement this process must use for `ckpt` (default: $CHECKPOINT)."""
+    explicit = os.environ.get("PLACEMENT")
+    if explicit:
+        return explicit
+    ckpt = ckpt or os.environ.get("CHECKPOINT")
+    if ckpt:
+        p = _manifest_placement(ckpt)
+        if p:
+            return p
+    return DEFAULT
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--ranking", default="/home/treadall/qmesh-exl3-mixed/ranking/expert_ranking_2.25.csv")
-    ap.add_argument("--hot-experts", type=int, default=4100)
-    ap.add_argument("--p7-gib", type=float, default=94.97)
-    ap.add_argument("--kv-gib", type=float, default=5.5)
-    ap.add_argument("--runtime-gib", type=float, default=3.365)
-    ap.add_argument("--gx1-gib", type=float, default=117.0)
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
-    plan = build(args.checkpoint, args.ranking, args.hot_experts, args.p7_gib,
-                 args.kv_gib, args.runtime_gib, args.gx1_gib)
-    with open(args.out, "w", encoding="utf8") as f:
-        json.dump(plan, f, indent=2)
-    print(json.dumps({k: v for k, v in plan.items() if k != "layers"}, indent=2))
+def sha(path):
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
 
 
-if __name__ == "__main__":
-    main()
+def load(ckpt = None):
+    """(placement dict, path, sha256 hex) for `ckpt`; remembers the sha for the seam handshake."""
+    path = resolve(ckpt)
+    digest = sha(path)
+    with open(path) as fh:
+        placement = json.load(fh)
+    _last["path"], _last["sha"] = path, digest
+    return placement, path, digest
+
+
+def hot(placement):
+    """The per-module hot list keyed the way the model's modules are: {"layers.N.ffn": [expert ids]}."""
+    return {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
+
+
+def current_sha():
+    """sha256 of the placement this process loaded, or None before any load."""
+    return _last["sha"]
+
+
+def current_path():
+    return _last["path"]

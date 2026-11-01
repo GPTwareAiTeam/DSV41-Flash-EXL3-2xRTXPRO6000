@@ -35,6 +35,7 @@ from qmesh.mem_budget import (
     CACHE_TOKENS, DEVICE, KV_CACHE_KWARGS, PLACEMENT, gib, engine_report, itemize, classify_target,
     classify_drafter, dump_byname, walk_named, _io_counters,
 )
+from qmesh import placement as seam_placement
 
 G = 2 ** 30
 
@@ -72,8 +73,8 @@ def arena_lines(tag: str):
 
 
 def main():
-    placement = json.load(open(PLACEMENT))
-    hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
+    placement, _path, _sha = seam_placement.load(os.environ["CHECKPOINT"])
+    hot = seam_placement.hot(placement)
     config = Config.from_directory(os.environ["CHECKPOINT"])
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot

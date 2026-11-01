@@ -32,6 +32,7 @@ import time
 import torch
 
 from qmesh.native import qes
+from qmesh import placement as seam_placement
 
 HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
@@ -152,7 +153,33 @@ class RemoteSeamHost:
               f"server_slots={self.slots} ns={self.ns} "
               f"server_build={ctl.build} placement_sha={ctl.placement_sha} "
               f"proto={qes.PROTO_VERSION} layers={ctl.layers}", flush = True)
+        self._check_placement(ctl)
         return self
+
+    @staticmethod
+    def _check_placement(ctl):
+        """Refuse, before the first request, a server whose cold tables were cut against another
+        placement file.
+
+        The Hello's placement sha is the one thing that pins every layer's hot/cold split at once: the
+        client derives each layer's cold count as num_experts - len(hot) from the file it loaded, and a
+        different file means different counts (the 2.8535 table's layer 0 has 259 cold, the 4620 packs'
+        248). The transport then carries cold-local ids the server cannot index, and the server -- by
+        design -- fail-stops rather than answer from the wrong experts, which reads like a transport
+        fault. Caught here it costs one line instead of a 145 s reload (2026-11-01 18:03: the prefill
+        client still read the repo default while the identity client read the pack's manifest).
+        """
+        srv = (getattr(ctl, "placement_sha", "") or "").strip()
+        mine = (seam_placement.current_sha() or "").strip()
+        if srv and mine and not (srv.startswith(mine[:16]) or mine.startswith(srv[:16])):
+            raise RuntimeError(
+                f"placement mismatch on {ctl.host}:{getattr(ctl, 'port', '?')}: the server's Hello "
+                f"advertises {srv[:16]} but this client loaded {mine[:16]} from "
+                f"{seam_placement.current_path()}; every layer's cold count would differ and the "
+                f"server would fail-stop on the first out-of-range id (set PLACEMENT to the server's "
+                f"file, or let the pack's PACK_MANIFEST.json pick it)")
+        print(f"SEAM_PLACEMENT server_sha={srv[:16] or 'unset'} client_sha={mine[:16] or 'unset'} "
+              f"path={seam_placement.current_path() or 'unset'}", flush = True)
 
     def _seam(self, bucket: int, device_index: int):
         """Data handle for one granted bucket, created on first use. The server assigned this

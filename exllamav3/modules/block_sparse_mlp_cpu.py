@@ -465,7 +465,18 @@ class BlockSparseMLP_CPU:
         split_k = int(getattr(ip, "moe_cpu_split", 0))
         remote_hot = getattr(ip, "moe_remote_hot", None)
         if remote_hot is not None and self.key in remote_hot:
-            split_k = self.num_experts - len(remote_hot[self.key])
+            hot_ids = remote_hot[self.key]
+            # Registration-time guard, before any request can be sent: the cold count this layer
+            # derives is num_experts - len(hot), so a hot list from another pack (or another expert
+            # count) silently shifts every cold id. Failing here names the layer and the file's
+            # intent instead of surfacing as a server fail-stop on the first long prefill.
+            if hot_ids and (min(hot_ids) < 0 or max(hot_ids) >= self.num_experts):
+                raise RuntimeError(
+                    f"placement hot list for {self.key} has expert ids in "
+                    f"[{min(hot_ids)},{max(hot_ids)}] but the layer has {self.num_experts} experts: "
+                    f"the placement file does not belong to this checkpoint (qmesh/placement.py "
+                    f"picks the pack's own table; PLACEMENT overrides it)")
+            split_k = self.num_experts - len(hot_ids)
         if split_k:
             assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \

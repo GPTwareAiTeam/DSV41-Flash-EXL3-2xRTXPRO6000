@@ -14,7 +14,8 @@ Phases: after load, after the warm-up decode (graphs captured -> statics exist),
 prefill, and after decode.
 
 Env:
-  CHECKPOINT, DRAFT_CHECKPOINT (defaults to CHECKPOINT), PLACEMENT,
+  CHECKPOINT, DRAFT_CHECKPOINT (defaults to CHECKPOINT),
+  PLACEMENT (default: the pack's PACK_MANIFEST.json, else qmesh/placement.final.json),
   KV_BITS (4|8|16, default 4), CACHE_TOKENS (default 1048576),
   DSPARK (1 loads the drafter), NUM_DRAFT (default 5), WARMUP_NEW (decode tokens of the warm-up
   prompt, default 24), LONG_PROMPT_FILE or CORPUS+LONG_TOKENS, LONG_NEW (decode tokens after the
@@ -38,10 +39,14 @@ import torch
 from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from exllamav3.util.memory import vram_accounting
 from qmesh.prefill_limit import PAGE_SIZE, PREFILL_ADAPTIVE, PrefillChunkLimiter
+from qmesh import placement as seam_placement
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
-PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
+# The pack's own table (qmesh/placement.py), not a repo default: this script walks the long prefill,
+# which touches far more experts than the identity phase, and a wrong cold count here is what made
+# the server refuse 2 of 384 ids on 2026-11-01 18:03.
+PLACEMENT = seam_placement.resolve(CHECKPOINT)
 KV_BITS = int(os.environ.get("KV_BITS", "4"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "1048576"))
 DSPARK = os.environ.get("DSPARK") == "1"
@@ -386,8 +391,10 @@ def peaks(title: str, base_alloc: int):
 
 
 def main():
-    placement = json.load(open(PLACEMENT))
-    hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
+    placement, placement_path, placement_sha = seam_placement.load(CHECKPOINT)
+    print(f"CLIENT_PLACEMENT path={placement_path} sha={placement_sha[:16]} ckpt={CHECKPOINT}",
+          flush = True)
+    hot = seam_placement.hot(placement)
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot

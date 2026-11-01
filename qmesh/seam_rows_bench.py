@@ -33,6 +33,7 @@ import time
 import torch
 
 from qmesh.remote_seam_host import RemoteSeamHost, HIDDEN, TOPK
+from qmesh import placement as seam_placement
 from qmesh.native import qes as _qes
 
 DEV = os.environ.get("SEAM_DEV", "rocep142s0f0")
@@ -40,7 +41,7 @@ PEER = os.environ.get("SEAM_PEER", "10.0.100.2")
 PORT = int(os.environ.get("SEAM_PORT", "47311"))
 REPS = int(os.environ.get("BENCH_REPS", "5"))
 MAX_LAYERS = int(os.environ.get("BENCH_LAYERS", "0"))
-PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
+PLACEMENT = seam_placement.resolve(os.environ.get("CHECKPOINT"))   # the pack's table when the pack ships one
 ROWS = [int(r) for r in os.environ.get("BENCH_ROWS", "1,2,3,4,5,6,7").split(",")]
 INTERLEAVE = int(os.environ.get("BENCH_INTERLEAVE", "0"))
 SYNC = os.environ.get("BENCH_SYNC", "1") != "0"
@@ -98,7 +99,7 @@ def make_ids(n, nc, dev):
 
 
 def main():
-    pl = json.load(open(PLACEMENT))
+    pl, _path, _sha = seam_placement.load(os.environ.get("CHECKPOINT"))
     cold = {int(k): len(v["warm"]) for k, v in pl["layers"].items()}
     layers = sorted(cold)
     if MAX_LAYERS:

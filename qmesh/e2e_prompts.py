@@ -8,7 +8,7 @@ line per prompt plus a summary. Timing comes from the engine's own job accountin
 
   CHECKPOINT   model dir (default /models/dsv41/exl3-2.8535-p7hot-hc1)
   DRAFT_CHECKPOINT  drafter (mtp) model dir (default: CHECKPOINT), e.g. the HC1 overlay
-  PLACEMENT    placement json (default qmesh/placement.final.json)
+  PLACEMENT    placement json (default: the pack's PACK_MANIFEST.json, else qmesh/placement.final.json)
   PROMPTS      path to prompt list (JSON array)  [default: built-in 3 prompts]
   PROMPTS_TXT  path to a text file; each non-empty line is one prompt (overrides PROMPTS)
   CORPUS       comma-separated corpus txt files; each file is truncated to CORPUS_TOKENS tokens
@@ -49,29 +49,15 @@ import torch
 
 from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
+from qmesh import placement as seam_placement
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
-
-def _placement_from_pack(ckpt):
-    """The pack's own placement file, when it ships one.
-
-    PACK_MANIFEST.json names the exact placement the pack was cut against, and its sha256 is what the
-    GX seam server's Hello carries, so a client that reads it cannot disagree with the server about
-    which experts are cold. The repo default is the 2.8535 pack's; used against the 4620 packs it sent
-    cold ids up to 256 into a 248-expert table and the server fail-stopped on the first forward
-    (2026-11-01 17:46, GX2, arm A), which reads exactly like a transport fault and is not one.
-    """
-    try:
-        with open(os.path.join(ckpt, "PACK_MANIFEST.json")) as fh:
-            p = json.load(fh).get("placement")
-    except (OSError, ValueError):
-        return None
-    return p if isinstance(p, str) and os.path.exists(p) else None
-
-
-PLACEMENT = (os.environ.get("PLACEMENT") or _placement_from_pack(CHECKPOINT)
-             or os.path.join(os.path.dirname(__file__), "placement.final.json"))
+# qmesh/placement.py owns the choice (explicit PLACEMENT, else the pack's manifest, else the repo
+# default) so this script, mem_budget.py and the loaders cannot each pick a different table: the
+# 18:03 prefill died because it was the one client that still read the 2.8535 table under the 4620
+# server. The resolved sha is also what the seam handshake checks against the server's Hello.
+PLACEMENT = seam_placement.resolve(CHECKPOINT)
 
 MAX_NEW = int(os.environ.get("MAX_NEW", "256"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
@@ -250,14 +236,12 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
 
 
 def main():
-    placement = json.load(open(PLACEMENT))
-    # Printed before any model work: the server's Hello carries its own placement sha, and a client
-    # whose table came from another pack shows up here as a different number instead of as a dead
-    # handle on the first forward.
-    print(f"CLIENT_PLACEMENT path={PLACEMENT} "
-          f"sha={hashlib.sha256(open(PLACEMENT, 'rb').read()).hexdigest()[:16]} "
-          f"ckpt={CHECKPOINT}", flush=True)
-    hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
+    placement, placement_path, placement_sha = seam_placement.load(CHECKPOINT)
+    # Printed before any model work: the seam handshake refuses a server whose Hello advertises
+    # another table, so this number either matches the server's or names the mismatch here.
+    print(f"CLIENT_PLACEMENT path={placement_path} sha={placement_sha[:16]} ckpt={CHECKPOINT}",
+          flush=True)
+    hot = seam_placement.hot(placement)
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot
