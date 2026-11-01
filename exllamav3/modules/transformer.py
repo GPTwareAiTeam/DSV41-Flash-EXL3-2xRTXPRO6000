@@ -13,6 +13,24 @@ import os
 # attention core, then graph B (attn residual + MLP + HC apply). Each block's residual is final at its exit.
 _PIECEWISE = os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0"
 
+# Opt-in per-phase decode marks (EXL3_ROUND_PROF=1): the attention core and the MLP core of each
+# block, so an eager decode run attributes the verify forward between attention+dense and the MoE
+# (which also holds the seam wait, measured separately by RemoteSeamHost's EXL3_SEAM_PROF). Only
+# the eager path can host Python marks: with piecewise graphs the MLP is replayed from a graph.
+_rp_on = os.environ.get("EXL3_ROUND_PROF", "0") == "1"
+_rp_mark_fn = None
+
+def _rpmark(name):
+    global _rp_mark_fn
+    if _rp_mark_fn is None:
+        try:
+            from ..generator.roundprof import mark as _m
+        except Exception:
+            _m = False
+        _rp_mark_fn = _m
+    if _rp_mark_fn:
+        _rp_mark_fn(name)
+
 class TransformerBlock(Module):
 
     def __init__(
@@ -185,6 +203,8 @@ class TransformerBlock(Module):
             else:
                 y = x.half()
             y = self.attn.forward(y, params)
+            if _rp_on and y.shape[1] == 1:
+                _rpmark("attn_end")
             if params.get("prefill") and not export_state:
                 return x
             if self.attn_resid_scalar is not None:
@@ -213,6 +233,8 @@ class TransformerBlock(Module):
                 else:
                     y = x.half()
             y = self.mlp.forward(y, params)
+            if _rp_on and y.shape[1] == 1:
+                _rpmark("mlp_end")
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
             if self.mlp_hc:

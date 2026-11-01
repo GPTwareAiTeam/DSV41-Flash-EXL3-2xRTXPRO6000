@@ -9,10 +9,16 @@ Env:
   SEAM_GID       GID index (default 5)
   SEAM_PEER      GX1 address (default 10.0.100.2)
   SEAM_PORT      seam TCP/RDMA rendezvous port (default 47311)
+  EXL3_SEAM_PROF 1 times issue -> collect per (bucket, rows) with CUDA events and dumps the per-layer
+                 round trip at exit (wire + GX1 compute). Eager only: a captured graph records the
+                 calls once at capture and then replays ops, so there is nothing to time per round.
 """
 from __future__ import annotations
 
+import atexit
 import os
+import statistics
+import time
 
 import torch
 
@@ -20,6 +26,30 @@ from qmesh.native import qes
 
 HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
+
+_PROF = os.environ.get("EXL3_SEAM_PROF", "0") == "1"
+# Decode batches only by default: prefill chunks would land in the same bucket keys
+_PROF_MAX_ROWS = int(os.environ.get("EXL3_SEAM_PROF_ROWS", "6"))
+_prof_rows = {}     # (bucket, n) -> [(host_ns_0, host_ns_1, ev0, ev1)]
+
+
+def _prof_dump():
+    if not _prof_rows:
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    print("[SEAMPROF] bucket rows    n   host_us   dev_ms  dev_us/row", flush = True)
+    for (bucket, n), vals in sorted(_prof_rows.items()):
+        hu = statistics.median((v[1] - v[0]) / 1e3 for v in vals)
+        dv = statistics.median(v[2].elapsed_time(v[3]) for v in vals)
+        print(f"[SEAMPROF] {bucket:6d} {n:5d} {len(vals):4d} {hu:9.3f} {dv:8.3f} "
+              f"{dv * 1e3 / max(n, 1):10.2f}", flush = True)
+
+
+if _PROF:
+    atexit.register(_prof_dump)
 
 
 class RemoteSeamHost:
@@ -91,9 +121,19 @@ class RemoteSeamHost:
             x, ids, w = xp, idp, wp
         seam = self._seam(bucket, dev.index or 0)
         stream = torch.cuda.current_stream(dev)
+        prof = _PROF and n <= _PROF_MAX_ROWS
+        if prof:
+            ev0 = torch.cuda.Event(enable_timing = True)
+            ev0.record(stream)
+            t0 = time.perf_counter_ns()
         seam.issue(layer_idx, x.data_ptr(), ids.data_ptr(), w.data_ptr(), stream.cuda_stream)
         out = torch.empty(bucket, HIDDEN, dtype=torch.float32, device=dev)
         seam.collect(layer_idx, out.data_ptr(), stream.cuda_stream)
+        if prof:
+            t1 = time.perf_counter_ns()
+            ev1 = torch.cuda.Event(enable_timing = True)
+            ev1.record(stream)
+            _prof_rows.setdefault((bucket, n), []).append((t0, t1, ev0, ev1))
         return out[:n]
 
     @staticmethod
