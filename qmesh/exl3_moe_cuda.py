@@ -164,13 +164,8 @@ def _live_mib(ffn) -> float:
     return total / 2**20
 
 
-def peak_mib(ffn) -> float:
-    """Peak of the restack, MiB: the layer's live cold bytes plus its largest stacked group.
-
-    `_stack_group` allocates a group's six stacked tensors before copying any expert into them, so
-    the group's sources and its stack are both live at that point; the per-group sums here are
-    exactly what the stack costs, because gate and up are stored side by side at their live sizes.
-    """
+def _group_mib(ffn) -> tuple[int, float]:
+    """(group count, largest group MiB) for a layer's bitrate split."""
     by_key: dict[tuple[int, int, int], int] = {}
     for e, g in enumerate(ffn.gates):
         key = (int(_inner(g).trellis.shape[2]), int(_inner(ffn.downs[e]).trellis.shape[2]),
@@ -180,8 +175,30 @@ def peak_mib(ffn) -> float:
             i = _inner(line)
             sz += sum(t.numel() * t.element_size() for t in (i.trellis, i.suh, i.svh))
         by_key[key] = by_key.get(key, 0) + sz
-    live = _live_mib(ffn) * 2**20
-    return (live + max(by_key.values(), default = 0)) / 2**20
+    return len(by_key), max(by_key.values(), default = 0) / 2**20
+
+
+def transient_mib(ffn) -> float:
+    """Largest single group the restack allocates before any source of that group is freed, MiB.
+
+    This is what a conversion actually has to find free, since the layer it converts is already
+    resident: `_stack_group` takes one group's sources (already outside MemAvailable) and allocates
+    the group's six stacked tensors on top, then frees those sources before the next group starts.
+    Measured on GX2 2026-11-01: 175 ms per 2.7-3.0 GiB layer, largest group 1.03-1.37 GiB, and the
+    steady-state MemAvailable fell by only ~0.9 GiB per converted layer.
+    """
+    return _group_mib(ffn)[1]
+
+
+def peak_mib(ffn) -> float:
+    """Absolute residency at the conversion's peak, MiB: live cold bytes plus the largest group.
+
+    Only the second term is new allocation (see `transient_mib`); the first is already resident and
+    already excluded from MemAvailable, so a gate has to compare MemAvailable against
+    `transient_mib`. Kept for reports: it is the figure that explains a box going over its head
+    when the gate is bypassed (GX1 2026-11-01 16:44 needed 5.4 GiB of a 1.32 GiB budget).
+    """
+    return _live_mib(ffn) + _group_mib(ffn)[1]
 
 
 def align_block(local_ids: torch.Tensor, block_m: int, num_experts: int, m_valid: int):

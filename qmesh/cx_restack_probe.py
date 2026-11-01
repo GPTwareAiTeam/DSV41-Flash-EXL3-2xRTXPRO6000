@@ -92,7 +92,7 @@ def main(argv=None):
     srv = S.SeamServer(a.model, placement, "cuda:0", ws_rows=0)
     print(f"SEAM_CX_PROBE_LOADED load_s={time.perf_counter() - t0:.0f} {memline()}", flush=True)
 
-    from qmesh.exl3_moe_cuda import CudaExl3Moe, RestackBroken, _live_mib, peak_mib
+    from qmesh.exl3_moe_cuda import CudaExl3Moe, RestackBroken, _live_mib, transient_mib
     layer = a.layer
     ffn = srv.layers[layer][0]
     # With SEAM_MOE_PRELOAD=1 (the server default for cudaexl3) every layer was converted while it
@@ -104,7 +104,7 @@ def main(argv=None):
               f"stacked_mib={cx.nbytes() / 2**20:.0f} {memline()}", flush=True)
     else:
         live = _live_mib(ffn)
-        need = peak_mib(ffn)
+        need = transient_mib(ffn)
         avail = S._avail_mib()
         print(f"SEAM_CX_PROBE_PLAN layer={layer} cold_mib={live:.0f} need_mib={need:.0f} "
               f"avail_mib={avail} gate_mib={a.gate_mib} "
@@ -128,7 +128,7 @@ def main(argv=None):
               f"{memline()}", flush=True)
         srv._cx_layers[layer] = cx
 
-    cold = sorted(int(x) for x in srv.layers[layer].__dict__.get("_cold_experts", []) or [])
+    cold = sorted(int(x) for x in (getattr(ffn, "_cold_experts", None) or []))
     if not cold:
         # The layer object does not remember its cold set; the ids only have to be in range and
         # routed, so take the first TOPK experts and give each row a uniform weight.

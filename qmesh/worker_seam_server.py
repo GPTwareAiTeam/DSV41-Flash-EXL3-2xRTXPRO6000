@@ -205,10 +205,11 @@ class SeamServer:
             # because nothing of the module was released in that case.
             if self.preload:
                 self._cx_moe(layer, self.layers[layer][0])
-        cx_n = sum(1 for v in getattr(self, "_cx_layers", {}).values() if v is not None)
+        cx_n = sum(1 for v in self._cx_layers.values() if v is not None)
         if self._cx_layers:
             print(f"SEAM_PACK_KERNEL cudaexl3_layers={cx_n} mixedk_layers={NL - cx_n} "
-                  f"of={NL} avail_mib={_avail_mib()} swap_mib={_swap_used_mib()}", flush=True)
+                  f"of={NL} avail_mib={_avail_mib()} avail_min_mib={getattr(self, '_cx_avail_min', '?')} "
+                  f"swap_mib={_swap_used_mib()} rss_peak_mib={_rss_peak_mib()}", flush=True)
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
@@ -325,8 +326,9 @@ class SeamServer:
         if layer in cx:
             return cx[layer]
         try:
-            from qmesh.exl3_moe_cuda import (CudaExl3Moe, RestackBroken,
-                                             _live_mib as _cx_cold_mib, peak_mib as _cx_peak_mib)
+            from qmesh.exl3_moe_cuda import (CudaExl3Moe, RestackBroken, transient_mib as
+                                             _cx_transient_mib, _live_mib as _cx_cold_mib,
+                                             peak_mib as _cx_peak_mib)
         except Exception as e:
             # No vendored extension on this box: the layer keeps its module copy, and saying so once
             # is better than dying inside compute()'s fail-stop on the first request.
@@ -334,20 +336,27 @@ class SeamServer:
             print(f"SEAM_MOE_NOEXT layer={layer} err={type(e).__name__}: {e} "
                   f"- serving this layer from the mixed-K module", flush=True)
             return None
-        # The restack cannot be done in place: a group's stacked tensors are allocated before any
-        # expert of that group is copied into them, so the peak is one layer's cold bytes plus up
-        # to one group's. On GB10 the pack and the device share one 121 GiB pool, and a
-        # cudaMalloc that cannot be satisfied does not fail cleanly there: it pages the pack out
-        # and wedges the whole host (GX1 2026-11-01 16:44: a 64-row request took >30 s, the client
-        # called the transport dead, sshd stopped answering - the layer-0 restack was the first
-        # thing to ask for ~4 GiB with 1.32 GiB available). Refuse the conversion up front when the
-        # peak does not fit, so the arm still runs on the module instead of taking the box down.
-        need = _cx_peak_mib(ffn)
+        # One group's stacked tensors are allocated before any expert of that group is copied into
+        # them, and the group's sources are freed before the next group starts, so a conversion on
+        # an already-resident layer needs exactly `transient_mib` of free memory, not the layer's
+        # size plus that (the sources are resident and already excluded from MemAvailable). On GB10
+        # the pack and the device share one 121 GiB pool, and a cudaMalloc that cannot be satisfied
+        # there does not fail cleanly: it pages the pack out and wedges the host (GX1 2026-11-01
+        # 16:44, needing 5.4 GiB against 1.32 GiB available). Refuse up front when the transient
+        # plus the floor does not fit, so the layer stays on the mixed-K module and the box lives.
+        need = _cx_transient_mib(ffn)
         avail = _avail_mib()
+        # Lowest MemAvailable seen at any conversion, reported with the load summary: a refusal or a
+        # near miss during the load is then evidence about the host (another process, page cache),
+        # not about the layer, which always costs the same at the same point in the load.
+        if avail >= 0:
+            prev = self.__dict__.get("_cx_avail_min", avail)
+            self._cx_avail_min = min(prev, avail)
         if avail >= 0 and need + CX_MARGIN_MIB > avail:
             cx[layer] = None
-            print(f"SEAM_MOE_NOFIT layer={layer} need_mib={need} avail_mib={avail} "
-                  f"margin_mib={CX_MARGIN_MIB} cold_mib={_cx_cold_mib(ffn)} "
+            print(f"SEAM_MOE_NOFIT layer={layer} need_mib={need:.0f} avail_mib={avail} "
+                  f"margin_mib={CX_MARGIN_MIB} cold_mib={_cx_cold_mib(ffn):.0f} "
+                  f"peak_mib={_cx_peak_mib(ffn):.0f} "
                   f"- restack would page the pack out; serving this layer from the mixed-K module",
                   flush=True)
             return None
