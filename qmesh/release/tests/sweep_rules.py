@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import importlib.util, os, sys, io, contextlib
 os.environ["PAIR_QUEUE_ROOT"] = "/tmp/sweepq"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
