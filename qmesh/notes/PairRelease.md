@@ -141,6 +141,12 @@ Evidence is per sha, not per pair: dev's manifest moves on with the next release
 follow days later. A failed attempt writes the same file with `ok=false`, the phase it died in and
 the reason, so a later promotion says *why* rather than "no evidence".
 
+`pair_canary_gate` in `pair_lib.sh` is the single definition of "dev passed": `pair_update.sh` refuses
+early with it, `pair_promote.sh` is the only door, and `pair_update_run.sh` -- the script that
+actually flips -- checks it again before any phase, so queueing the ticket's script by hand is not a
+way around either door. `tests/promote_gate.sh` sweeps all of them, including that a refused ticket
+runs no docker command at all.
+
 The order is therefore: `pair_prepare.sh dev <sha>` (out of band) → `pair_update.sh dev <sha>
 --flip-only` → wait for `PAIR_UPDATED … ids=n>` → `pair_prepare.sh prod <sha>` in the fresh,
 non-serving prod containers → `pair_promote.sh <sha>` (which re-checks dev, the seam fingerprint and
