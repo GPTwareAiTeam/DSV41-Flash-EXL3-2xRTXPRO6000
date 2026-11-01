@@ -74,6 +74,16 @@ class SeamServer:
         # fail_after: testing hook for the fail-stop below - raise on call N+1. 0 = never.
         self.fail_after = int(fail_after or 0)
         self.seen = 0
+        # One compute at a time. The C proxy calls this hook from a thread per open handle, and a
+        # client with several row buckets keeps several handles (1/6/64...) with one request in
+        # flight each, so two threads can be inside _forward at once: the pinned-slab pointers are
+        # per handle, but the module (its _buf_get scratch, its fused row buffers) and the one CUDA
+        # stream are not. The Python-side tensor bookkeeping of the two calls then interleaves while
+        # the other thread sits in stream.synchronize() or .cpu() with the GIL released - the same
+        # scratch buffer is rebuilt under a kernel that is still reading it. That is a CUDA illegal
+        # access / launch failure inside the GX compute, i.e. exactly the "6-row" deaths of
+        # 2026-11-01, and it cannot be seen by a single-handle benchmark (that is serialized).
+        self.compute_lock = threading.Lock()
         # ws_rows: serve each request in pieces of at most this many rows, so the peak device
         # workspace follows ws_rows instead of the row bucket (see _forward). 0 = one piece.
         placement = json.load(open(placement_path))
@@ -149,7 +159,11 @@ class SeamServer:
             if self.fail_after and self.seen > self.fail_after:
                 raise RuntimeError(f"injected compute failure on call {self.seen} (--fail-after "
                                    f"{self.fail_after})")
-            self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+            # The lock covers the whole forward, not just one piece: a request served in ws_rows
+            # pieces still builds its scratch between pieces, and the pieces of two requests must
+            # not interleave inside the module.
+            with self.compute_lock:
+                self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
         except Exception as e:  # noqa: BLE001 - see the docstring: no safe local recovery
             print(f"SEAM_COMPUTE_FAIL layer={layer} rows={rows} err={type(e).__name__}: {e} "
                   f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()} "
