@@ -46,6 +46,33 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
     exl3_moe_kernel_k8_n128_cb1(), exl3_moe_kernel_k8_n256_cb1(), exl3_moe_kernel_k8_n128_cb2(), exl3_moe_kernel_k8_n256_cb2()
 };
 
+// Blocks of `kernel` the runtime can keep resident per SM at the MoE launch shape, capped at 2. The grid is
+// co-resident by design (the group barriers spin), so the launch never counts on more than the runtime
+// reports, and the cap keeps the group buffers sized by exl3_moe_max_concurrency sufficient.
+// EXL3_MOE_BPS=n overrides the query on both backends (a sweep knob); EXL3_ROCM_MOE_BPS=n, and =1 forcing a
+// single block, stay supported
+static int moe_blocks_per_sm(fp_exl3_moe_kernel kernel, int device, int smem)
+{
+    static int forced = -2;
+    if (forced == -2)
+    {
+        const char* e = getenv("EXL3_MOE_BPS");
+        if (!e) e = getenv("EXL3_ROCM_MOE_BPS");
+        forced = e ? atoi(e) : -1;
+    }
+    if (forced > 0) return forced;
+    int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
+    cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         DevCtx::instance().get_smem_request(device));
+    int nb = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, (const void*) kernel, block_dim, smem) != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+        nb = 1;
+    }
+    return MAX(1, MIN(nb, 2));
+}
+
 #if defined(USE_ROCM)
 
 // Pipelined mainloop instances (rocm/quant/exl3_moe_inner_rdna.cuh), same [K][cb - 1][N_off] order
@@ -107,30 +134,6 @@ static int moe_pipe_smem(int n_tile)
                          : moe_pipe::smem_launch_bytes<MOE_TILESIZE_K, 128>();
 }
 
-// Blocks of `kernel` the runtime can keep resident per WGP at the MoE launch shape, capped at 2. The
-// pipelined kernel is register-budgeted for two (EXL3_MOE_PIPE_WPE); the grid is co-resident by design
-// (group barriers spin), so the launch never counts on more than the runtime reports.
-// EXL3_ROCM_MOE_BPS=1 forces one block per WGP
-static int moe_blocks_per_sm(fp_exl3_moe_kernel kernel, int device, int smem)
-{
-    static int forced = -2;
-    if (forced == -2)
-    {
-        const char* e = getenv("EXL3_ROCM_MOE_BPS");
-        forced = e ? atoi(e) : -1;
-    }
-    if (forced == 1) return 1;
-    int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
-    cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         DevCtx::instance().get_smem_request(device));
-    int nb = 0;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, (const void*) kernel, block_dim, smem) != cudaSuccess)
-    {
-        (void) cudaGetLastError();
-        nb = 1;
-    }
-    return MAX(1, MIN(nb, 2));
-}
 
 int exl3_moe_max_concurrency(int device)
 {
@@ -505,13 +508,30 @@ void exl3_moe
     }
     const int launch_smem = pipe ? moe_pipe_smem(N_off ? 256 : 128) : smem_max;
 #else
-    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= num_sms, "Concurrency too high for device num_sms");
+    // Slots: blocks the runtime keeps resident per SM x SMs, from the launch's own occupancy (shared memory
+    // request and register frame), cached per instance. The grid must be co-resident for the group barriers,
+    // so a launch sized from num_sms alone would leave any extra occupancy the kernels can hold unused.
+    // Measured on GB10 every instance of this family takes a 128-register frame at 512 threads, i.e. the whole
+    // register file for one block per SM, so the query returns 1 here; the machinery is for narrower shapes
+    static std::map<void*, int> bps_cache[MAX_DEVICES];
+    int bps = 1;
+    {
+        auto it = bps_cache[device].find((void*) kernel);
+        if (it == bps_cache[device].end())
+        {
+            bps = moe_blocks_per_sm(kernel, device, smem_max);
+            bps_cache[device][(void*) kernel] = bps;
+        }
+        else bps = it->second;
+    }
+    const int slots = num_sms * bps;
+    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= slots, "Concurrency too high for device num_sms");
     int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
-    int group_size = MOE_SMS_PER_EXPERT;
+    int group_size = MIN(MOE_SMS_PER_EXPERT, MAX(1, slots / num_groups));
     if (num_active > 0)
     {
         num_groups = MIN(num_groups, num_active);
-        group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
+        group_size = MIN(slots / num_groups, MOE_MAX_SMS_PER_EXPERT);
     }
     const int launch_smem = smem_max;
 #endif

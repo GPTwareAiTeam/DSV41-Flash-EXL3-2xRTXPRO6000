@@ -43,7 +43,10 @@ void moe_gemm_tile
 )
 {
     // Fragment pipeline depth: the 64-row tile keeps two B stages so its A fragments fit
-    constexpr int FS = (MT >= 64) ? 2 : MOE_FRAG_STAGES;
+    #ifndef EXL3_MOE_FS_WIDE
+        #define EXL3_MOE_FS_WIDE 2
+    #endif
+    constexpr int FS = (MT >= 64) ? EXL3_MOE_FS_WIDE : MOE_FRAG_STAGES;
     #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr
     #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
     // Compile-time rate: t_bits, or t_bits + 0.5 with t_half (mul1 codebook only). Otherwise the runtime K
@@ -137,7 +140,16 @@ void moe_gemm_rows_pipe
 // PIPE (RDNA only): true = the g/u/d GEMMs run the pipelined mainloop (EXL3_ROCM_MOE_PIPE=1, default),
 // false = the shared inner through moe_gemm_tile (the CUDA path, EXL3_ROCM_MOE_PIPE=0 on RDNA)
 template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool t_half = false, bool PIPE = false>
-__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
+// Occupancy hint: EXL3_MOE_MIN_BLOCKS = n asks ptxas for a frame that fits n co-resident blocks
+// (__launch_bounds__(threads, n) halves it to 64 registers at 512 threads). Keep 1. Naming the block size
+// alone is what matters: on GB10 it takes the 512-row-tier layer call from 36.04 to 29.7 ms (the 16-row
+// launches hold 128 registers, one block per SM, at the same instruction count). Built at 2 the frame drops
+// to 64 registers and spills 1.5 KB per thread into local memory, which costs far more than the occupancy
+// buys (2048-row layer call 41.6 ms -> 161 ms). Both knobs stay for experiments
+#ifndef EXL3_MOE_MIN_BLOCKS
+    #define EXL3_MOE_MIN_BLOCKS 1
+#endif
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16, EXL3_MOE_MIN_BLOCKS)
 EXL3_MOE_KERNEL_ATTR
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
