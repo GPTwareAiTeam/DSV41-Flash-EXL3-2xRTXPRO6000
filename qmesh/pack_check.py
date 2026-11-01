@@ -36,6 +36,28 @@ def shard_sizes(path: str, shards) -> list:
     return out
 
 
+def names_from_headers(path: str) -> dict:
+    """Every tensor name in every *.safetensors of `path`, read from the files' own headers.
+
+    Needed when the reference is a symlink farm with a stale index (the HC1 overlay carries the base
+    index, so its index lies about the drafter shards). Only header bytes are read, never tensor data.
+    """
+    out = {}
+    for name in sorted(os.listdir(path)):
+        if not name.endswith(".safetensors"):
+            continue
+        p = os.path.join(path, name)
+        if os.path.islink(p):
+            p = os.path.realpath(p)
+        with open(p, "rb") as fh:
+            n = int.from_bytes(fh.read(8), "little")
+            hdr = json.loads(fh.read(n))
+        for key in hdr:
+            if key != "__metadata__":
+                out[key] = name
+    return out
+
+
 EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(\w+)$")
 
 
@@ -100,7 +122,10 @@ def main():
         print(f"PACK file {extra}={'yes' if ok else 'NO'}")
     if not ref:
         return 0 if not bad else 1
-    ridx = index_of(ref)
+    if os.environ.get("PACK_REF_HEADERS", "1") == "1":
+        ridx = names_from_headers(ref)
+    else:
+        ridx = index_of(ref)
     missing = sorted(set(ridx) - set(pidx))
     added = sorted(set(pidx) - set(ridx))
     pl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "placement.final.json")
