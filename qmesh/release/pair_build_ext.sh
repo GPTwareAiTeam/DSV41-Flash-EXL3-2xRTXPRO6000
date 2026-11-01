@@ -62,13 +62,18 @@ build_side() {
     || { pair_step "EXT_SKIP $side $ct not_running"; return 1; }
   [ -z "$(side_docker "$side" exec "$ct" pgrep -f worker_seam_server.py 2>/dev/null)" ] \
     || { pair_step "EXT_REFUSE $side server_running_in=$ct"; return 1; }
-  local builds
-  builds=$(side_hostsh "$side" "pgrep -c -x 'ninja|cc1plus|nvcc|cicc' 2>/dev/null || true")
+  # Count only compilers young enough to still be working: exl3-tp2-moe has kept 223 nvcc and 126
+  # cc1plus alive for days, and waiting on those dead ones would block every build forever.
+  local builds ignored stale=${PAIR_BUILD_STALE_SECS:-1800}
+  compilers() {
+    side_hostsh "$1" "ps -eo etimes=,comm= | awk -v s=$stale '\$2 ~ /^(ninja|cc1plus|nvcc|cicc)\$/ {if (\$1 < s) f++; else o++} END {print f+0\" \"o+0}'"
+  }
+  read -r builds ignored <<<"$(compilers "$side")"
   local waited=0 cap=${PAIR_BUILD_WAIT_SECS:-1800}
   while [ "${builds:-0}" != 0 ] && [ "$waited" -lt "$cap" ]; do
-    pair_step "EXT_WAIT $side compiler_running=$builds waited=${waited}s (another build owns the host)"
+    pair_step "EXT_WAIT $side compiler_running=$builds stale_ignored=${ignored:-0} waited=${waited}s (another build owns the host)"
     sleep 30; waited=$((waited + 30))
-    builds=$(side_hostsh "$side" "pgrep -c -x 'ninja|cc1plus|nvcc|cicc' 2>/dev/null || true")
+    read -r builds ignored <<<"$(compilers "$side")"
   done
   [ "${builds:-0}" = 0 ] || { pair_step "EXT_REFUSE $side compiler_running=$builds waited=${waited}s"; return 1; }
   if [ "$side" = gx ]; then
