@@ -45,6 +45,32 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# Diagnostic: one SEAM_TIER line per routed call with the row-count band of every expert and how many
+# assignments each tier took. EXL3_MOE_TIER_TRACE=1 turns it on and it is inert when unset; it is how
+# a tier change is *seen* to have reached the dispatch instead of being assumed from the timing.
+TIER_TRACE = os.environ.get("EXL3_MOE_TIER_TRACE", "0") != "0"
+_tier_n = 0
+
+
+def _tier_trace(num_ex, num_tokens, top_k, rows_limit, counts, fused_total, groups):
+    """Print the tier plan of one call: 1-32 / 33-64 / 65-128 / 129-256 / 257+ expert counts."""
+    global _tier_n
+    _tier_n += 1
+    if counts is None:
+        print(f"SEAM_TIER call={_tier_n} tokens={num_tokens} top_k={top_k} "
+              f"fused_rows={rows_limit} plan=all-fused assignments={fused_total}", flush = True)
+        return
+    bands = (("1-32", 32), ("33-64", 64), ("65-128", 128), ("129-256", 256), ("257+", 1 << 30))
+    hist, lo = [], 1
+    for name, hi in bands:
+        hist.append(f"{name}:{sum(1 for c in counts[:num_ex] if lo <= c <= hi)}")
+        lo = hi + 1
+    print(f"SEAM_TIER call={_tier_n} tokens={num_tokens} top_k={top_k} fused_rows={rows_limit} "
+          f"assignments={sum(counts[:num_ex])} fused_assignments={fused_total} "
+          f"recon_experts={sum(len(g) for g in groups)} "
+          f"recon_assignments={sum(counts[e] for g in groups for e in g)} "
+          f"max_rows_expert={max(counts[:num_ex], default = 0)} hist={','.join(hist)}", flush = True)
+
 
 @dataclass
 class FusedBuffers:
@@ -1255,6 +1281,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             from .moe_batch_recon import plan_groups
                             groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap,
                                                  rate_of = recon.rate_key if recon.rates else None)
+
+                if TIER_TRACE:
+                    _tier_trace(num_ex, num_tokens, top_k, self.fused_rows, expert_count_list,
+                                fused_total, groups)
 
                 # Deterministic accumulation (FUSED_DET): every assignment of the fused and
                 # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,

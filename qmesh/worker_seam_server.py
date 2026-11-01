@@ -88,6 +88,30 @@ class SeamServer:
             return
         from exllamav3 import Config, Model
 
+        # Refuse to start a load this box cannot hold. The pack is 113.65 GiB of a 121.6 GiB
+        # unified pool: a load started with less than pack + margin available does not fail, it
+        # swaps (3.8 GiB seen 2026-11-01), and every expert call then page faults (4 s outliers in
+        # SEAM_COMPUTE) or fails a launch outright. Better an explicit exit 3 than a slow poison.
+        self.pack_paths = [os.path.join(model_dir, f"cold-L{layer:02d}.safetensors")
+                           for layer in range(NL)]
+        sizes = [os.path.getsize(p) if os.path.exists(p) else 0 for p in self.pack_paths]
+        self.pack_mib = sum(sizes) / 2**20
+        margin = int(os.environ.get("SEAM_LOAD_MARGIN_MIB", "1024"))
+        avail = _avail_mib()
+        if not sizes[0]:
+            print(f"SEAM_NO_PACK dir={model_dir} - expected cold-L00.safetensors", flush=True)
+            sys.exit(3)
+        if (os.environ.get("SEAM_FORCE_LOAD", "0") == "0" and avail >= 0
+                and avail < self.pack_mib + margin):
+            print(f"SEAM_NO_MEMORY need_mib={self.pack_mib:.0f}+{margin} avail_mib={avail} "
+                  f"swapped_mib={_swap_used_mib()} - refusing to load: the pack does not fit in "
+                  f"MemAvailable and loading it would swap the box. Free it, or set "
+                  f"SEAM_FORCE_LOAD=1 to try anyway", flush=True)
+            sys.exit(3)
+        self.fadvise = os.environ.get("SEAM_FADVISE", "1") != "0"
+        print(f"SEAM_PACK_LOAD need_mib={self.pack_mib:.0f} avail_mib={avail} margin_mib={margin} "
+              f"fadvise={int(self.fadvise)} swapped_mib={_swap_used_mib()}", flush=True)
+
         self.stream = torch.cuda.Stream(device=device)
         config = Config.from_directory(model_dir)
         model = Model.from_config(config)
@@ -97,8 +121,12 @@ class SeamServer:
             self.layers[layer] = build_layer(base, cold, device)
             del base
             torch.cuda.empty_cache()
+            # The layer's file-backed pages were only ever a staging copy: drop them so the cache
+            # does not take memory the next layer (or a 4096-row workspace) needs.
+            dropped = _drop_page_cache(self.pack_paths[layer]) if self.fadvise else False
             print(f"layer {layer}: {len(cold)} cold experts, "
-                  f"{torch.cuda.memory_allocated(device) / 2**30:.2f} GiB", flush=True)
+                  f"{torch.cuda.memory_allocated(device) / 2**30:.2f} GiB "
+                  f"avail_mib={_avail_mib()} cached_dropped={int(dropped)}", flush=True)
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
@@ -276,6 +304,28 @@ def _swap_used_mib() -> int:
     return (total - free) // 1024
 
 
+def _drop_page_cache(path: str) -> bool:
+    """Evict one pack file's page cache after its experts are on the device.
+
+    The loader mmaps each cold-L<NN>.safetensors and copies it into the arena; the mmapped pages
+    stay in the page cache. On GB10 (121.6 GiB host and device memory are one pool) that cache
+    competes with the experts themselves: with the pack resident, 2.9 GiB of stale cache per layer
+    is the difference between headroom for a 4096-row workspace and a swap storm. posix_fadvise
+    drops only this file's pages (no root, no global drop_caches, which this container cannot
+    write: /proc/sys/vm is read-only here)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 def _dev_mem_mib() -> str:
     """`free_mib=/total_mib=/allocated_mib=/reserved_mib=` for the unified pool, best effort.
 
@@ -293,8 +343,82 @@ def _dev_mem_mib() -> str:
         return "free_mib=-1 total_mib=-1 allocated_mib=-1 reserved_mib=-1"
 
 
-def ws_probe(server, spec, min_avail_mib):
-    """Measure the GX-side workspace of the real cold-expert forward, one row count at a time.
+def _set_tier(server, limit):
+    """Force the tier split of a measurement: every layer module's fused-kernel row capacity is
+    also its dispatch threshold, so experts above it take the batched reconstruct tier
+    (moe_batch_recon) and experts at or below it the fused kernel. The buffers were sized at load
+    (FUSED_ROWS_WIDE / TEMP_ROWS_FUSED), so this changes routing only: the memory bill, the pack
+    and the process stay as they are, which is what makes a back-to-back A/B on identical input
+    possible. Returns the number of modules changed."""
+    n = 0
+    for ffn, _ncold in server.layers.values():
+        if hasattr(ffn, "fused_rows"):
+            ffn.fused_rows = int(limit)
+            n += 1
+    return n
+
+
+def _probe_stage(rows, ncold):
+    """Pinned request slab for a probe: finite 1.0 in bf16 x and weights and in-range expert ids,
+    so the probe exercises the same routing/dispatch path a real chunk does (zeros would hide a
+    piece that came back empty). Returns (stage, x_ptr, ids_ptr, w_ptr, out_ptr)."""
+    lane = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2) + rows * HIDDEN * 4
+    stage = torch.zeros(lane, dtype = torch.uint8, pin_memory = True)
+    base = stage.data_ptr()
+    x_ptr = base
+    ids_ptr = base + rows * HIDDEN * 2
+    w_ptr = ids_ptr + rows * TOPK * 4
+    out_ptr = w_ptr + rows * TOPK * 2
+    view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN)[:] = 0x3c00
+    view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)[:] = \
+        np.arange(rows * TOPK, dtype = np.int32).reshape(rows, TOPK) % max(ncold, 1)
+    view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:] = 0x3c00
+    return stage, x_ptr, ids_ptr, w_ptr, out_ptr
+
+
+def _probe_run(server, rows, ptrs, tag):
+    """Warm once, then time one call. Returns us or None after reporting the failure."""
+    x_ptr, ids_ptr, w_ptr, out_ptr = ptrs
+    dev = server.device
+    try:
+        # Warm: the first call of a tier allocates/locates that tier's buffers and kernels, and
+        # leaving it in the timed call is what made the 2048 rung read 472 us/row instead of 140.
+        server._forward(0, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+        torch.cuda.synchronize(dev)
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        print(f"SEAM_WS rows={rows} tier={tag} OOM warmup err={str(e).splitlines()[0][:200]}",
+              flush = True)
+        return None
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(dev)
+    t0 = time.perf_counter_ns()
+    try:
+        server._forward(0, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+        torch.cuda.synchronize(dev)
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        print(f"SEAM_WS rows={rows} tier={tag} OOM err={str(e).splitlines()[0][:200]}", flush = True)
+        return None
+    return (time.perf_counter_ns() - t0) / 1e3
+
+
+def _report_recon(server, rows, tag):
+    """Print the batched reconstruct tier's group plan as built by this load, and whether forcing
+    the dispatch threshold can work at all. Experts above fused_rows go to that tier; if the
+    module has no recon state (batch_recon False) they would be dropped instead of served, so a
+    forced rung must be skipped rather than timed and reported as fast."""
+    states = [(layer, getattr(ffn, "batch_recon", None)) for layer, (ffn, _nc) in server.layers.items()]
+    have = [(layer, r) for layer, r in states if r not in (None, False)]
+    caps = sorted({int(r.cap) for _l, r in have})
+    max_rows = sorted({int(r.max_rows) for _l, r in have})
+    print(f"SEAM_WS_RECON rows={rows} tier={tag} layers={len(have)}/{len(states)} "
+          f"cap={caps} max_rows={max_rows} "
+          f"fused_rows={sorted({int(getattr(f, 'fused_rows', -1)) for f, _nc in server.layers.values()})}",
+          flush = True)
+    return bool(have)
+
+
+def ws_probe(server, spec, min_avail_mib, tiers = ()):
+    """Measure the GX-side workspace and cost of the real cold-expert forward, one row count at a time.
 
     The slab (slab_mib) is only the pinned staging bill. What a bigger row bucket really costs on
     the GX is the device memory today's mixed-K forward allocates for that many rows, and that has
@@ -302,53 +426,60 @@ def ws_probe(server, spec, min_avail_mib):
     _forward the server runs, at each row count, and prints the peak and the MemAvailable around
     it. An OOM or a nearly empty box is reported as such and the ladder continues, so one run maps
     the whole 2048/4096/8192 decision.
+
+    `tiers` sweeps the dispatch threshold (fused_rows) instead of only the row count: every rung
+    is warmed and then timed, so one pack load gives the whole rows x tiers table. The load-time
+    value is restored afterwards.
     """
     if server.stub:
         print("SEAM_WS stub=1: nothing to measure without the cold experts", flush = True)
         return
     dev = server.device
     ncold = server.layers[0][1]
+    # Always measure the load-time threshold first (it is the deployed behaviour); a tiers list
+    # adds the forced rungs after it, so one run is a complete A/B against the baseline.
+    original = next((ffn.fused_rows for ffn, _ in server.layers.values()
+                     if hasattr(ffn, "fused_rows")), None)
+    ladder = [t for t in tiers if t != original]
+    ladder = ([original] if original is not None else []) + ladder or [None]
+    recon_ok = None   # decided after the first rung has built the recon state
     for rows in [int(x) for x in spec.split(",") if x.strip()]:
-        avail0 = _avail_mib()
-        if 0 <= avail0 < min_avail_mib:
-            print(f"SEAM_WS rows={rows} SKIP avail_mib={avail0} min_avail_mib={min_avail_mib}: "
-                  f"the pack is resident and the box has no room left to measure in", flush = True)
-            continue
-        lane = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2) + rows * HIDDEN * 4
-        stage = torch.zeros(lane, dtype = torch.uint8, pin_memory = True)
-        base = stage.data_ptr()
-        x_ptr = base
-        ids_ptr = base + rows * HIDDEN * 2
-        w_ptr = ids_ptr + rows * TOPK * 4
-        out_ptr = w_ptr + rows * TOPK * 2
-        # In-range expert ids (the module only has `ncold` experts) and a finite 1.0 in bf16, so the
-        # probe exercises the same routing/fused path a real chunk does.
-        view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN)[:] = 0x3c00
-        view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)[:] = \
-            np.arange(rows * TOPK, dtype = np.int32).reshape(rows, TOPK) % max(ncold, 1)
-        view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:] = 0x3c00
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(dev)
-        t0 = time.perf_counter_ns()
-        try:
-            server._forward(0, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
-            torch.cuda.synchronize(dev)
-        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-            print(f"SEAM_WS rows={rows} OOM avail_mib={avail0} err={str(e).splitlines()[0][:200]}",
-                  flush = True)
-            del stage
-            torch.cuda.empty_cache()
-            continue
-        us = (time.perf_counter_ns() - t0) / 1e3
-        print(f"SEAM_WS rows={rows} alloc_mib={torch.cuda.memory_allocated(dev) / 2**20:.1f} "
-              f"reserved_mib={torch.cuda.memory_reserved(dev) / 2**20:.1f} "
-              f"peak_alloc_mib={torch.cuda.max_memory_allocated(dev) / 2**20:.1f} "
-              f"peak_reserved_mib={torch.cuda.max_memory_reserved(dev) / 2**20:.1f} "
-              f"avail_before_mib={avail0} avail_after_mib={_avail_mib()} us={us:.0f} "
-              f"us_per_row={us / max(rows, 1):.2f} fin={bool(np.isfinite(view(out_ptr, rows * HIDDEN * 4, np.float32)).all())}",
-              flush = True)
+        stage, x_ptr, ids_ptr, w_ptr, out_ptr = _probe_stage(rows, ncold)
+        for limit in ladder:
+            tag = "default" if limit == original or limit is None else str(int(limit))
+            forced = limit is not None and limit != original
+            if forced and recon_ok is False:
+                print(f"SEAM_WS rows={rows} tier={tag} SKIP: no batched reconstruct tier on this "
+                      f"module, so experts above tier={tag} would be dropped, not served",
+                      flush = True)
+                continue
+            if limit is not None and not _set_tier(server, limit):
+                print(f"SEAM_WS rows={rows} tier={tag} SKIP: no module exposes fused_rows",
+                      flush = True)
+                continue
+            avail0 = _avail_mib()
+            if 0 <= avail0 < min_avail_mib:
+                print(f"SEAM_WS rows={rows} tier={tag} SKIP avail_mib={avail0} "
+                      f"min_avail_mib={min_avail_mib}: the pack is resident and the box has no "
+                      f"room left to measure in", flush = True)
+                continue
+            us = _probe_run(server, rows, (x_ptr, ids_ptr, w_ptr, out_ptr), tag)
+            if recon_ok is None:
+                recon_ok = _report_recon(server, rows, tag)
+            if us is not None:
+                print(f"SEAM_WS rows={rows} tier={tag} "
+                      f"alloc_mib={torch.cuda.memory_allocated(dev) / 2**20:.1f} "
+                      f"reserved_mib={torch.cuda.memory_reserved(dev) / 2**20:.1f} "
+                      f"peak_alloc_mib={torch.cuda.max_memory_allocated(dev) / 2**20:.1f} "
+                      f"peak_reserved_mib={torch.cuda.max_memory_reserved(dev) / 2**20:.1f} "
+                      f"avail_before_mib={avail0} avail_after_mib={_avail_mib()} us={us:.0f} "
+                      f"us_per_row={us / max(rows, 1):.2f} "
+                      f"fin={bool(np.isfinite(view(out_ptr, rows * HIDDEN * 4, np.float32)).all())}",
+                      flush = True)
         del stage
         torch.cuda.empty_cache()
+    if original is not None:
+        _set_tier(server, original)
 
 
 def ws_check(server, rows):
@@ -368,17 +499,11 @@ def ws_check(server, rows):
         print(f"SEAM_WS_CHECK rows={rows} skipped: needs 0 < --ws-rows < rows", flush = True)
         return
     ncold = next(iter(server.layers.values()))[1]
-    lane = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2) + rows * HIDDEN * 4
-    stage = torch.zeros(lane, dtype = torch.uint8, pin_memory = True)
-    base = stage.data_ptr()
-    x_ptr, ids_ptr = base, base + rows * HIDDEN * 2
-    w_ptr, out_ptr = ids_ptr + rows * TOPK * 4, ids_ptr + rows * TOPK * 4 + rows * TOPK * 2
+    stage, x_ptr, ids_ptr, w_ptr, out_ptr = _probe_stage(rows, ncold)
     # A deterministic ramp in [0,1), not zeros: identical zeros would hide a piece that came back
     # empty. bf16 is the top half of an fp32, so the flat uint16 view takes the high 16 bits.
     ramp = (np.arange(rows * HIDDEN, dtype = np.float32) % 97 / 97).view(np.uint32) >> 16
     view(x_ptr, rows * HIDDEN * 2, np.uint16)[:] = ramp.astype(np.uint16)
-    view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)[:] = \
-        np.arange(rows * TOPK, dtype = np.int32).reshape(rows, TOPK) % max(ncold, 1)
     view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:] = 0x3f00   # 0.5 in bf16
 
     def run():
@@ -396,6 +521,59 @@ def ws_check(server, rows):
           f"ref_absmax={scale:.6g} identical={bool(np.array_equal(whole, piece))}", flush = True)
     del stage
     torch.cuda.empty_cache()
+
+
+def ws_tier_check(server, rows, tiers):
+    """Does forcing the batched reconstruct tier change the numbers?
+
+    Same deterministic ramp request as ws_check, run once per dispatch threshold in `tiers` (the
+    load-time threshold first when it is not in the list), and the largest absolute difference
+    against the first run. The tiers accumulate in different orders (fused kernel slot tiles vs one
+    batched GEMM over a padded slab), so identical bits are not expected here; ws_check proves bit
+    identity *within* a tier, this bounds the difference *between* them.
+    """
+    if server.stub:
+        print("SEAM_WS_TIER stub=1: nothing to compare without the cold experts", flush = True)
+        return
+    limits = [int(x) for x in tiers if str(x).strip()]
+    if not limits:
+        print("SEAM_WS_TIER skipped: needs a tier list", flush = True)
+        return
+    original = next((ffn.fused_rows for ffn, _ in server.layers.values()
+                     if hasattr(ffn, "fused_rows")), None)
+    if original is None:
+        print("SEAM_WS_TIER skipped: no module exposes fused_rows", flush = True)
+        return
+    ncold = next(iter(server.layers.values()))[1]
+    stage, x_ptr, ids_ptr, w_ptr, out_ptr = _probe_stage(rows, ncold)
+    ramp = (np.arange(rows * HIDDEN, dtype = np.float32) % 97 / 97).view(np.uint32) >> 16
+    view(x_ptr, rows * HIDDEN * 2, np.uint16)[:] = ramp.astype(np.uint16)
+    view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:] = 0x3f00   # 0.5 in bf16
+
+    def run():
+        server._forward(0, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+        torch.cuda.synchronize(server.device)
+        return view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN).copy()
+
+    base, ref = None, None
+    for limit in [original] + [t for t in limits if t != original]:
+        _set_tier(server, limit)
+        run()                     # warm: the recon tier builds its scratch on first use
+        out = run()
+        scale = float(np.abs(out).max()) or 1.0
+        if ref is None:
+            base, ref = limit, out
+            print(f"SEAM_WS_TIER rows={rows} tier={limit} ref=1 absmax={scale:.6g} "
+                  f"fin={bool(np.isfinite(out).all())}", flush = True)
+            continue
+        d = float(np.abs(out - ref).max())
+        print(f"SEAM_WS_TIER_DIFF rows={rows} a={base} b={limit} max_abs={d:.6g} "
+              f"rel={d / scale:.3g} fin={bool(np.isfinite(out).all())} "
+              f"identical={bool(np.array_equal(out, ref))}", flush = True)
+    _set_tier(server, original)
+    del stage
+    torch.cuda.empty_cache()
+
 
 
 def main():
@@ -443,11 +621,21 @@ def main():
                            "which is what a bucket sized to the box's headroom needs. Set this "
                            "when the bucket is bigger than the box's workspace, e.g. 2048 rows "
                            "on a 733 MiB box keeps the peak near 150 MiB.")
+    ap.add_argument("--ws-tiers", default = os.environ.get("SEAM_WS_TIERS", ""),
+                    help = "comma separated fused_rows thresholds to sweep for --ws-probe / "
+                           "--ws-tier-check: the threshold is the dispatch split, so experts above "
+                           "it take the batched reconstruct tier (measured ~4x faster at prefill "
+                           "widths). Every rung is warmed before it is timed; the load-time value "
+                           "is restored afterwards.")
     ap.add_argument("--ws-check", type = int, default = 0, metavar = "ROWS",
                     help = "run the same ROWS-row request once in one piece and once in --ws-rows "
                            "pieces and print the largest difference (SEAM_WS_CHECK), then exit: "
                            "proves that capping the workspace by chunking does not change the "
                            "numbers. ROWS must be a multiple of --ws-rows.")
+    ap.add_argument("--ws-tier-check", type = int, default = 0, metavar = "ROWS",
+                    help = "run the same ROWS-row request once per --ws-tiers threshold and print "
+                           "the largest difference from the load-time tier (SEAM_WS_TIER_DIFF), "
+                           "then exit: how far forcing the batched tier moves the numbers.")
     ap.add_argument("--fail-after", type = int, default = int(os.environ.get("SEAM_FAIL_AFTER", "0")),
                     help = "test hook: raise inside the compute hook on call N+1 (stub servers "
                            "included), to prove that a failing compute fails the client instead of "
@@ -469,13 +657,18 @@ def main():
         # workspace knobs say.
         print(f"SEAM_SERVER_DEVMEM {_dev_mem_mib()} avail_mib={_avail_mib()} "
               f"swapped_mib={_swap_used_mib()}", flush=True)
-    if args.ws_probe or args.ws_check:
-        # Both modes share one pack load: the ladder first (it resets the peak counters), then the
-        # equivalence check, whose own peak does not matter.
+    tiers = tuple(int(x) for x in args.ws_tiers.split(",") if x.strip())
+    if tiers:
+        print(f"SEAM_WS_TIERS={','.join(map(str, tiers))}", flush = True)
+    if args.ws_probe or args.ws_check or args.ws_tier_check:
+        # All modes share one pack load: the ladder first (it resets the peak counters), then the
+        # equivalence checks, whose own peaks do not matter.
         if args.ws_probe:
-            ws_probe(server, args.ws_probe, args.ws_probe_min_avail)
+            ws_probe(server, args.ws_probe, args.ws_probe_min_avail, tiers = tiers)
         if args.ws_check:
             ws_check(server, args.ws_check)
+        if args.ws_tier_check:
+            ws_tier_check(server, args.ws_tier_check, tiers)
         return
     threading.Thread(target = _reporter, daemon = True).start()
 
