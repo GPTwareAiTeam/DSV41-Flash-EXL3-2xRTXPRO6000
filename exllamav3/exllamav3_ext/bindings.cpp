@@ -56,6 +56,7 @@
 #include "parallel/barrier.cuh"
 #include "parallel/gather.cuh"
 #include "parallel/all_reduce.cuh"
+#include "parallel/p2p_oneshot.cuh"
 #include "parallel/prefill_ar.cuh"
 
 #include "libtorch/gated_delta_net.h"
