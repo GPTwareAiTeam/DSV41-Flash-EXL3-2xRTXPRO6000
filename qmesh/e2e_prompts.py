@@ -173,6 +173,16 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
         if fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             fh.flush()
+        if MEM_BREAKDOWN and prompt is None:
+            # Peak VRAM of the long-context prefill, reported the moment it finishes rather than
+            # folded into the end-of-run peak (which later short prompts cannot exceed anyway).
+            free_l, total_l = torch.cuda.mem_get_info(0)
+            g = 2 ** 30
+            print(f"MEMB after_long arm={spec} tokens={int(ids.shape[-1])} "
+                  f"used={(total_l - free_l) / g:.3f} free={free_l / g:.3f} "
+                  f"peak_allocated={torch.cuda.max_memory_allocated(0) / g:.3f} "
+                  f"peak_reserved={torch.cuda.max_memory_reserved(0) / g:.3f} "
+                  f"prefill_chunks={limiter.chunks if limiter else 0}", flush=True)
         if idx >= WARMUP:
             rows.append(row)
         del job
