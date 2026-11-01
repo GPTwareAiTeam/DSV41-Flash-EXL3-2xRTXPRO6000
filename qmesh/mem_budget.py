@@ -653,6 +653,11 @@ def main():
         prefill_done = False
         prefill_wall = 0.0
         rows = 0
+        # Generated text of the long job, so a needle prompt can be scored (NEEDLE_TEXT=1): the answers
+        # are the only evidence that the 131k prefill kept the needle, and the events are otherwise
+        # counted and thrown away.
+        gen_text = []
+        gen_ids = []
         # The first yielded event is stage "started", long before any prompt token is ingested, and a job
         # that dies inside prefill() reports zeros in its own counters, so the split below is timed on the
         # host as well: prefill ends when the job reports prefill done (or streams its first token), and a
@@ -665,6 +670,10 @@ def main():
                     raise err if isinstance(err, BaseException) else RuntimeError(f"job error: {err!r}")
                 if r.get("eos"):
                     st = r
+                if r.get("text"):
+                    gen_text.append(str(r["text"]))
+                if r.get("ids") is not None:
+                    gen_ids.append(r["ids"])
                 if not prefill_done and (r.get("text") or r.get("stage") == "streaming"
                                          or job.is_prefill_done()):
                     prefill_done = True
@@ -687,6 +696,12 @@ def main():
 
         print(f"MEM_DECODE steps={int(st.get('new_tokens', 0))} wall_s={gen:.2f} "
               f"events={rows} total_wall_s={wall:.2f}", flush = True)
+        if gen_text or gen_ids:
+            text = "".join(gen_text)
+            flat = [int(v) for t in gen_ids for v in t.reshape(-1).tolist()]
+            print(f"LONG_TEXT chars={len(text)} tokens={len(flat)} "
+                  f"text={text!r}", flush = True)
+            print(f"LONG_TEXT_IDS {flat}", flush = True)
         peaks("decode", base_alloc)
         engine_report(model, cache, generator, "after_long")
 
