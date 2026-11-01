@@ -13,6 +13,8 @@ line per prompt plus a summary. Timing comes from the engine's own job accountin
   PROMPTS_TXT  path to a text file; each non-empty line is one prompt (overrides PROMPTS)
   CORPUS       comma-separated corpus txt files; each file is truncated to CORPUS_TOKENS tokens
   CORPUS_TOKENS default 24000
+  LONG_TOKENS  one long-context prompt of this many tokens, tiled from CORPUS
+  LONG_PROMPT_FILE  one long prompt read from a file (overrides CORPUS/LONG_TOKENS)
   MAX_NEW      new tokens per prompt (default 256)
   MAX_CHUNK    prefill chunk (default 2048)
   DSPARK       1 to enable the DSpark draft model
@@ -50,6 +52,7 @@ MEM_BREAKDOWN = os.environ.get("MEM_BREAKDOWN") == "1"
 CORPUS_TOKENS = int(os.environ.get("CORPUS_TOKENS", "24000"))
 CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
 LONG_TOKENS = int(os.environ.get("LONG_TOKENS", "0"))
+LONG_PROMPT_FILE = os.environ.get("LONG_PROMPT_FILE", "")
 # KV_BITS=4 (default) is DeepSeek's trained FP4 layout for the compressed pools: whole 512-wide
 # latent rows plus indexer keys, as the model was trained; 8 packs the nope part with CacheLayer_quant;
 # 16 is the fp16 pool. The DSA pools take the same kwargs on target and draft caches
@@ -155,7 +158,12 @@ def main():
     # LONG_TOKENS: a single long-context prompt tiled from the corpus files, for peak-VRAM and
     # prefill-rate measurement at a real context width
     long_ids = None
-    if LONG_TOKENS:
+    if LONG_PROMPT_FILE:
+        long_ids = tokenizer.encode(open(LONG_PROMPT_FILE).read(), add_bos=True,
+                                    encode_special_tokens=True)
+        print(f"LONG_PROMPT tokens={int(long_ids.shape[-1])} file={LONG_PROMPT_FILE}", flush=True)
+        prompts = [("long", None)] + prompts[:WARMUP]
+    elif LONG_TOKENS:
         cat = []
         for path in (CORPUS_FILES or []):
             cat.append(tokenizer.encode(open(path).read(), add_bos=False,
