@@ -506,6 +506,7 @@ def main():
         prefill_t = None
         prefill_peak = None
         out = None
+        n = 0  # results yielded (one per token, plus the prefill and eos markers)
         aborted = False
         while generator.num_remaining_jobs():
             # Per-arm wall limit: a prefill arm that runs past it is cancelled after the chunk in
@@ -572,7 +573,9 @@ def main():
         tok_s_seen = []  # (depth, chunk, tok/s) of arms that completed prefill, for the estimate below
         arms_t0 = time.time()
         for depth, chunk in PREFILL_ARMS:
-            if depth + 2 * PAGE_SIZE > CACHE_TOKENS:
+            # The page pool holds CACHE_TOKENS / PAGE_SIZE pages and enqueue() asserts on overflow: a job of
+            # `depth` prompt tokens plus one generated token needs ceil((depth + 1) / PAGE_SIZE) pages
+            if (depth + 1 + PAGE_SIZE - 1) // PAGE_SIZE > CACHE_TOKENS // PAGE_SIZE:
                 print(f"PREFILL_ARM depth={depth} chunk={chunk} skipped=page_limit "
                       f"cache_tokens={CACHE_TOKENS}", flush = True)
                 continue
@@ -600,8 +603,9 @@ def main():
                   f"tok_per_s={'none' if not tps else f'{tps:.1f}'} "
                   f"chunks={r['chunks']} shrunk={r['shrunk']} aborted={int(r['aborted'])} "
                   f"wall_s={r['wall_s']:.2f} peak_rise_mib={r['peak_rise_mib']:.0f} "
-                  f"pieces={None if r['chunks'] is None else int(depth / SEAM_ROWS)} "
-                  f"round_trips={None if r['chunks'] is None else int(depth / SEAM_ROWS) * COLD_LAYERS} "
+                  f"pieces={None if r['chunks'] is None else -(-chunk // SEAM_ROWS)} "
+                  f"round_trips={None if r['chunks'] is None else -(-chunk // SEAM_ROWS) * COLD_LAYERS} "
+                  f"round_trips_total={None if r['chunks'] is None else -(-chunk // SEAM_ROWS) * COLD_LAYERS * r['chunks']} "
                   f"decide_us_median={r['decide_us_median']}", flush = True)
             free_now, _total_now = torch.cuda.mem_get_info(DEVICE)
             print(f"PREFILL_ARM_PEAK depth={depth} chunk={chunk} "
@@ -613,7 +617,7 @@ def main():
         generator.max_chunk_size = MAX_CHUNK
         print(f"PREFILL_ARMS_DONE arms_s={time.time() - arms_t0:.0f} "
               f"rates={tok_s_seen}", flush = True)
-        return
+
     # --- long-context prefill + decode peaks ----------------------------------------------
     if LONG_PROMPT_FILE:
         ids = tokenizer.encode(open(LONG_PROMPT_FILE).read(), add_bos = True,
@@ -633,8 +637,9 @@ def main():
         ids = None
 
     if ids is not None:
-        assert int(ids.shape[-1]) + LONG_NEW <= CACHE_TOKENS, \
-            f"long prompt {int(ids.shape[-1])} + {LONG_NEW} > CACHE_TOKENS={CACHE_TOKENS}"
+        assert (int(ids.shape[-1]) + LONG_NEW + PAGE_SIZE - 1) // PAGE_SIZE <= CACHE_TOKENS // PAGE_SIZE, \
+            f"long prompt {int(ids.shape[-1])} + {LONG_NEW} needs " \
+            f"{(int(ids.shape[-1]) + LONG_NEW + PAGE_SIZE - 1) // PAGE_SIZE} pages > {CACHE_TOKENS // PAGE_SIZE}"
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats(DEVICE)
         base_alloc = torch.cuda.memory_allocated(DEVICE)
@@ -699,11 +704,12 @@ def main():
             print(f"MEM_DEPTH source_tokens={int(base.shape[-1])} probes={probes}", flush = True)
             prev_want, prev_s = 0, 0.0
             for want in probes:
-                # A job needs ceil((tokens + max_new) / PAGE_SIZE) pages, and enqueue() asserts when that
-                # exceeds the pool: reserve one page for the generated token and one of slack.
-                if want + 2 * PAGE_SIZE > CACHE_TOKENS:
+                # enqueue() asserts when a job needs more pages than the pool holds; one generated token
+                # needs its own page
+                if (want + 1 + PAGE_SIZE - 1) // PAGE_SIZE > CACHE_TOKENS // PAGE_SIZE:
                     print(f"MEM_DEPTH tokens={want} skipped=page_limit cache_tokens={CACHE_TOKENS} "
-                          f"pages={want // PAGE_SIZE + 2}/{CACHE_TOKENS // PAGE_SIZE}", flush = True)
+                          f"pages={(want + 1 + PAGE_SIZE - 1) // PAGE_SIZE}/{CACHE_TOKENS // PAGE_SIZE}",
+                          flush = True)
                     continue
                 if prev_want and prev_s:
                     pred = prev_s * want / prev_want
