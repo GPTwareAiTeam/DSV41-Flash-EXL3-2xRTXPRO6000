@@ -120,7 +120,7 @@ def _lib():
     lib.qes_status.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(Nego)]
     lib.qes_issue.restype = ctypes.c_int
     lib.qes_issue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-                              ctypes.c_void_p, ctypes.c_void_p]
+                              ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
     lib.qes_collect.restype = ctypes.c_int
     lib.qes_collect.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
     lib.qes_destroy.restype = None
@@ -261,10 +261,13 @@ class Seam:
         self.rows = int(bucket)   # bucket == request rows, kept for the old call sites
         self.device_ordinal = int(device_ordinal)
 
-    def issue(self, layer, x_ptr, ids_ptr, w_ptr, stream_ptr):
+    def issue(self, layer, x_ptr, ids_ptr, w_ptr, stream_ptr, n_cold: int = 0):
+        """n_cold is the layer's cold-expert count on this placement: the client proxy refuses to
+        send an id outside [-1, n_cold) instead of letting the server's placement check abort the
+        server process. 0 = unknown, no check."""
         if not self._h:
             raise RuntimeError("seam handle is closed")
-        rc = lib().qes_issue(self._h, layer, x_ptr, ids_ptr, w_ptr, stream_ptr)
+        rc = lib().qes_issue(self._h, layer, x_ptr, ids_ptr, w_ptr, stream_ptr, int(n_cold))
         if rc:
             raise RuntimeError(f"qes_issue layer={layer} rc={rc}: {last_error()}")
 

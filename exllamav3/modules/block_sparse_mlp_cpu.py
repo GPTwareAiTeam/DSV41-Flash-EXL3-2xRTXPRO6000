@@ -616,10 +616,19 @@ class BlockSparseMLP_CPU:
                     return None, ("fused", pending)
             sel_cpu = self._split_translate(selected_experts)
             return None, self.cpu_host.submit_issue(
-                self.cpu_layer_idx, y, sel_cpu, routing_weights)
+                self.cpu_layer_idx, y, sel_cpu, routing_weights, n_cold = self._split_n_cold())
         sel_cpu = self._split_translate(selected_experts)
         return self.cpu_host.submit_prefill(
-            self.cpu_layer_idx, y, sel_cpu, routing_weights), None
+            self.cpu_layer_idx, y, sel_cpu, routing_weights,
+            n_cold = self._split_n_cold()), None
+
+    def _split_n_cold(self):
+        """The cold-expert count the tail ids above are indexed against, i.e. the bound the
+        transport checks each pick against before it goes on the wire (None when the split is
+        dynamic: the map kernel owns the range and its count changes per step)."""
+        if self._split_map is not None or self.cpu_split_first is None:
+            return None
+        return self.num_experts - self.cpu_split_first
 
     def _split_translate(self, selected_experts):
         """Copy-path selection translate: dynamic placement runs the map kernel (hit counts,

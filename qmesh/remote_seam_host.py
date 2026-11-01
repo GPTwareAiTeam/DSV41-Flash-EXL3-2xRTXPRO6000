@@ -26,6 +26,7 @@ from __future__ import annotations
 import atexit
 import os
 import statistics
+import sys
 import time
 
 import torch
@@ -118,6 +119,10 @@ class RemoteSeamHost:
         self.slots = 1
         self.ns = 1
         self._splits = set()
+        # Persistent per-(device, bucket) staging for the wire tensors (see _stage). These are the
+        # only device buffers qes_issue reads, and they are never freed, so the copies it enqueues
+        # can never race an allocation that reuses the same block.
+        self._stage_bufs = {}
 
     def connect(self):
         """Negotiates the session with the GX server (idempotent). Raises RuntimeError with the
@@ -160,28 +165,46 @@ class RemoteSeamHost:
         self.layer_index[key] = idx
         return idx
 
-    def _pad(self, x, ids, w):
-        """Pads one piece up to the smallest granted bucket >= its rows (pad rows: id -1, weight
-        0 -> exact zero contribution). Returns (bucket, x, ids, w)."""
+    def _stage(self, x, ids, w):
+        """Copies one piece into this host's persistent per-bucket staging tensors.
+
+        qes_issue only *enqueues* the device->host copies of x/ids/w, so the tensors it reads must
+        still be alive when those copies run. Building them per call (`.to(dtype).contiguous()`)
+        hands the allocator blocks it can reuse for the next layer's routing, and a block reused by
+        a kernel queued *ahead* of our copy makes the wire carry another layer's picks -- measured
+        2026-11-01 as layer 7 id 277 of 274 cold and layer 30 id 284 of 275, with the mirror copy
+        reading the same bad value out of the caller's tensor. Staging per bucket, owned for the
+        host's lifetime, means the seam never reads a block the allocator can hand out again (and a
+        captured graph never keeps a pointer to a freed block).
+
+        One staging set per bucket, reused across requests, is safe because the copies are
+        stream-ordered: a later request's staging write runs after the earlier request's copy,
+        however the slots overlap. Pad rows are reset to id -1 / weight 0 so they contribute exactly
+        zero and no stale id can reach the client's range check."""
         n = x.shape[0]
-        bucket = next(b for b in self.buckets if b >= n)
-        if bucket == n:
-            return bucket, x, ids, w
         dev = x.device
-        xp = torch.zeros(bucket, HIDDEN, dtype = torch.bfloat16, device = dev)
-        idp = torch.full((bucket, TOPK), -1, dtype = torch.int32, device = dev)
-        wp = torch.zeros(bucket, TOPK, dtype = torch.bfloat16, device = dev)
+        bucket = next(b for b in self.buckets if b >= n)
+        key = (dev.index or 0, bucket)
+        st = self._stage_bufs.get(key)
+        if st is None:
+            st = (torch.empty(bucket, HIDDEN, dtype = torch.bfloat16, device = dev),
+                  torch.full((bucket, TOPK), -1, dtype = torch.int32, device = dev),
+                  torch.zeros(bucket, TOPK, dtype = torch.bfloat16, device = dev))
+            self._stage_bufs[key] = st
+        xp, idp, wp = st
         xp[:n] = x
         idp[:n] = ids
         wp[:n] = w
+        if n < bucket:
+            idp[n:].fill_(-1)
+            wp[n:].zero_()
         return bucket, xp, idp, wp
 
-    def _issue_chunk(self, layer_idx, x, ids, w):
-        """x bf16 [n,H], ids i32 [n,K], w bf16 [n,K], n <= buckets[-1]. Pads to the smallest
-        granted bucket >= n (pad rows: id -1, weight 0 -> exact zero contribution). Returns
-        (seam, out)."""
+    def _issue_chunk(self, layer_idx, x, ids, w, n_cold = None):
+        """x [n,H], ids [n,K], w [n,K], n <= buckets[-1]. Stages to the smallest granted bucket >= n
+        (pad rows: id -1, weight 0 -> exact zero contribution) and returns (seam, out)."""
         n = x.shape[0]
-        bucket, x, ids, w = self._pad(x, ids, w)
+        bucket, xp, idp, wp = self._stage(x, ids, w)
         dev = x.device
         seam = self._seam(bucket, dev.index or 0)
         stream = torch.cuda.current_stream(dev)
@@ -190,8 +213,20 @@ class RemoteSeamHost:
             ev0 = torch.cuda.Event(enable_timing = True)
             ev0.record(stream)
             t0 = time.perf_counter_ns()
-        seam.issue(layer_idx, x.data_ptr(), ids.data_ptr(), w.data_ptr(), stream.cuda_stream)
-        out = torch.empty(bucket, HIDDEN, dtype=torch.float32, device=dev)
+        try:
+            seam.issue(layer_idx, xp.data_ptr(), idp.data_ptr(), wp.data_ptr(),
+                       stream.cuda_stream, n_cold or 0)
+        except RuntimeError:
+            # The transport refused this request (e.g. an id its own cold set cannot hold): the
+            # proxy's "qes:" line names layer, slot, values and cold count. The stack says which
+            # module/path submitted them, which is what the id-space hunt needs.
+            if os.environ.get("SEAM_ID_TRACE"):
+                import traceback
+                print(f"SEAM_ID_TRACE layer={layer_idx} rows={n} bucket={bucket} n_cold={n_cold}",
+                      file = sys.stderr, flush = True)
+                traceback.print_stack()
+            raise
+        out = torch.empty(bucket, HIDDEN, dtype = torch.float32, device = dev)
         seam.collect(layer_idx, out.data_ptr(), stream.cuda_stream)
         if prof:
             t1 = time.perf_counter_ns()
@@ -202,11 +237,9 @@ class RemoteSeamHost:
 
     @staticmethod
     def _prep(y, selected, weights):
-        """Pack to the seam's wire dtypes on device: x bf16 [rows,H], ids i32 [rows,K], w bf16 [rows,K]."""
-        x = y.reshape(-1, HIDDEN).to(torch.bfloat16).contiguous()
-        ids = selected.reshape(-1, TOPK).to(torch.int32).contiguous()
-        w = weights.reshape(-1, TOPK).to(torch.bfloat16).contiguous()
-        return x, ids, w
+        """Views of the caller's routing output, cast and cast-safe-copied later by _stage:
+        x [rows,H], ids [rows,K], w [rows,K]."""
+        return (y.reshape(-1, HIDDEN), selected.reshape(-1, TOPK), weights.reshape(-1, TOPK))
 
     def _split(self, rows: int, step: int | None = None):
         """Prefill split of `rows` onto the granted buckets, chunked at `step` (default chunk_rows)
@@ -235,7 +268,7 @@ class RemoteSeamHost:
         if not direct:
             out[pos:pos + n] = dst[:n]
 
-    def submit_prefill(self, layer_idx, y, selected, weights):
+    def submit_prefill(self, layer_idx, y, selected, weights, n_cold = None):
         """Prefill one layer's chunk and return fp32 [rows, HIDDEN] on the caller's stream.
 
         The chunk is split into micro-batches at chunk_rows (the largest granted bucket), and up
@@ -248,7 +281,10 @@ class RemoteSeamHost:
 
         Causality is per micro-batch, not per layer: a micro-batch's layer L+1 call needs its own
         layer L output, which the pieces keep in plan order. Overlap between layers of the *same*
-        tokens is still impossible (L+1 reads L's output)."""
+        tokens is still impossible (L+1 reads L's output).
+
+        n_cold is this layer's cold-expert count, carried on every request so the client proxy can
+        refuse an id the placement cannot hold (see qes.Seam.issue)."""
         self.connect()
         x, ids, w = self._prep(y, selected, weights)
         rows = x.shape[0]
@@ -263,7 +299,7 @@ class RemoteSeamHost:
                   f"calls={len(plan)} ns={ns} server_slots={self.slots} "
                   f"buckets={','.join(map(str, self.buckets))} plan={widths}", flush = True)
         if len(plan) == 1:
-            return self._issue_chunk(layer_idx, x, ids, w)
+            return self._issue_chunk(layer_idx, x, ids, w, n_cold)
         # One fp32 [rows,H] output that every micro-batch writes into: torch.cat would hold the
         # parts and the copy at once (+rows*H*4 bytes, 235 MiB at 8192 rows), which the prefill
         # memory budget does not have.
@@ -274,19 +310,19 @@ class RemoteSeamHost:
         for s, e, _ in plan:
             if len(inflight) >= ns:
                 self._collect_piece(layer_idx, inflight.pop(0), out, stream)
-            bucket, xp, idp, wp = self._pad(x[s:e], ids[s:e], w[s:e])
+            bucket, xp, idp, wp = self._stage(x[s:e], ids[s:e], w[s:e])
             seam = self._seam(bucket, dev_index)
             seam.issue(layer_idx, xp.data_ptr(), idp.data_ptr(), wp.data_ptr(),
-                       stream.cuda_stream)
+                       stream.cuda_stream, n_cold or 0)
             inflight.append((s, e - s, bucket, xp, idp, wp, seam))
         while inflight:
             self._collect_piece(layer_idx, inflight.pop(0), out, stream)
         return out
 
-    def submit_issue(self, layer_idx, y, selected, weights):
+    def submit_issue(self, layer_idx, y, selected, weights, n_cold = None):
         """Decode-size batches (<= largest bucket) run as one chunk; the output is produced
         by the collect enqueued inside, so the caller's 'collect' is a no-op handle."""
-        return self.submit_prefill(layer_idx, y, selected, weights)
+        return self.submit_prefill(layer_idx, y, selected, weights, n_cold)
 
     def submit_collect(self, handle):
         return handle

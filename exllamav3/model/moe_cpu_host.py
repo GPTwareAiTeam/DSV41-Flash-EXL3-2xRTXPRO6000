@@ -1386,12 +1386,15 @@ class MoeCpuHost:
                 self._collect_compute(jobs, out, rtmp, h)
         return out
 
-    def submit_issue(self, layer_idx, y, selected_experts, routing_weights):
+    def submit_issue(self, layer_idx, y, selected_experts, routing_weights, n_cold = None):
         """
         Two-phase submit for the per-layer expert split: stage this layer's inputs and publish
         the compute job(s) nwo, defer the stream-side waits and readbacks to submit_collect so
         the caller can enqueue its own GPU expert work in between. That work then executes
         concurrently with the worker instead of behind the flag wait.
+
+        n_cold is the seam host's wire-range bound (qmesh/remote_seam_host.py); this pinned-ring
+        path addresses its own slot layout and has nothing to check it against.
         """
         with torch.cuda.device(y.device):
             spec = self.specs[layer_idx]
@@ -1861,7 +1864,7 @@ class MoeCpuHost:
         if msg[0] != "ok":
             raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
 
-    def submit_prefill(self, layer_idx, y, selected_experts, routing_weights):
+    def submit_prefill(self, layer_idx, y, selected_experts, routing_weights, n_cold = None):
         """
         Split the routed-expert workload by per-expert token count: hot experts (count >=
         stream_t) have their weights staged by the worker, DMA'd through the pinned ring to a
@@ -1870,6 +1873,9 @@ class MoeCpuHost:
         unmasked assignment. Tail jobs are issued before the streamed batches and collected
         after them, so the CPU works the tail while the GPU streams. Falls back to the plain CPU
         path when nothing qualifies.
+
+        n_cold is the seam host's wire-range bound (qmesh/remote_seam_host.py); this pinned-ring
+        path addresses its own slot layout and has nothing to check it against.
         """
         spec = self.specs[layer_idx]
         rows = y.shape[0]

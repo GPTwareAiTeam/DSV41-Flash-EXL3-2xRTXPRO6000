@@ -162,8 +162,11 @@ QES_API int qes_status(const char* host, int ctl_port, qes_nego* out);
 
 /* ---- data path ------------------------------------------------------------------------- */
 
+/* n_cold: the layer's cold-expert count on the caller's placement, or 0 when unknown. It rides in the
+ * request header and the client proxy refuses to send a pick outside [-1, n_cold), so a bad id takes
+ * this client down instead of the server (client_check_ids in the .cu). */
 QES_API int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int32_t* ids,
-                      const void* w_bf16, cudaStream_t stream);
+                      const void* w_bf16, cudaStream_t stream, int n_cold);
 QES_API int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream);
 
 QES_API void qes_destroy(qes_handle* h);

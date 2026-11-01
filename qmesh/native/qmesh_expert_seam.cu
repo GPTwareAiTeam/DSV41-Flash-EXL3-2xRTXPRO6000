@@ -195,7 +195,10 @@ struct SlotHdr {
   uint32_t magic; /* SLOT_MAGIC */
   uint32_t layer; /* QES_NL range */
   uint32_t rows;  /* must equal the bucket the handle was opened with */
-  uint32_t pad;
+  uint32_t n_cold; /* client: cold experts the ids were clamped to, 0 = not supplied. The server
+                      ignores it; the client's proxy checks the payload against it before sending
+                      (see client_proxy), so an out-of-range id never reaches QES_ROLE_SERVER's
+                      placement check as an unexplained fail-stop. */
   uint64_t pad2[6]; /* keep the header one 64 B line */
 };
 
@@ -437,6 +440,12 @@ struct qes_handle {
     int layer = -1, slot = -1;
   } pending[QES_MAX_SLOTS];
   int n_pending = 0, next_slot = 0;
+  /* QES_DUMP_IDS: pinned mirror of the ids argument of the request being issued. The proxy dumps
+   * the slab bytes it forwards; this is the same copy taken straight from the caller's tensor, so
+   * a dump line that already shows an out-of-range id separates a client value bug (the tensor
+   * was wrong, or the allocator had recycled it while the copy was still queued) from a transport
+   * bug (the copy landed, the wire did not carry it). */
+  int32_t* dump_src = nullptr;
   qes_server_fn server_fn = nullptr; /* optional compute hook (server role) */
   void* server_ctx = nullptr;
   struct qes_client_session* owner = nullptr; /* client handles are unlinked on destroy */
@@ -662,17 +671,69 @@ void dump_wire_ids(qes_handle* h, int slot, uint64_t seq) {
   fprintf(stderr, "SEAM_WIRE_IDS port=%d rows=%u slot=%d seq=%llu layer=%u hdr_rows=%u n=%d ids=[",
           h->tcp_port, h->rows, slot, (unsigned long long)seq, hdr->layer, hdr->rows, n);
   for (int i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", ids[i]);
-  /* The weights and the first hidden values ride in the same payload, so they say whether the
-   * request as a whole is the router's output for this layer (a bad id then comes from the
-   * router or from the translate) or a pad/stale slot (weight 0 where a pick should be). */
   fprintf(stderr, "] w=[");
   for (int i = 0; i < n; i++) fprintf(stderr, "%s%.6g", i ? " " : "", bf16f(w[i]));
-  fprintf(stderr, "] x0=%.6g x1=%.6g\n", bf16f(x[0]), bf16f(x[1 % QES_HIDDEN]));
+  fprintf(stderr, "] x0=%.6g x1=%.6g", bf16f(x[0]), bf16f(x[1 % QES_HIDDEN]));
+  /* The same ids taken from the caller's tensor at issue time (qes_issue): equal to the slab ids
+   * above means the bytes the proxy forwards are the bytes the caller handed over. The weights and
+   * the first hidden values ride in the same payload, so they say whether the request as a whole is
+   * the router's output for this layer or a pad/stale slot (weight 0 where a pick should be). */
+  if (h->dump_src) {
+    const int32_t* src = h->dump_src + (size_t)slot * n;
+    fprintf(stderr, " src=[");
+    for (int i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", src[i]);
+    fprintf(stderr, "]");
+  }
+  fprintf(stderr, "\n");
   fflush(stderr);
 }
 
 /* Client proxy: forwards every new request seq in any slot. The slot's header (layer, rows) is
  * part of the payload, so the proxy posts the header and the payload in one WRITE. */
+/* The last point before an id leaves this process: the bytes the NIC is about to send, read on the
+ * proxy thread once the GPU's release publish has made them visible. A check on the issue path would
+ * have to sync the stream, and a sync hides the failure it is looking for (2026-11-01: the failing
+ * runs stop reproducing as soon as anything reads the ids back there), so it lives here where the
+ * compute path pays nothing.
+ * QES_ROLE_SERVER checks the same thing against its own placement and aborts the *process* on a
+ * mismatch, which costs a full cold-pack reload (~150 s). Catching it on the sending side keeps the
+ * server alive and names the request that would have killed it. */
+bool client_check_ids(qes_handle* h, int slot) {
+  const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, slot));
+  const int32_t n_cold = (int32_t)hdr->n_cold;
+  if (n_cold <= 0) return true; /* the caller supplied no bound: nothing to check against */
+  const int32_t* ids = (const int32_t*)(h->slab + off_req(h, slot) + h->ids_off);
+  const int n = h->rows * QES_TOPK;
+  int bad = 0, first_at = -1, first_id = 0;
+  for (int k = 0; k < n; k++) {
+    if (ids[k] >= -1 && ids[k] < n_cold) continue;
+    if (!bad++) {
+      first_at = k;
+      first_id = ids[k];
+    }
+  }
+  if (!bad) return true;
+  fprintf(stderr,
+          "qes: NOT SENT: client ids out of range on rows=%u port=%d layer=%u slot=%d seq=%llu: "
+          "%d of %d pick(s) outside [-1,%d), first at %d: %d. The caller handed the seam an id its "
+          "own cold set cannot hold, so the server's placement for this layer would index out of "
+          "range; the request is dropped and this handle is taken down instead of the server.\n",
+          h->rows, h->tcp_port, hdr->layer, slot, (unsigned long long)h->handled[slot], bad, n,
+          n_cold, first_at, first_id);
+  fflush(stderr);
+  /* Unblock the GPU waiter and NaN the response the caller is about to copy out, so a dropped
+   * request cannot be mistaken for a computed one: the handle is dead, so the next seam call on it
+   * raises through seam_dead_check with the message above. */
+  __atomic_store_n((uint64_t*)(h->slab + off_fresp(h, slot)), load_acq(h->slab, off_freq(h, slot)),
+                   __ATOMIC_RELEASE);
+  __atomic_store_n((uint32_t*)(h->slab + off_fail(h, slot)), 2u, __ATOMIC_RELEASE);
+  float* resp = (float*)(h->slab + off_resp(h, slot));
+  for (size_t k = 0; k < h->resp_len / sizeof(float); k++) resp[k] = __builtin_nanf("");
+  h->dead.store(true);
+  h->running.store(false);
+  return false;
+}
+
 /* A response that never came leaves the GPU waiter with no escape hatch, so wait_kernel raises the
  * slot's fail word instead of trapping. Pick it up here, print it once, and take the handle down
  * the same way a CQ error does: the session fails with a Python exception, not a sticky CUDA error. */
@@ -697,9 +758,9 @@ void client_proxy(qes_handle* h) {
       uint64_t r = load_acq(h->slab, off_freq(h, i));
       if (r > h->handled[i]) {
         dump_wire_ids(h, i, r);
+        if (!client_check_ids(h, i)) return;
         if (!post_payload(h, off_hdr(h, i), (uint32_t)(LINE + h->req_len))) return;
         if (!post_flag(h, off_freq(h, i), r)) return;
-        h->handled[i] = r;
         h->calls.fetch_add(1, std::memory_order_relaxed);
       }
     }
@@ -923,6 +984,10 @@ void stop_handle(qes_handle* h) {
     cudaFreeHost(h->slab);
     h->slab = nullptr;
   }
+  if (h->dump_src) {
+    cudaFreeHost(h->dump_src);
+    h->dump_src = nullptr;
+  }
   if (h->owns_pd && h->pd) {
     ibv_dealloc_pd(h->pd);
     h->pd = nullptr;
@@ -1105,6 +1170,13 @@ extern "C" qes_handle* qes_client_handle(qes_client_session* s, const char* dev_
     return nullptr;
   }
   memset(h->slab, 0, h->slab_bytes);
+  if (dump_ids() && h->rows <= 8) {
+    /* Small pinned mirror, one slice per slot, so the dump can show the ids argument itself next
+     * to the slab bytes the proxy forwards (see qes_handle::dump_src). */
+    if (cudaHostAlloc(&h->dump_src, (size_t)h->slots * h->rows * QES_TOPK * 4,
+                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+      h->dump_src = nullptr;
+  }
 
   int n = 0;
   ibv_device** list = ibv_get_device_list(&n);
@@ -2078,7 +2150,7 @@ int seam_dead_check(qes_handle* h, const char* what) {
 }
 
 extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int32_t* ids,
-                         const void* w_bf16, cudaStream_t stream) {
+                         const void* w_bf16, cudaStream_t stream, int n_cold) {
   if (!h || h->role != QES_ROLE_CLIENT || layer < 0 || layer >= QES_NL) return -1;
   if (int rc = seam_dead_check(h, "issue")) return rc;
   if (h->n_pending >= h->slots) {
@@ -2121,6 +2193,7 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
   hdr.magic = SLOT_MAGIC;
   hdr.layer = (uint32_t)layer;
   hdr.rows = (uint32_t)h->rows;
+  hdr.n_cold = n_cold > 0 ? (uint32_t)n_cold : 0u;
   memcpy(h->slab + off_hdr(h, slot), &hdr, sizeof(hdr));
   /* The header is a CPU write; order it before the GPU-side publish that lets the proxy forward
    * the payload (the NIC only sends it once the whole payload, header included, is visible). */
@@ -2130,6 +2203,12 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
     return -2;
   if (cudaMemcpyAsync(req + h->ids_off, ids, (size_t)h->rows * QES_TOPK * 4,
                       cudaMemcpyDeviceToHost, stream))
+    return -2;
+  /* Same stream, same source pointer, and before the publish below: if the slab copy above is what
+   * the wire carries, this mirror says whether the caller's tensor already held that value. */
+  if (h->dump_src &&
+      cudaMemcpyAsync(h->dump_src + (size_t)slot * h->rows * QES_TOPK, ids,
+                      (size_t)h->rows * QES_TOPK * 4, cudaMemcpyDeviceToHost, stream))
     return -2;
   if (cudaMemcpyAsync(req + h->w_off, w_bf16, (size_t)h->rows * QES_TOPK * 2,
                       cudaMemcpyDeviceToHost, stream))
