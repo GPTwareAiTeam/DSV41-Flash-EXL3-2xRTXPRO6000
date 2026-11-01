@@ -95,3 +95,8 @@ on both pairs on the same build, anything that failed and what was done about it
   table of 100 commits in recipe-artifacts/gpu0-gx1/PORT_AUDIT.md. sm_120 ext builds (353 s), imports OK.
   Merge-clean into v2. GPU test list in PORT_AUDIT.md. Conflicts with fix/graph-dspark-export in
   transformer.py: GraphDSpark rebasing onto port/v12-audit. Merge order after GPU tests: port -> graph -> seam.
+- 02:46 EST GraphDSpark rebased onto port/v12-audit: branch fix/graph-dspark-export-v2 (45d52f69). In-graph tap
+  dropped; v1.2's post-replay eager tap (carried by the port) kept, <1% of step cost. Only a CPU guard test +
+  DUMP_IDS added. CPU tests 6 pass / 8 GPU-skipped; negative controls fail as expected. Merge order:
+  port/v12-audit -> fix/graph-dspark-export-v2 (fast-forward on top of port) -> seam/session-multiclient
+  (STATUS.md doc conflict only). Quant A ~1 h 59 m left (~04:45 EST), B ~4 h.
