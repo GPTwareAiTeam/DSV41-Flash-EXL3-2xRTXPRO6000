@@ -50,6 +50,15 @@ WARMUP_NEW = int(os.environ.get("WARMUP_NEW", "24"))
 LONG_PROMPT_FILE = os.environ.get("LONG_PROMPT_FILE", "")
 LONG_TOKENS = int(os.environ.get("LONG_TOKENS", "0"))
 LONG_NEW = int(os.environ.get("LONG_NEW", "16"))
+# Prompt format for LONG_PROMPT_FILE. The v1.2 needle harness that scored 5/5 on the 128k fixture
+# (artifacts/2x-rtx-tp2/fp4kv/needle.sh, PROMPT_IDS=8) does not feed the file as raw text: it builds
+# "PROMPTS[i] + '\n\n' + transcript" and wraps that in the checkpoint's own chat template with
+# add_bos=False. A raw add_bos=True read makes the base model continue the prose, which is what the
+# first 131k arm did. LONG_CHAT=1 reproduces the reference format; LONG_LEAD is the instruction that
+# precedes the transcript (PROMPTS[8] in run_tp2.py).
+LONG_CHAT = os.environ.get("LONG_CHAT") == "1"
+LONG_LEAD = os.environ.get("LONG_LEAD", "Name three planets in our solar system.")
+ENC_DIR = os.environ.get("ENC_DIR", "/models/dsv41/DeepSeek-V4.1-Flash-1017-orig/encoding")
 CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 # Deep-context probes for the statics (dsv4_attn_out and friends): tokens from a tiled corpus, and
@@ -620,11 +629,28 @@ def main():
 
     # --- long-context prefill + decode peaks ----------------------------------------------
     if LONG_PROMPT_FILE:
-        ids = tokenizer.encode(open(LONG_PROMPT_FILE).read(), add_bos = True,
-                               encode_special_tokens = True)
-        if LONG_TOKENS:
-            ids = ids[:, :LONG_TOKENS]
+        raw = open(LONG_PROMPT_FILE).read()
+        if LONG_CHAT:
+            # Same path as the reference harness: instruction, blank line, transcript, chat template,
+            # no BOS. The template puts the assistant header after the transcript, which is what makes
+            # the model answer the request block instead of continuing the story.
+            import sys as _sys
+            if ENC_DIR not in _sys.path:
+                _sys.path.insert(0, ENC_DIR)
+            from encoding import encode_messages
+            body = f"{LONG_LEAD}\n\n{raw}" if LONG_LEAD else raw
+            text = encode_messages([{"role": "user", "content": body}], thinking_mode = "chat")
+            ids = tokenizer.encode(text, add_bos = False, encode_special_tokens = True)
+            print(f"LONG_CHAT lead={LONG_LEAD!r} enc={ENC_DIR} chars={len(text)}", flush = True)
+            if LONG_TOKENS:
+                print("LONG_TOKENS ignored with LONG_CHAT=1 (truncating ids would cut the template "
+                      "footer); cut the fixture file instead", flush = True)
+        else:
+            ids = tokenizer.encode(raw, add_bos = True, encode_special_tokens = True)
+            if LONG_TOKENS:
+                ids = ids[:, :LONG_TOKENS]
         print(f"LONG_PROMPT tokens={int(ids.shape[-1])} file={LONG_PROMPT_FILE}", flush = True)
+        print(f"LONG_PROMPT_TAIL {raw[-160:]!r}", flush = True)
     elif LONG_TOKENS:
         pieces = [tokenizer.encode(open(p).read(), add_bos = False, encode_special_tokens = True)[0]
                   for p in CORPUS_FILES]
@@ -646,7 +672,12 @@ def main():
         limiter = None
         if PREFILL_ADAPTIVE:
             generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(DEVICE)
-        job = Job(input_ids = ids, max_new_tokens = LONG_NEW, sampler = GreedySampler())
+        # IGNORE_EOS=1 mirrors tp2_bench.run_prompt: force LONG_NEW tokens so a short answer cannot end
+        # the job before it prints (the reference needle arm ran MAX_NEW=200 for the same reason).
+        ignore_eos = os.environ.get("IGNORE_EOS") == "1"
+        job = Job(input_ids = ids, max_new_tokens = LONG_NEW,
+                  min_new_tokens = LONG_NEW if ignore_eos else 0, sampler = GreedySampler(),
+                  stop_conditions = [] if ignore_eos else [tokenizer.eos_token_id])
         generator.enqueue(job)
         t = time.time()
         st = None
@@ -672,7 +703,12 @@ def main():
                     st = r
                 if r.get("text"):
                     gen_text.append(str(r["text"]))
-                if r.get("ids") is not None:
+                # The generator reports generated ids under "token_ids" (tp2_bench reads that key);
+                # "ids" stays as a fallback for older result shapes. Reading only "ids" is why the
+                # first 131k arm printed LONG_TEXT_IDS [] although it produced 80 tokens.
+                if r.get("token_ids") is not None:
+                    gen_ids.append(r["token_ids"])
+                elif r.get("ids") is not None:
                     gen_ids.append(r["ids"])
                 if not prefill_done and (r.get("text") or r.get("stage") == "streaming"
                                          or job.is_prefill_done()):
@@ -698,7 +734,7 @@ def main():
               f"events={rows} total_wall_s={wall:.2f}", flush = True)
         if gen_text or gen_ids:
             text = "".join(gen_text)
-            flat = [int(v) for t in gen_ids for v in t.reshape(-1).tolist()]
+            flat = [int(v) for t in gen_ids for v in (t.tolist() if hasattr(t, "tolist") else list(t))]
             print(f"LONG_TEXT chars={len(text)} tokens={len(flat)} "
                   f"text={text!r}", flush = True)
             print(f"LONG_TEXT_IDS {flat}", flush = True)
