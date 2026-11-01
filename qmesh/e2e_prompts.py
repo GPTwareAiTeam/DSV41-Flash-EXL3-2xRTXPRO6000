@@ -6,8 +6,8 @@ one prompt per record separated by a blank line), runs greedy decoding, and prin
 line per prompt plus a summary. Timing comes from the engine's own job accounting
 (time_enqueued / time_prefill / time_generate / new_tokens) and from wall clock.
 
-Env:
   CHECKPOINT   model dir (default /models/dsv41/exl3-serve-final)
+  DRAFT_CHECKPOINT  drafter (mtp) model dir (default: CHECKPOINT), e.g. the HC1 overlay
   PLACEMENT    placement json (default qmesh/placement.final.json)
   PROMPTS      path to prompt list (JSON array)  [default: built-in 3 prompts]
   PROMPTS_TXT  path to a text file; each non-empty line is one prompt (overrides PROMPTS)
@@ -32,10 +32,11 @@ os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 
 import torch
 
-from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
+from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-serve-final")
+DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
 PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
 MAX_NEW = int(os.environ.get("MAX_NEW", "256"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
@@ -45,7 +46,18 @@ WARMUP = int(os.environ.get("WARMUP", "0"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 OUT = os.environ.get("OUT", "")
 DEBUG_RESULTS = os.environ.get("DEBUG_RESULTS") == "1"
+MEM_BREAKDOWN = os.environ.get("MEM_BREAKDOWN") == "1"
 CORPUS_TOKENS = int(os.environ.get("CORPUS_TOKENS", "24000"))
+CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
+LONG_TOKENS = int(os.environ.get("LONG_TOKENS", "0"))
+# KV_BITS=4 (default) is DeepSeek's trained FP4 layout for the compressed pools: whole 512-wide
+# latent rows plus indexer keys, as the model was trained; 8 packs the nope part with CacheLayer_quant;
+# 16 is the fp16 pool. The DSA pools take the same kwargs on target and draft caches
+KV_BITS = int(os.environ.get("KV_BITS", "4"))
+assert KV_BITS in (4, 8, 16), "KV_BITS must be 4, 8 or 16"
+KV_CACHE_KWARGS = ({} if KV_BITS == 16 else
+                   {"kv_format": "fp4"} if KV_BITS == 4 else
+                   {"layer_type": CacheLayer_quant, "k_bits": 8, "v_bits": 8})
 DEFAULT_PROMPTS = [
     "The capital of France is",
     "Write a Python function that returns the nth Fibonacci number.",
@@ -92,7 +104,7 @@ def main():
     }
     model = Model.from_config(config)
     # Recipe A sizes its hybrid expert pools during load, so the cache has to exist first
-    cache = Cache(model, max_num_tokens=CACHE_TOKENS, max_history=5)
+    cache = Cache(model, max_num_tokens=CACHE_TOKENS, max_history=5, **KV_CACHE_KWARGS)
     t0 = time.time()
     model.load(device="cuda:0", progressbar=False)
     free, total = torch.cuda.mem_get_info(0)
@@ -104,26 +116,64 @@ def main():
     draft_model = None
     draft_cache = None
     if DSPARK:
-        draft_config = Config.from_directory(CHECKPOINT)
+        draft_config = Config.from_directory(DRAFT_CHECKPOINT)
         draft_model = Model.from_config(draft_config, component="mtp")
-        draft_cache = Cache(draft_model, max_num_tokens=CACHE_TOKENS, max_history=5)
+        draft_cache = Cache(draft_model, max_num_tokens=CACHE_TOKENS, max_history=5, **KV_CACHE_KWARGS)
         t1 = time.time()
         draft_model.load(device="cuda:0", progressbar=False)
         print(f"DSPARK_LOADED {time.time() - t1:.1f}s", flush=True)
     generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=MAX_CHUNK,
                           draft_model=draft_model, draft_cache=draft_cache,
                           num_draft_tokens=NUM_DRAFT if DSPARK else None)
+    if MEM_BREAKDOWN:
+        # Resident VRAM by owner after load (target + drafter + caches + generator statics),
+        # before any job; then the peak since this reset is reported at the end
+        from exllamav3.util.memory import vram_accounting
+        g = 2 ** 30
+        device = torch.device("cuda:0")
+        for name, m, c in (("target", model, cache), ("drafter", draft_model, draft_cache)):
+            if m is None:
+                continue
+            r = vram_accounting(m, c, generator if name == "target" else None, [device])[0]
+            print(f"MEMB {name} weights={r.weights / g:.3f} kv_cache={r.cache / g:.3f} "
+                  f"recurrent={r.recurrent / g:.3f} statics={r.statics / g:.3f} "
+                  f"generator={r.generator / g:.3f} other={r.other / g:.3f} kv_bits={KV_BITS}", flush=True)
+            if r.statics_by_tag:
+                for tag, b in sorted(r.statics_by_tag.items(), key=lambda kv: -kv[1]):
+                    print(f"MEMB statics_tag {name} {tag}={b / g:.3f}", flush=True)
+        free, total = torch.cuda.mem_get_info(device)
+        print(f"MEMB device total={total / g:.3f} used={(total - free) / g:.3f} "
+              f"torch_reserved={torch.cuda.memory_reserved(device) / g:.3f} "
+              f"torch_allocated={torch.cuda.memory_allocated(device) / g:.3f} "
+              f"non_torch={(total - free - torch.cuda.memory_reserved(device)) / g:.3f}", flush=True)
+        torch.cuda.reset_peak_memory_stats(device)
 
     prompts = load_prompts()[: int(os.environ.get("MAX_PROMPTS", "0")) or None]
     # Warm-up prompts are synthetic, excluded from the summary, and never touch the prompt list
     warm = ["Write a paragraph about the history of sailing ships and their navigation instruments."] * WARMUP
     prompts = [(f"warm{i}", p) for i, p in enumerate(warm)] + prompts
+    # LONG_TOKENS: a single long-context prompt tiled from the corpus files, for peak-VRAM and
+    # prefill-rate measurement at a real context width
+    long_ids = None
+    if LONG_TOKENS:
+        cat = []
+        for path in (CORPUS_FILES or []):
+            cat.append(tokenizer.encode(open(path).read(), add_bos=False,
+                                        encode_special_tokens=True)[0])
+        assert cat, "LONG_TOKENS needs CORPUS=<file[,file...]>"
+        flat = torch.cat(cat)
+        bos = tokenizer.encode("a", add_bos=True, encode_special_tokens=True)[0, :1]
+        reps = LONG_TOKENS // int(flat.shape[-1]) + 1
+        long_ids = torch.cat([bos, flat.repeat(reps)[: LONG_TOKENS - 1]]).unsqueeze(0)
+        print(f"LONG_PROMPT tokens={int(long_ids.shape[-1])} files={len(cat)}", flush=True)
+        prompts = [("long", None)] + prompts[:WARMUP]
     fh = open(OUT, "a", encoding="utf-8") if OUT else None
     rows = []
     for idx, (label, prompt) in enumerate(prompts):
-        ids = tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True)
-        assert len(ids) + MAX_NEW <= CACHE_TOKENS, \
-            f"prompt {label}: {len(ids)} tokens + {MAX_NEW} new exceed CACHE_TOKENS={CACHE_TOKENS}"
+        ids = (long_ids if prompt is None else
+               tokenizer.encode(prompt, add_bos=True, encode_special_tokens=True))
+        assert int(ids.shape[-1]) + MAX_NEW <= CACHE_TOKENS, \
+            f"prompt {label}: {int(ids.shape[-1])} tokens + {MAX_NEW} new exceed CACHE_TOKENS={CACHE_TOKENS}"
         limiter = None
         if PREFILL_ADAPTIVE:
             generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(torch.device("cuda:0"))
@@ -197,6 +247,13 @@ def main():
         "tokens": sum(r["new_tokens"] for r in rows),
         "wall_s": round(sum(r["wall_s"] for r in rows), 2),
     }
+    if MEM_BREAKDOWN:
+        g = 2 ** 30
+        device = torch.device("cuda:0")
+        free_now, total = torch.cuda.mem_get_info(device)
+        print(f"MEMB peak_since_load allocated={torch.cuda.max_memory_allocated(device) / g:.3f} "
+              f"reserved={torch.cuda.max_memory_reserved(device) / g:.3f} "
+              f"device_used_now={(total - free_now) / g:.3f} free_now={free_now / g:.3f}", flush=True)
     print("SUMMARY " + json.dumps(summary), flush=True)
     if fh:
         fh.write("SUMMARY " + json.dumps(summary) + "\n")
