@@ -17,6 +17,8 @@ Env:
   SEAM_BUCKETS   row buckets to *request* (default 1,6,64,256,512,1024,2048,4096); the
                  server's answer wins, so a superset request adapts to any server list
   SEAM_WAIT      1 = queue behind the server's active session instead of failing fast
+  SEAM_OVERLAP   0 = wait for each layer's reply inside submit_issue (the pre-split order); 1, the
+                 default, issues and lets the caller's own experts run before the wait
   EXL3_SEAM_PROF 1 times issue -> collect per (bucket, rows) with CUDA events and dumps the per-layer
                  round trip at exit (wire + GX1 compute). Eager only: a captured graph records the
                  calls once at capture and then replays ops, so there is nothing to time per round.
@@ -43,6 +45,11 @@ _PROF_MAX_ROWS = int(os.environ.get("EXL3_SEAM_PROF_ROWS", "6"))
 # Per-request stage trace: layer, bucket, cold count, stream and source pointers, printed host-side
 # only so it cannot change the ordering it is meant to observe.
 _ID_TRACE = os.environ.get("SEAM_ID_TRACE", "0") == "1"
+# SEAM_OVERLAP=1 issues a layer's cold-expert request and returns immediately, so the caller's own
+# GPU experts (block_sparse_mlp.py:1194 submits, :1519 combines) run while the GX computes the cold
+# share; 0 waits for the reply inside submit_issue, which is what the transport did before, so the
+# same build can measure both orders.
+_OVERLAP = os.environ.get("SEAM_OVERLAP", "1") == "1"
 _prof_rows = {}     # (bucket, n) -> [(host_ns_0, host_ns_1, ev0, ev1)]
 
 
@@ -63,6 +70,26 @@ def _prof_dump():
 
 if _PROF:
     atexit.register(_prof_dump)
+
+class _Prefill:
+    """One layer call's seam work in flight, from submit_issue to submit_collect.
+
+    Holds the caller's routing views (nothing is copied yet for the pieces not issued), the plan of
+    micro-batches, the single output tensor they all write into, and the requests already on the
+    wire. Kept as a plain object so the caller can run its own expert kernels in between without
+    the host touching a stream or a synchronisation primitive."""
+    __slots__ = ("host", "layer", "x", "ids", "w", "n_cold", "plan", "out", "rows",
+                 "stream", "dev_index", "next", "inflight")
+
+    def __init__(self, host, layer, x, ids, w, n_cold, plan, out, rows, stream, dev_index):
+        self.host = host
+        self.layer = int(layer)
+        self.x, self.ids, self.w, self.n_cold = x, ids, w, n_cold
+        self.plan = plan
+        self.out, self.rows = out, rows
+        self.stream, self.dev_index = stream, dev_index
+        self.next = 0            # index into plan of the next piece to issue
+        self.inflight = []       # issued pieces awaiting collection, in issue order
 
 
 class RemoteSeamHost:
@@ -302,15 +329,16 @@ class RemoteSeamHost:
         ev.record(torch.cuda.current_stream(dev))
         self._trace_prev[key] = (pre, caller, staged, ev, layer_idx, n)
 
-    def _issue_chunk(self, layer_idx, x, ids, w, n_cold = None):
-        """x [n,H], ids [n,K], w [n,K], n <= buckets[-1]. Stages to the smallest granted bucket >= n
-        (pad rows: id -1, weight 0 -> exact zero contribution) and returns (seam, out)."""
+    def _issue_piece(self, layer_idx, pos, x, ids, w, n_cold, dev_index):
+        """Stages one micro-batch to the smallest granted bucket >= its rows, puts it on the wire,
+        and returns the in-flight record _collect_piece consumes. Nothing waits here: the split
+        from collect is the whole point, because the caller's own expert kernels run next."""
         n = x.shape[0]
         bucket, xp, idp, wp = self._stage(layer_idx, x, ids, w)
-        dev = x.device
-        seam = self._seam(bucket, dev.index or 0)
-        stream = torch.cuda.current_stream(dev)
+        seam = self._seam(bucket, dev_index)
+        stream = torch.cuda.current_stream(x.device)
         prof = _PROF and n <= _PROF_MAX_ROWS and not torch.cuda.is_current_stream_capturing()
+        t0 = ev0 = None
         if prof:
             ev0 = torch.cuda.Event(enable_timing = True)
             ev0.record(stream)
@@ -340,14 +368,7 @@ class RemoteSeamHost:
                       file = sys.stderr, flush = True)
                 traceback.print_stack()
             raise
-        out = torch.empty(bucket, HIDDEN, dtype = torch.float32, device = dev)
-        seam.collect(layer_idx, out.data_ptr(), stream.cuda_stream)
-        if prof:
-            t1 = time.perf_counter_ns()
-            ev1 = torch.cuda.Event(enable_timing = True)
-            ev1.record(stream)
-            _prof_rows.setdefault((bucket, n), []).append((t0, t1, ev0, ev1))
-        return out[:n]
+        return (pos, n, bucket, xp, idp, wp, seam, t0, ev0)
 
     @staticmethod
     def _prep(y, selected, weights):
@@ -371,7 +392,7 @@ class RemoteSeamHost:
         """Collects one in-flight piece into `out` at its row offset. The collect's host->device
         copy and the issue's device->host copy are on the caller's stream, so this never waits on
         the host: the wait kernel for piece m simply sits after piece m+1's issue in the stream."""
-        pos, n, bucket, _xp, _idp, _wp, seam = piece
+        pos, n, bucket, _xp, _idp, _wp, seam, t0, ev0 = piece
         direct = pos + bucket <= out.shape[0]
         if direct:
             dst = out[pos:pos + bucket]
@@ -381,21 +402,37 @@ class RemoteSeamHost:
         seam.collect(layer_idx, dst.data_ptr(), stream.cuda_stream)
         if not direct:
             out[pos:pos + n] = dst[:n]
+        if t0 is not None:
+            t1 = time.perf_counter_ns()
+            ev1 = torch.cuda.Event(enable_timing = True)
+            ev1.record(stream)
+            _prof_rows.setdefault((bucket, n), []).append((t0, t1, ev0, ev1))
 
-    def submit_prefill(self, layer_idx, y, selected, weights, n_cold = None):
-        """Prefill one layer's chunk and return fp32 [rows, HIDDEN] on the caller's stream.
+    def _announce(self, layer_idx, rows, plan):
+        """One SEAM_SPLIT line per (rows, plan) shape: what the split looks like on this server."""
+        shape = (rows, tuple(b for _, _, b in plan))
+        if shape in self._splits:
+            return
+        self._splits.add(shape)
+        widths = ",".join(f"{b}x{sum(1 for s, e, _ in plan if _ == b)}" for b in
+                          dict.fromkeys(b for _, _, b in plan))
+        print(f"SEAM_SPLIT layer={layer_idx} rows={rows} chunk_rows={self.chunk_rows} "
+              f"calls={len(plan)} ns={self.ns} server_slots={self.slots} "
+              f"buckets={','.join(map(str, self.buckets))} plan={widths}", flush = True)
 
-        The chunk is split into micro-batches at chunk_rows (the largest granted bucket), and up
-        to `ns` of them are kept in flight at once: micro-batch m+1's request is on the wire (and
-        its slot's compute already queued on GX) while the client is still waiting for m's
-        response, so the transport and the GX expert compute overlap instead of alternating. All
-        of it is stream-ordered (issue = device->host copy + publish, collect = wait kernel +
-        host->device copy), so it stays graph-capturable and needs no host synchronisation: the
-        waits for m and m+1 are two kernels in the same stream, in order.
+    def submit_issue(self, layer_idx, y, selected, weights, n_cold = None):
+        """Puts this layer's cold-expert request on the wire and returns a pending handle.
 
-        Causality is per micro-batch, not per layer: a micro-batch's layer L+1 call needs its own
-        layer L output, which the pieces keep in plan order. Overlap between layers of the *same*
-        tokens is still impossible (L+1 reads L's output).
+        The caller runs its own GPU experts between this and submit_collect, so the GX's cold
+        compute overlaps the P7's hot compute instead of following it. This used to call
+        submit_prefill, which collects before returning: every layer waited out the whole RDMA
+        round trip at the top of the MoE block with the GPU idle, and the prefill numbers of
+        2026-11-01 (292.5 tok/s at 32k) carried that stall on all 40 layers.
+
+        A chunk is split into micro-batches at the largest granted bucket; `ns` of them may be in
+        flight (one on today's server: one payload slot per handle), so a chunk that fits in one
+        bucket -- every decode step, and every prefill call at chunk_rows -- is issued here and
+        waited for in submit_collect, which is a full round trip of overlap on all 40 layers.
 
         n_cold is this layer's cold-expert count, carried on every request so the client proxy can
         refuse an id the placement cannot hold (see qes.Seam.issue)."""
@@ -403,43 +440,50 @@ class RemoteSeamHost:
         x, ids, w = self._prep(y, selected, weights)
         rows = x.shape[0]
         plan = self._split(rows)
-        ns = max(1, min(self.ns, len(plan)))
-        shape = (rows, ns, tuple(b for _, _, b in plan))
-        if shape not in self._splits:
-            self._splits.add(shape)
-            widths = ",".join(f"{b}x{sum(1 for s, e, _ in plan if _ == b)}" for b in
-                              dict.fromkeys(b for _, _, b in plan))
-            print(f"SEAM_SPLIT layer={layer_idx} rows={rows} chunk_rows={self.chunk_rows} "
-                  f"calls={len(plan)} ns={ns} server_slots={self.slots} "
-                  f"buckets={','.join(map(str, self.buckets))} plan={widths}", flush = True)
-        if len(plan) == 1:
-            return self._issue_chunk(layer_idx, x, ids, w, n_cold)
+        self._announce(layer_idx, rows, plan)
         # One fp32 [rows,H] output that every micro-batch writes into: torch.cat would hold the
         # parts and the copy at once (+rows*H*4 bytes, 235 MiB at 8192 rows), which the prefill
-        # memory budget does not have.
-        out = torch.empty(rows, HIDDEN, dtype = torch.float32, device = x.device)
-        stream = torch.cuda.current_stream(x.device)
-        dev_index = x.device.index or 0
-        inflight = []
-        for s, e, _ in plan:
-            if len(inflight) >= ns:
-                self._collect_piece(layer_idx, inflight.pop(0), out, stream)
-            bucket, xp, idp, wp = self._stage(layer_idx, x[s:e], ids[s:e], w[s:e])
-            seam = self._seam(bucket, dev_index)
-            seam.issue(layer_idx, xp.data_ptr(), idp.data_ptr(), wp.data_ptr(),
-                       stream.cuda_stream, n_cold or 0)
-            inflight.append((s, e - s, bucket, xp, idp, wp, seam))
-        while inflight:
-            self._collect_piece(layer_idx, inflight.pop(0), out, stream)
-        return out
-
-    def submit_issue(self, layer_idx, y, selected, weights, n_cold = None):
-        """Decode-size batches (<= largest bucket) run as one chunk; the output is produced
-        by the collect enqueued inside, so the caller's 'collect' is a no-op handle."""
-        return self.submit_prefill(layer_idx, y, selected, weights, n_cold)
+        # memory budget does not have. A single piece writes into its own bucket-sized buffer and
+        # is returned as a prefix, exactly as the one-shot path always did.
+        out = (torch.empty(plan[0][2], HIDDEN, dtype = torch.float32, device = x.device)
+               if len(plan) == 1 else
+               torch.empty(rows, HIDDEN, dtype = torch.float32, device = x.device))
+        p = _Prefill(self, layer_idx, x, ids, w, n_cold, plan, out, rows,
+                     torch.cuda.current_stream(x.device), x.device.index or 0)
+        while p.next < len(p.plan) and len(p.inflight) < self.ns:
+            s, e, _ = p.plan[p.next]
+            p.inflight.append(self._issue_piece(p.layer, s, p.x[s:e], p.ids[s:e], p.w[s:e],
+                                                n_cold, p.dev_index))
+            p.next += 1
+        if not _OVERLAP:
+            return self.submit_collect(p)
+        return p
 
     def submit_collect(self, handle):
-        return handle
+        """Waits for the pending request(s) and returns fp32 [rows, HIDDEN] on the caller's stream.
+
+        Pieces the ns window did not cover (a chunk split into more micro-batches than there are
+        slots) are issued and drained here, keeping the window full, so those pieces cost the
+        transport's usual alternation -- the same order the one-shot path used for all of them."""
+        if not isinstance(handle, _Prefill):
+            # Already a finished tensor: SEAM_OVERLAP=0 submitted and waited in one call.
+            return handle
+        p = handle
+        while p.next < len(p.plan):
+            while len(p.inflight) >= self.ns:
+                self._collect_piece(p.layer, p.inflight.pop(0), p.out, p.stream)
+            s, e, _ = p.plan[p.next]
+            p.inflight.append(self._issue_piece(p.layer, s, p.x[s:e], p.ids[s:e], p.w[s:e],
+                                                p.n_cold, p.dev_index))
+            p.next += 1
+        while p.inflight:
+            self._collect_piece(p.layer, p.inflight.pop(0), p.out, p.stream)
+        return p.out[:p.rows]
+
+    def submit_prefill(self, layer_idx, y, selected, weights, n_cold = None):
+        """Single-phase form for callers with nothing to overlap (benches, the CPU host's streamed
+        path): issue then collect back to back, the same code the two-phase callers use."""
+        return self.submit_collect(self.submit_issue(layer_idx, y, selected, weights, n_cold))
 
     def submit_issue_fused(self, *args, **kwargs):
         raise NotImplementedError("seam path uses EXL3_MOE_SPLIT_FUSED=0")
