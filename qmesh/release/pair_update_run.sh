@@ -47,6 +47,18 @@ status_write() {  # <eta_min> <doing>
   [ -n "${GPU_RUN_STATUS:-}" ] && echo "eta_min=$1 doing=$2" > "$GPU_RUN_STATUS" 2>/dev/null
   return 0
 }
+# Who else is on this pair: tickets in its queue (not our own) or a live client/server process in
+# either of its containers. Recreating a container SIGKILLs an arm someone else is running (2026-11-01
+# 09:39: an 12-minute prefill arm died with CLIENT_RC=137 and no traceback), so this refuses instead.
+# Only processes matter: the queue already serialises tickets, so a queued ticket behind ours can not
+# race us, but an arm exec'd into the container (or a server still up) will be killed by the recreate.
+pair_others_busy() {
+  local n
+  n=$(docker exec "$P7CT" pgrep -fc 'worker_seam_server|pair_arm|pair_p7_smoke|qes' 2>/dev/null)
+  if [ "${n:-0}" != 0 ]; then printf 'p7_procs=%s ' "$n"; fi
+  n=$(pair_gxsh "docker exec $GXCT pgrep -fc 'worker_seam_server|pair_arm|qes' 2>/dev/null")
+  if [ "${n:-0}" != 0 ]; then printf 'gx_procs=%s ' "$n"; fi
+}
 gpu_free() {
   local used
   used=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i "$GPU" 2>/dev/null)
@@ -103,6 +115,18 @@ if ! gpu_free && [ "${PAIR_UPDATE_FORCE:-0}" != 1 ]; then
   pair_step "PAIR_UPDATE_REFUSED pair=$PAIR gpu_busy (GPU $GPU has a compute app; queue it instead)"
   exit 3
 fi
+for t in "$PAIR_QUEUE"/gpu_queue/[0-9]*-*; do
+  [ -e "$t" ] || continue
+  base=$(basename "$t")
+  case "$base" in *-PairUpdate|*-PairUpdateRun) continue ;; esac
+  pair_step "UPDATE_QUEUE_NOTE pair=$PAIR other_ticket=$base (queued behind us; the queue serialises)"
+done
+others=$(pair_others_busy)
+if [ -n "$others" ] && [ "${PAIR_UPDATE_FORCE:-0}" != 1 ]; then
+  pair_step "PAIR_UPDATE_REFUSED pair=$PAIR pair_busy $others (a client or ticket owns this pair; wait for it)"
+  exit 3
+fi
+[ -n "$others" ] && pair_step "UPDATE_FORCED pair=$PAIR pair_busy $others (PAIR_UPDATE_FORCE=1)"
 status_write 120 "cutting release"
 
 # ---- 1. cut -------------------------------------------------------------------------------------
