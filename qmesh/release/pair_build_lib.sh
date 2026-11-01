@@ -85,7 +85,13 @@ build_side() {
   fi
   local builds
   builds=$(side_hostsh "$side" "pgrep -c -x 'ninja|cc1plus|nvcc|cicc' 2>/dev/null || true")
-  [ "${builds:-0}" = 0 ] || { pair_step "LIB_REFUSE $side compiler_running=$builds"; return 1; }
+  local waited=0 cap=${PAIR_BUILD_WAIT_SECS:-1800}
+  while [ "${builds:-0}" != 0 ] && [ "$waited" -lt "$cap" ]; do
+    pair_step "LIB_WAIT $side compiler_running=$builds waited=${waited}s (another build owns the host)"
+    sleep 30; waited=$((waited + 30))
+    builds=$(side_hostsh "$side" "pgrep -c -x 'ninja|cc1plus|nvcc|cicc' 2>/dev/null || true")
+  done
+  [ "${builds:-0}" = 0 ] || { pair_step "LIB_REFUSE $side compiler_running=$builds waited=${waited}s"; return 1; }
   if [ "$side" = gx ]; then
     local avail
     avail=$(side_hostsh gx "awk '/^MemAvailable:/{print int(\$2/1048576)}' /proc/meminfo")
