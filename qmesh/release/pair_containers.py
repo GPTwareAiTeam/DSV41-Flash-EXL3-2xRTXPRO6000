@@ -349,11 +349,15 @@ def cmd_rollback(cfg, ts):
 
 
 def link_side_cmd(root, sha):
-    """Atomic symlink flip: build the new link under a temp name, then rename over the old one."""
-    rel = os.path.join(root, "releases", sha)
-    return (f"set -e; mkdir -p {root}/releases; "
-            f"ln -sfn {rel} {root}/.current.tmp && mv -T {root}/.current.tmp {root}/current; "
-            f"ln -sfn {rel}/ext {root}/.extcache.tmp && mv -T {root}/.extcache.tmp {root}/extcache; "
+    """Atomic symlink flip with RELATIVE targets.
+
+    The same directory is mounted at a different path inside each container (/pair), so an absolute
+    target dangles there: on 2026-11-01 10:15 `readlink -f /src/exllamav3` returned nothing and the
+    flip failed after both sides had built. Relative targets read correctly from both namespaces.
+    """
+    return (f"set -e; mkdir -p {root}/releases; cd {root}; "
+            f"ln -sfn releases/{sha} .current.tmp && mv -T .current.tmp current; "
+            f"ln -sfn releases/{sha}/ext .extcache.tmp && mv -T .extcache.tmp extcache; "
             f"readlink -f {root}/current; readlink -f {root}/extcache")
 
 
