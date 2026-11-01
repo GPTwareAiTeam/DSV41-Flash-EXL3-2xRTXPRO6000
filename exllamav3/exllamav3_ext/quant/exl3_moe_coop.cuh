@@ -14,7 +14,10 @@
 #define MOE_COOP_ACT_RELU2 2
 #define MOE_COOP_ACT_SILU_OAI 3
 
-#define MOE_COOP_THREADS 512
+#define MOE_COOP_THREADS 256
+#ifndef MOE_COOP_MINB
+#define MOE_COOP_MINB 3
+#endif
 #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp (32-column groups per block)
 #define MOE_COOP_COLS (MOE_COOP_WNT * 16)
 
@@ -122,6 +125,10 @@ MoeCoopParams exl3_moe_coop_prepare
     const c10::optional<at::Tensor>& sh_gate_w,
     float& K_gu, float& K_d, int& cb
 );
+
+// Stage routed selections and weights with the shared expert appended to each row.
+void exl3_moe_fold_stage(const at::Tensor& sel, const at::Tensor& rw,
+                         at::Tensor& fold_sel, at::Tensor& fold_rw, int rows, int topk, int expert);
 
 // Per-call part: input rows, routing, optional shared-expert output (bsz rows, width H), launch
 void exl3_moe_coop_run
