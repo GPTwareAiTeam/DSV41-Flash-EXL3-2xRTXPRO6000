@@ -133,7 +133,7 @@ PY
   # ---- build -------------------------------------------------------------------------------------
   local tmp="/pair/releases/$SHA/.lib-$arch-$$"
   local flags="-O2 -std=c++17 -arch=$sm -Xcompiler -fPIC -shared -x cu qmesh_expert_seam.cu -o $tmp/$PAIR_LIB.$arch.so -libverbs -lcuda -lcudart -Xlinker -rpath=$libdir -I."
-  inner="set -e; cd /pair/releases/$SHA/src/qmesh/native; rm -rf $tmp; mkdir -p $tmp; \
+  inner="set -e; cd /pair/releases/$SHA/src/qmesh/native; mkdir -p bin $tmp; rm -rf $tmp/*; \
          nice -n 15 env MAX_JOBS=8 /usr/local/cuda/bin/nvcc $flags; \
          mv -f $tmp/$PAIR_LIB.$arch.so bin/$PAIR_LIB.$arch.so; rmdir $tmp; \
          sha256sum bin/$PAIR_LIB.$arch.so"
