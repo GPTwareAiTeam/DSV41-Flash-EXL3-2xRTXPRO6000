@@ -171,6 +171,18 @@ class SeamServer:
               f"fadvise={int(self.fadvise)} swapped_mib={_swap_used_mib()}", flush=True)
 
         self.stream = torch.cuda.Stream(device=device)
+        # The kernel has to be importable before the load starts: vendor/cuda-exl3 is built per box
+        # (qmesh/build_cudaexl3.sh) and a server started on a checkout without it would otherwise
+        # die on the first request, deep inside compute()'s fail-stop.
+        self.preload = PRELOAD_CX and MOE_KERNEL == "cudaexl3" and not stub
+        if self.preload:
+            try:
+                from qmesh import exl3_moe_cuda  # noqa: F401  (loads the vendor extension)
+            except Exception as e:
+                self.preload = False
+                print(f"SEAM_MOE_NOEXT preload=off err={type(e).__name__}: {e} "
+                      f"- every layer will stay on the mixed-K module", flush=True)
+        self._cx_layers: dict = {}
         config = Config.from_directory(model_dir)
         model = Model.from_config(config)
         for layer in range(NL):
@@ -187,6 +199,16 @@ class SeamServer:
                   f"avail_mib={_avail_mib()} cached_mib={_cached_mib()} "
                   f"rss_peak_mib={_rss_peak_mib()} swap_mib={_swap_used_mib()} "
                   f"cached_dropped={int(dropped)}", flush=True)
+            # Convert now, not on the first request for this layer: this is the only moment the
+            # group transient fits (see PRELOAD_CX). _cx_moe prints SEAM_MOE_CX or SEAM_MOE_NOFIT
+            # per layer, and a refusal leaves the layer on the mixed-K module, which is correct
+            # because nothing of the module was released in that case.
+            if self.preload:
+                self._cx_moe(layer, self.layers[layer][0])
+        cx_n = sum(1 for v in getattr(self, "_cx_layers", {}).values() if v is not None)
+        if self._cx_layers:
+            print(f"SEAM_PACK_KERNEL cudaexl3_layers={cx_n} mixedk_layers={NL - cx_n} "
+                  f"of={NL} avail_mib={_avail_mib()} swap_mib={_swap_used_mib()}", flush=True)
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
@@ -302,8 +324,16 @@ class SeamServer:
         cx = self.__dict__.setdefault("_cx_layers", {})
         if layer in cx:
             return cx[layer]
-        from qmesh.exl3_moe_cuda import (CudaExl3Moe, RestackBroken, _live_mib as _cx_cold_mib,
-                                         peak_mib as _cx_peak_mib)
+        try:
+            from qmesh.exl3_moe_cuda import (CudaExl3Moe, RestackBroken,
+                                             _live_mib as _cx_cold_mib, peak_mib as _cx_peak_mib)
+        except Exception as e:
+            # No vendored extension on this box: the layer keeps its module copy, and saying so once
+            # is better than dying inside compute()'s fail-stop on the first request.
+            cx[layer] = None
+            print(f"SEAM_MOE_NOEXT layer={layer} err={type(e).__name__}: {e} "
+                  f"- serving this layer from the mixed-K module", flush=True)
+            return None
         # The restack cannot be done in place: a group's stacked tensors are allocated before any
         # expert of that group is copied into them, so the peak is one layer's cold bytes plus up
         # to one group's. On GB10 the pack and the device share one 121 GiB pool, and a
@@ -407,6 +437,15 @@ SWAP_WARN_MIB = 512
 # not just this process (GX1, 2026-11-01 16:44). Set SEAM_CX_MARGIN_MIB=0 only to measure a restack
 # on a box you are willing to lose.
 CX_MARGIN_MIB = int(os.environ.get("SEAM_CX_MARGIN_MIB", "1536"))
+
+# Convert each cold layer to the cuda-exl3 kernel as it loads, on by default when that kernel is
+# the one in use. The conversion needs one layer's cold bytes *plus* its largest bitrate group
+# transiently (see exl3_moe_cuda._stack_group); with the full pack resident a GX has ~1.0 GiB
+# MemAvailable and a 2.74 GiB layer therefore cannot convert, while the same layer costs nothing
+# during the load because MemAvailable is still 116 GiB there (GX2, 2026-11-01: avail_mib 120079 ->
+# 1000 over 40 layers, 116223 right after layer 0). Deferring the restack to the first request is
+# what wedged GX1. SEAM_MOE_PRELOAD=0 restores that behaviour for a box measured to have slack.
+PRELOAD_CX = os.environ.get("SEAM_MOE_PRELOAD", "1") != "0"
 
 
 def ws_mib_for(rows: int, ws_rows: int = 0) -> float:

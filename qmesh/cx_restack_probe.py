@@ -94,32 +94,39 @@ def main(argv=None):
 
     from qmesh.exl3_moe_cuda import CudaExl3Moe, RestackBroken, _live_mib, peak_mib
     layer = a.layer
-    ffn = srv.layers[layer]
-    live = _live_mib(ffn)
-    need = peak_mib(ffn)
-    avail = S._avail_mib()
-    print(f"SEAM_CX_PROBE_PLAN layer={layer} cold_mib={live:.0f} need_mib={need:.0f} "
-          f"avail_mib={avail} gate_mib={a.gate_mib} fits={int(avail >= 0 and need + a.gate_mib <= avail)} "
-          f"{memline()}", flush=True)
-    if avail >= 0 and need + a.gate_mib > avail:
-        print(f"SEAM_CX_PROBE_NOFIT layer={layer} need_mib={need:.0f}+{a.gate_mib} > "
-              f"avail_mib={avail} - refusing the conversion (it would page the pack out)",
-              flush=True)
-        stop.set()
-        return 4
-
-    t0 = time.perf_counter()
-    try:
-        cx = CudaExl3Moe(ffn, "cuda:0")
-    except RestackBroken as e:
-        print(f"SEAM_CX_PROBE_BROKEN layer={layer} err={e} {memline()}", flush=True)
-        stop.set()
-        return 5
-    print(f"SEAM_CX_PROBE_RESTACK layer={layer} groups={cx.describe()} "
-          f"stacked_mib={cx.nbytes() / 2**20:.0f} build_s={time.perf_counter() - t0:.1f} "
-          f"{memline()}", flush=True)
-    srv._cx_layers = getattr(srv, "_cx_layers", {})
-    srv._cx_layers[layer] = cx
+    ffn = srv.layers[layer][0]
+    # With SEAM_MOE_PRELOAD=1 (the server default for cudaexl3) every layer was converted while it
+    # loaded, which is the only moment the group transient fits; converting it a second time here
+    # would restack a layer whose per-expert sources are already released.
+    cx = srv._cx_layers.get(layer)
+    if cx is not None:
+        print(f"SEAM_CX_PROBE_PRELOADED layer={layer} groups={cx.describe()} "
+              f"stacked_mib={cx.nbytes() / 2**20:.0f} {memline()}", flush=True)
+    else:
+        live = _live_mib(ffn)
+        need = peak_mib(ffn)
+        avail = S._avail_mib()
+        print(f"SEAM_CX_PROBE_PLAN layer={layer} cold_mib={live:.0f} need_mib={need:.0f} "
+              f"avail_mib={avail} gate_mib={a.gate_mib} "
+              f"fits={int(avail >= 0 and need + a.gate_mib <= avail)} "
+              f"{memline()}", flush=True)
+        if avail >= 0 and need + a.gate_mib > avail:
+            print(f"SEAM_CX_PROBE_NOFIT layer={layer} need_mib={need:.0f}+{a.gate_mib} > "
+                  f"avail_mib={avail} - refusing the conversion (it would page the pack out)",
+                  flush=True)
+            stop.set()
+            return 4
+        t0 = time.perf_counter()
+        try:
+            cx = CudaExl3Moe(ffn, "cuda:0")
+        except RestackBroken as e:
+            print(f"SEAM_CX_PROBE_BROKEN layer={layer} err={e} {memline()}", flush=True)
+            stop.set()
+            return 5
+        print(f"SEAM_CX_PROBE_RESTACK layer={layer} groups={cx.describe()} "
+              f"stacked_mib={cx.nbytes() / 2**20:.0f} build_s={time.perf_counter() - t0:.1f} "
+              f"{memline()}", flush=True)
+        srv._cx_layers[layer] = cx
 
     cold = sorted(int(x) for x in srv.layers[layer].__dict__.get("_cold_experts", []) or [])
     if not cold:

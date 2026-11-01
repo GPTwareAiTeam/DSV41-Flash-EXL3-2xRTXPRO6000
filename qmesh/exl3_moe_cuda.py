@@ -284,12 +284,13 @@ class CudaExl3Moe:
                                    [ffn.downs[e] for e in idx], self.device,
                                    free_source = drop_source)
             except Exception as e:
-                # Past the first group the sources of the groups already stacked are gone, so the
-                # layer can no longer run on the mixed-K module: say so instead of leaving a
-                # half-converted layer behind (worker_seam_server._cx_moe turns this into a fatal).
-                if self.groups and drop_source:
-                    raise RestackBroken(f"group {key} of layer with {self.num_experts} experts: "
-                                        f"{type(e).__name__}: {e}") from e
+                # Once drop_source has run, this layer's per-expert copies and the module's fused
+                # bundles are gone, so *any* failure - the first group included - leaves nothing
+                # the mixed-K path could answer with. Say that instead of letting
+                # worker_seam_server._cx_moe fall back to a module whose experts were released.
+                if drop_source:
+                    raise RestackBroken(f"group {key} ({len(idx)} experts) of layer with "
+                                        f"{self.num_experts} experts: {type(e).__name__}: {e}") from e
                 raise
             grp.source = idx
             self.groups.append(grp)
