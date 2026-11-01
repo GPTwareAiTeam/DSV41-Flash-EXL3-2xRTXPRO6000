@@ -63,14 +63,18 @@
 
 namespace {
 
-constexpr int ROWS_MAX = 64;
+/* Row bucket ceiling. A bucket is one payload slot's width, so this is bounded by pinned host
+ * memory (one slab per bucket on each side), not by the wire: 8192 rows is 240 MiB per side with
+ * one slot (protocol v3 layout). */
+constexpr int ROWS_MAX = 8192;
 constexpr size_t LINE = 64;
 constexpr uint64_t WAIT_TIMEOUT_NS = 30ull * 1000 * 1000 * 1000;
 
 /* Control channel: negotiation hello/reply and the data-handshake guard words. */
 constexpr uint32_t CTL_MAGIC = 0x32534551u;        /* "QES2" */
 constexpr uint32_t CTL_REPLY_MAGIC = 0x32525351u;  /* "QSR2" */
-constexpr uint32_t DATA_MAGIC = 0x53454851u;      /* "QHES" */
+constexpr uint32_t DATA_MAGIC = 0x33454851u;      /* "QHE3": protocol v3 slot layout */
+constexpr uint32_t SLOT_MAGIC = 0x31544851u;       /* "QHT1": slot request header */
 constexpr int CTL_HELLO_TIMEOUT_MS = 2000;        /* a silent TCP peer must not stall the server */
 constexpr int DATA_HELLO_TIMEOUT_S = 5;          /* a dead data peer must not stall the accept loop */
 constexpr int SOCK_IO_TIMEOUT_S = 15;
@@ -137,21 +141,51 @@ std::string csv(const int* v, int n) {
 
 size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
-/* Per-layer geometry of the wire slab for `rows` request rows. */
+/* QES_TRACE=1 prints the wire geometry of every write. A remote-invalid-request completion on an
+ * RDMA WRITE only says `opcode=1 port=<p> rows=<r>`: the responder rejected the address, the
+ * length or the rkey, and nothing in the existing counters says which. These lines pin it to one
+ * port by giving, on both sides and for the same port, the registered slab length, the stride, the
+ * base address and the rkey, plus the offset and length of each posted write. */
+bool qes_trace() {
+  static const bool on = getenv("QES_TRACE") != nullptr;
+  return on;
+}
+
+const char* role_name(int role) {
+  return role == QES_ROLE_SERVER ? "srv" : "cli";
+}
+
+constexpr uint64_t TRACE_FLAG = 1ULL << 63;
+
+/* Wire geometry for `rows` request rows and `slots` payload slots. One slot is
+ *   [64B F_REQ line][64B F_RESP line][64B request header][x | ids | w][out]
+ * and the request header (layer, rows) travels with the payload, so any slot serves any layer:
+ * protocol v2 reserved a slot per layer, which multiplied the staging memory by QES_NL and capped
+ * the usable row bucket at what 40 slabs allowed. */
 struct Geometry {
-  size_t req_len, ids_off, w_off, resp_len, stride, slab_bytes;
+  size_t req_len, ids_off, w_off, resp_len, resp_off, stride, slab_bytes;
 };
 
-Geometry geometry(int rows) {
+Geometry geometry(int rows, int slots) {
   Geometry g{};
   g.req_len = (size_t)rows * (QES_HIDDEN * 2 + QES_TOPK * 4 + QES_TOPK * 2);
   g.ids_off = (size_t)rows * QES_HIDDEN * 2;
   g.w_off = g.ids_off + (size_t)rows * QES_TOPK * 4;
   g.resp_len = (size_t)rows * QES_HIDDEN * 4;
-  g.stride = align_up(g.req_len, LINE) + align_up(g.resp_len, LINE) + 2 * LINE;
-  g.slab_bytes = g.stride * QES_NL;
+  g.resp_off = 3 * LINE + align_up(g.req_len, LINE);
+  g.stride = g.resp_off + align_up(g.resp_len, LINE);
+  g.slab_bytes = g.stride * (size_t)slots;
   return g;
 }
+
+/* Request header at the front of every request payload (protocol v3). */
+struct SlotHdr {
+  uint32_t magic; /* SLOT_MAGIC */
+  uint32_t layer; /* QES_NL range */
+  uint32_t rows;  /* must equal the bucket the handle was opened with */
+  uint32_t pad;
+  uint64_t pad2[6]; /* keep the header one 64 B line */
+};
 
 /* Data handshake, exchanged on a data port once per (session, bucket). */
 struct Hello {
@@ -159,11 +193,12 @@ struct Hello {
   uint8_t gid[16];
   uint64_t base;
   uint32_t rkey;
-  uint32_t layers, rows;
+  uint32_t layers;
+  uint32_t rows;
   uint32_t magic;   /* DATA_MAGIC: catches a peer that speaks another data-handshake build */
   uint32_t session; /* control session id: rejects a stray connection from an older session */
   uint32_t port;    /* data port, for diagnostics */
-  uint32_t pad;
+  uint32_t slots;   /* payload slots per handle: the slab layout depends on it */
 };
 
 /* Control hello/reply: fixed size, little endian on both hosts. */
@@ -189,7 +224,7 @@ struct CtlReply {
   uint32_t buckets[QES_MAX_BUCKETS];
   uint32_t ports[QES_MAX_BUCKETS];
   uint32_t requested[QES_MAX_BUCKETS];
-  uint32_t reserved;
+  uint32_t slots; /* payload slots per handle (protocol v3) */
   char build[QES_BUILD_LEN];
   char placement_sha[QES_BUILD_LEN];
   char message[QES_MSG_LEN];
@@ -330,17 +365,24 @@ __global__ void publish_kernel(uint64_t* seq) {
   asm volatile("st.release.sys.u64 [%0], %1;" :: "l"(seq), "l"(v) : "memory");
 }
 
-/* Spin until resp_seq >= req_seq. Traps after WAIT_TIMEOUT_NS instead of hanging. */
-__global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq) {
+/* Spin until resp_seq >= req_seq. A dead transport must never trap the GPU: `__trap()` raised a
+ * sticky `unspecified launch failure` that killed the whole client process for one lost handle.
+ * After WAIT_TIMEOUT_NS the kernel raises the slot's fail word (bytes 8..11 of the freq line, which
+ * nothing else uses) and returns; the proxy sees that word, marks the handle dead and prints why,
+ * and the next issue/collect on it raises in Python. */
+__global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, uint32_t* fail) {
   uint64_t want = *req_seq;
   uint64_t t0, now;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
   while (true) {
     uint64_t got;
     asm volatile("ld.acquire.sys.u64 %0, [%1];" : "=l"(got) : "l"(resp_seq) : "memory");
-    if (got >= want) break;
+    if (got >= want) return;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-    if (now - t0 > WAIT_TIMEOUT_NS) __trap();
+    if (now - t0 > WAIT_TIMEOUT_NS) {
+      asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(fail), "r"(1u) : "memory");
+      return;
+    }
   }
 }
 
@@ -355,7 +397,8 @@ struct qes_handle {
   ibv_mr* mr = nullptr;
   ibv_port_attr port_attr{};
   uint8_t* slab = nullptr; /* pinned, mapped host */
-  size_t slab_bytes = 0, stride = 0, req_len = 0, resp_len = 0;
+  int slots = 1;           /* payload slots in this slab (in-flight requests per handle) */
+  size_t slab_bytes = 0, stride = 0, req_len = 0, resp_len = 0, resp_off = 0;
   size_t ids_off = 0, w_off = 0;
   uint64_t remote_base = 0;
   uint32_t remote_rkey = 0;
@@ -366,7 +409,13 @@ struct qes_handle {
   std::atomic<bool> dead{false};
   std::atomic<uint64_t> calls{0};
   std::thread proxy;
-  uint64_t handled[QES_NL] = {}; /* proxy-owned: last seq answered per layer */
+  uint64_t handled[QES_MAX_SLOTS] = {}; /* proxy-owned: last seq forwarded/answered per slot */
+  /* Client side: requests in flight, oldest first. One layer may have several (a prefill chunk
+   * split into micro-batches), so collect() pairs with the oldest request of that layer. */
+  struct Pending {
+    int layer = -1, slot = -1;
+  } pending[QES_MAX_SLOTS];
+  int n_pending = 0, next_slot = 0;
   qes_server_fn server_fn = nullptr; /* optional compute hook (server role) */
   void* server_ctx = nullptr;
   struct qes_client_session* owner = nullptr; /* client handles are unlinked on destroy */
@@ -382,6 +431,7 @@ void nego_from_reply(const CtlReply& r, qes_nego* out) {
   memset(out, 0, sizeof(*out));
   out->status = r.status;
   out->version = (int)r.version;
+  out->slots = (int)r.slots;
   out->layers = (int)r.layers;
   out->n_buckets = (int)r.n_buckets;
   out->n_requested = (int)r.n_requested;
@@ -428,14 +478,24 @@ struct qes_client_session {
 
 namespace {
 
-size_t off_req(const qes_handle* h, int L) { return (size_t)L * h->stride; }
-size_t off_resp(const qes_handle* h, int L) { return off_req(h, L) + align_up(h->req_len, LINE); }
-size_t off_freq(const qes_handle* h, int L) { return off_resp(h, L) + align_up(h->resp_len, LINE); }
-size_t off_fresp(const qes_handle* h, int L) { return off_freq(h, L) + LINE; }
+size_t off_slot(const qes_handle* h, int i) { return (size_t)i * h->stride; }
+size_t off_freq(const qes_handle* h, int i) { return off_slot(h, i); }
+size_t off_fresp(const qes_handle* h, int i) { return off_slot(h, i) + LINE; }
+size_t off_hdr(const qes_handle* h, int i) { return off_slot(h, i) + 2 * LINE; }
+size_t off_req(const qes_handle* h, int i) { return off_slot(h, i) + 3 * LINE; }
+size_t off_resp(const qes_handle* h, int i) { return off_slot(h, i) + h->resp_off; }
 
 uint64_t load_acq(const uint8_t* base, size_t off) {
   return __atomic_load_n((const uint64_t*)(base + off), __ATOMIC_ACQUIRE);
 }
+
+uint32_t load_acq32(const uint8_t* base, size_t off) {
+  return __atomic_load_n((const uint32_t*)(base + off), __ATOMIC_ACQUIRE);
+}
+
+/* Bytes 8..11 of a slot's freq line: raised by wait_kernel when a response never came. Offset 0
+ * holds the request seq and the rest of the 64 B line is unused, so no slot geometry changes. */
+size_t off_fail(const qes_handle* h, int i) { return off_freq(h, i) + 8; }
 
 /* Polls completions. A QP error marks the handle dead and stops its proxy instead of aborting:
  * the owning session then tears down and the server keeps serving. */
@@ -445,8 +505,13 @@ bool drain_cq(qes_handle* h) {
   while ((n = ibv_poll_cq(h->cq, 16, wc)) > 0) {
     for (int i = 0; i < n; i++)
       if (wc[i].status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "qes: wc error %s opcode=%d port=%d rows=%d\n",
-                ibv_wc_status_str(wc[i].status), (int)wc[i].opcode, h->tcp_port, h->rows);
+        fprintf(stderr,
+                "qes: wc error %s opcode=%d port=%d rows=%d vend_err=0x%x wr_id=0x%llx "
+                "off=%zu kind=%s\n",
+                ibv_wc_status_str(wc[i].status), (int)wc[i].opcode, h->tcp_port, h->rows,
+                wc[i].vendor_err, (unsigned long long)wc[i].wr_id,
+                (size_t)(wc[i].wr_id & ~TRACE_FLAG),
+                (wc[i].wr_id & TRACE_FLAG) ? "flag" : "payload");
         fflush(stderr);
         h->dead.store(true);
         h->running.store(false);
@@ -472,8 +537,15 @@ bool post_payload(qes_handle* h, size_t off, uint32_t len) {
   wr.sg_list = &sge;
   wr.num_sge = 1;
   wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.wr_id = (uint64_t)off;
   wr.wr.rdma.remote_addr = h->remote_base + off;
   wr.wr.rdma.rkey = h->remote_rkey;
+  if (qes_trace())
+    fprintf(stderr,
+            "SEAM_TRACE_PUT role=%s port=%d rows=%u off=%zu len=%u remote=0x%016llx "
+            "rkey=0x%08x slab=%zu\n",
+            role_name(h->role), h->tcp_port, h->rows, off, len,
+            (unsigned long long)(h->remote_base + off), h->remote_rkey, h->slab_bytes);
   ibv_send_wr* bad = nullptr;
   if (ibv_post_send(h->qp, &wr, &bad)) {
     set_err("ibv_post_send payload failed (port=%d rows=%d)", h->tcp_port, h->rows);
@@ -491,9 +563,16 @@ bool post_flag(qes_handle* h, size_t remote_off, uint64_t seq) {
   wr.sg_list = &sge;
   wr.num_sge = 1;
   wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.wr_id = (uint64_t)remote_off | TRACE_FLAG;
   wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
   wr.wr.rdma.remote_addr = h->remote_base + remote_off;
   wr.wr.rdma.rkey = h->remote_rkey;
+  if (qes_trace())
+    fprintf(stderr,
+            "SEAM_TRACE_FLAG role=%s port=%d rows=%u off=%zu seq=%llu remote=0x%016llx "
+            "rkey=0x%08x slab=%zu\n",
+            role_name(h->role), h->tcp_port, h->rows, remote_off, (unsigned long long)seq,
+            (unsigned long long)(h->remote_base + remote_off), h->remote_rkey, h->slab_bytes);
   ibv_send_wr* bad = nullptr;
   if (ibv_post_send(h->qp, &wr, &bad)) {
     set_err("ibv_post_send flag failed (port=%d rows=%d)", h->tcp_port, h->rows);
@@ -502,10 +581,10 @@ bool post_flag(qes_handle* h, size_t remote_off, uint64_t seq) {
   return true;
 }
 
-void server_compute(qes_handle* h, int L) {
+void server_compute(qes_handle* h, int slot, int L) {
   const float add = (float)(L + 1);
-  const uint16_t* x = (const uint16_t*)(h->slab + off_req(h, L));
-  float* out = (float*)(h->slab + off_resp(h, L));
+  const uint16_t* x = (const uint16_t*)(h->slab + off_req(h, slot));
+  float* out = (float*)(h->slab + off_resp(h, slot));
   const int n = h->rows * QES_HIDDEN;
   for (int i = 0; i < n; i++) {
     uint32_t bits = (uint32_t)x[i] << 16;
@@ -515,41 +594,78 @@ void server_compute(qes_handle* h, int L) {
   }
 }
 
-/* Client proxy: forwards every new request seq on any layer. */
+/* Client proxy: forwards every new request seq in any slot. The slot's header (layer, rows) is
+ * part of the payload, so the proxy posts the header and the payload in one WRITE. */
+/* A response that never came leaves the GPU waiter with no escape hatch, so wait_kernel raises the
+ * slot's fail word instead of trapping. Pick it up here, print it once, and take the handle down
+ * the same way a CQ error does: the session fails with a Python exception, not a sticky CUDA error. */
 void client_proxy(qes_handle* h) {
   while (h->running.load(std::memory_order_relaxed)) {
     if (!drain_cq(h)) break;
-    for (int L = 0; L < QES_NL; L++) {
-      uint64_t r = load_acq(h->slab, off_freq(h, L));
-      if (r > h->handled[L]) {
-        if (!post_payload(h, off_req(h, L), (uint32_t)h->req_len)) return;
-        if (!post_flag(h, off_freq(h, L), r)) return;
-        h->handled[L] = r;
+    for (int i = 0; i < h->slots; i++) {
+      if (load_acq32(h->slab, off_fail(h, i))) {
+        fprintf(stderr,
+                "qes: no response for layer slot %d on rows=%u port=%d within %llu s "
+                "(seq=%llu answered=%llu): the seam transport is dead\n",
+                i, h->rows, h->tcp_port, (unsigned long long)(WAIT_TIMEOUT_NS / 1000000000ull),
+                (unsigned long long)load_acq(h->slab, off_freq(h, i)),
+                (unsigned long long)h->handled[i]);
+        fflush(stderr);
+        h->dead.store(true);
+        h->running.store(false);
+        return;
+      }
+    }
+    for (int i = 0; i < h->slots; i++) {
+      uint64_t r = load_acq(h->slab, off_freq(h, i));
+      if (r > h->handled[i]) {
+        if (!post_payload(h, off_hdr(h, i), (uint32_t)(LINE + h->req_len))) return;
+        if (!post_flag(h, off_freq(h, i), r)) return;
+        h->handled[i] = r;
         h->calls.fetch_add(1, std::memory_order_relaxed);
       }
     }
   }
 }
 
-/* Server proxy: computes and returns every new request seq on any layer. */
+/* Server proxy: computes and returns every new request seq in any slot. The layer comes from the
+ * request header the client sent, so this loop is the same for every layer and several slots may
+ * be computed/returned before the first response lands (the client keeps them in flight). */
 void server_proxy(qes_handle* h) {
   while (h->running.load(std::memory_order_relaxed)) {
     if (!drain_cq(h)) break;
-    for (int L = 0; L < QES_NL; L++) {
-      uint64_t r = load_acq(h->slab, off_freq(h, L));
-      if (r > h->handled[L]) {
-        if (h->server_fn) {
-          h->server_fn(h->server_ctx, L, h->rows, h->slab + off_req(h, L),
-                       (const int32_t*)(h->slab + off_req(h, L) + h->ids_off),
-                       h->slab + off_req(h, L) + h->w_off, (float*)(h->slab + off_resp(h, L)));
-        } else {
-          server_compute(h, L);
-        }
-        if (!post_payload(h, off_resp(h, L), (uint32_t)h->resp_len)) return;
-        if (!post_flag(h, off_fresp(h, L), r)) return;
-        h->handled[L] = r;
-        h->calls.fetch_add(1, std::memory_order_relaxed);
+    for (int i = 0; i < h->slots; i++) {
+      uint64_t r = load_acq(h->slab, off_freq(h, i));
+      if (r <= h->handled[i]) continue;
+      const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, i));
+      if (hdr->magic != SLOT_MAGIC || hdr->rows != (uint32_t)h->rows ||
+          hdr->layer >= (uint32_t)QES_NL) {
+        fprintf(stderr,
+                "qes: bad request header slot=%d magic=0x%08x layer=%u rows=%u want_rows=%d\n", i,
+                hdr->magic, hdr->layer, hdr->rows, h->rows);
+        fflush(stderr);
+        h->dead.store(true);
+        h->running.store(false);
+        return;
       }
+      const int L = (int)hdr->layer;
+      const uint8_t* req = h->slab + off_req(h, i);
+      if (h->server_fn) {
+        h->server_fn(h->server_ctx, L, h->rows, req, (const int32_t*)(req + h->ids_off),
+                     req + h->w_off, (float*)(h->slab + off_resp(h, i)));
+      } else {
+        server_compute(h, i, L);
+      }
+      if (qes_trace())
+        fprintf(stderr,
+                "SEAM_TRACE_CMP role=srv port=%d rows=%u layer=%d slot=%d seq=%llu off_req=%zu "
+                "off_resp=%zu req_len=%zu resp_len=%zu slab=%zu\n",
+                h->tcp_port, h->rows, L, i, (unsigned long long)r, off_req(h, i), off_resp(h, i),
+                h->req_len, h->resp_len, h->slab_bytes);
+      if (!post_payload(h, off_resp(h, i), (uint32_t)h->resp_len)) return;
+      if (!post_flag(h, off_fresp(h, i), r)) return;
+      h->handled[i] = r;
+      h->calls.fetch_add(1, std::memory_order_relaxed);
     }
   }
 }
@@ -568,6 +684,7 @@ Hello make_hello(qes_handle* h, uint32_t session, uint32_t psn) {
   mine.rkey = h->mr->rkey;
   mine.layers = QES_NL;
   mine.rows = (uint32_t)h->rows;
+  mine.slots = (uint32_t)h->slots;
   mine.magic = DATA_MAGIC;
   mine.session = session;
   mine.port = (uint32_t)h->tcp_port;
@@ -607,6 +724,33 @@ bool qp_create(qes_handle* h, const char** why) {
   }
   return true;
 }
+/* A state transition that fails is the one place the seam can lose a handle while both peers still
+ * think the session is healthy, and the errno plus the state the hardware reports afterwards is all
+ * the evidence there is: a responder QP that takes an incoming request while it is still in INIT or
+ * RTR is moved to ERROR, so its own RTS transition then fails with EINVAL while the requester gets
+ * "remote invalid request" on its first write. Print both instead of a bare reason string. */
+void qp_fail(qes_handle* h, const char* step, int err, const Hello& peer, const char** why) {
+  ibv_qp_attr a{};
+  ibv_qp_init_attr i{};
+  const char* state = "unknown";
+  if (!ibv_query_qp(h->qp, &a, IBV_QP_STATE, &i)) {
+    switch (a.qp_state) {
+      case IBV_QPS_RESET: state = "reset"; break;
+      case IBV_QPS_INIT: state = "init"; break;
+      case IBV_QPS_RTR: state = "rtr"; break;
+      case IBV_QPS_RTS: state = "rts"; break;
+      case IBV_QPS_SQD: state = "sqd"; break;
+      case IBV_QPS_SQE: state = "sqe"; break;
+      case IBV_QPS_ERR: state = "error"; break;
+      default: break;
+    }
+  }
+  *why = step;
+  fprintf(stderr,
+          "qes: %s failed errno=%d (%s) state=%s qpn=%u peer_qpn=%u port=%d rows=%u slots=%d\n",
+          step, err, strerror(err), state, h->qp->qp_num, peer.qpn, h->tcp_port, h->rows,
+          h->slots);
+}
 
 /* RTR+RTS towards the peer's QP. */
 bool qp_connect(qes_handle* h, const Hello& peer, uint32_t my_psn, const char** why) {
@@ -627,7 +771,7 @@ bool qp_connect(qes_handle* h, const Hello& peer, uint32_t my_psn, const char** 
   r.ah_attr.grh.hop_limit = 1;
   if (ibv_modify_qp(h->qp, &r, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                                     IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
-    *why = "qp rtr";
+    qp_fail(h, "qp rtr", errno, peer, why);
     return false;
   }
   ibv_qp_attr s{};
@@ -639,7 +783,7 @@ bool qp_connect(qes_handle* h, const Hello& peer, uint32_t my_psn, const char** 
   s.max_rd_atomic = 4;
   if (ibv_modify_qp(h->qp, &s, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                                     IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC)) {
-    *why = "qp rts";
+    qp_fail(h, "qp rts", errno, peer, why);
     return false;
   }
   h->remote_base = peer.base;
@@ -648,17 +792,18 @@ bool qp_connect(qes_handle* h, const Hello& peer, uint32_t my_psn, const char** 
 }
 
 /* Checks the peer's data hello. */
-bool check_hello(const Hello& peer, int rows, int port, uint32_t want_session, char* why,
+bool check_hello(const Hello& peer, int rows, int slots, int port, uint32_t want_session, char* why,
                  size_t why_len) {
   if (peer.magic != DATA_MAGIC) {
     snprintf(why, why_len, "bad data hello magic=0x%08x hello_bytes=%zu", peer.magic, sizeof(Hello));
     return false;
   }
-  if (peer.layers != QES_NL || peer.rows != (uint32_t)rows) {
+  if (peer.layers != QES_NL || peer.rows != (uint32_t)rows || peer.slots != (uint32_t)slots) {
     snprintf(why, why_len,
-             "peer layout mismatch port=%d peer_layers=%u peer_rows=%u local_layers=%d "
-             "local_rows=%u hello_bytes=%zu",
-             port, peer.layers, peer.rows, (int)QES_NL, (uint32_t)rows, sizeof(Hello));
+             "peer layout mismatch port=%d peer_layers=%u peer_rows=%u peer_slots=%u "
+             "local_layers=%d local_rows=%u local_slots=%d hello_bytes=%zu",
+             port, peer.layers, peer.rows, peer.slots, (int)QES_NL, (uint32_t)rows, slots,
+             sizeof(Hello));
     return false;
   }
   if (peer.port != (uint32_t)port) {
@@ -845,7 +990,13 @@ extern "C" qes_handle* qes_client_handle(qes_client_session* s, const char* dev_
     return nullptr;
   }
   const int port = s->nego.ports[idx];
-  const Geometry g = geometry(bucket);
+  const int slots = s->nego.slots;
+  if (slots < 1 || slots > QES_MAX_SLOTS) {
+    set_err("qes_client_handle: server advertises slots=%d, this build serves 1..%d", slots,
+            QES_MAX_SLOTS);
+    return nullptr;
+  }
+  const Geometry g = geometry(bucket, slots);
 
   qes_handle* h = new qes_handle();
   h->role = QES_ROLE_CLIENT;
@@ -854,10 +1005,12 @@ extern "C" qes_handle* qes_client_handle(qes_client_session* s, const char* dev_
   h->gid_idx = gid_idx;
   h->tcp_port = port;
   h->port_idx = 1;
+  h->slots = slots;
   h->req_len = g.req_len;
   h->ids_off = g.ids_off;
   h->w_off = g.w_off;
   h->resp_len = g.resp_len;
+  h->resp_off = g.resp_off;
   h->stride = g.stride;
   h->slab_bytes = g.slab_bytes;
 
@@ -938,7 +1091,7 @@ extern "C" qes_handle* qes_client_handle(qes_client_session* s, const char* dev_
     return nullptr;
   }
   char why2[256];
-  if (!check_hello(peer, bucket, port, s->session, why2, sizeof(why2))) {
+  if (!check_hello(peer, bucket, slots, port, s->session, why2, sizeof(why2))) {
     set_err("qes_client_handle: rejected by %s:%d: %s", s->host, port, why2);
     stop_handle(h);
     return nullptr;
@@ -948,6 +1101,19 @@ extern "C" qes_handle* qes_client_handle(qes_client_session* s, const char* dev_
     stop_handle(h);
     return nullptr;
   }
+  /* One line per handle: what this side believes the peer's registered slab is. Pair it with the
+   * server's SEAM_TRACE_EP line for the same port to catch a layout disagreement immediately. */
+  if (qes_trace())
+    fprintf(stderr,
+            "SEAM_TRACE_HANDLE role=cli port=%d rows=%u slots=%d stride=%zu slab=%zu "
+            "req=%zu resp=%zu remote_base=0x%016llx remote_rkey=0x%08x\n",
+            port, bucket, slots, h->stride, h->slab_bytes, h->req_len, h->resp_len,
+            (unsigned long long)h->remote_base, h->remote_rkey);
+  /* The peer's hello may only be answered once this side is in RTS: the server sends its hello from
+   * RTR+RTS (see session_handle_up), so "hello received" means "peer QP is ready for our writes". */
+  if (qes_trace())
+    fprintf(stderr, "SEAM_TRACE_RTS role=cli port=%d rows=%u qpn=%u\n", port, bucket,
+            h->qp->qp_num);
   h->running.store(true);
   h->proxy = std::thread(client_proxy, h);
   {
@@ -995,7 +1161,8 @@ struct BucketEp {
    * that bucket accepts it whenever it arrives. */
   int ls = -1;
   uint8_t* slab = nullptr;
-  size_t slab_bytes = 0, stride = 0, req_len = 0, resp_len = 0, ids_off = 0, w_off = 0;
+  size_t slab_bytes = 0, stride = 0, req_len = 0, resp_len = 0, resp_off = 0, ids_off = 0,
+         w_off = 0;
   ibv_mr* mr = nullptr;
 };
 
@@ -1010,6 +1177,7 @@ struct Pending {
 struct qes_server {
   char dev_name[64] = {};
   int gid_idx = 0, dev = 0, ctl_port = 0;
+  int slots = 1; /* payload slots per handle, advertised to every client */
   int n_buckets = 0;
   int buckets[QES_MAX_BUCKETS] = {};
   char build[QES_BUILD_LEN] = {};
@@ -1077,6 +1245,7 @@ void reply_init(CtlReply* r, const qes_server* s) {
   r->magic = CTL_REPLY_MAGIC;
   r->version = QES_PROTO_VERSION;
   r->layers = QES_NL;
+  r->slots = (uint32_t)s->slots;
   strncpy(r->build, s->build, QES_BUILD_LEN - 1);
   strncpy(r->placement_sha, s->placement_sha, QES_BUILD_LEN - 1);
 }
@@ -1104,6 +1273,7 @@ int intersect(const qes_server* s, const CtlHello& hello, CtlReply* r) {
   r->n_requested = std::min<uint32_t>(hello.n_buckets, QES_MAX_BUCKETS);
   for (uint32_t j = 0; j < r->n_requested; j++) r->requested[j] = hello.buckets[j];
   r->layers = QES_NL;
+  r->slots = (uint32_t)s->slots;
   return n;
 }
 
@@ -1130,10 +1300,12 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   h->pd = s->pd;
   h->port_attr = s->port_attr;
   h->slab = ep.slab;
+  h->slots = s->slots;
   h->slab_bytes = ep.slab_bytes;
   h->stride = ep.stride;
   h->req_len = ep.req_len;
   h->resp_len = ep.resp_len;
+  h->resp_off = ep.resp_off;
   h->ids_off = ep.ids_off;
   h->w_off = ep.w_off;
   h->mr = ep.mr;
@@ -1158,27 +1330,47 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   const uint32_t my_psn = (uint32_t)(lrand48() & 0xffffff);
   Hello mine = make_hello(h, ss->id, my_psn);
   Hello peer{};
+  /* Order matters here: read the client's hello, reach RTR+RTS, and only then answer with ours.
+   * The client posts its first payload write as soon as our hello arrives and its own RTR+RTS is
+   * done, so our QP must already be past INIT at that moment. A request that reaches a QP still in
+   * INIT is answered with an "invalid request" NAK and kills a handle that was never used - that was
+   * the decode-phase wc error, on exactly one freshly connected bucket per arm. Answering after
+   * RTR+RTS makes the ordering explicit instead of a race: responder ready -> hello -> requester
+   * ready -> first write. */
   bool ok = xfer(fd, &peer, sizeof(peer), false, &why);
-  if (ok) ok = xfer(fd, &mine, sizeof(mine), true, &why);
-  close(fd);
   if (!ok) {
-    set_err_quiet("seam session %u: data handshake on port %d (rows=%d) failed: %s", ss->id,
-                  port, ep.rows, why);
+    set_err_quiet("seam session %u: data handshake on port %d (rows=%d) failed: %s", ss->id, port,
+                  ep.rows, why);
+    close(fd);
     stop_handle(h);
     if (stale) *stale = true;
     return nullptr;
   }
   char why2[256];
-  if (!check_hello(peer, ep.rows, port, ss->id, why2, sizeof(why2))) {
+  if (!check_hello(peer, ep.rows, s->slots, port, ss->id, why2, sizeof(why2))) {
     set_err_quiet("seam session %u from %s: rejected data connection on port %d: %s", ss->id,
                   ss->ip, port, why2);
+    close(fd);
     stop_handle(h);
     if (stale) *stale = true;
     return nullptr;
   }
   if (!qp_connect(h, peer, my_psn, &why)) {
     set_err("seam session %u: %s (port=%d rows=%d)", ss->id, why, port, ep.rows);
+    close(fd);
     stop_handle(h);
+    return nullptr;
+  }
+  if (qes_trace())
+    fprintf(stderr, "SEAM_TRACE_RTS role=srv port=%d rows=%u qpn=%u\n", port, ep.rows,
+            h->qp->qp_num);
+  ok = xfer(fd, &mine, sizeof(mine), true, &why);
+  close(fd);
+  if (!ok) {
+    set_err_quiet("seam session %u: data handshake on port %d (rows=%d) failed: %s", ss->id, port,
+                  ep.rows, why);
+    stop_handle(h);
+    if (stale) *stale = true;
     return nullptr;
   }
   h->running.store(true);
@@ -1524,7 +1716,7 @@ void handle_ctl_conn(qes_server* s, int fd, const char* ip) {
 extern "C" qes_server* qes_server_open(const char* dev_name, int gid_idx, int ctl_port,
                                        int device_ordinal, const int* buckets, int n_buckets,
                                        const char* build_id, const char* placement_sha,
-                                       int allow_wait, qes_nego* err) {
+                                       int allow_wait, int slots, qes_nego* err) {
   if (err) memset(err, 0, sizeof(*err));
   if (!dev_name || ctl_port <= 0 || !buckets || n_buckets < 1 || n_buckets > QES_MAX_BUCKETS) {
     set_err("qes_server_open: bad arguments");
@@ -1540,6 +1732,10 @@ extern "C" qes_server* qes_server_open(const char* dev_name, int gid_idx, int ct
       set_err("qes_server_open: buckets must be ascending and unique");
       return nullptr;
     }
+  if (slots < 1 || slots > QES_MAX_SLOTS) {
+    set_err("qes_server_open: slots must be 1..%d (got %d)", QES_MAX_SLOTS, slots);
+    return nullptr;
+  }
 
   qes_server* s = new qes_server();
   strncpy(s->dev_name, dev_name, sizeof(s->dev_name) - 1);
@@ -1551,6 +1747,7 @@ extern "C" qes_server* qes_server_open(const char* dev_name, int gid_idx, int ct
   if (build_id) strncpy(s->build, build_id, QES_BUILD_LEN - 1);
   if (placement_sha) strncpy(s->placement_sha, placement_sha, QES_BUILD_LEN - 1);
   s->allow_wait = allow_wait != 0;
+  s->slots = slots;
 
   const char* why = "";
   if (cudaSetDevice(s->dev) != cudaSuccess) {
@@ -1593,11 +1790,12 @@ extern "C" qes_server* qes_server_open(const char* dev_name, int gid_idx, int ct
     BucketEp& ep = s->eps[i];
     ep.rows = buckets[i];
     ep.port = ctl_port + 1 + i;
-    const Geometry g = geometry(ep.rows);
+    const Geometry g = geometry(ep.rows, slots);
     ep.req_len = g.req_len;
     ep.ids_off = g.ids_off;
     ep.w_off = g.w_off;
     ep.resp_len = g.resp_len;
+    ep.resp_off = g.resp_off;
     ep.stride = g.stride;
     ep.slab_bytes = g.slab_bytes;
     if (cudaHostAlloc(&ep.slab, ep.slab_bytes, cudaHostAllocMapped | cudaHostAllocPortable) !=
@@ -1613,6 +1811,13 @@ extern "C" qes_server* qes_server_open(const char* dev_name, int gid_idx, int ct
       qes_server_free(s);
       return nullptr;
     }
+    /* Same geometry, server side: port, stride, registered length, base, rkey. */
+    if (qes_trace())
+      fprintf(stderr,
+              "SEAM_TRACE_EP role=srv port=%d rows=%u slots=%d stride=%zu slab=%zu req=%zu "
+              "resp=%zu base=0x%016llx rkey=0x%08x\n",
+              ep.port, ep.rows, slots, ep.stride, ep.slab_bytes, ep.req_len, ep.resp_len,
+              (unsigned long long)(uintptr_t)ep.slab, ep.mr->rkey);
   }
 
   s->listen_fd = tcp_listen(s->ctl_port, &why);
@@ -1635,9 +1840,9 @@ extern "C" qes_server* qes_server_open(const char* dev_name, int gid_idx, int ct
     }
   }
 
-  say("SEAM_LISTEN ctl=%d buckets=%s ports=%d..%d build=%s placement_sha=%s", s->ctl_port,
-      csv(s->buckets, s->n_buckets).c_str(), s->ctl_port + 1, s->ctl_port + s->n_buckets, s->build,
-      s->placement_sha);
+  say("SEAM_LISTEN ctl=%d buckets=%s ports=%d..%d slots=%d build=%s placement_sha=%s",
+      s->ctl_port, csv(s->buckets, s->n_buckets).c_str(), s->ctl_port + 1,
+      s->ctl_port + s->n_buckets, s->slots, s->build, s->placement_sha);
   return s;
 }
 
@@ -1650,8 +1855,8 @@ extern "C" void qes_server_set_fn(qes_server* s, qes_server_fn fn, void* ctx) {
 extern "C" int qes_server_run(qes_server* s) {
   if (!s) return -1;
   s->stopping.store(false);
-  say("SEAM_SERVER_READY proto=%d ctl=%d buckets=%s", QES_PROTO_VERSION, s->ctl_port,
-      csv(s->buckets, s->n_buckets).c_str());
+  say("SEAM_SERVER_READY proto=%d ctl=%d buckets=%s slots=%d", QES_PROTO_VERSION, s->ctl_port,
+      csv(s->buckets, s->n_buckets).c_str(), s->slots);
   while (!s->stopping.load()) {
     pollfd fds[2];
     fds[0] = {s->listen_fd, POLLIN, 0};
@@ -1765,29 +1970,91 @@ extern "C" int qes_status(const char* host, int ctl_port, qes_nego* out) {
  * Data path (per-call protocol unchanged)
  * ========================================================================================= */
 
+/* A handle whose QP raised an error (or whose response never came) can never recover: say so in a
+ * form the Python wrapper can raise, instead of letting the caller wait out a timeout or consume a
+ * stale response and turn one dead bucket into a sticky CUDA error for the whole process. */
+int seam_dead_check(qes_handle* h, const char* what) {
+  if (!h->dead.load(std::memory_order_relaxed)) return 0;
+  set_err("qes_%s: the seam handle rows=%d port=%d is dead (the transport failed, see the "
+          "\"qes:\" line above this one)",
+          what, h->rows, h->tcp_port);
+  return -5;
+}
+
 extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int32_t* ids,
                          const void* w_bf16, cudaStream_t stream) {
   if (!h || h->role != QES_ROLE_CLIENT || layer < 0 || layer >= QES_NL) return -1;
-  uint8_t* req = h->slab + off_req(h, layer);
+  if (int rc = seam_dead_check(h, "issue")) return rc;
+  if (h->n_pending >= h->slots) {
+    set_err("qes_issue: %d request(s) already in flight on rows=%d (slots=%d): collect one first",
+            h->n_pending, h->rows, h->slots);
+    return -4;
+  }
+  int slot = -1;
+  for (int k = 0; k < h->slots && slot < 0; k++) {
+    const int cand = (h->next_slot + k) % h->slots;
+    bool used = false;
+    for (int p = 0; p < h->n_pending; p++)
+      if (h->pending[p].slot == cand) used = true;
+    if (!used) slot = cand;
+  }
+  if (slot < 0) {
+    set_err("qes_issue: no free slot on rows=%d (slots=%d, in_flight=%d)", h->rows, h->slots,
+            h->n_pending);
+    return -4;
+  }
+  SlotHdr hdr{};
+  hdr.magic = SLOT_MAGIC;
+  hdr.layer = (uint32_t)layer;
+  hdr.rows = (uint32_t)h->rows;
+  memcpy(h->slab + off_hdr(h, slot), &hdr, sizeof(hdr));
+  /* The header is a CPU write; order it before the GPU-side publish that lets the proxy forward
+   * the payload (the NIC only sends it once the whole payload, header included, is visible). */
+  std::atomic_thread_fence(std::memory_order_release);
+  uint8_t* req = h->slab + off_req(h, slot);
   if (cudaMemcpyAsync(req, x_bf16, (size_t)h->rows * QES_HIDDEN * 2, cudaMemcpyDeviceToHost, stream))
     return -2;
-  if (cudaMemcpyAsync(req + h->ids_off, ids, (size_t)h->rows * QES_TOPK * 4, cudaMemcpyDeviceToHost,
-                      stream))
+  if (cudaMemcpyAsync(req + h->ids_off, ids, (size_t)h->rows * QES_TOPK * 4,
+                      cudaMemcpyDeviceToHost, stream))
     return -2;
   if (cudaMemcpyAsync(req + h->w_off, w_bf16, (size_t)h->rows * QES_TOPK * 2,
                       cudaMemcpyDeviceToHost, stream))
     return -2;
-  publish_kernel<<<1, 1, 0, stream>>>((uint64_t*)(h->slab + off_freq(h, layer)));
-  return cudaGetLastError() == cudaSuccess ? 0 : -3;
+  if (qes_trace())
+    fprintf(stderr,
+            "SEAM_TRACE_REQ role=cli port=%d rows=%u layer=%d slot=%d off_hdr=%zu off_req=%zu "
+            "req_len=%zu slab=%zu\n",
+            h->tcp_port, h->rows, layer, slot, off_hdr(h, slot), off_req(h, slot), h->req_len,
+            h->slab_bytes);
+  publish_kernel<<<1, 1, 0, stream>>>((uint64_t*)(h->slab + off_freq(h, slot)));
+  if (cudaGetLastError() != cudaSuccess) return -3;
+  h->pending[h->n_pending].layer = layer;
+  h->pending[h->n_pending].slot = slot;
+  h->n_pending++;
+  h->next_slot = (slot + 1) % h->slots;
+  return 0;
 }
 
 extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream) {
   if (!h || h->role != QES_ROLE_CLIENT || layer < 0 || layer >= QES_NL) return -1;
-  wait_kernel<<<1, 1, 0, stream>>>((const uint64_t*)(h->slab + off_freq(h, layer)),
-                                   (const uint64_t*)(h->slab + off_fresp(h, layer)));
-  if (cudaMemcpyAsync(out_f32, h->slab + off_resp(h, layer), h->resp_len, cudaMemcpyHostToDevice,
+  if (int rc = seam_dead_check(h, "collect")) return rc;
+  int idx = -1;
+  for (int p = 0; p < h->n_pending && idx < 0; p++)
+    if (h->pending[p].layer == layer) idx = p;
+  if (idx < 0) {
+    set_err("qes_collect: no request in flight for layer %d on rows=%d (in_flight=%d)", layer,
+            h->rows, h->n_pending);
+    return -1;
+  }
+  const int slot = h->pending[idx].slot;
+  wait_kernel<<<1, 1, 0, stream>>>((const uint64_t*)(h->slab + off_freq(h, slot)),
+                                   (const uint64_t*)(h->slab + off_fresp(h, slot)),
+                                   (uint32_t*)(h->slab + off_fail(h, slot)));
+  if (cudaMemcpyAsync(out_f32, h->slab + off_resp(h, slot), h->resp_len, cudaMemcpyHostToDevice,
                       stream))
     return -2;
+  for (int p = idx; p + 1 < h->n_pending; p++) h->pending[p] = h->pending[p + 1];
+  h->n_pending--;
   return cudaGetLastError() == cudaSuccess ? 0 : -3;
 }
 

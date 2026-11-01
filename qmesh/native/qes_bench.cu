@@ -83,9 +83,11 @@ int main(int argc, char** argv) {
       if (v > 0) buckets[n++] = (int)v;
       p = *end == ',' ? end + 1 : end;
     }
+    const char* sl = getenv("QES_SLOTS");
+    const int slots = sl ? atoi(sl) : 1;
     qes_nego rep;
     qes_server* s = qes_server_open(argv[2], atoi(argv[3]), atoi(argv[4]), 0, buckets, n,
-                                    "bench", "", 0, &rep);
+                                    "bench", "", 0, slots, &rep);
     if (!s) { fprintf(stderr, "server open failed: %s\n", qes_last_error()); return 1; }
     printf("server up: %s\n", rep.message); fflush(stdout);
     int rc = qes_server_run(s);

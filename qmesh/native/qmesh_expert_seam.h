@@ -1,6 +1,6 @@
 /* qmesh_expert_seam: P7 <-> GX1 expert-offload seam over host-staged RC RDMA.
  *
- * Session model (protocol v2)
+ * Session model (protocol v3)
  * --------------------------
  * The GX server loads the cold experts once and then serves client sessions forever. One TCP
  * control port (default 47311) carries the versioned hello/negotiation; the per-bucket data
@@ -18,19 +18,24 @@
  *
  * Server (GX1):
  *   qes_server* s = qes_server_open(dev, gid, 47311, 0, buckets, n, build, placement_sha,
- *                                   allow_wait, &err);
+ *                                   allow_wait, slots, &err);
  *   qes_server_set_fn(s, fn, ctx);          // optional compute hook, called from proxy threads
  *   qes_server_run(s);                      // serves sessions until qes_server_shutdown(s)
  *
- * Per-call wire (unchanged): per layer and direction an RC RDMA WRITE of the payload followed by
- * an 8-byte RDMA WRITE of the sequence flag on the same QP. RC delivers in order, so a flag
- * observed by the peer implies its payload is visible.
+ * Per-call wire: for each request an RC RDMA WRITE of [64 B header | x | ids | w] followed by an
+ * 8-byte RDMA WRITE of that slot's sequence flag on the same QP; the reply is an RDMA WRITE of
+ * out followed by the slot's reply flag. RC delivers in order, so a flag observed by the peer
+ * implies its payload is visible. The header carries the layer index and row count, so one
+ * payload slot serves any layer (protocol v3; before v3 a slot existed per layer, which cost 40x
+ * the staging memory and capped the usable row bucket).
  *
  * Client (P7) role 0 issues per-layer requests from CUDA streams/graphs:
  *   x:   bf16 [rows,5120] device ptr, ids: int32 [rows,6] device ptr (cold-local ids, -1 = hot),
  *   w:   bf16 [rows,6] device ptr, out: fp32 [rows,5120] device ptr.
  * Both calls are kernel launches; sequence counters live in mapped host memory, so the calls are
- * capturable in CUDA graphs. Each layer L owns one slot.
+ * capturable in CUDA graphs. A handle owns `slots` payload slots (default 1) and issues into the
+ * next free one; with one slot issue/collect pairs strictly serialize, which is what the client
+ * policy does. A handle with more slots may have that many requests in flight.
  *
  * Memory: pinned host memory (cudaHostAllocMapped). No GPUDirect RDMA: it is blocked on both hosts
  * (nvidia-peermem absent on P7, ibv_reg_mr EFAULT on GX1).
@@ -47,8 +52,9 @@
 
 /* Control protocol version. Both sides must agree; a mismatch is reported on the client with
  * both versions and build ids as the message text. */
-#define QES_PROTO_VERSION 2
+#define QES_PROTO_VERSION 3
 #define QES_MAX_BUCKETS 12
+#define QES_MAX_SLOTS 8     /* payload slots per data handle (in-flight requests per bucket) */
 #define QES_BUILD_LEN 40
 #define QES_MSG_LEN 192
 
@@ -80,6 +86,7 @@ typedef struct qes_server qes_server;
 
 typedef struct {
   int32_t status;      /* QES_ST_* */
+  int32_t slots;       /* payload slots per data handle: the client sizes its slabs with this */
   int32_t version;     /* server protocol version */
   int32_t layers;      /* server QES_NL */
   int32_t n_buckets;   /* buckets the client may use in this session */
@@ -118,11 +125,14 @@ QES_API void qes_client_close(qes_client_session* s);
 
 /* Opens the RDMA device and the control listener, and pins one staging slab per bucket (the
  * slabs and their MRs are reused by every session). buckets must be ascending and unique.
+ * `slots` (1..QES_MAX_SLOTS) is the number of payload slots per handle: it is advertised to the
+ * client, which sizes its own slabs from it, so both sides must agree (a mismatch is rejected at
+ * the data handshake).
  * Returns NULL on a local failure (reason in qes_last_error(), details in `err`). */
 QES_API qes_server* qes_server_open(const char* dev_name, int gid_idx, int ctl_port,
                                     int device_ordinal, const int* buckets, int n_buckets,
                                     const char* build_id, const char* placement_sha, int allow_wait,
-                                    qes_nego* err);
+                                    int slots, qes_nego* err);
 
 /* Optional server-side compute hook, used by every session handle the server creates. Pointers
  * are into the pinned slab for layer L: x bf16 [rows,QES_HIDDEN], ids int32 [rows,QES_TOPK]

@@ -24,8 +24,9 @@ TOPK = 6
 NL = 40
 ROLE_CLIENT = 0
 ROLE_SERVER = 1
-PROTO_VERSION = 2
+PROTO_VERSION = 3
 MAX_BUCKETS = 12
+MAX_SLOTS = 8   # QES_MAX_SLOTS: payload slots in flight per handle
 BUILD_LEN = 40
 MSG_LEN = 192
 
@@ -44,6 +45,7 @@ _LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin",
 class Nego(ctypes.Structure):
     """Mirror of qes_nego."""
     _fields_ = [("status", ctypes.c_int32),
+                ("slots", ctypes.c_int32),
                 ("version", ctypes.c_int32),
                 ("layers", ctypes.c_int32),
                 ("n_buckets", ctypes.c_int32),
@@ -104,7 +106,8 @@ def _lib():
     lib.qes_server_open.restype = ctypes.c_void_p
     lib.qes_server_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                     ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_char_p,
-                                    ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(Nego)]
+                                    ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
+                                    ctypes.POINTER(Nego)]
     lib.qes_server_set_fn.restype = None
     lib.qes_server_set_fn.argtypes = [ctypes.c_void_p, _SERVER_FN, ctypes.c_void_p]
     lib.qes_server_run.restype = ctypes.c_int
@@ -214,6 +217,7 @@ class Control:
         self.build = self.nego.build_id
         self.placement_sha = self.nego.placement
         self.layers = int(self.nego.layers)
+        self.slots = int(self.nego.slots)
 
     def seam(self, dev_name: str, gid_idx: int, bucket: int, device_ordinal: int = 0) -> "Seam":
         """Data handle for a negotiated bucket (created on first use, one per bucket/device)."""
@@ -262,14 +266,14 @@ class Seam:
             raise RuntimeError("seam handle is closed")
         rc = lib().qes_issue(self._h, layer, x_ptr, ids_ptr, w_ptr, stream_ptr)
         if rc:
-            raise RuntimeError(f"qes_issue layer={layer} rc={rc}")
+            raise RuntimeError(f"qes_issue layer={layer} rc={rc}: {last_error()}")
 
     def collect(self, layer, out_ptr, stream_ptr):
         if not self._h:
             raise RuntimeError("seam handle is closed")
         rc = lib().qes_collect(self._h, layer, out_ptr, stream_ptr)
         if rc:
-            raise RuntimeError(f"qes_collect layer={layer} rc={rc}")
+            raise RuntimeError(f"qes_collect layer={layer} rc={rc}: {last_error()}")
 
     def close(self):
         if self._h:
@@ -286,8 +290,15 @@ class Server:
 
     def __init__(self, dev_name: str, gid_idx: int, port: int = 47311,
                  device_ordinal: int = 0, buckets = (1, 2, 3, 4, 5, 6, 64),
-                 build: str | None = None, placement_sha: str = "", wait: bool = False):
+                 build: str | None = None, placement_sha: str = "", wait: bool = False,
+                 slots: int = 1):
         self.port = int(port)
+        # Payload slots per handle: a client may have this many requests in flight, so a prefill
+        # chunk split into micro-batches keeps the wire and the GX compute overlapping instead of
+        # alternating. Costs slots * rows * 30.2 KiB of pinned memory per bucket on the GX.
+        self.slots = int(slots)
+        if self.slots < 1 or self.slots > MAX_SLOTS:
+            raise ValueError(f"slots must be 1..{MAX_SLOTS} (got {slots})")
         self.buckets = tuple(int(b) for b in buckets)
         self.nego = Nego()
         req = _int_array(self.buckets)
@@ -295,7 +306,7 @@ class Server:
                                         int(device_ordinal), req, len(req),
                                         (build or build_id()).encode(),
                                         str(placement_sha).encode(), 1 if wait else 0,
-                                        ctypes.byref(self.nego))
+                                        self.slots, ctypes.byref(self.nego))
         if not self._h:
             raise RuntimeError(f"seam server open on {dev_name} port {port} failed: "
                                f"{last_error()}")
