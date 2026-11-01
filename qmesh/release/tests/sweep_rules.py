@@ -198,7 +198,7 @@ check("the ids driver runs only as the main module",
       'if __name__ == "__main__":' in src("pair_arm_ids.py"), "")
 check("a path handed to the containers is translated to their mount",
       'echo "/pair/${p#"$PAIR_ROOT"/}"' in src("pair_lib.sh")
-      and 'echo "/artifacts/${p#"$PAIR_ART"/}"' in src("pair_lib.sh"), "")
+      and 'echo "/artifacts/${p#"$art"/}"' in src("pair_lib.sh"), "")
 check("the smoke reads the worker's own refusal, not the wrapper's rc",
       "*SEAM_NO_MEMORY*" in src("pair_smoke.sh")
       and 'fail "memory server_no_memory' in src("pair_smoke.sh"), "")

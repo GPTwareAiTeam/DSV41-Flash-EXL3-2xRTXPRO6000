@@ -65,10 +65,11 @@ pair_cuda_arch_for() {  # <sm_120|sm_121> -> torch arch list entry
 # tree at /artifacts (containers/*.json); a host path handed to `docker exec -e` must be
 # translated or the file a driver writes "does not exist" from inside.
 pair_ct_path() {  # <host path> -> path inside the pair containers
-  local p=$1
+  local p=$1 art=$PAIR_HOME/recipe-artifacts
   case "$p" in
     "$PAIR_ROOT"/*) echo "/pair/${p#"$PAIR_ROOT"/}" ;;
-    "$PAIR_ART"/*)  echo "/artifacts/${p#"$PAIR_ART"/}" ;;
+    # the mount is the whole artifacts tree, not the pair's subdirectory: /artifacts/gpu0-gx1/...
+    "$art"/*) echo "/artifacts/${p#"$art"/}" ;;
     *) echo "$p" ;;
   esac
 }
