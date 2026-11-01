@@ -114,7 +114,14 @@ check("promote passes the flag and nothing else does",
       'PAIR_PROMOTE=1 "${cmd[@]}"' in src("pair_promote.sh")
       and 'PAIR_PROMOTE=1' not in src("pair_update_run.sh"), "")
 check("promote requires per-sha dev evidence", "dev/evidence/$SHA.json" in src("pair_promote.sh"), "")
-check("promote wants decode ids, not just a row", "no_decode_ids" in src("pair_promote.sh"), "")
+check("promote wants decode ids, not just a row", "pair_canary_gate" in src("pair_promote.sh"), "")
+check("one definition of the canary gate",
+      sum(s.count("no_decode_ids") for s in (src("pair_lib.sh"), src("pair_update.sh"),
+                                            src("pair_promote.sh"), src("pair_update_run.sh"),
+                                            src("pair_smoke.sh"))) == 1, "")
+check("the script that flips checks the canary too",
+      "pair_canary_gate" in ur, "")
+check("update_run needs the sha for prod", '[ "$PAIR" = prod ]' in ur, "")
 check("smoke runs the arm with ids", "--ids" in sm, "")
 check("missing ids fail the smoke", "arm_no_ids" in sm, "")
 check("smoke totals the ids across arms", "SMOKE_ARM_IDS_TOTAL" in sm, "")

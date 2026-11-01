@@ -106,6 +106,38 @@ pair_seam_version() {  # <tree> -> PROTO_VERSION / QES_PROTO_VERSION when the tr
   [ -z "$v" ] && v=$(sed -n 's/^#define QES_PROTO_VERSION *\([0-9][0-9]*\).*/\1/p' "$tree/qmesh/native/qmesh_expert_seam.h" 2>/dev/null | head -1)
   echo "${v:--}"
 }
+# pair_canary_gate <sha> <evidence-file> -- prints "ok" when that sha passed its dev canary, else the
+# reasons it did not. ONE definition, because three places must agree on what "dev passed" means:
+# pair_update.sh (the fast refusal), pair_promote.sh (the only way in) and pair_update_run.sh (the
+# script that actually flips, so queueing it directly is not a way around the gate).
+pair_canary_gate() {
+  python3 - "${2:?evidence file}" "${1:?sha}" <<'PY'
+import json, sys
+path, sha = sys.argv[1:3]
+try:
+    d = json.load(open(path))
+except Exception as exc:                                                # noqa: BLE001
+    print(f"unreadable {exc}")
+    raise SystemExit(0)
+bad = []
+if d.get("release_sha") != sha:
+    bad.append(f"sha={str(d.get('release_sha'))[:12]}")
+if d.get("pair") != "dev":
+    bad.append(f"pair={d.get('pair')}")
+if not d.get("ok"):
+    bad.append(f"ok=false at {d.get('failed_at_phase') or '?'} ({d.get('why') or 'no reason'})")
+smoke = d.get("smoke") or {}
+if not smoke.get("row"):
+    bad.append("no_smoke_row")
+try:
+    n = int((smoke.get("ids") or {}).get("n") or 0)
+except (TypeError, ValueError):
+    n = 0
+if n <= 0:
+    bad.append("no_decode_ids")
+print(" ".join(bad) if bad else "ok")
+PY
+}
 
 # ---- manifests ----------------------------------------------------------------------------------
 pair_manifest_get() {  # <field.path...> -> value on stdout ("" when absent); reads $PAIR_MANIFEST

@@ -74,6 +74,20 @@ out=$(./pair_promote.sh "$SHA" --force 2>&1); rc=$?
 want "promote refuses a sha without dev evidence" "no dev canary evidence" "$out"
 [ "$rc" = 2 ] && echo "OK   promote evidence refusal exit=2" || { echo "FAIL promote evidence exit=$rc"; fails=$((fails + 1)); }
 
+# 8. The ticket's own script refuses prod without a canary, so queueing pair_update_run.sh by hand is
+#    not a way around the gate. Both cases refuse before any phase: no sha, and a sha dev never ran.
+out=$(PAIR_DRY=0 ./pair_update_run.sh prod 2>&1); rc=$?
+want "prod ticket without a sha refused" "prod needs an explicit sha" "$out"
+FAKE=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+out=$(PAIR_DRY=0 ./pair_update_run.sh prod "$FAKE" 2>&1); rc=$?
+want "prod ticket with an unproven sha refused" "dev canary for deadbeefdead does not qualify" "$out"
+[ "$rc" = 2 ] && echo "OK   prod ticket bypass exit=2" || { echo "FAIL prod ticket bypass exit=$rc"; fails=$((fails + 1)); }
+if [ -d "$WORK/state" ] && [ -s "$WORK/state/exec.log" ]; then
+  echo "FAIL the refused ticket ran a docker command"; fails=$((fails + 1))
+else
+  echo "OK   the refused ticket touched nothing"
+fi
+
 echo
 if [ "$fails" = 0 ]; then echo "RESULT PASS fails=0"; else echo "RESULT FAIL fails=$fails"; fi
 exit $((fails != 0))

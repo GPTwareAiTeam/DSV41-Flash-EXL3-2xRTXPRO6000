@@ -49,25 +49,7 @@ printf '%s\n' "$dev_check"
 # refusal names the missing piece instead of a gate deep inside the prod ticket.
 ev=$PAIR_STATE/dev/evidence/$SHA.json
 [ -f "$ev" ] || pair_die "no dev canary evidence for ${SHA:0:12}: $ev (dev must reach PAIR_UPDATED)"
-ev_gate=$(python3 - "$ev" "$SHA" <<'PY'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception as exc:                                                # noqa: BLE001
-    print(f"unreadable {exc}"); sys.exit(0)
-bad = []
-if d.get("release_sha") != sys.argv[2]:
-    bad.append(f"sha={str(d.get('release_sha'))[:12]}")
-if d.get("pair") != "dev":
-    bad.append(f"pair={d.get('pair')}")
-if not d.get("ok"):
-    bad.append(f"ok=false at {d.get('failed_at_phase') or '?'} ({d.get('why') or 'no reason'})")
-ids = ((d.get("smoke") or {}).get("ids") or {})
-if int(ids.get("n") or 0) <= 0:
-    bad.append("no_decode_ids")
-print(" ".join(bad) if bad else "ok")
-PY
-)
+ev_gate=$(pair_canary_gate "$SHA" "$ev")
 [ "$ev_gate" = ok ] || pair_die "dev evidence for ${SHA:0:12} does not qualify: $ev_gate ($ev)"
 pair_step "PROMOTE_EVIDENCE sha=${SHA:0:12} ids=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print((d.get("smoke") or {}).get("ids",{}).get("n",0))' "$ev") file=$ev"
 

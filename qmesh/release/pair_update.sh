@@ -52,30 +52,7 @@ if [ "$PAIR" = prod ]; then
   if [ ! -f "$ev" ]; then
     pair_die "no dev canary evidence for ${SHA:0:12}: $ev (dev must reach PAIR_UPDATED first)"
   fi
-  gate=$(python3 - "$ev" "$SHA" <<'PY'
-import json, sys
-path, sha = sys.argv[1:3]
-try:
-    d = json.load(open(path))
-except Exception as exc:                                                # noqa: BLE001
-    print(f"unreadable {exc}")
-    sys.exit(0)
-problems = []
-if d.get("release_sha") != sha:
-    problems.append(f"sha={str(d.get('release_sha'))[:12]}")
-if d.get("pair") != "dev":
-    problems.append(f"pair={d.get('pair')}")
-if not d.get("ok"):
-    problems.append(f"ok=false at {d.get('failed_at_phase') or '?'} ({d.get('why') or 'no reason'})")
-smoke = d.get("smoke") or {}
-if not smoke.get("row"):
-    problems.append("no_smoke_row")
-ids = smoke.get("ids") or {}
-if int(ids.get("n") or 0) <= 0:
-    problems.append("no_decode_ids")
-print(" ".join(problems) if problems else "ok")
-PY
-)
+  gate=$(pair_canary_gate "$SHA" "$ev")
   [ "$gate" = ok ] || pair_die "dev canary for ${SHA:0:12} does not qualify: $gate ($ev)"
   pair_step "UPDATE_CANARY pair=$PAIR sha=${SHA:0:12} dev_evidence=$ev ok"
 fi

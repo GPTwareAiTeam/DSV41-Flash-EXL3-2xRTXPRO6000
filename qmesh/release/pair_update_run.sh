@@ -29,6 +29,18 @@ PAIR_ARG=${1:?usage: pair_update_run.sh <pair> [sha]}
 SHA_ARG=${2:-}
 pair_load "$PAIR_ARG"
 
+# The script that actually flips checks the canary too, so queueing it directly is not a way around
+# pair_update.sh/pair_promote.sh. It needs the sha up front: dev evidence is recorded per sha, and a
+# prod flip of "whatever current happens to point at" is exactly the drift this exists to stop.
+if [ "$PAIR" = prod ] && [ "${PAIR_DRY:-0}" != 1 ]; then
+  [ -n "$SHA_ARG" ] || pair_die "prod needs an explicit sha: dev canary evidence is recorded per sha" \
+    "(use scripts/pair_promote.sh <sha>)"
+  canary=$(pair_canary_gate "$SHA_ARG" "$PAIR_STATE/dev/evidence/$SHA_ARG.json")
+  [ "$canary" = ok ] || pair_die "prod refused: dev canary for ${SHA_ARG:0:12} does not qualify: " \
+    "$canary (use scripts/pair_promote.sh <sha>)"
+  pair_step "UPDATE_CANARY pair=prod sha=${SHA_ARG:0:12} dev_evidence=$PAIR_STATE/dev/evidence/$SHA_ARG.json ok"
+fi
+
 mkdir -p "$PAIR_STATE_DIR/logs"
 PAIR_LOG=${PAIR_LOG:-$PAIR_STATE_DIR/logs/update-$PAIR-$(date -u +%Y%m%dT%H%M%SZ).log}
 export PAIR_LOG
