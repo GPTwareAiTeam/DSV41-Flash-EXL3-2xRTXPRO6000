@@ -35,6 +35,10 @@ SMOKE_ARM_TIMEOUT=${SMOKE_ARM_TIMEOUT:-300}
 SMOKE_NEW=${SMOKE_NEW:-8}
 SMOKE_CACHE_TOKENS=${SMOKE_CACHE_TOKENS:-4096}
 SMOKE_SLACK_GATE=${SMOKE_SLACK_GATE:-0}          # 1 = a thin slack refuses the release (see notes)
+# Payload slots per handle. Two is what the wide grant was measured with: the split prefill needs a
+# second slot to pipeline into, and seam_server_ensure.sh only passes --slab-slots to a release whose
+# worker knows the flag (proto 3). One slot still works on an old release, just without pipelining.
+SMOKE_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-2}
 ENSURE=${SEAM_ENSURE:-}
 if [ -z "$ENSURE" ]; then
   for c in "$PAIR_SCRIPTS/seam_server_ensure.sh" "$HERE/seam_server_ensure.sh"; do
@@ -62,7 +66,7 @@ echo "SMOKE_MEM_BEFORE $(gx_mem)"
 pair_step "SMOKE_SERVER_START pair=$PAIR ct=$GXCT build=$BUILD_ID buckets=$BUCKETS timeout=${SMOKE_SERVER_TIMEOUT}s"
 srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT \
           SERVER_BUCKETS=$BUCKETS SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT \
-          SEAM_SLACK_GATE=$SMOKE_SLACK_GATE SEAM_ENV="SEAM_BUILD_ID=$BUILD_ID" \
+          SEAM_SLACK_GATE=$SMOKE_SLACK_GATE SEAM_SLAB_SLOTS=$SMOKE_SLAB_SLOTS SEAM_ENV="SEAM_BUILD_ID=$BUILD_ID" \
           "$ENSURE" --fresh --buckets "$BUCKETS" 2>&1)
 srv_rc=$?
 [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$srv_out" >> "$PAIR_LOG"

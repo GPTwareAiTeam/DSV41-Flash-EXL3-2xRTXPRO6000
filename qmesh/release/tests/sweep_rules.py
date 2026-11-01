@@ -24,7 +24,9 @@ names = [n for _, p, g in rows for n in (p, g)]
 check("container names unique across pairs", len(names) == len(set(names)), str(rows))
 d = dict((r[0], (r[1], r[2])) for r in rows)
 check("dev owns seam-p7-dev / seam-gx2-dev", d["dev"] == ("seam-p7-dev", "seam-gx2-dev"), str(d["dev"]))
-check("prod owns seam-p7-prod / seam-gx1v2", d["prod"] == ("seam-p7-prod", "seam-gx1v2"), str(d["prod"]))
+check("prod owns seam-p7-prod / seam-gx1-prod", d["prod"] == ("seam-p7-prod", "seam-gx1-prod"), str(d["prod"]))
+check("the containers arms actually use belong to no pair",
+      not any(n in names for n in ("seam-p7v2", "seam-gx1v2", "seam-gx1b", "seam-p7v2-robust")), str(names))
 
 cfg = pc.load_conf("dev"); cfg["p7ct"] = "seam-p7-prod"
 m = die_msg(pc.check_ownership, cfg)

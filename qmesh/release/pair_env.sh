@@ -31,4 +31,5 @@ printf 'SEAM_GID=%q\n' "$SEAM_GID"
 printf 'GX_GID=%q\n' "$GX_GID"
 printf 'SEAM_PEER=%q\n' "$SEAM_PEER"
 printf 'SEAM_PORT=%q\n' "$PORT"
-printf 'SEAM_BUCKETS=%q\n' "$BUCKETS"
+# SEAM_BUCKETS is deliberately not exported: the client asks for its own superset and the server
+# narrows to the list it granted. Exporting the server's list here caps prefill chunks at its top row.

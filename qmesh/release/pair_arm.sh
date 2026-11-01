@@ -43,7 +43,8 @@ envs=(
   -e "CUDA_VISIBLE_DEVICES=$GPU"
   -e "REMOTE_TRANSPORT=seam"
   -e "SEAM_DEV=$SEAM_DEV" -e "SEAM_GID=$SEAM_GID" -e "SEAM_PEER=$SEAM_PEER"
-  -e "SEAM_PORT=$PORT" -e "SEAM_BUCKETS=$BUCKETS"
+  # no SEAM_BUCKETS: the client's own default is the superset and the server narrows it to what it
+  # granted. Pinning the server's list here would silently cap every prefill chunk at its max row.
   -e "MAX_PROMPTS=$ROWS" -e "MAX_NEW=$MAX_NEW" -e "WARMUP=$WARMUP" -e "WARMUP_NEW=$MAX_NEW"
   -e "CACHE_TOKENS=$CACHE" -e "PROMPTS=$PROMPTS" -e "CHECKPOINT=$CHECKPOINT"
 )
