@@ -788,6 +788,11 @@ class SafetensorsCollection:
                 moved_mib += top / 2 ** 20
                 freed += cap - top
             self.arena_all[dev] = kept
+            # A block that was dropped or relocated must not stay on the open list: the slab path would
+            # keep it alive and carve later allocations into bytes no audit entry covers
+            opens = self.arena.get(dev)
+            if opens:
+                self.arena[dev] = [o for o in opens if any(o is k for k in kept)]
             if moved or freed:
                 cap = sum(e[3] for e in kept)
                 used = sum(e[1] for e in kept)
