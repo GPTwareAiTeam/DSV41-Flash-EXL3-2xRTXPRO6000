@@ -151,6 +151,14 @@ bool qes_trace() {
   return on;
 }
 
+/* QES_TRACE=1 traces setup and the WRs each side posts; QES_TRACE=2 also traces every completion
+ * and the bytes a compute produced, which tells "the peer never wrote it" apart from "the peer
+ * wrote zeros". */
+int trace_level() {
+  static const int lvl = getenv("QES_TRACE") ? atoi(getenv("QES_TRACE")) : 0;
+  return lvl;
+}
+
 const char* role_name(int role) {
   return role == QES_ROLE_SERVER ? "srv" : "cli";
 }
@@ -368,9 +376,16 @@ __global__ void publish_kernel(uint64_t* seq) {
 /* Spin until resp_seq >= req_seq. A dead transport must never trap the GPU: `__trap()` raised a
  * sticky `unspecified launch failure` that killed the whole client process for one lost handle.
  * After WAIT_TIMEOUT_NS the kernel raises the slot's fail word (bytes 8..11 of the freq line, which
- * nothing else uses) and returns; the proxy sees that word, marks the handle dead and prints why,
- * and the next issue/collect on it raises in Python. */
-__global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, uint32_t* fail) {
+ * nothing else uses), poisons the response slot with NaN and returns; the proxy sees that word,
+ * marks the handle dead and prints why, and the next issue/collect on it raises in Python.
+ *
+ * The poisoning is what makes "loud" true for the call that timed out itself. Without it the collect
+ * that gave up still copied the response slot, which holds the *previous* answer, and returned 0:
+ * measured 2026-11-01 (failstop run 1101-094834) as `CALL_OK 3 finite=True` printed right after
+ * "no response ... within 30 s". A dead seam must hand the caller NaN (isfinite() false), never
+ * plausible rows. */
+__global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, uint32_t* fail,
+                            float* resp, int n_floats) {
   uint64_t want = *req_seq;
   uint64_t t0, now;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
@@ -381,6 +396,8 @@ __global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, u
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
     if (now - t0 > WAIT_TIMEOUT_NS) {
       asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(fail), "r"(1u) : "memory");
+      const float nan = __int_as_float(0x7fc00000);
+      for (int i = threadIdx.x; i < n_floats; i += blockDim.x) resp[i] = nan;
       return;
     }
   }
@@ -504,6 +521,14 @@ bool drain_cq(qes_handle* h) {
   int n;
   while ((n = ibv_poll_cq(h->cq, 16, wc)) > 0) {
     for (int i = 0; i < n; i++)
+      if (trace_level() >= 2)
+        fprintf(stderr,
+                "SEAM_TRACE_CQE role=%s port=%d rows=%d opcode=%d wr_id=0x%llx kind=%s "
+                "byte_len=%u status=%s\n",
+                role_name(h->role), h->tcp_port, h->rows, (int)wc[i].opcode,
+                (unsigned long long)wc[i].wr_id, (wc[i].wr_id & TRACE_FLAG) ? "flag" : "payload",
+                wc[i].byte_len, ibv_wc_status_str(wc[i].status));
+    for (int i = 0; i < n; i++)
       if (wc[i].status != IBV_WC_SUCCESS) {
         fprintf(stderr,
                 "qes: wc error %s opcode=%d port=%d rows=%d vend_err=0x%x wr_id=0x%llx "
@@ -540,6 +565,11 @@ bool post_payload(qes_handle* h, size_t off, uint32_t len) {
   wr.wr_id = (uint64_t)off;
   wr.wr.rdma.remote_addr = h->remote_base + off;
   wr.wr.rdma.rkey = h->remote_rkey;
+  /* A payload WRITE is unsignaled: the flag WRITE that follows it is the completion that matters,
+   * and RC ordering makes the payload land first. QES_TRACE=2 asks for its CQE anyway: "the flag
+   * arrived and the payload did not" is the shape of a write that was dropped, and then the two
+   * completions are the only evidence there is. */
+  if (trace_level() >= 2) wr.send_flags = IBV_SEND_SIGNALED;
   if (qes_trace())
     fprintf(stderr,
             "SEAM_TRACE_PUT role=%s port=%d rows=%u off=%zu len=%u remote=0x%016llx "
@@ -592,6 +622,12 @@ void server_compute(qes_handle* h, int slot, int L) {
     memcpy(&f, &bits, 4);
     out[i] = f + add;
   }
+  if (trace_level() >= 2)
+    fprintf(stderr,
+            "SEAM_TRACE_VAL role=srv port=%d slot=%d layer=%d out=[%.3f %.3f %.3f %.3f] "
+            "out_off=%zu src=0x%llx\n",
+            h->tcp_port, slot, L, out[0], out[1], out[2], out[3], off_resp(h, slot),
+            (unsigned long long)(h->remote_base + off_resp(h, slot)));
 }
 
 /* Client proxy: forwards every new request seq in any slot. The slot's header (layer, rows) is
@@ -1610,6 +1646,23 @@ void end_active(qes_server* s, const char* reason) {
   admit_waiters(s);
 }
 
+/* A session whose control socket is already closed is over, even if the poll arm that reaps it has
+ * not run yet. Accept and that arm fire in the same iteration and accept is handled first, so a
+ * client that closes and immediately reconnects (every battery, every short run) used to be told
+ * "server busy" about a session that had already said bye. Only a client that is still connected
+ * keeps the server. After the hello the only byte a client writes on this socket is 'B' (bye). */
+void reap_if_closed(qes_server* s) {
+  if (!s->active || s->active->fd < 0) return;
+  char b[1] = {0};
+  ssize_t k = recv(s->active->fd, b, 1, MSG_PEEK | MSG_DONTWAIT);
+  if (k == 0)
+    end_active(s, "client-closed");
+  else if (k < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+    end_active(s, "client-reset");
+  else if (k > 0 && b[0] == 'B')
+    end_active(s, "client-bye");
+}
+
 /* Reads and answers one control connection. May start (or queue) a session. */
 void handle_ctl_conn(qes_server* s, int fd, const char* ip) {
   sock_opts(fd, 2, SOCK_IO_TIMEOUT_S);
@@ -1681,6 +1734,7 @@ void handle_ctl_conn(qes_server* s, int fd, const char* ip) {
     return;
   }
 
+  reap_if_closed(s);
   if (s->active) {
     if ((hello.flags & CTL_FLAG_WAIT) && s->allow_wait &&
         s->waiting.size() < (size_t)QES_MAX_BUCKETS) {
@@ -2047,15 +2101,31 @@ extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_
     return -1;
   }
   const int slot = h->pending[idx].slot;
-  wait_kernel<<<1, 1, 0, stream>>>((const uint64_t*)(h->slab + off_freq(h, slot)),
-                                   (const uint64_t*)(h->slab + off_fresp(h, slot)),
-                                   (uint32_t*)(h->slab + off_fail(h, slot)));
+  // A whole warp is enough to poison a timed-out response quickly (resp_len/4 up to ~10M floats for
+  // the largest bucket) and costs nothing on the answered path, where the loop is never entered.
+  wait_kernel<<<1, 32, 0, stream>>>((const uint64_t*)(h->slab + off_freq(h, slot)),
+                                    (const uint64_t*)(h->slab + off_fresp(h, slot)),
+                                    (uint32_t*)(h->slab + off_fail(h, slot)),
+                                    (float*)(h->slab + off_resp(h, slot)),
+                                    (int)(h->resp_len / sizeof(float)));
   if (cudaMemcpyAsync(out_f32, h->slab + off_resp(h, slot), h->resp_len, cudaMemcpyHostToDevice,
                       stream))
     return -2;
   for (int p = idx; p + 1 < h->n_pending; p++) h->pending[p] = h->pending[p + 1];
   h->n_pending--;
   return cudaGetLastError() == cudaSuccess ? 0 : -3;
+}
+
+/* Debug: dump this handle's slab to a file. Offsets only mean something next to Geometry above;
+ * used to prove whether a response the peer says it posted is actually in the slab the client
+ * copies from (a zeroed response region and a healthy flag word cannot be told apart otherwise). */
+extern "C" int qes_debug_dump(qes_handle* h, const char* path) {
+  if (!h || !path) return -1;
+  FILE* f = fopen(path, "wb");
+  if (!f) return -1;
+  const size_t n = fwrite(h->slab, 1, h->slab_bytes, f);
+  fclose(f);
+  return n == h->slab_bytes ? 0 : -2;
 }
 
 extern "C" void qes_destroy(qes_handle* h) { stop_handle(h); }

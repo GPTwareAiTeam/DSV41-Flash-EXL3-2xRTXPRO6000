@@ -149,7 +149,14 @@ class SeamServer:
         chunks a prefill at the largest granted bucket) without a bigger workspace.
         """
         if self.stub:
-            view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = 0.0
+            # Known-answer stub: the same out[r][j] = float(x[r][j]) + (layer + 1) the C proxy
+            # computes when no hook is installed. Zeros would make a dead response path
+            # indistinguishable from a correct answer - on 2026-11-01 a zero-answering stub hid a
+            # full day of "is the payload arriving at all?" behind `finite=True` - so a stub answer
+            # must depend on both the request bytes and the layer index.
+            xb = view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN)
+            xf = (xb.astype(np.uint32) << 16).view(np.float32)
+            view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = xf + (layer + 1)
             return
         ffn, _ = self.layers[layer]
         step = self.ws_rows if 0 < self.ws_rows < rows else rows
