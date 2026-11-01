@@ -46,6 +46,10 @@ NL = qes.NL
 # rows: small calls are where a bad id shows, and the log stays quiet for prefill-sized buckets.
 _IDS_LOG_MAX = int(os.environ.get("SEAM_IDS_LOG_MAX_ROWS", "6"))
 
+# Printed ids for a rejected request: the whole array for small calls (the values are the
+# diagnosis), capped for big ones.
+_IDS_BAD_MAX = int(os.environ.get("SEAM_IDS_BAD_MAX_ROWS", "64"))
+
 
 def _check_ids(layer, rows, ids, num_experts):
     """Audit one request's cold ids on the host, straight from the pinned slab (no device work).
@@ -68,6 +72,9 @@ def _check_ids(layer, rows, ids, num_experts):
         print(f"SEAM_IDS layer={layer} rows={rows} n={ids.size} min={lo} max={hi} "
               f"miss={neg} n_cold={num_experts}", flush=True)
     if bad:
+        if ids.size <= _IDS_BAD_MAX * TOPK:
+            print(f"SEAM_IDS_BAD layer={layer} rows={rows} n_cold={num_experts} "
+                  f"ids={ids.reshape(-1).tolist()}", flush=True)
         raise RuntimeError(f"cold ids out of range: {bad} of {ids.size} picks in [{lo},{hi}] "
                            f"for {num_experts} cold experts on layer {layer}, largest bad id "
                            f"{int(ids[ids >= num_experts][:8].max())}")
