@@ -31,9 +31,12 @@ import time
 
 import numpy as np
 import torch
-from exllamav3 import Config, Model
 
 from qmesh.native import qes
+
+# exllamav3 is imported inside SeamServer.__init__: its module import JIT-builds exllamav3_ext
+# (minutes on a cold cache, and it blocks on the torch extension baton), which a --stub server
+# must never pay for - the wire/protocol baseline has to come up on a box whose GPU is busy.
 
 HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
@@ -100,11 +103,15 @@ class SeamServer:
         placement = json.load(open(placement_path))
         self.device = device
         self.stub = stub
-        self.stream = torch.cuda.Stream(device=device)
+        self.stream = None
         self.layers = {}
         if stub:
-            # Wire/protocol baseline: no experts are needed, so the server is up in seconds.
+            # Wire/protocol baseline: no experts are needed and nothing here touches CUDA or
+            # exllamav3, so a stub server is up in seconds even while the GPU holds another pack.
             return
+        from exllamav3 import Config, Model
+
+        self.stream = torch.cuda.Stream(device=device)
         config = Config.from_directory(model_dir)
         model = Model.from_config(config)
         for layer in range(NL):
