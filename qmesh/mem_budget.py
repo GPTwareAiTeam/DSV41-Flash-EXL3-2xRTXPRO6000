@@ -49,6 +49,9 @@ LONG_TOKENS = int(os.environ.get("LONG_TOKENS", "0"))
 LONG_NEW = int(os.environ.get("LONG_NEW", "16"))
 CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
+# Deep-context probes for the statics (dsv4_attn_out and friends): tokens from a tiled corpus, and
+# the wall time a probe may be predicted to take before it is skipped (the previous probe scales it).
+DEPTH_MAX_S = float(os.environ.get("DEPTH_MAX_S", "300"))
 LOAD_ONLY = os.environ.get("LOAD_ONLY") == "1"
 DEVICE = torch.device("cuda:0")
 G = 2 ** 30
@@ -181,6 +184,132 @@ def report(own: Owner, title: str):
             print(f"MEM_GROUP {title} {gb:.3f} {cat}", flush = True)
 
 
+ARENA_BLOCK_BYTES = 128 << 20
+
+
+def _view_key(t: torch.Tensor):
+    """Key a tensor the way vram_accounting does: pooled weights live as views into 128 MiB arena
+    blocks (counted per view), everything else is counted once per storage."""
+    s = t.untyped_storage()
+    if s.nbytes() == ARENA_BLOCK_BYTES:
+        return ("view", t.data_ptr(), t.numel() * t.element_size())
+    return ("storage", s.data_ptr(), s.nbytes())
+
+
+def walk_named(root, skip_ids = frozenset()):
+    """Every CUDA tensor reachable from root, with the attribute path that first reached its key."""
+    out: dict = {}
+    ids: set = set()
+    stack = [(root, "")]
+    while stack:
+        o, path = stack.pop()
+        if id(o) in ids or id(o) in skip_ids:
+            continue
+        ids.add(id(o))
+        if isinstance(o, torch.Tensor):
+            if o.is_cuda and o.device == DEVICE:
+                out.setdefault(_view_key(o), (path, o))
+            continue
+        if isinstance(o, (str, bytes, int, float, bool, type(None))):
+            continue
+        if isinstance(o, (list, tuple, set)):
+            stack.extend((v, f"{path}[{i}]") for i, v in enumerate(o))
+            continue
+        if isinstance(o, dict):
+            stack.extend((v, f"{path}[{k}]") for k, v in o.items())
+            continue
+        try:
+            stack.extend((v, f"{path}.{k}") for k, v in vars(o).items())
+        except TypeError:
+            pass
+    return out
+
+
+def _norm_path(path: str) -> str:
+    return path.replace("[", ".").replace("]", "")
+
+
+
+def classify_target(path: str) -> str:
+    p = _norm_path(path).lower()
+    leaf = p.rsplit(".", 1)[-1]
+    if ".attn." in p and ("compressor" in p or "indexer" in p):
+        return "attn." + ("compressor" if "compressor" in p else "indexer")
+    if ".experts." in p or ".experts" in p:
+        if leaf == "trellis":
+            return "hot_experts.trellis"
+        if leaf in ("suh", "svh", "mul1", "scale"):
+            return "hot_experts.aux_" + leaf
+        return "hot_experts.other"
+    if "shared_experts" in p:
+        return "shared_experts.trellis" if leaf == "trellis" else "shared_experts.aux"
+    if ".ffn.gate" in p or "routing_gate" in p:
+        return "router"
+    if ".attn." in p:
+        for comp in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b", "sink", "norm"):
+            if comp in p:
+                return f"attn.{comp}"
+        return "attn.other"
+    if ".engram" in p:
+        return "engram"
+    if p.startswith("head.") or ".head." in p:
+        return "head"
+    if "embed" in p:
+        return "embed"
+    if "norm" in leaf or "hc_" in p or "expandstream" in p:
+        return "norms_hc"
+    if p.startswith(("aligner", "image_", "vision")):
+        return "vision_aligner"
+    return "other:" + p.rsplit(".", 2)[-2] + "." + leaf
+
+
+def itemize(root, title: str, classify, skip_ids = frozenset(), engine_gib = None):
+    """Print MEM_WITEM: CUDA weight bytes of root grouped by classify(path), deduplicated the way
+    vram_accounting deduplicates (arena views once each, other tensors once per storage)."""
+    rows = walk_named(root, skip_ids)
+    by: dict = {}
+    ex: dict = {}
+    for key, (path, _t) in rows.items():
+        cat = classify(path)
+        by[cat] = by.get(cat, 0) + key[-1]
+        ex.setdefault(cat, []).append(path)
+    for cat, nb in sorted(by.items(), key = lambda kv: -kv[1]):
+        if gib(nb) < 0.01:
+            continue
+        sample = ", ".join(ex[cat][:2])
+        print(f"MEM_WITEM {title} {gib(nb):.3f} {cat} [{sample}]", flush = True)
+    total = sum(by.values())
+    tail = (f" engine={engine_gib:.3f} arena_tail={engine_gib - gib(total):.3f}"
+            if engine_gib is not None else "")
+    print(f"MEM_WITEM {title} {gib(total):.3f} TOTAL n_views={len(rows)}{tail}", flush = True)
+    return by
+
+
+def classify_generator(path: str) -> str:
+    p = _norm_path(path)
+    # first attribute under the walk root is the generator's own slot; keep two levels of detail
+    parts = [s for s in p.split(".") if s]
+    return ".".join(parts[:2]) if parts else "?"
+
+
+def classify_drafter(path: str) -> str:
+    p = _norm_path(path).lower()
+    leaf = p.rsplit(".", 1)[-1]
+    if ".experts" in p:
+        return "drafter_experts.trellis" if leaf == "trellis" else "drafter_experts.aux"
+    if "shared_experts" in p:
+        return "drafter_shared.trellis" if leaf == "trellis" else "drafter_shared.aux"
+    if ".attn." in p:
+        return "drafter_attn"
+    if "markov" in p or "conf" in p:
+        return "drafter_head." + leaf
+    if "norm" in leaf or "hc_" in p:
+        return "drafter_norms_hc"
+    if p.startswith("mtp.2") or p.startswith("mtp"):
+        return "drafter_block_other." + leaf
+    return "drafter_other." + leaf
+
+
 def engine_report(model, cache, generator, title: str):
     r = vram_accounting(model, cache, generator, [DEVICE])[0]
     print(f"MEMB {title} weights={gib(r.weights):.3f} kv_cache={gib(r.cache):.3f} "
@@ -262,6 +391,22 @@ def main():
         print(f"MEM_KV drafter_pool_bytes={gib(r1.cache):.3f} "
               f"drafter_recurrent_bytes={gib(r1.recurrent):.3f}", flush = True)
 
+
+    # --- itemised weight / generator split (owner question: every piece by module type) -------
+    iskip = {id(model.config), id(getattr(model.config, "stc", None)), id(cache), id(generator),
+             id(tokenizer)}
+    if draft_model is not None:
+        iskip |= {id(draft_model), id(draft_cache), id(draft_model.config),
+                  id(getattr(draft_model.config, "stc", None))}
+    iskip.discard(None)
+    itemize(model, "target", classify_target, iskip, engine_gib = gib(r0.weights))
+    if draft_model is not None:
+        itemize(draft_model, "drafter", classify_drafter,
+                {id(draft_model.config), id(getattr(draft_model.config, "stc", None)),
+                 id(draft_cache), id(generator), id(model), id(cache)})
+    itemize(generator, "generator", classify_generator,
+            {id(model), id(cache), id(draft_model), id(draft_cache), id(tokenizer),
+             id(model.config), id(getattr(model.config, "stc", None))})
     # --- after load ------------------------------------------------------------------------
     skip = {id(draft_model), id(draft_cache), id(generator), id(model), id(model.config),
             id(getattr(model.config, "stc", None))}
@@ -355,24 +500,85 @@ def main():
         job = Job(input_ids = ids, max_new_tokens = LONG_NEW, sampler = GreedySampler())
         generator.enqueue(job)
         t = time.time()
-        first = None
+        st = None
+        prefill_done = False
         rows = 0
+        # The first yielded event is stage "started", long before any prompt token is ingested, so the
+        # split below uses the job's own counters (time_enqueued / time_prefill / time_generate) and the
+        # peak is taken after synchronise() once the whole job has drained.
         while generator.num_remaining_jobs():
-            for _ in generator.iterate():
-                if first is None:
-                    first = time.time() - t
-                    print(f"MEM_PREFILL tokens={int(ids.shape[-1])} wall_s={first:.1f} "
-                          f"tok_per_s={int(ids.shape[-1]) / max(first, 1e-9):.1f} "
-                          f"chunks={limiter.chunks if limiter else None} "
-                          f"shrunk={limiter.shrunk if limiter else None}", flush = True)
+            for r in generator.iterate():
+                if r.get("eos"):
+                    st = r
+                if not prefill_done and (r.get("text") or r.get("stage") == "streaming"):
+                    prefill_done = True
                     peaks("prefill", base_alloc)
                     torch.cuda.reset_peak_memory_stats(DEVICE)
                     base_alloc = torch.cuda.memory_allocated(DEVICE)
                 rows += 1
-        print(f"MEM_DECODE steps={rows} wall_s={time.time() - t - (first or 0):.2f} "
-              f"ms_per_step={1000 * (time.time() - t - (first or 0)) / max(rows - 1, 1):.1f}", flush = True)
+        torch.cuda.synchronize()
+        wall = time.time() - t
+        st = st or {}
+        pf = float(st.get("time_enqueued", 0.0)) + float(st.get("time_prefill", 0.0))
+        gen = float(st.get("time_generate", 0.0))
+        print(f"MEM_PREFILL tokens={int(ids.shape[-1])} prefill_s={pf:.2f} "
+              f"tok_per_s={int(ids.shape[-1]) / max(pf, 1e-9):.1f} "
+              f"chunks={limiter.chunks if limiter else None} "
+              f"shrunk={limiter.shrunk if limiter else None}", flush = True)
+        print(f"MEM_DECODE steps={int(st.get('new_tokens', 0))} wall_s={gen:.2f} "
+              f"events={rows} total_wall_s={wall:.2f}", flush = True)
         peaks("decode", base_alloc)
         engine_report(model, cache, generator, "after_long")
+
+    # --- depth probes: statics (dsv4_attn_out et al.) at deeper context ---------------------
+    probes = [int(v) for v in os.environ.get("DEPTH_PROBES", "524288,1048570").split(",") if v.strip()]
+    if probes:
+        texts = ([open(LONG_PROMPT_FILE).read()] if LONG_PROMPT_FILE else []) + \
+                [open(p).read() for p in CORPUS_FILES]
+        if not texts:
+            print("MEM_DEPTH skipped=no-prompt-source", flush = True)
+        else:
+            base = torch.cat([tokenizer.encode(t, add_bos = False, encode_special_tokens = True)[0]
+                              for t in texts])
+            bos = tokenizer.encode("a", add_bos = True, encode_special_tokens = True)[0, :1]
+            print(f"MEM_DEPTH source_tokens={int(base.shape[-1])} probes={probes}", flush = True)
+            prev_want, prev_s = 0, 0.0
+            for want in probes:
+                if want + 1 > CACHE_TOKENS:
+                    print(f"MEM_DEPTH tokens={want} skipped=exceeds-cache", flush = True)
+                    continue
+                if prev_want and prev_s:
+                    pred = prev_s * want / prev_want
+                    if pred > DEPTH_MAX_S:
+                        print(f"MEM_DEPTH tokens={want} skipped=predicted_s={pred:.0f} "
+                              f"limit={DEPTH_MAX_S}", flush = True)
+                        continue
+                reps = want // int(base.shape[-1]) + 1
+                pids = torch.cat([bos, base.repeat(reps)[: want - 1]]).unsqueeze(0)
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats(DEVICE)
+                pbase = torch.cuda.memory_allocated(DEVICE)
+                limiter = None
+                if PREFILL_ADAPTIVE:
+                    generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(DEVICE)
+                pst = None
+                generator.enqueue(Job(input_ids = pids, max_new_tokens = 1, sampler = GreedySampler()))
+                t = time.time()
+                while generator.num_remaining_jobs():
+                    for r in generator.iterate():
+                        if r.get("eos"):
+                            pst = r
+                torch.cuda.synchronize()
+                pst = pst or {}
+                ps = float(pst.get("time_enqueued", 0.0)) + float(pst.get("time_prefill", 0.0))
+                prev_want, prev_s = want, ps
+                print(f"MEM_DEPTH tokens={int(pids.shape[-1])} prefill_s={ps:.2f} "
+                      f"tok_per_s={int(pids.shape[-1]) / max(ps, 1e-9):.1f} "
+                      f"chunks={limiter.chunks if limiter else None} "
+                      f"shrunk={limiter.shrunk if limiter else None} "
+                      f"total_wall_s={time.time() - t:.2f}", flush = True)
+                peaks(f"depth_{want}", pbase)
+                engine_report(model, cache, generator, f"after_{want}")
 
 
 if __name__ == "__main__":
