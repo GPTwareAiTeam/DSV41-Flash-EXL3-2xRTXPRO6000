@@ -189,6 +189,21 @@ the evidence, then queues the prod ticket).
   `EXT_FAIL … EXT_CLIENT_MISS` instead of shipping a cache every run rebuilds. `pair_smoke.sh` keeps
   the arm's bytes in `<state>/logs/smoke-arm-<pair>-<stamp>.log` and prints `SMOKE_ARM_LOG`, the GX
   server log tail (`SMOKE_SERVER_TAIL`) and both containers' `extcache` listings on failure.
+* **A ticket with nothing to run** -- `pair_update.sh` enqueued `"${cmd[@]}"` without ever
+  building `cmd`, and bash expands an empty array to nothing without a word: the queue got a
+  ticket with no command, `gpu_run_pair.sh` started it, `end rc=1 elapsed=0m` and the pair was
+  reported as having had its update. `pair_enqueue` now refuses an empty command, and
+  `tests/update_enqueue.sh` reads the argv the runner actually receives.
+* **A prefix is not the release** -- the stamps name the full commit because that is what
+  prepare builds, while the operator types `4f299c3a`. `<build>.sh verify <pair> 4f299c3a`
+  compared the 8-character prefix to the stamp and printed `LIB_STAMP_MISMATCH
+  source_sha=<the same sha>` -- a refusal that hid itself. Every entry point resolves the
+  argument to a commit (`rev-parse --verify <sha>^{commit}`) before it is compared.
+* **The grant is not free** -- the server reserves workspace for its *widest* granted bucket
+  whether or not anything asks for it: 294 MiB at 2048 rows against ~9 MiB at 64. On a box
+  whose pack leaves ~1 GiB free that reservation is the difference between a smoke and a
+  paging wall. `SMOKE_BUCKETS` (default `1,6,64`) narrows the grant to what the smoke
+  exercises; the pair's real server still takes `--buckets` from `pairs.conf`.
 * **Smoke arm killed silently under swap** -- on a GX box that is paging (avail < 1 GiB, 3-4 GiB
   swapped) the first token of the smoke row can outlast the arm timeout, which then returns 124 with
   no output at all. That is a capacity failure: report the memory lines, do not read it as a
