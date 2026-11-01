@@ -201,6 +201,32 @@ def view(addr, nbytes, dtype):
     return np.frombuffer(buf, dtype=dtype)
 
 
+def slab_mib(buckets) -> float:
+    """Pinned slab this server will allocate for `buckets`, MiB, one side.
+
+    Same geometry as qes_server_open() in qmesh/native/qmesh_expert_seam.cu: one slab per row
+    bucket, NL layers of align64(rows*(HIDDEN*2 + TOPK*6)) request bytes plus
+    align64(rows*HIDDEN*4) response bytes and two 64 B alignment pads."""
+    al = lambda v: (v + 63) // 64 * 64  # noqa: E731
+    total = 0
+    for rows in buckets:
+        req = rows * (HIDDEN * 2 + TOPK * 4 + TOPK * 2)
+        resp = rows * HIDDEN * 4
+        total += (al(req) + al(resp) + 2 * 64) * NL
+    return total / 2**20
+
+
+def _avail_mib() -> int:
+    """Host MemAvailable, MiB: what is left on this box for the slabs (see seam_auto_buckets)."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default="/cold")
@@ -210,10 +236,12 @@ def main():
     ap.add_argument("--port", type=int, default=47311)
     ap.add_argument("--stub", action="store_true",
                     help="answer every request with zeros (wire/protocol baseline, no expert compute)")
-    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,2,3,4,5,6,64"),
+    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,256,512,1024"),
                     help="row buckets this server can serve (ascending, one port per bucket from "
                          "--port+1). Clients request a subset; the superset default means one "
-                         "long-lived server serves every benchmark arm without a reload.")
+                         "long-lived server serves every benchmark arm without a reload. The largest "
+                         "bucket is the per-call row limit the client splits prefill on, so size it "
+                         "to the GX box's memory headroom (1.18 MiB pinned per row per side).")
     ap.add_argument("--wait", action="store_true",
                     help="queue a second client behind the active session instead of rejecting it "
                          "(also settable per client with SEAM_WAIT=1)")
@@ -238,8 +266,13 @@ def main():
     threading.Thread(target = _reporter, daemon = True).start()
 
     # One pinned slab per row bucket, registered once; each client session gets fresh QPs on
-    # them and the server answers the control hello with the bucket -> port mapping.
+    # them and the server answers the control hello with the bucket -> port mapping. The slabs are
+    # allocated here, after the pack load, so the list has to have been sized to the box's free
+    # memory beforehand (seam_server_ensure.sh --buckets auto does that): print the bill first.
     buckets = sorted({int(r) for r in args.buckets.split(",") if r.strip()})
+    print(f"SEAM_SERVER_SLAB buckets={','.join(map(str, buckets))} "
+          f"predicted_mib={slab_mib(buckets)} rows_max={buckets[-1]} "
+          f"avail_mib={_avail_mib()}", flush = True)
     placement_sha = hashlib.sha256(open(args.placement, "rb").read()).hexdigest()[:12]
     srv = qes.Server(args.dev, args.gid, args.port, 0, buckets, build = qes.build_id(),
                      placement_sha = placement_sha, wait = args.wait)

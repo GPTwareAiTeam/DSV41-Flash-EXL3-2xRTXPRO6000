@@ -64,12 +64,23 @@ class RemoteSeamHost:
     answers with the row buckets it can serve and one data port per bucket; a batch of n rows is
     padded to the smallest granted bucket >= n with id -1 and weight 0 (exact zeros on GX1), and
     batches above the largest bucket are issued in bucket-sized chunks. All work stays on the
-    caller's stream."""
+    caller's stream.
 
-    # Row buckets requested from the server. The server's answer (a subset, in its own order)
-    # becomes `self.buckets`; SEAM_BUCKETS=1,2,3,4,5,6,64 stops a 2..5-row verify from padding up
-    # to the 6-row bucket on GX1. Must be a subset of the server's --buckets.
-    BUCKETS = tuple(int(b) for b in os.environ.get("SEAM_BUCKETS", "1,6,64").split(",") if b.strip())
+    Prefill therefore splits on the client: a chunk of R rows costs floor(R / GX_MAX) round trips
+    at the largest granted bucket plus one for the remainder, which is padded to the smallest
+    granted bucket >= it (exact, no padding, when R is a multiple of that bucket). GX_MAX is not a
+    client constant: the server advertises its buckets, the client asks for the standard set and
+    adopts the intersection, so a server that can only afford 256 rows makes every prefill chunk
+    go 16 calls deep instead of failing."""
+
+    # Row buckets *requested* from the server. The answer is the server's own list restricted to
+    # this request, in the server's order, so a request that is a superset of any plausible server
+    # list costs nothing and adapts to the memory a given GX box can afford: 1 and 6 serve
+    # decode/verify, 256..4096 are the prefill widths (powers of two), and a server configured with
+    # 64 still narrows a 2..63-row verify to the 64-row bucket as before. The largest granted
+    # bucket is the per-call row limit used for prefill splitting.
+    BUCKETS = tuple(int(b) for b in os.environ.get("SEAM_BUCKETS", "1,6,256,512,1024,2048,4096")
+                    .split(",") if b.strip())
 
 
     @classmethod
@@ -109,13 +120,14 @@ class RemoteSeamHost:
         want = os.environ.get("SEAM_WAIT", "0") == "1"
         ctl = qes.Control(self.host, self.port, buckets = self.BUCKETS, wait = want)
         self.buckets = ctl.buckets
+        self.chunk_rows = self.buckets[-1]
         self.ctl = ctl
         print(f"SEAM_NEGOTIATED host={self.host} port={self.port} "
               f"requested={','.join(map(str, self.BUCKETS))} "
               f"accepted={','.join(map(str, ctl.buckets))} "
-              f"ports={','.join(map(str, ctl.ports))} server_build={ctl.build} "
-              f"placement_sha={ctl.placement_sha} proto={qes.PROTO_VERSION} "
-              f"layers={ctl.layers}", flush = True)
+              f"ports={','.join(map(str, ctl.ports))} chunk_rows={self.chunk_rows} "
+              f"server_build={ctl.build} placement_sha={ctl.placement_sha} "
+              f"proto={qes.PROTO_VERSION} layers={ctl.layers}", flush = True)
         return self
 
     def _seam(self, bucket: int, device_index: int):
@@ -176,16 +188,40 @@ class RemoteSeamHost:
         w = weights.reshape(-1, TOPK).to(torch.bfloat16).contiguous()
         return x, ids, w
 
+    def _split(self, rows: int):
+        """Prefill split of `rows` onto the granted buckets: full chunks at chunk_rows, then the
+        remainder in the smallest granted bucket >= it. Returns [(start, stop, bucket)]; the bucket
+        is not a multiple of chunk_rows when the remainder pads (id -1 rows cost GX1 nothing but a
+        slot of compute)."""
+        step = self.chunk_rows
+        out = [(i, min(i + step, rows), step) for i in range(0, rows - rows % step, step)]
+        rem = rows % step
+        if rem:
+            out.append((rows - rem, rows, next(b for b in self.buckets if b >= rem)))
+        return out
+
     def submit_prefill(self, layer_idx, y, selected, weights):
         """Synchronous on the stream: each chunk is issued and collected before the next is
         issued, so one layer's request slot is never rewritten while the GX1 server still reads
-        it. Returns fp32 [rows, HIDDEN] on the caller's stream."""
+        it. Returns fp32 [rows, HIDDEN] on the caller's stream.
+
+        Chunks are cut at chunk_rows (the largest granted bucket) with the remainder in the
+        smallest granted bucket that holds it, so a 8192-row prefill piece is 8 calls at 1024
+        plus nothing on GX boxes that can afford 1024 rows per call. This is independent of the
+        P7 prefill chunk limiter: whatever the limiter hands over is split here."""
         self.connect()
         x, ids, w = self._prep(y, selected, weights)
-        step = self.buckets[-1]
-        parts = [self._issue_chunk(layer_idx, x[i:i + step], ids[i:i + step], w[i:i + step])
-                 for i in range(0, x.shape[0], step)]
-        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        plan = self._split(x.shape[0])
+        shape = (x.shape[0], len(plan), tuple(b for _, _, b in plan))
+        if shape not in self._splits:
+            self._splits.add(shape)
+            widths = ",".join(f"{b}x{sum(1 for s, e, _ in plan if _ == b)}" for b in
+                              dict.fromkeys(b for _, _, b in plan))
+            print(f"SEAM_SPLIT layer={layer_idx} rows={x.shape[0]} chunk_rows={self.chunk_rows} "
+                  f"calls={len(plan)} buckets={','.join(map(str, self.buckets))} plan={widths}",
+                  flush = True)
+        parts = [self._issue_chunk(layer_idx, x[s:e], ids[s:e], w[s:e]) for s, e, _ in plan]
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim = 0)
 
     def submit_issue(self, layer_idx, y, selected, weights):
         """Decode-size batches (<= largest bucket) run as one chunk; the output is produced
