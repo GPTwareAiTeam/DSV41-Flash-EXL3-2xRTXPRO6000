@@ -101,3 +101,36 @@ charged to the chunk that allocates it, in proportion to its rows: the 3121-row 
 rose 1340 MiB against a row term of 1164 (+176) and the two fits give 63 and 56 KiB/row, so
 `PREFILL_FIRST_ROW_KIB=64` is added per row of the first chunk only (`start == 0`). 8192 rows now predict
 3568 MiB (measured 3573), 3121 rows 1359 (measured 1340); later chunks keep the 382 KiB/row term.
+
+## Seam session setup race: server sends its hello before its QP is live (2026-11-01)
+`session_handle_up` used to be *recv peer hello → send own hello → close(fd) → check_hello →
+qp_connect (RTR, then RTS)*. The client proceeds as soon as it has the server's hello, so its first payload
+WRITE could reach a responder QP that was still in INIT, or between RTR and RTS. The HCA answers that write
+with `remote invalid request` — `qes: wc error remote invalid request error opcode=1 port=47318 rows=64
+vend_err=0xdfffeca0 wr_id=0x0 off=0 kind=payload` — and the same packet moves the responder QP to ERROR, so
+the server's own `ibv_modify_qp(RTS)` fails and the session is rejected. A rejected session is survivable
+now, but the *client* side of it was not: the 30 s wait kernel called `__trap()`, which raised a sticky
+`CUDA error: unspecified launch failure` and killed the client process (rc 134).
+
+Proof it was ordering and not layout (`artifacts/seamrobust/trace-1101-082030/`): the server log has
+`qes: seam session 1: qp rts (port=47318 rows=64)` immediately followed by
+`SEAM_SESSION_REJECT … sid=1 reason=setup-failed`, a pair that only `qp_connect`'s failure path can print,
+on exactly the port whose client write NAKed; the client's `SEAM_TRACE_HANDLE` (port 47318, stride 1968512,
+slab 78740480, `remote_base`/`remote_rkey`) is byte-identical to the server's `SEAM_TRACE_EP`, and
+`check_hello` passed. Phase 0 (deployed build, trace on) reproduced it every time; phase 1 with the reorder
+was 7/7 `SEAM_CONNECT`, no `qes: wc error`, `CLIENT_RC=0`, `SEAM_SESSION_END … calls=3876`.
+
+Fix: *recv peer hello → check_hello → qp_connect (RTR, RTS) → print `SEAM_TRACE_RTS role=srv` → send own
+hello → close(fd)*. The peer cannot start WRITEs before the responder QP is live, and it costs no extra round
+trip. Every failure path still closes the fd and keeps the stale/non-stale distinction the session logic
+needs. A missing readiness gate on the server helper (client started ~15 s after `SEAM_SERVER_LOADED`, while
+the pinned slab was still being allocated) made that window enormous on one prod arm; that helper bug is
+fixed separately, and this reorder removes the residual few-hundred-µs window on a fully-ready server.
+
+Fail-stop instead of trap: `wait_kernel` no longer traps. After `WAIT_TIMEOUT_NS` it raises a fail word in
+bytes 8..11 of the slot's freq line (offset 0 is the request seq, the rest of the 64 B line is unused, so
+neither the slot geometry nor the wire layout changes) and returns; `client_proxy` sees the word, prints
+`qes: no response for layer slot N … the seam transport is dead`, and marks the handle dead the same way a
+CQ error does; `qes_issue`/`qes_collect` then fail with −5 and `last_error()` reaches Python as a
+`RuntimeError`. A lost handle now costs one session, not the process. Failed `ibv_modify_qp` calls print the
+state the HCA really reports (`qes: qp rts failed errno=… state=… qpn=… peer_qpn=… port=… rows=…`).
