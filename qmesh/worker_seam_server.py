@@ -440,8 +440,15 @@ def ws_probe(server, spec, min_avail_mib, tiers = ()):
     # adds the forced rungs after it, so one run is a complete A/B against the baseline.
     original = next((ffn.fused_rows for ffn, _ in server.layers.values()
                      if hasattr(ffn, "fused_rows")), None)
-    ladder = [t for t in tiers if t != original]
+    # Only downwards: the fused kernel's buffers were sized for the load-time capacity (and mtile_ok
+    # False means it is TEMP_ROWS_FUSED, not FUSED_ROWS_WIDE), so a higher rung would run past them.
+    ladder = [t for t in tiers if t != original and (original is None or int(t) < int(original))]
     ladder = ([original] if original is not None else []) + ladder or [None]
+    over = [t for t in tiers if original is not None and int(t) > int(original)]
+    if over:
+        print(f"SEAM_WS_TIERS_ABOVE load={original} want={over}: skipped, the fused buffers were "
+              f"sized at load (set EXL3_MOE_FUSED_ROWS_WIDE before the load to sweep them)",
+              flush = True)
     recon_ok = None   # decided after the first rung has built the recon state
     for rows in [int(x) for x in spec.split(",") if x.strip()]:
         stage, x_ptr, ids_ptr, w_ptr, out_ptr = _probe_stage(rows, ncold)
