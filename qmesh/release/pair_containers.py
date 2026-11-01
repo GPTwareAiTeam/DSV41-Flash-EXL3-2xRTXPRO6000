@@ -311,7 +311,7 @@ def cmd_inner(cfg, sha=None, verify=True):
         if rc or out.strip() != "true":
             print(f"INNER {cfg['pair']} {side} {ct} not_running")
             continue
-        cmd = ("set -e; mkdir -p /pair; "
+        cmd = ("set -e; mkdir -p /src /pair; "
                "if [ ! -L /src/exllamav3 ]; then rm -rf /src/exllamav3; fi; "
                "ln -sfn /pair/current/src /src/exllamav3")
         # right after a recreate, /pair/current may not have moved yet: wire the symlink, verify later
