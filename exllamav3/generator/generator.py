@@ -1947,6 +1947,9 @@ class Generator:
                 rejected = 0
                 W = batch_logits.shape[1]
                 job.verify_widths[W] = job.verify_widths.get(W, 0) + 1
+                # Per-round verify width for the round-cost fit (EXL3_DSPARK_EV_COST): a no-op unless
+                # EXL3_ROUND_PROF=1, and only noted when the round already opened a profile round
+                rprof.note("width", int(W))
 
                 # Positions within a job are independent when no per-position constraint advances between
                 # them: no active filter (masks are rebuilt per accepted position), no sampling past IDs
@@ -2152,6 +2155,7 @@ class Generator:
                     observe = getattr(self.draft_model, "observe_accepted", None)
                     if observe is not None:
                         observe(accepted_length - 1)
+                    rprof.note("accepted", int(accepted_length - 1))
 
                 # The last sampled token leads the next forward
                 self.model.prefetch_tokens([sampled_token.item()])

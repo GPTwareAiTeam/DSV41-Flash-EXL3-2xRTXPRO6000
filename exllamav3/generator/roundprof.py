@@ -96,6 +96,37 @@ else:
                 print(f"[RPROF] slow round={r} total_ms={(rs[-1][2] - rs[0][2]) / 1e6:.1f} "
                       f"worst={worst[0]} host_ms={worst[1]:.1f} gpu_ms={worst[2]:.1f}", flush = True)
             print(f"[RPROF] slow_rounds={slow} sum_total_ms={sum(totals):.1f}", flush = True)
+        # Round cost as a function of the verify width: the numbers EXL3_DSPARK_EV_COST wants.
+        rset = set(rounds)
+        tot_by_round = {}
+        for r in rounds:
+            rs = sorted([m for m in _marks if m[0] == r], key = lambda m: m[2])
+            if len(rs) > 1:
+                tot_by_round[r] = (rs[-1][2] - rs[0][2]) / 1e6
+        width_of = {r: int(v) for r, n, v in _notes if n == "width" and r in rset}
+        if width_of:
+            byw = {}
+            for r, w in width_of.items():
+                if r in tot_by_round:
+                    byw.setdefault(w, []).append(tot_by_round[r])
+            print(f"[RPROF] {'width':>5s} {'n':>5s} {'round_ms_med':>12s} {'round_ms_mean':>13s}", flush=True)
+            for w in sorted(byw):
+                vals = byw[w]
+                print(f"[RPROF] {w:5d} {len(vals):5d} {statistics.median(vals):12.3f} "
+                      f"{statistics.fmean(vals):13.3f}", flush=True)
+            xs = [(float(w), tot_by_round[r]) for r, w in width_of.items() if r in tot_by_round]
+            if len({w for w, _ in xs}) > 1:
+                n = len(xs)
+                sx = sum(w for w, _ in xs)
+                sy = sum(t for _, t in xs)
+                sxx = sum(w * w for w, _ in xs)
+                sxy = sum(w * t for w, t in xs)
+                den = n * sxx - sx * sx
+                if den:
+                    b = (n * sxy - sx * sy) / den
+                    a = (sy - b * sx) / n
+                    print(f"[RPROF] width_fit rounds={n} intercept_ms={a:.3f} "
+                          f"slope_ms_per_row={b:.3f}", flush=True)
         # Counters
         agg = {}
         _rs = set(rounds)

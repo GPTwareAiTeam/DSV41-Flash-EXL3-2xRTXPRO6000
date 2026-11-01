@@ -51,7 +51,7 @@ CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 # Deep-context probes for the statics (dsv4_attn_out and friends): tokens from a tiled corpus, and
 # the wall time a probe may be predicted to take before it is skipped (the previous probe scales it).
-DEPTH_MAX_S = float(os.environ.get("DEPTH_MAX_S", "300"))
+DEPTH_MAX_S = float(os.environ.get("DEPTH_MAX_S", "420"))
 LOAD_ONLY = os.environ.get("LOAD_ONLY") == "1"
 DEVICE = torch.device("cuda:0")
 G = 2 ** 30
