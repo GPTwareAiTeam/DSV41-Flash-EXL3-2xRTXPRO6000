@@ -90,3 +90,8 @@ on both pairs on the same build, anything that failed and what was done about it
   identity + ms/token). Merge-clean into v2. Queue after quant A on GPU0, before merging.
 - 02:25 EST sens/RESULTS.md written (per-matrix study); exl3-sens-1031/exl3-sens2-1031 removed.
 - 02:16 EST GX2 batch 1 archived (afd 214G + 5 dirs); GX2 340G free; ARCHIVE_INDEX + journal updated.
+- 02:50 EST PortAudit: branch port/v12-audit, 17 commits porting v1.2 engine/kernel work lost in the rebase
+  (hc row-blocked mix, m48 tile, MoE fold, coop geometry, piecewise graphs + verify body, dsv4 scratch, tests);
+  table of 100 commits in recipe-artifacts/gpu0-gx1/PORT_AUDIT.md. sm_120 ext builds (353 s), imports OK.
+  Merge-clean into v2. GPU test list in PORT_AUDIT.md. Conflicts with fix/graph-dspark-export in
+  transformer.py: GraphDSpark rebasing onto port/v12-audit. Merge order after GPU tests: port -> graph -> seam.
