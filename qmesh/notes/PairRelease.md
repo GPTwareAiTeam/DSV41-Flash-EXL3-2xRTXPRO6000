@@ -387,3 +387,32 @@ consistent and is the right check for mixing; it does not say two *trees* measur
 throughput baseline taken on a hand-patched tree is re-taken on the release before it is compared
 (`pair_ref.sh <pair> --compare` is where that comparison lives).
 
+**The lock is not the fix, and release 2 must not be sold as one.** The identity gate on the prod
+pair (release 2's own server file, one client, legacy buckets `1,6,64`, ns=1) reproduced the morning
+death exactly: `12:35:38 SPLIT_GATE_SERVER … avail_min_mib=560 swap_max_mib=3762` then
+`SEAM_COMPUTE_FAIL layer=19 rows=6 err=AcceleratorError: CUDA error: unspecified launch failure`,
+and the split arm was never reached. The lock removes a real hazard -- two `_forward`s interleaving
+inside one module scratch and one stream -- but a single-threaded client still dies, so the faulting
+frame is elsewhere. Release 2 is still the right thing to *hold* a pair on (release 1's wire, the
+margin floor, a build id on both halves); it is not a cure, and a dev flip onto it tonight would
+only move the same crash to the dev pair.
+
+The provenance caveat, concretely: the 512-row and 131k arms were measured on `242854c1` -- no lock,
+`SEAM_LOAD_MARGIN_MIB` 1024 -- while release 2 carries the lock and 2048. So the sequence for
+quoting any of those numbers after a flip is: re-measure on the release
+(`pair_ref.sh <pair> --compare`), then compare. Skipping that step compares two schedulers and two
+margins, not two builds.
+
+### Status of release 2: withdrawn, not flipped
+
+`3c361e8f` was cut for both pairs at 12:33 and the dev build was started; the negative identity
+gate arrived while it ran. The build was stopped, the leftover compiler processes were killed, and
+`releases/3c361e8f…` was removed from all four sides (`pairs/{dev,prod}/releases` on P7 and on both
+GX boxes) together with its half-built ext cache and the torch `lock` baton a killed build leaves
+behind. No `current` link was ever moved: dev still points at `32923b9a`, prod has no link, no
+manifest exists, and nothing was queued, so neither pair changed state tonight.
+
+The merge stays in `tools/pair-release` history -- it is release 1 plus a lock that removes a real
+(if not *the*) hazard, and the fix that is coming will be merged on top of it -- but no release
+should be cut for a pair until the faulting frame is named and tested. Cutting an unreleased tree
+is free; flipping a pair onto one is not.
