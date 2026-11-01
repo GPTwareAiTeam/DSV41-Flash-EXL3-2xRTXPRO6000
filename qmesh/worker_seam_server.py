@@ -125,6 +125,7 @@ class SeamServer:
         except Exception as e:  # noqa: BLE001 - see the docstring: no safe local recovery
             print(f"SEAM_COMPUTE_FAIL layer={layer} rows={rows} err={type(e).__name__}: {e} "
                   f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()} "
+                  f"dev_{_dev_mem_mib()} "
                   f"calls={sum(len(v) for v in _times.values())} "
                   f"- exiting: a server that cannot compute must not answer", flush=True)
             sys.stderr.flush()
@@ -261,7 +262,23 @@ def _swap_used_mib() -> int:
                 free = int(line.split()[1])
     except OSError:
         return -1
-    return (total - free) // 1024
+
+
+def _dev_mem_mib() -> str:
+    """`free_mib=/total_mib=/allocated_mib=/reserved_mib=` for the unified pool, best effort.
+
+    Host MemAvailable alone cannot say whether the *device* side has room: on GB10 device and host
+    memory are one pool, so once the 113.65 GiB pack is resident a cold-expert forward can still
+    fail a launch while MemAvailable shows ~1 GiB and several GiB are swapped out. Printing the
+    allocator's own view at load and at any SEAM_COMPUTE_FAIL turns "unspecified launch failure"
+    into a number: free_mib near zero = the pack does not fit this box, not a kernel bug."""
+    try:
+        free, total = torch.cuda.mem_get_info()
+        return (f"free_mib={int(free) // 2**20} total_mib={int(total) // 2**20} "
+                f"allocated_mib={torch.cuda.memory_allocated() // 2**20} "
+                f"reserved_mib={torch.cuda.memory_reserved() // 2**20}")
+    except Exception:  # noqa: BLE001 - diagnostics must never be the thing that fails
+        return "free_mib=-1 total_mib=-1 allocated_mib=-1 reserved_mib=-1"
 
 
 def ws_probe(server, spec, min_avail_mib):
@@ -434,6 +451,12 @@ def main():
     print(f"SEAM_SERVER_LOADED {time.time() - t0:.1f}s stub={int(args.stub)} "
           f"fail_after={args.fail_after} build={os.environ.get('SEAM_BUILD_ID') or '-'} "
           f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()}", flush=True)
+    if not args.stub:
+        # The device side of the bill, once per load: free_mib near zero with several GiB swapped
+        # means this pack is too big for the box and any arm dies in a launch failure, whatever the
+        # workspace knobs say.
+        print(f"SEAM_SERVER_DEVMEM {_dev_mem_mib()} avail_mib={_avail_mib()} "
+              f"swapped_mib={_swap_used_mib()}", flush=True)
     if args.ws_probe or args.ws_check:
         # Both modes share one pack load: the ladder first (it resets the peak counters), then the
         # equivalence check, whose own peak does not matter.
