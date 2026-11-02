@@ -261,6 +261,24 @@ pair_ticket_hardcap() {  # -> epoch the calling queue ticket must be off this bo
   done
   return 1
 }
+
+pair_gate_is_ours() {  # 0 when the claim line names this shell or one of its ancestors
+  # A server may only be stopped inside the claim that protects the box (pair_smoke's smoke_exit says so
+  # in as many words). On 2026-11-02 07:53 a foreign prologue stopped dev's worker without holding the
+  # gate, could not take it afterwards, and left the pair serving nothing until the next ticket. The
+  # claim is written with the holder's pid, so "mine" is that pid being this process or one of its
+  # parents; a claim from another host can not be ours, because its /proc is not here.
+  local f p rest
+  f=$(pair_gx_gate_file) || return 1
+  p=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  case "${p:-}" in ''|*[!0-9]*) return 1 ;; esac
+  while [ "${p:-0}" -gt 1 ] 2>/dev/null; do
+    [ "$p" = "$$" ] && return 0
+    rest=$(sed -n 's/.*) //p' "/proc/$p/stat" 2>/dev/null)
+    p=$(printf '%s\n' "$rest" | awk '{print $2}')
+  done
+  return 1
+}
 pair_gx_gate_up() {  # <label> <minutes> -> atomic; never replaces a claim that is still held
   local f cap until now
   f=$(pair_gx_gate_file) || { echo "PAIR_GATE_REFUSED gate_unresolved label=${1:-?}" >&2; return 5; }
@@ -384,6 +402,19 @@ pair_server_stop() {  # stops the recorded worker if it is still the one that wa
     python3\ -u\ qmesh/worker_seam_server.py*) ;;
     *) printf 'SERVER_STOP_SKIP pid=%s (gone or not the worker: %s)\n' "$pid" "$(printf '%s' "${live:0:60}")"; rm -f "$f"; return 0 ;;
   esac
+  # Stopping is a lifecycle event on the box: it belongs inside the claim that protects it. A job that
+  # does not hold the gate can stop a server it can not then reload -- on 2026-11-02 07:53 that is how
+  # dev served nothing between two tickets. Free box or our own claim: proceed as before.
+  if [ "${PAIR_STOP_FORCE:-0}" != 1 ]; then
+    case "$(pair_gx_gate_state)" in
+      free|gate_unresolved) ;;
+      *) pair_gate_is_ours || {
+           printf 'SERVER_STOP_REFUSED pid=%s build=%s gate="%s" -- another job owns %s, so this stop could not reload it (PAIR_STOP_FORCE=1 overrides)\n' \
+             "$pid" "${build:-?}" "$(pair_gx_gate_state)" "$GXCT"
+           return 1
+         } ;;
+    esac
+  fi
   out=$(pair_gxsh "docker exec $GXCT kill -TERM $pid && echo sent" 2>/dev/null)
   if [ "${out:-}" = sent ]; then
     printf 'SERVER_STOP pid=%s build=%s\n' "$pid" "${build:-?}"
