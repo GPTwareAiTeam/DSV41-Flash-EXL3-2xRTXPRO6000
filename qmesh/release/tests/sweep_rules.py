@@ -271,6 +271,10 @@ check("GX host commands never take a container path",
               for l in code_lines(src("pair_build_ext.sh")))
       and not any("rel_c" in l and "pair_gxsh" in l and "docker exec" not in l
                   for f in ("pair_smoke.sh", "pair_update_run.sh") for l in code_lines(src(f))), "")
+check("a glob in a docker exec goes through a shell",
+      not any("docker exec" in l and "_C*" in l and "sh -c" not in l
+              for f in ("pair_build_ext.sh", "pair_smoke.sh", "pair_update_run.sh", "pair_lib.sh")
+              for l in code_lines(src(f))), "")
 
 
 

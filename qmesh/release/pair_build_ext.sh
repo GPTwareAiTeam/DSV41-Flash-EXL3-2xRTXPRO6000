@@ -184,7 +184,8 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
     # rel_c is a path INSIDE the container; the host half of this script has no /pair, so a lookup (or
     # a chown) run through pair_gxsh without docker exec reports the kernel missing on a build that just
     # succeeded -- and the chown would silently do nothing, leaving root-owned files in the release.
-    cxso=$(pair_gxsh "docker exec $(printf %q "$ct") ls -1 $rel_c/src/vendor/cuda-exl3/src/cuda_exl3/_C*.so 2>/dev/null | head -1")
+    # docker exec runs no shell, so even in the container the `_C*.so` has to be expanded by sh -c.
+    cxso=$(pair_gxsh "docker exec $(printf %q "$ct") sh -c $(printf %q "ls -1 $rel_c/src/vendor/cuda-exl3/src/cuda_exl3/_C*.so | head -1")" 2>/dev/null)
     [ -n "$cxso" ] || { pair_step "CX_FAIL gx no_so_in_release_tree"; return 1; }
     cxname=$(basename "$cxso")
     cxsha=$(pair_gxsh "docker exec $(printf %q "$ct") sha256sum '$cxso'" 2>/dev/null | cut -d' ' -f1)
