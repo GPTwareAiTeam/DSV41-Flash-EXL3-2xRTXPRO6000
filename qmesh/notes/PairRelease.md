@@ -729,7 +729,7 @@ Heads when this was written (2026-11-02, 11:35 local):
 | --- | --- | --- |
 | `tools/pair-release` | `c543dadc` | the release branch; dev canary `d330dcf5` is its parent |
 | `seam/session-multiclient` | `b84f1a81` | merged as `d330dcf5`; three later commits (`6852d901`, `92f27583`, `e9cb08c8`) are NOT merged and NOT validated |
-| `gxport2/cpp-compute` | `51afa401` | GX transport work, not merged |
+| `gxport2/cpp-compute` | `a995b10e` | the C moe hook (`51afa401` + 9 files); merges only with the BOUND flip, after a build (audit 1) |
 | `gxport2/large-m` | `3ee60f98` | not merged |
 | `gxport2/next` | `b2d0ed0d` | not merged |
 
@@ -737,3 +737,33 @@ The merge that made `d330dcf5` is the shape to copy: 31 files, +3359/−44, seve
 ancestors of the merge, and `git diff b84f1a81 d330dcf5` empty for the runtime tree. The rule for
 the next hand-over is the same: the sibling says "sha, branch, what it changes, what you must not
 run it without"; the owner merges, cuts, and queues.
+
+## Wins audit: recorded now, acted on after both pairs serve (2026-11-02)
+
+The supervisor's list, taken down during the canary so nothing is lost. None of it starts before
+both pairs run `d330dcf5`; the order below is the order they will be taken in.
+
+1. **The C moe hook ships with the C-hook release, not before.** `gxport2/cpp-compute` is now
+   `a995b10e` (parent `51afa401`), 9 files, +2686: the hook (`qmesh/native/qmesh_moe_cpp.{h,cpp}`,
+   `qmesh_moe_kernels.cu`) and its bench/check tools. Its `qmesh/moe_cpp.py` is byte-identical to the
+   released `378c175d`, so it cannot move the seam hook path; the native trio is `378c175d` plus the
+   bounds-only alignment path (+119/−42). The worktree also holds one staged, uncompiled change:
+   `SEAM_MOE_CPP_BOUND` default 1 → 0 in `qmesh/native/qmesh_moe_cpp.cpp`, with the struct
+   initialiser and two comments that called bound mode the default (1 file, 13/11). The merge is
+   **`a995b10e` plus that flip as one reviewed commit**, after an in-container build, and it travels
+   to the pairs as its own release -- `SEAM_MOE_CPP` stays unset in the pair env, so the flip only
+   changes what a reader of the code assumes, and a default nobody has compiled is not a default.
+2. **The artifacts tree is not versioned, and its scripts are what runs.** `recipe-artifacts/gpu0-gx1`
+   has no git repo, yet `queue/run_{dev,prod}.sh`, `scripts/pair_*`, `scripts/g6_*` and the
+   `scripts/seam_*` tickets are the code that touches the pairs. Proposal (not started): make the
+   install itself a tracked artifact. `qmesh/release/` in `tools/pair-release` stays the source for
+   pair tooling, and the agents' one-purpose tickets move next to it under `qmesh/tickets/`; a single
+   `scripts/install.sh` copies each file, syntax-checks it, writes `scripts/.installed.json`
+   (`sha256`, `source_sha`, `installed_at`) and `install.sh --check` reports anything whose bytes
+   differ from the manifest. Then "what is running" is a sha, exactly like a release, and the
+   hand-copy ritual disappears instead of being documented. Until then the ritual in this note is the
+   contract: copy to `.new`, `bash -n`, `chmod +x`, `mv`, `cmp`.
+3. **Two branches stay tools, unmerged.** `eval/ppl-4460` (`4b8131e5`, three commits) is the served-path
+   perplexity harness; `p7graph/prefill` (`5df31dd2`) is the P7 prefill profiler and the
+   host/device timing correction. Both are recorded as tools in `EXL3_PORT_BACKLOG.md` items 9 and
+   10 -- they measure the pairs, they are not runtime, and nothing about them queues.
