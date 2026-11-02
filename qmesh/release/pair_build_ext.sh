@@ -120,26 +120,34 @@ build_side() {
   local link=/src/exllamav3 back build_src=$rel_c/src
   back=$(side_docker "$side" exec "$ct" sh -c "readlink $link" 2>/dev/null)
   if [ -n "$back" ]; then
+    # The probe is copied in and run as a *file*. Run from stdin, python puts the cwd on sys.path,
+    # and cwd is the resolved path (/pair/releases/<sha>/src, because getcwd() never returns a
+    # symlink) -- so the cache got the release spelling while every client, which runs a script and
+    # therefore has PYTHONPATH=/src/exllamav3 on sys.path, got the /src spelling. torch's version
+    # hash covers the include path, so the two spellings are two caches: each side rebuilt all 145
+    # units for the other one (2026-11-02, twice, once inside a smoke).
     inner="ln -sfn $rel_c/src $link
 trap 'ln -sfn $back $link' EXIT
+cat > /tmp/pair_ext_probe.py
 cd $link && nice -n 15 env MAX_JOBS=$JOBS NINJAFLAGS=-j$JOBS MAKEFLAGS=-j$JOBS \
 PYTHONPATH=$link TORCH_CUDA_ARCH_LIST=$archlist TORCH_EXTENSIONS_DIR=$rel_c/ext \
-EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -
+EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u /tmp/pair_ext_probe.py
 rc=\$?
 # A plain client import -- no find_spec shim, env exactly as the image sets it -- must reuse what we
 # just built. If it recompiles, torch's version hash disagrees with the client's (build flags or the
 # include path spelling), and every real client pays that rebuild silently inside its own run.
 if [ \$rc = 0 ]; then
   cd $link && TORCH_EXTENSIONS_DIR=$rel_c/ext TORCH_CUDA_ARCH_LIST=$archlist \
-    timeout \${EXT_CLIENT_TIMEOUT:-120} python3 -c 'import exllamav3.ext as e; print(\"EXT_CLIENT_HIT\", e.exllamav3_ext.__file__)'
+    timeout \${EXT_CLIENT_TIMEOUT:-180} python3 -c 'import exllamav3.ext as e; print(\"EXT_CLIENT_HIT\", e.exllamav3_ext.__file__)'
   rc=\$?
 fi
 exit \$rc"
   else
     pair_step "EXT_LINK $side $link missing (building through $rel_c/src)"
-    inner="cd $rel_c/src && nice -n 15 env MAX_JOBS=$JOBS NINJAFLAGS=-j$JOBS MAKEFLAGS=-j$JOBS \
+    inner="cat > /tmp/pair_ext_probe.py
+cd $rel_c/src && nice -n 15 env MAX_JOBS=$JOBS NINJAFLAGS=-j$JOBS MAKEFLAGS=-j$JOBS \
 PYTHONPATH=$rel_c/src TORCH_CUDA_ARCH_LIST=$archlist TORCH_EXTENSIONS_DIR=$rel_c/ext \
-EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
+EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u /tmp/pair_ext_probe.py"
   fi
   if [ "$side" = p7 ]; then
     out=$(docker exec -i "$ct" bash -lc "$inner" < "$HERE/pair_ext_probe.py" 2>&1); rc=$?

@@ -116,6 +116,9 @@ check("ext built through the client path (/src/exllamav3)",
 check("ext build restores the link afterwards", "trap 'ln -sfn $back $link' EXIT" in be, "")
 check("client import is proven, not assumed",
       "EXT_CLIENT_HIT" in be and "EXT_CLIENT_MISS" in be and "EXT_CLIENT_TIMEOUT" in be, "")
+check("ext build runs the probe as a file, never on stdin",
+      "python3 -u /tmp/pair_ext_probe.py" in be and "python3 -u -" not in be, "")
+
 check("client check uses the release's own cache",
       "cd $link && TORCH_EXTENSIONS_DIR=$rel_c/ext" in be, "")
 
