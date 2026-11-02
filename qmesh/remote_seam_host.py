@@ -465,8 +465,11 @@ class RemoteSeamHost:
                       f"capturing={int(torch.cuda.is_current_stream_capturing())} "
                       f"x=0x{x.data_ptr():x} ids=0x{ids.data_ptr():x} idp=0x{idp.data_ptr():x}",
                       file = sys.stderr, flush = True)
+            # `n`, not the bucket: the transport carries the real row count to the GX, which then
+            # computes and answers `n` rows (SlotHdr::rows). The bucket is only what the handle was
+            # opened with, so a remainder piece no longer pays for the padding it sits in.
             seam.issue(layer_idx, xp.data_ptr(), idp.data_ptr(), wp.data_ptr(),
-                       wire.cuda_stream, n_cold or 0)
+                       wire.cuda_stream, n_cold or 0, n)
         except RuntimeError:
             # The transport refused this request (e.g. an id its own cold set cannot hold): the
             # proxy's "qes:" line names layer, slot, values and cold count. The stack says which
@@ -492,9 +495,10 @@ class RemoteSeamHost:
 
     def _split(self, rows: int, step: int | None = None):
         """Prefill split of `rows` onto the granted buckets, chunked at `step` (default chunk_rows)
-        with the remainder in the smallest granted bucket >= it. Returns [(start, stop, bucket)];
-        the bucket is not a multiple of `step` when the remainder pads (id -1 rows cost the GX
-        nothing but a slot of compute)."""
+        with the remainder in the smallest granted bucket >= it. Returns [(start, stop, bucket)].
+        The remainder's bucket is not a multiple of `step`; the transport carries the piece's own
+        row count (`n`, see _issue_piece), so the bucket only sizes the slab and the wire geometry,
+        and the padded tail rows cost the GX nothing: it computes `n` rows and answers `n` rows."""
         step = step or self.chunk_rows
         out = [(i, min(i + step, rows), step) for i in range(0, rows - rows % step, step)]
         rem = rows % step
@@ -506,16 +510,8 @@ class RemoteSeamHost:
         """Collects one in-flight piece into `out` at its row offset. The collect's host->device
         copy and the issue's device->host copy are on the caller's stream, so this never waits on
         the host: the wait kernel for piece m simply sits after piece m+1's issue in the stream."""
-        pos, n, bucket, _xp, _idp, _wp, seam, t0, ev0 = piece
-        direct = pos + bucket <= out.shape[0]
-        if direct:
-            dst = out[pos:pos + bucket]
-        else:
-            # Padded tail piece: the seam fills a whole bucket, only `n` rows are real.
-            dst = torch.empty(bucket, HIDDEN, dtype = torch.float32, device = out.device)
-        seam.collect(layer_idx, dst.data_ptr(), stream.cuda_stream)
-        if not direct:
-            out[pos:pos + n] = dst[:n]
+        pos, n, _bucket, _xp, _idp, _wp, seam, t0, ev0 = piece
+        seam.collect(layer_idx, out[pos:pos + n].data_ptr(), stream.cuda_stream, n)
         if _MARK and layer_idx in _marks and n >= _MARK_MIN_ROWS:
             # The wait kernel is behind the collect above, so this event's device time is when the
             # reply had landed and its rows were in `out`: the far end of the layer's seam wait.
@@ -525,7 +521,7 @@ class RemoteSeamHost:
             t1 = time.perf_counter_ns()
             ev1 = torch.cuda.Event(enable_timing = True)
             ev1.record(stream)
-            _prof_rows.setdefault((bucket, n), []).append((t0, t1, ev0, ev1))
+            _prof_rows.setdefault((_bucket, n), []).append((t0, t1, ev0, ev1))
 
     def _announce(self, layer_idx, rows, plan):
         """One SEAM_SPLIT line per (rows, plan) shape: what the split looks like on this server."""

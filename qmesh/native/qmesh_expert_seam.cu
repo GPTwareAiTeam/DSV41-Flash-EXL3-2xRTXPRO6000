@@ -212,7 +212,10 @@ Geometry geometry(int rows, int slots) {
 struct SlotHdr {
   uint32_t magic; /* SLOT_MAGIC */
   uint32_t layer; /* QES_NL range */
-  uint32_t rows;  /* must equal the bucket the handle was opened with */
+  uint32_t rows;  /* rows this request really carries: 1..the bucket the handle was opened with.
+                     The bucket sizes the slab, the wire geometry and the RDMA transfer; the compute
+                     follows this field, so a 2560-row prefill chunk served by a 4096-row handle is a
+                     2560-row compute on the GX and a 2560-row response. */
   uint32_t n_cold; /* client: cold experts the ids were clamped to, 0 = not supplied. The server
                       ignores it; the client's proxy checks the payload against it before sending
                       (see client_proxy), so an out-of-range id never reaches QES_ROLE_SERVER's
@@ -683,11 +686,13 @@ bool post_flag(qes_handle* h, size_t remote_off, uint64_t seq) {
   return true;
 }
 
-void server_compute(qes_handle* h, int slot, int L) {
+/* The no-hook server path (stub benches): out[r][j] = float(x[r][j]) + (layer + 1) over the request's
+ * own `rows` rows, not the bucket's. */
+void server_compute(qes_handle* h, int slot, int L, int rows) {
   const float add = (float)(L + 1);
   const uint16_t* x = (const uint16_t*)(h->slab + off_req(h, slot));
   float* out = (float*)(h->slab + off_resp(h, slot));
-  const int n = h->rows * QES_HIDDEN;
+  const int n = rows * QES_HIDDEN;
   for (int i = 0; i < n; i++) {
     uint32_t bits = (uint32_t)x[i] << 16;
     float f;
@@ -815,7 +820,14 @@ bool client_check_ids(qes_handle* h, int slot, uint64_t seq) {
   const int32_t n_cold = (int32_t)hdr->n_cold;
   if (n_cold <= 0) return true; /* the caller supplied no bound: nothing to check against */
   const int32_t* ids = (const int32_t*)(h->slab + off_req(h, slot) + h->ids_off);
-  const int n = h->rows * QES_TOPK;
+  /* Only the rows this request carries are checked. The slot is laid out for the bucket, so when
+   * rows < bucket the tail still holds the previous request's ids - real bytes from another
+   * request, which can be outside this layer's cold set for reasons that have nothing to do with
+   * the caller (measured 2026-11-01: three stale picks at bucket 6 killed a decode handle after
+   * 120 good requests, once the request carried its own 2-5 rows instead of padding to the
+   * bucket). Scanning h->rows is what the padded protocol could do; it is wrong the moment a
+   * partial request exists. */
+  const int n = (int)hdr->rows * QES_TOPK;
   int bad = 0, first_at = -1, first_id = 0;
   for (int k = 0; k < n; k++) {
     if (ids[k] >= -1 && ids[k] < n_cold) continue;
@@ -826,12 +838,12 @@ bool client_check_ids(qes_handle* h, int slot, uint64_t seq) {
   }
   if (!bad) return true;
   fprintf(stderr,
-          "qes: NOT SENT: client ids out of range on rows=%u port=%d layer=%u slot=%d seq=%llu "
-          "handled=%llu fresp=%llu: %d of %d pick(s) outside [-1,%d), first at %d: %d. The caller "
-          "handed the seam an id its own cold set cannot hold, so the server's placement for this "
-          "layer would index out of range; the request is dropped and this handle is taken down "
-          "instead of the server.\n",
-          h->rows, h->tcp_port, hdr->layer, slot, (unsigned long long)seq,
+          "qes: NOT SENT: client ids out of range on rows=%u bucket=%u port=%d layer=%u slot=%d "
+          "seq=%llu handled=%llu fresp=%llu: %d of %d pick(s) outside [-1,%d), first at %d: %d. The "
+          "caller handed the seam an id its own cold set cannot hold, so the server's placement "
+          "for this layer would index out of range; the request is dropped and this handle is "
+          "taken down instead of the server.\n",
+          hdr->rows, h->rows, h->tcp_port, hdr->layer, slot, (unsigned long long)seq,
           (unsigned long long)h->handled[slot],
           (unsigned long long)load_acq(h->slab, off_fresp(h, slot)), bad, n, n_cold, first_at,
           first_id);
@@ -896,7 +908,11 @@ void client_proxy(qes_handle* h) {
          * layer. That is the only way a caller's own translate can look wrong here, and forwarding
          * it would compute one layer with another's cold ids: drop it and name the mix. */
         const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, i));
-        if (hdr->magic != SLOT_MAGIC || hdr->rows != (uint32_t)h->rows || hdr->seq != r) {
+        /* rows is the request's real row count, bounded by the handle's bucket: it is not an equality
+         * test any more (see SlotHdr::rows), but a header that claims more rows than the slab was
+         * opened for, or none at all, is still a header from another world. */
+        if (hdr->magic != SLOT_MAGIC || hdr->rows == 0 || hdr->rows > (uint32_t)h->rows ||
+            hdr->seq != r) {
           fprintf(stderr,
                   "qes: NOT SENT: slot %d on rows=%u port=%d announced seq=%llu but its header says "
                   "magic=0x%08x layer=%u rows=%u seq=%llu n_cold=%u: header and payload in that slot "
@@ -917,8 +933,18 @@ void client_proxy(qes_handle* h) {
         }
         dump_wire_ids(h, i, r);
         if (!client_check_ids(h, i, r)) return;
-        if (!post_payload(h, off_hdr(h, i), (uint32_t)(LINE + h->req_len)) ||
-            !post_flag(h, off_freq(h, i), r)) {
+        /* Only the request's own rows go on the wire. The slot is laid out for the bucket, so x, ids
+         * and w sit at bucket offsets and cannot be one WR for a partial request: the header and the
+         * x prefix are contiguous, ids and w are posted separately. Same QP, same thread, and the
+         * flag below is posted after them, so the peer sees the rows before it sees the seq (RC
+         * completes in order), exactly as with the single bucket-sized WR this replaces. */
+        const uint32_t rows = hdr->rows;
+        const bool sent =
+            post_payload(h, off_hdr(h, i), (uint32_t)(LINE + (size_t)rows * QES_HIDDEN * 2)) &&
+            post_payload(h, off_req(h, i) + h->ids_off, rows * QES_TOPK * 4) &&
+            post_payload(h, off_req(h, i) + h->w_off, rows * QES_TOPK * 2) &&
+            post_flag(h, off_freq(h, i), r);
+        if (!sent) {
           /* A WR the verbs layer rejects (SQ full, lkey or length outside this handle's registered
            * slab) leaves the request unsent and unretried, so this slot would spin its fail word
            * for WAIT_TIMEOUT_NS and every later issue would wait SLOT_ACK_TIMEOUT_NS for an ack
@@ -948,7 +974,10 @@ void server_proxy(qes_handle* h) {
       uint64_t r = load_acq(h->slab, off_freq(h, i));
       if (r <= h->handled[i]) continue;
       const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, i));
-      if (hdr->magic != SLOT_MAGIC || hdr->rows != (uint32_t)h->rows ||
+      /* rows is the request's own row count (SlotHdr::rows): the bucket bounds it, and everything
+       * below - the module call, the response - is sized by it, so the padding a big bucket leaves at
+       * the end of a prefill chunk costs the GX nothing. */
+      if (hdr->magic != SLOT_MAGIC || hdr->rows == 0 || hdr->rows > (uint32_t)h->rows ||
           hdr->layer >= (uint32_t)QES_NL || hdr->seq != r) {
         fprintf(stderr,
                 "qes: bad request header slot=%d magic=0x%08x layer=%u rows=%u want_rows=%d "
@@ -962,11 +991,12 @@ void server_proxy(qes_handle* h) {
       }
       const int L = (int)hdr->layer;
       const uint8_t* req = h->slab + off_req(h, i);
+      const int rows = (int)hdr->rows;
       if (h->server_fn) {
-        h->server_fn(h->server_ctx, L, h->rows, req, (const int32_t*)(req + h->ids_off),
+        h->server_fn(h->server_ctx, L, rows, req, (const int32_t*)(req + h->ids_off),
                      req + h->w_off, (float*)(h->slab + off_resp(h, i)));
       } else {
-        server_compute(h, i, L);
+        server_compute(h, i, L, rows);
       }
       if (qes_trace())
         fprintf(stderr,
@@ -974,7 +1004,9 @@ void server_proxy(qes_handle* h) {
                 "off_resp=%zu req_len=%zu resp_len=%zu slab=%zu\n",
                 h->tcp_port, h->rows, L, i, (unsigned long long)r, off_req(h, i), off_resp(h, i),
                 h->req_len, h->resp_len, h->slab_bytes);
-      if (!post_payload(h, off_resp(h, i), (uint32_t)h->resp_len) ||
+      /* Only the answered rows travel back: the client's collect copies the same count, so the
+       * bucket's tail in either slab is never read (see qes_collect). */
+      if (!post_payload(h, off_resp(h, i), (uint32_t)((size_t)rows * QES_HIDDEN * 4)) ||
           !post_flag(h, off_fresp(h, i), r)) {
         /* One client's slot could not be answered: take this handle down so the session thread
          * ends it (SEAM_SESSION_END reason=qp-error) and the server goes back to accepting the
@@ -2355,8 +2387,12 @@ int seam_dead_check(qes_handle* h, const char* what) {
   return -5;
 }
 
+/* rows_used: how many of the bucket's rows this request carries, or <= 0 for the whole bucket. The
+ * bucket sizes the slab, the RDMA regions and every offset; the copies here, the compute on the
+ * peer and the response follow rows_used (see SlotHdr::rows). A prefill chunk that the grant puts
+ * in a 4096-row bucket while it only has 2560 rows therefore costs 2560 rows of wire and compute. */
 extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int32_t* ids,
-                         const void* w_bf16, cudaStream_t stream, int n_cold) {
+                         const void* w_bf16, cudaStream_t stream, int n_cold, int rows_used) {
   if (!h || h->role != QES_ROLE_CLIENT || layer < 0 || layer >= QES_NL) return -1;
   if (int rc = seam_dead_check(h, "issue")) return rc;
   if (h->n_pending >= h->slots) {
@@ -2412,7 +2448,8 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
   SlotHdr hdr{};
   hdr.magic = SLOT_MAGIC;
   hdr.layer = (uint32_t)layer;
-  hdr.rows = (uint32_t)h->rows;
+  const int nrows = rows_used > 0 && rows_used <= h->rows ? rows_used : h->rows;
+  hdr.rows = (uint32_t)nrows;
   hdr.n_cold = n_cold > 0 ? (uint32_t)n_cold : 0u;
   /* The seq publish_kernel is about to produce for this slot (it does `*F_REQ + 1`). Both proxies
    * compare it against the seq they are handling, so a header that does not belong to the payload
@@ -2431,18 +2468,18 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
                       sizeof(SlotHdr), cudaMemcpyHostToDevice, stream))
     return -2;
   uint8_t* req = h->slab + off_req(h, slot);
-  if (cudaMemcpyAsync(req, x_bf16, (size_t)h->rows * QES_HIDDEN * 2, cudaMemcpyDeviceToHost, stream))
+  if (cudaMemcpyAsync(req, x_bf16, (size_t)nrows * QES_HIDDEN * 2, cudaMemcpyDeviceToHost, stream))
     return -2;
-  if (cudaMemcpyAsync(req + h->ids_off, ids, (size_t)h->rows * QES_TOPK * 4,
+  if (cudaMemcpyAsync(req + h->ids_off, ids, (size_t)nrows * QES_TOPK * 4,
                       cudaMemcpyDeviceToHost, stream))
     return -2;
   /* Same stream, same source pointer, and before the publish below: if the slab copy above is what
    * the wire carries, this mirror says whether the caller's tensor already held that value. */
   if (h->dump_src &&
       cudaMemcpyAsync(h->dump_src + (size_t)slot * h->rows * QES_TOPK, ids,
-                      (size_t)h->rows * QES_TOPK * 4, cudaMemcpyDeviceToHost, stream))
+                      (size_t)nrows * QES_TOPK * 4, cudaMemcpyDeviceToHost, stream))
     return -2;
-  if (cudaMemcpyAsync(req + h->w_off, w_bf16, (size_t)h->rows * QES_TOPK * 2,
+  if (cudaMemcpyAsync(req + h->w_off, w_bf16, (size_t)nrows * QES_TOPK * 2,
                       cudaMemcpyDeviceToHost, stream))
     return -2;
   if (qes_trace())
@@ -2466,7 +2503,10 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
   return 0;
 }
 
-extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream) {
+/* rows: the row count of the request being collected (the same value qes_issue was given), or <= 0
+ * for the whole bucket. Only those rows are copied out: the peer answered exactly that many, so the
+ * rest of the slot's response region holds an older request's rows and must not reach the caller. */
+extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream, int rows) {
   if (!h || h->role != QES_ROLE_CLIENT || layer < 0 || layer >= QES_NL) return -1;
   if (int rc = seam_dead_check(h, "collect")) return rc;
   int idx = -1;
@@ -2478,14 +2518,16 @@ extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_
     return -1;
   }
   const int slot = h->pending[idx].slot;
+  const int nrows = rows > 0 && rows <= h->rows ? rows : h->rows;
+  const size_t resp_bytes = (size_t)nrows * QES_HIDDEN * 4;
   // A whole warp is enough to poison a timed-out response quickly (resp_len/4 up to ~10M floats for
   // the largest bucket) and costs nothing on the answered path, where the loop is never entered.
   wait_kernel<<<1, 32, 0, stream>>>((const uint64_t*)(h->slab + off_freq(h, slot)),
                                     (const uint64_t*)(h->slab + off_fresp(h, slot)),
                                     (uint32_t*)(h->slab + off_fail(h, slot)),
                                     (float*)(h->slab + off_resp(h, slot)),
-                                    (int)(h->resp_len / sizeof(float)), WAIT_TIMEOUT_NS);
-  if (cudaMemcpyAsync(out_f32, h->slab + off_resp(h, slot), h->resp_len, cudaMemcpyHostToDevice,
+                                    (int)(resp_bytes / sizeof(float)), WAIT_TIMEOUT_NS);
+  if (cudaMemcpyAsync(out_f32, h->slab + off_resp(h, slot), resp_bytes, cudaMemcpyHostToDevice,
                       stream))
     return -2;
   for (int p = idx; p + 1 < h->n_pending; p++) h->pending[p] = h->pending[p + 1];
