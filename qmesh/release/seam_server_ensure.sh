@@ -426,6 +426,10 @@ seam_server_ensure() {
                        [ -e \"\$f\" ] && echo \"\$f\"; done" 2>/dev/null)
   if [ -n "$stale" ]; then
     echo "SEAM_ENSURE stale torch build lock(s): $(echo $stale)"
+    # The token names each path, not just the count: a reader (GxPort2's A/B driver, a post-mortem
+    # grep) has to be able to tell *which* import was blocked, and `$(echo $stale)` below flattens
+    # the list onto one line. The removal itself is the same rm -f that follows.
+    for _f in $stale; do echo "STALE_LOCK_REMOVED path=$_f"; done
     seam_gxct "for f in /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock; do
                  [ -e \"\$f\" ] && rm -f \"\$f\"; done" >/dev/null 2>&1
   fi

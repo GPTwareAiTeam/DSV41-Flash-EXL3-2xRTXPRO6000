@@ -66,6 +66,9 @@ locks=$(pair_torch_locks "$GXCT")
 if [ -n "$locks" ]; then
   if [ "$(pair_torch_build_live "$GXCT")" = 0 ]; then
     pair_gxsh "docker exec $GXCT sh -c 'rm -f /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock'" >/dev/null 2>&1
+    # One line per path, in the token GxPort2's driver greps: "which import was blocked" is the question
+    # a post-mortem asks, and a comma-joined list in the cleared= line answers only for one of them.
+    for _f in $locks; do pair_step "STALE_LOCK_REMOVED path=$_f side=gx ct=$GXCT"; done
     pair_step "PAIR_SERVE_TORCH_LOCK cleared=$(printf '%s' "$locks" | tr '\n' ',')"
   else
     pair_gx_gate_down
