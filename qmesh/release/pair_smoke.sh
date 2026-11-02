@@ -107,13 +107,14 @@ if ! pair_gx_gate_take "smoke-$PAIR" $(( (SMOKE_SERVER_TIMEOUT + SMOKE_ARM_TIMEO
   echo "SMOKE_GATE_BUSY $(pair_gx_gate_state)"
   fail "gx_busy $(pair_gx_gate_state)"
 fi
-# The claim and the server this smoke loaded are both its own. pair_gx_gate_down used to be the whole
-# trap, so a smoke that was terminated left the pack resident and every later ticket queued behind it.
-# A smoke that reached its verdict keeps the server: that server is the update's result, not a leak.
-SMOKE_VERDICT=0
+# The claim and the server this smoke loaded are both its own, and both have to be released when it
+# ends -- pass or fail. It used to keep the server on a passing verdict as "the update's result", and a
+# prod smoke from 01:17 was still serving an hour later with nobody attached: a server outliving the
+# ticket that started it is a leak whether or not it measured well. Stop first, then drop the claim:
+# a stop is a lifecycle event on the box, so it belongs inside the claim, not after it.
 smoke_exit() {
+  pair_server_stop
   pair_gx_gate_down
-  [ "$SMOKE_VERDICT" = 1 ] || pair_server_stop
 }
 trap smoke_exit EXIT
 echo "SMOKE_GATE owner=smoke-$PAIR until=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$(pair_gx_gate_file)")"
@@ -351,6 +352,6 @@ esac
 awk -v got="$pf_tps" -v want="$SMOKE_PREFILL_MIN_TPS" 'BEGIN { exit !(got + 0 >= want + 0) }' \
   || fail "prefill_slow depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS"
 echo "SMOKE_PREFILL_OK depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS aborts=0"
-SMOKE_VERDICT=1
-[ "${PAIR_SMOKE_KEEP_SERVER:-0}" = 1 ] || rm -f "$(pair_server_pidfile)"
 echo "SMOKE_OK $PAIR $SHA $BUILD_ID"
+# The pidfile stays: the EXIT trap uses it to stop the server it started. Deleting it on the passing
+# path is what turned a measured update into a server nobody could attribute an hour later.

@@ -10,6 +10,20 @@ This note describes the release system in `qmesh/release/` (branch `tools/pair-r
 into `/home/treadall/recipe-artifacts/gpu0-gx1/scripts/`). It answers one question per pair:
 **are both halves on the same release, and is that release the one we think it is?**
 
+## A smoke stops the server it started (2026-11-02)
+
+`pair_smoke.sh` used to keep its worker on a passing verdict and delete the pidfile that named it, on
+the theory that the loaded server was "the update's result". Prod's 01:17 smoke did exactly that: at
+02:30 `seam-gx1-prod` was still serving a release from an hour earlier, with no record of which ticket
+owned it -- and a later ticket that wanted the box could not tell a live pair server from a leak. A
+server whose owner is a finished ticket is a leak even when it measures well.
+
+The EXIT trap now runs `pair_server_stop` and then `pair_gx_gate_down`, in that order: a stop is a
+lifecycle event on the box and belongs inside the claim. The success path no longer touches the
+pidfile, so the trap always has the record it needs; `pair_update_run.sh` no longer asks the smoke to
+keep the server, and no longer deletes the record after verify. A pair that needs a server gets one
+from the ensure when a client asks, under that client's claim.
+
 ## A container that lost its GPU is restarted, not recreated (2026-11-02)
 
 The 02:18 systemd daemon reload (an `nmcli connection modify` for the new MTU) re-derived the device

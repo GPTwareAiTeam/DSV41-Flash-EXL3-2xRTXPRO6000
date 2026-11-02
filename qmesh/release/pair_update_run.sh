@@ -392,9 +392,9 @@ rc=${PIPESTATUS[0]}
 # ---- 6. smoke -----------------------------------------------------------------------------------
 phase smoke
 status_write 20 "server start + one decode row"
-# The smoke may keep the worker it loaded (it is this update's result); everything else about the pid
-# file is the smoke's to decide, so stand-alone smokes clean up after themselves.
-smoke_out=$(PAIR_SMOKE_KEEP_SERVER=1 "$HERE/pair_smoke.sh" "$PAIR" "$SHA" 2>&1)
+# The smoke stops the worker it loaded, pass or fail: a server that outlives its ticket is a leak, and
+# the pair starts one again through the ensure when a client needs it.
+smoke_out=$("$HERE/pair_smoke.sh" "$PAIR" "$SHA" 2>&1)
 smoke_rc=$?
 printf '%s\n' "$smoke_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
 if [ "$smoke_rc" != 0 ]; then
@@ -474,10 +474,8 @@ check_rc=$?
 printf '%s\n' "$check_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
 [ "$check_rc" = 0 ] || fail "post-update check rc=$check_rc"
 VERIFIED=1
-# The server this ticket loaded is now the pair's serving server, verified on this release: it stops
-# being a ticket's to interrupt, so the recorded pid goes. A stale claim here would let a later
-# ticket's interruption kill a server its own smoke never started.
-rm -f "$(pair_server_pidfile)"
+# The smoke stopped its own worker and dropped its record; nothing of this ticket's is still running
+# on the box, which is what lets the next ticket take the gate without inheriting a stranger's server.
 status_write 1 "done"
 
 # Evidence last, so the file only exists once the pair is really on the release and verified.

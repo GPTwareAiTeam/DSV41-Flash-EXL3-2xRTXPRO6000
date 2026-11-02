@@ -232,7 +232,7 @@ check("a claim carries its host, and only a same-host pid may declare it dead",
       "host=%s" in src("pair_lib.sh")
       and 'hostname -s' in src("pair_lib.sh")
       and 'flock' in src("pair_lib.sh")
-      and 'host=\([^ ]*\)' in src("seam_server_ensure.sh"), "")
+      and r'host=\([^ ]*\)' in src("seam_server_ensure.sh"), "")
 check("a dry run cannot declare a free GPU for a real ticket",
       '[ "$PAIR_DRY" = 1 ] && [ -n "${PAIR_DRY_GPU:-}" ]' in src("pair_update_run.sh"), "")
 check("a rehearsed cut keeps its seeded release stand-in",
@@ -365,7 +365,11 @@ check("the stub smoke keeps its own gate directory",
 check("the smoke records the worker it started",
       'pair_server_record' in src("pair_smoke.sh"), "")
 check("an interrupted smoke stops its own server, a verified one keeps it",
-      'SMOKE_VERDICT' in src("pair_smoke.sh") and 'pair_server_stop' in src("pair_smoke.sh")
+      'SMOKE_VERDICT' not in src("pair_smoke.sh")
+      and 'PAIR_SMOKE_KEEP_SERVER' not in src("pair_smoke.sh")
+      and 'PAIR_SMOKE_KEEP_SERVER' not in src("pair_update_run.sh")
+      and 'pair_server_stop' in src("pair_smoke.sh")
+      and src("pair_smoke.sh").index("pair_server_stop") < src("pair_smoke.sh").index("pair_gx_gate_down")
       and 'smoke_exit' in src("pair_smoke.sh"), "")
 check("the interrupt path stops by recorded pid, not by pattern",
       'pair_server_stop' in src("pair_update_run.sh")
@@ -376,8 +380,9 @@ check("the preflight reclaims this pair's own orphan before refusing",
       _upd.count("others=$(pair_others_busy)") == 1
       and 'UPDATE_ORPHAN' in _upd
       and _upd.index('pair_server_stop 2>&1') < _upd.index('others=$(pair_others_busy)'), "")
-check("a verified flip releases the recorded server pid",
-      'rm -f "$(pair_server_pidfile)"' in src("pair_update_run.sh"), "")
+check("a verified flip leaves no server behind it",
+      'PAIR_SMOKE_KEEP_SERVER' not in src("pair_update_run.sh")
+      and 'rm -f "$(pair_server_pidfile)"' not in src("pair_update_run.sh"), "")
 # A pair's first release has no containers to reuse, and the lib build runs inside them: prepare that
 # answers "unchanged" to a CREATE plan leaves the release cut and the pair unable to start a server.
 check("prepare creates a missing pair container instead of reporting it unchanged",
