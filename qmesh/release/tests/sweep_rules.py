@@ -752,6 +752,52 @@ _r = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; pair_gx_gate_up keeper 5 >/dev/
 check("a resolvable GXCT still reads its own box's claim",
       "file=%s/gx2.gate" % _gd in _r.stdout and "state=keeper until=" in _r.stdout,
       (_r.stdout + _r.stderr).strip()[:200])
+
+# A server may only be stopped inside the claim that protects the box. At 07:53 on 2026-11-02 a
+# foreign prologue TERMed dev's worker while GxPort2 held gx2, could not take the gate afterwards,
+# and the pair served nothing until the next ticket. The guard is exercised in both directions:
+# a claim held by somebody else must leave the worker alone, our own claim must stop it as before.
+_sd = _tf.mkdtemp(prefix="stopgate")
+_e = dict(_env); _e["GXCT"] = "seam-gx2-dev"; _e["PAIR"] = "dev"
+_e["PAIR_STATE_DIR"] = _sd; _e["GPU_TICKET_HARDCAP"] = str(int(__import__("time").time()) + 600)
+open(_sd + "/server-dev.pid", "w").write("pair=dev build=dev-deadbeef pid=999999 at=1970-01-01T00:00:00Z\n")
+_stop_probe = (
+    '. "%s/pair_lib.sh"; PAIR_DRY=0; '
+    'pair_gxsh() { case "$*" in *cmdline*) echo "python3 -u qmesh/worker_seam_server.py --x";; '
+    '*kill*) echo sent;; esac; }; '
+    'pair_server_stop; echo "rc=$?"; test -f "%s/server-dev.pid" && echo pidfile_kept' % (HERE, _sd))
+_holder = _sp.Popen(["sleep", "120"])
+try:
+    open(_gd + "/gx2.gate", "w").write("owner=GxPort2 pid=%d until=%d host=%s\n"
+                                       % (_holder.pid, int(__import__("time").time()) + 600,
+                                          _sp.run(["hostname", "-s"], capture_output=True,
+                                                  text=True).stdout.strip()))
+    _r = _sp.run(["bash", "-c", _stop_probe], env=_e, capture_output=True, text=True)
+    check("a stop refuses while a live foreign claim owns the box",
+          "SERVER_STOP_REFUSED" in _r.stdout and "rc=1" in _r.stdout
+          and "pidfile_kept" in _r.stdout and "SERVER_STOP pid=" not in _r.stdout,
+          (_r.stdout + _r.stderr).strip()[:200])
+    open(_gd + "/gx2.gate", "w").write("owner=GxPort2 pid=%d until=%d host=elsewhere\n"
+                                       % (_holder.pid, int(__import__("time").time()) + 600))
+    _r = _sp.run(["bash", "-c", _stop_probe], env=_e, capture_output=True, text=True)
+    check("a claim written on another host can never be read as ours",
+          "SERVER_STOP_REFUSED" in _r.stdout and "rc=1" in _r.stdout,
+          (_r.stdout + _r.stderr).strip()[:200])
+finally:
+    _holder.terminate(); _holder.wait()
+os.unlink(_gd + "/gx2.gate")  # a remote-host claim stays claimed until it expires; clear it so the
+                              # positive case tests our own claim rather than the previous file
+_r = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; PAIR_DRY=0; '
+              'pair_gxsh() { case "$*" in *cmdline*) echo "python3 -u qmesh/worker_seam_server.py --x";; '
+              '*kill*) echo sent;; esac; }; '
+              'pair_gx_gate_up mine 5 >/dev/null 2>&1; '
+              'pair_server_stop; echo "rc=$?"' % HERE], env=_e, capture_output=True, text=True)
+check("our own claim still stops the worker, and clears the pidfile",
+      "SERVER_STOP pid=999999" in _r.stdout and "rc=0" in _r.stdout
+      and not os.path.exists(_sd + "/server-dev.pid"), (_r.stdout + _r.stderr).strip()[:200])
+_sh.rmtree(_sd, ignore_errors=True)
+if os.path.exists(_gd + "/gx2.gate"):
+    os.unlink(_gd + "/gx2.gate")
 check("the wrapper hands its hard cap to the ticket's children",
       "export GPU_TICKET_HARDCAP=$hard" in src("gpu_run_pair.sh")
       and "hardcap=%s" in src("gpu_run_pair.sh"), "")
