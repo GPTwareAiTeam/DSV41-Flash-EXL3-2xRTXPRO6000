@@ -157,3 +157,11 @@ library - the two commits after `dabfa4c9` add a `SEAM_HOOK_US` stderr line and 
 message, nothing on the wire or in the layout. `state=stale` next to passing numbers is that, and
 rebuilding is a `build_gx_transport.sh` away once the box is free, at the cost of a new build id for
 every container sharing the tree.
+
+**What the ranked table is.** `placement.hot4460-cold2800x4-8100x2.ranked.json` (sha `5982a8baa736`)
+against the shipped `placement.hot4460-cold2800x4-8100x2.json` (sha `844251e79b9d`): per layer
+`hot + warm` is a permutation of `0..383`, the hot and warm *sets* are identical to the plain file's,
+`warm_bpw` is non-increasing (all 4-bit, then all 2-bit), `warm_4bpw_n` equals the count of 4-bit
+entries, and the totals are 4460 hot / 10900 cold / 2800 at 4 bits: 40 layers, 0 exceptions. So the
+client's `sorted(hot + warm) == range(num_experts)` assert cannot fire on it, and the only thing the
+ranked run changes is cold numbering.
