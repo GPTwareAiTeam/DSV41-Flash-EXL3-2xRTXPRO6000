@@ -42,6 +42,8 @@ REL=$(pair_release_dir "$SHA")
 [ -d "$REL/src" ] || pair_die "release ${SHA:0:8} is not cut at $REL (run pair_cut.sh first)"
 BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' "$REL/RELEASE.json") \
   || pair_die "no RELEASE.json in $REL"
+LIB_TIMEOUT=${LIB_TIMEOUT:-900}
+
 SEAM_FP=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["seam"]["fingerprint"])' "$REL/RELEASE.json")
 GX_BUILD_AVAIL_GIB=${GX_BUILD_AVAIL_GIB:-60}
 side_ct() { [ "$1" = p7 ] && echo "$P7CT" || echo "$GXCT"; }
@@ -198,7 +200,18 @@ PY
   return 0
 }
 
+# The GX half claims the box for the same reason the ext build does: the transport is compiled there
+# with 8 jobs next to whatever else has a pack loaded, and a load that lands mid-compile kills it. The
+# claim can only be taken inside a queue ticket, so a GX build outside one is refused rather than run
+# unclaimed. P7-only builds need no ticket.
 rc=0
+case "$SIDES" in
+  both|gx)
+    if ! pair_gx_gate_take "build_lib-$PAIR" $(( (LIB_TIMEOUT + 300) / 60 )) "${GX_GATE_WAIT_MIN:-20}"; then
+      pair_die "GX_GATE_BUSY $GXCT $(pair_gx_gate_state): the box is claimed by another job"
+    fi
+    trap pair_gx_gate_down EXIT ;;
+esac
 case "$SIDES" in
   both) build_side p7 || rc=1; [ "$rc" = 0 ] && { build_side gx || rc=1; } ;;
   p7) build_side p7 || rc=1 ;;

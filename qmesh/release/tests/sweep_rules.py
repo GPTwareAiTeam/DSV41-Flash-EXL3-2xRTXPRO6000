@@ -349,9 +349,10 @@ check("the piece size is the pair's number, pinned",
 # pack, so it takes the claim the same way.
 check("every GX job claims the box through the helper",
       all(any("pair_gx_gate_take " in l for l in code_lines(src(f)))
-          for f in ("pair_build_ext.sh", "pair_smoke.sh", "pair_serve.sh"))
+          for f in ("pair_build_ext.sh", "pair_build_lib.sh", "pair_smoke.sh", "pair_serve.sh"))
       and not any("pair_gx_gate_up " in l
-                  for f in ("pair_build_ext.sh", "pair_smoke.sh", "pair_serve.sh") for l in code_lines(src(f)))
+                  for f in ("pair_build_ext.sh", "pair_build_lib.sh", "pair_smoke.sh", "pair_serve.sh")
+                  for l in code_lines(src(f)))
       and "pair_gx_gate_state() {" in src("pair_lib.sh")
       and "pair_gx_gate_down() {" in src("pair_lib.sh"), "")
 # "The pair is down" must be a state somebody chose, reached from the release `current` names and only
