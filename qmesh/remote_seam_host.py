@@ -93,16 +93,17 @@ def _mark_dump():
         torch.cuda.synchronize()
     except Exception:
         pass
-    print("[SEAMMARK] layer  issue_to_payload  issue_to_hot0  hot_span  hot1_to_collect  "
-          "issue_to_collect   (ms of device time)", flush = True)
+    print("[SEAMMARK] layer route_to_payload route_to_hot0  hot_span  hot1_to_collect "
+          "route_to_collect   (ms of device time)", flush = True)
     for layer in sorted(_marks):
         m = _marks[layer]
-        if not all(k in m for k in ("issue", "hot0", "hot1", "collect")):
+        if not all(k in m for k in ("route", "hot0", "hot1", "collect")):
             continue
-        t0 = m["issue"]
-        # payload is recorded on the wire stream (the copies + publish of this layer's request), so
-        # a value well below issue_to_hot0 is the GX starting to receive before the P7's hot
-        # experts rather than after them.
+        t0 = m["route"]
+        # route is recorded on the caller's stream where the routing that produces this layer's
+        # picks is done, i.e. the earliest a correct copy could start. With the copies on the wire
+        # stream route_to_hot0 is the caller's own hand-off cost; on the caller's stream it carries
+        # the copy as well, which is the difference this report exists to show.
         pay = (f"{t0.elapsed_time(m['payload']):17.3f}" if "payload" in m else
                f"{'n/a (same stream)':>17}")
         print(f"[SEAMMARK] {layer:5d} {pay} "
@@ -110,6 +111,9 @@ def _mark_dump():
               f"{m['hot0'].elapsed_time(m['hot1']):9.3f} "
               f"{m['hot1'].elapsed_time(m['collect']):16.3f} "
               f"{t0.elapsed_time(m['collect']):16.3f}", flush = True)
+        ids = " ".join(f"{k}={m[k + '_s']:x}" for k in ("route", "hot0", "hot1", "collect", "payload")
+                       if k + "_s" in m)
+        print(f"[SEAMMARK] {layer:5d} streams {ids}", flush = True)
 
 
 if _PROF:
@@ -463,6 +467,7 @@ class RemoteSeamHost:
             # request is complete in the slab and the proxy thread can put it on the wire. On the
             # caller's stream it would say the same thing only in the copies-on-compute order.
             _marks[layer_idx]["payload"] = self._record_ev(wire)
+            _marks[layer_idx]["payload_s"] = wire.cuda_stream
         return (pos, n, bucket, xp, idp, wp, seam, t0, ev0)
 
     @staticmethod
@@ -554,6 +559,12 @@ class RemoteSeamHost:
             _marks.setdefault(layer_idx, {})
         p = _Prefill(self, layer_idx, x, ids, w, n_cold, plan, out, rows,
                      torch.cuda.current_stream(x.device), x.device.index or 0)
+        if mk:
+            # The point the copies are allowed to start from, on the stream that owns the routing.
+            # Recorded before the issue loop, so its gap to hot0 is the caller's own hand-off in
+            # both arms -- the copy itself included only when the copies ride this stream.
+            _marks[layer_idx]["route"] = self._record_ev(p.stream)
+            _marks[layer_idx]["route_s"] = p.stream.cuda_stream
         while p.next < len(p.plan) and len(p.inflight) < self.ns:
             s, e, _ = p.plan[p.next]
             p.inflight.append(self._issue_piece(p.layer, s, p.x[s:e], p.ids[s:e], p.w[s:e],
@@ -561,6 +572,7 @@ class RemoteSeamHost:
             p.next += 1
         if mk:
             _marks[layer_idx]["issue"] = self._record_ev(p.stream)
+            _marks[layer_idx]["issue_s"] = p.stream.cuda_stream
         if not _OVERLAP:
             return self.submit_collect(p)
         return p
@@ -577,6 +589,7 @@ class RemoteSeamHost:
         p = handle
         if _MARK and p.layer in _marks:
             _marks[p.layer]["collect"] = self._record_ev(p.stream)
+            _marks[p.layer]["collect_s"] = p.stream.cuda_stream
         while p.next < len(p.plan):
             while len(p.inflight) >= self.ns:
                 self._collect_piece(p.layer, p.inflight.pop(0), p.out, p.stream)
@@ -592,6 +605,7 @@ class RemoteSeamHost:
     def _record_ev(stream):
         ev = torch.cuda.Event(enable_timing = True)
         ev.record(stream)
+
         return ev
 
     def mark(self, layer_idx, label):
@@ -600,7 +614,9 @@ class RemoteSeamHost:
         stream, so the gaps to the seam's own events are device order and not host order."""
         if not _MARK or layer_idx not in _marks or label in _marks[layer_idx]:
             return
-        _marks[layer_idx][label] = self._record_ev(torch.cuda.current_stream())
+        s = torch.cuda.current_stream()
+        _marks[layer_idx][label] = self._record_ev(s)
+        _marks[layer_idx][label + "_s"] = s.cuda_stream
 
     def submit_prefill(self, layer_idx, y, selected, weights, n_cold = None):
         """Single-phase form for callers with nothing to overlap (benches, the CPU host's streamed
