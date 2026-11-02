@@ -1250,6 +1250,12 @@ def _install_cpp_hook(srv, server):
     """
     if os.environ.get("SEAM_MOE_CPP", "0") == "0":
         return None
+    if server.stub:
+        # No pack and no restacks, so there is nothing to point C at; say it rather than let the
+        # registration fail with the KeyError of an empty cache.
+        print("SEAM_MOE_CPP_OFF stub=1 - the stub answers from the protocol, not from experts",
+              flush = True)
+        return None
     try:
         from qmesh.moe_cpp import CppMoe
         cpp = CppMoe(server).install(handle=srv._h)
