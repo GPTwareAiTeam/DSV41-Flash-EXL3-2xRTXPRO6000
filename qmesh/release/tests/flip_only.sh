@@ -92,9 +92,13 @@ want_not "flip-only builds nothing" "LIB_BUILD" "$out"
 want_not "flip-only builds no ext" "EXT_BUILD" "$out"
 [ "$rc" = 0 ] && echo "OK   prepared exit=0" || { echo "FAIL prepared exit=$rc"; fails=$((fails + 1)); }
 
-# 5. A container spec delta -- here the /mnt/data12 mount the owner removed from the P7 specs -- is
-#    the one delta a flip ticket may apply, and only when the operator asked for it with --recreate.
-#    The live container is given the old mount, exactly what plan reads on the real boxes.
+# 5. A container spec delta -- here the /mnt/data12 mount the owner removed from the P7 specs -- is an
+#    ADVISORY, not a stop and not a recreate. The owner's rule is that an existing container is never
+#    recreated or renamed: a release changes what runs, not the box. So a delta can only be reported,
+#    and the earlier shape of this test -- delta stops the flip, --recreate applies it, the old
+#    container is renamed and the new one loses the mount -- was withdrawn on 2026-11-02. What is
+#    asserted now: the flip proceeds, says the mount is not in the spec, and changes no container,
+#    with or without PAIR_ALLOW_RECREATE.
 python3 - "$WORK/state/state.json" "$PAIR" <<'PY'
 import json, sys
 p, pair = sys.argv[1], sys.argv[2]
@@ -106,14 +110,20 @@ for name in st:
 json.dump(st, open(p, "w"))
 PY
 out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
-want "a spec delta nobody queued stops the flip" "PAIR_UPDATE_FAILED pair=$PAIR phase=prepared" "$out"
-want "and the ticket names --recreate" "--recreate" "$out"
-want_not "and it touches no container" "UPDATE_CONTAINERS pair=$PAIR recreated" "$out"
-[ "$rc" != 0 ] && echo "OK   spec delta exit=$rc" || { echo "FAIL spec delta exited 0"; fails=$((fails + 1)); }
-out=$(PAIR_FLIP_ONLY=1 PAIR_ALLOW_RECREATE=1 run "$SHA"); rc=$?
-want "a queued --recreate re-creates from the spec" "UPDATE_CONTAINERS pair=$PAIR recreated ts=" "$out"
+# The plan is what an operator reads the delta in: the flip itself sends it to the pair log only.
+plan=$(python3 ./pair_containers.py plan "$PAIR" 2>&1)
+want "a spec delta is reported as an advisory, not a reason to stop" \
+     "advisory=mount:-/mnt/data12/models/exl3=/mnt/data12/models/exl3 (not in spec)" "$plan"
+want "and the flip carries on over the prepared release" \
+     "UPDATE_CONTAINERS pair=$PAIR unchanged (prepared)" "$out"
+want_not "and it recreates nothing" "UPDATE_CONTAINERS pair=$PAIR recreated" "$out"
 want "and the release still lands" "PAIR_UPDATED_DRY pair=$PAIR sha=$SHA" "$out"
-[ "$rc" = 0 ] && echo "OK   recreate exit=$rc" || { echo "FAIL recreate exit=$rc"; fails=$((fails + 1)); }
+[ "$rc" = 0 ] && echo "OK   spec delta exit=$rc" || { echo "FAIL spec delta exited $rc"; fails=$((fails + 1)); }
+out=$(PAIR_FLIP_ONLY=1 PAIR_ALLOW_RECREATE=1 run "$SHA"); rc=$?
+want_not "PAIR_ALLOW_RECREATE does not recreate an existing container either" \
+         "UPDATE_CONTAINERS pair=$PAIR recreated" "$out"
+want "and the release still lands with it set" "PAIR_UPDATED_DRY pair=$PAIR sha=$SHA" "$out"
+[ "$rc" = 0 ] && echo "OK   recreate-flag exit=$rc" || { echo "FAIL recreate-flag exit=$rc"; fails=$((fails + 1)); }
 python3 - "$WORK/state/state.json" "$PAIR" <<'PY'
 import json, sys
 st = json.load(open(sys.argv[1]))
@@ -121,8 +131,8 @@ pair = sys.argv[2]
 p7 = [n for n in st if n.startswith("seam-p7-") and n.endswith("-" + pair) and ".bak-" not in n]
 old = [n for n in st if n.startswith("seam-p7-") and ".bak-" in n]
 mnt = [m for n in p7 for m in st[n]["Mounts"] if m["Destination"].startswith("/mnt")]
-ok = len(p7) == 1 and len(old) == 1 and not mnt
-print(("OK   " if ok else "FAIL ") + "the new P7 container keeps no /mnt mount, the old one is renamed"
+ok = len(p7) == 1 and not old and bool(mnt)
+print(("OK   " if ok else "FAIL ") + "the P7 container is the same one, renamed to nothing, mount untouched"
       + ("" if ok else f" (p7={p7} bak={old} mnt={mnt})"))
 sys.exit(0 if ok else 1)
 PY

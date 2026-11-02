@@ -24,6 +24,31 @@ export PAIR_ROOT_OVERRIDE="$WORK/pair" PAIR_STATE_OVERRIDE="$WORK/pairs" PAIR_SS
 # waited out the real dev smoke's claim (SMOKE_GATE_WAIT_MIN, 20 min) before it could fail -- the
 # battery looked hung on 2026-11-02 while dev was actually running.
 mkdir -p "$WORK/noq"
+# pair_smoke.sh takes the box claim before it starts anything (pair_gx_gate_take), and a claim may only
+# be taken by a queue ticket: pair_ticket_hardcap looks for GPU_TICKET_HARDCAP or a ticket of an
+# ancestor pid. Swept by hand there is neither, so the smoke stopped at `PAIR_GATE_REFUSED
+# outside_ticket label=smoke-dev` + `SMOKE_FAIL gx_busy free` and the verdict logic these four cases
+# are about was never reached (4 red on 2026-11-02). The cap here is what a real ticket exports; the
+# gate itself is still this work dir's, so nothing on a box is touched.
+export GPU_TICKET_HARDCAP=$(( $(date +%s) + 1800 ))
+# Every question the smoke asks of a container goes through stub ssh -> `docker` *here*, and there is
+# no seam-p7-dev or seam-gx2-dev on this workstation: before this stub existed the smoke stopped at
+# `SMOKE_FAIL nvml gx=` or `SMOKE_FAIL ext_client_miss p7` and never reached its own logic. The stub
+# answers the two questions that must be "yes" (the container sees the driver, and a client import
+# reuses the stamped artifact) and fails everything else, so a missing container still reads as one.
+export PATH="$WORK/bin:$PATH"
+cat > "$WORK/bin/docker" <<'SH'
+#!/bin/bash
+case "$*" in
+  "exec "*" nvidia-smi -L")
+    echo "GPU 0: NVIDIA GeForce RTX 4090 (UUID: GPU-stub)" ;;
+  *import\ exllamav3.ext*)
+    echo "SMOKE_EXT_HIT /pair/extcache/exllamav3_ext/stub.so" ;;
+  *)
+    exit 1 ;;
+esac
+SH
+chmod +x "$WORK/bin/docker"
 unset PAIR_DRY PAIR_DRY_SSH
 fails=0
 want() {  # <case> <expected-substring> <text>

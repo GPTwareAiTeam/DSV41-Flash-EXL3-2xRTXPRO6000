@@ -41,5 +41,23 @@ while :; do
   sleep 60; waited=$((waited + 1))
 done
 
+# A ticket is the only place a container may be repaired, so the first thing it does is put both halves
+# back on `current`. On 2026-11-02 the previous GX build was killed mid-flight and left seam-gx2-dev
+# wired at the unflipped release (`pair_check dev` = GX DRIFT, nothing importing /pair/current/src).
+# This is idempotent: it only rewrites a symlink that resolves elsewhere, and it never touches a real
+# directory or a container without /pair/current/src (an unpromoted pair has nothing to restore to).
+relink_side() {
+  local side=$1 ct=$2 got
+  local inner='if [ -L /src/exllamav3 ] && [ -e /pair/current/src ]; then ln -sfn /pair/current/src /src/exllamav3; fi; readlink -f /src/exllamav3'
+  if [ "$side" = p7 ]; then
+    got=$(docker exec "$ct" sh -c "$inner" 2>/dev/null)
+  else
+    got=$(pair_gxsh "docker exec $(printf %q "$ct") sh -c $(printf %q "$inner")" 2>/dev/null)
+  fi
+  pair_step "CANARY_RELINK $side $ct -> ${got:-?}"
+}
+relink_side p7 "$P7CT"
+relink_side gx "$GXCT"
+
 nice -n 15 "$HERE/pair_prepare.sh" "$PAIR_ARG" "$SHA_ARG" --side gx || exit 2
 PAIR_FLIP_ONLY=1 exec "$HERE/pair_update_run.sh" "$PAIR_ARG" "$SHA_ARG"

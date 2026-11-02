@@ -196,8 +196,8 @@ def plan_side(cfg, side):
     # 12 TB /mnt/data12 drive; the owner's pack rule (2026-11-02: packs live on the serving box's own
     # disk) drops it from the spec. Comparing only the wanted mounts made that removal invisible --
     # plan said "unchanged" and the next flip would have kept the drive in place. An extra live mount
-    # is reported here as a removal (`mount:-`) and leaves when the container is recreated at a queued
-    # update; the spec itself may not name /mnt at all (SPEC_REFUSED in spec()).
+    # is reported here as a removal (`mount:-`); the spec itself may not name /mnt at all
+    # (SPEC_REFUSED in spec()).
     #
     # It is an advisory, not a verdict: a removal can only be applied by recreating the container, and
     # the owner forbids recreating one that exists ("never recreate or rename an existing container").
