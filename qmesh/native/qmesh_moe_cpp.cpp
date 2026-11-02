@@ -742,10 +742,17 @@ extern "C" int qmc_compute(void* ctx, int layer, int rows, const void* x_bf16, c
   clock_gettime(CLOCK_MONOTONIC, &ts0);
   c->calls++;
 
-  int avail = avail_mib();
-  if (c->fwd_floor > 0 && avail >= 0 && avail < c->fwd_floor) {
-    c10::cuda::CUDACachingAllocator::emptyCache();
+  /* The floor is the only thing here that needs the machine's memory, and the shipping pair leaves
+   * SEAM_FWD_FLOOR_MIB unset: without this guard every request opened /proc/meminfo for a value
+   * nobody read (4.0 us per call measured on the GB10 host, 2 % of a 64-row 203 us piece). With a
+   * floor set the read stays where it was, once per call, before the piece picker. */
+  int avail = -1;
+  if (c->fwd_floor > 0) {
     avail = avail_mib();
+    if (avail >= 0 && avail < c->fwd_floor) {
+      c10::cuda::CUDACachingAllocator::emptyCache();
+      avail = avail_mib();
+    }
   }
   if (c->fwd_floor > 0 && avail >= 0 && avail < c->fwd_floor) {
     c->refused++;
