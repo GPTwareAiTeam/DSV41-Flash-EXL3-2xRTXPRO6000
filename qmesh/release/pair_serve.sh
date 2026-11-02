@@ -55,6 +55,40 @@ fi
 pair_gx_gate_take "serve-$PAIR" $(( ${SERVE_TIMEOUT_MIN:-25} )) 0 \
   || pair_die "PAIR_SERVE_GX_BUSY $(pair_gx_gate_state)"
 
+# The box is ours now, so the two things the smoke checks are checked here too, in the same order: a
+# container whose device cgroup was re-derived by a systemd reload is alive and cannot see the GPU, and
+# restarting it is seconds against a whole ticket; and a JIT lock left by a build killed mid-link blocks
+# every import at 512 MB with an empty log. Prod's first serve died exactly this way ("No CUDA GPUs are
+# available" in the worker's init, 30 s in), which is a restart, not a release problem.
+pair_ensure_nvml p7 "$P7CT" || { pair_gx_gate_down; pair_die "PAIR_SERVE_NVML p7=$P7CT"; }
+pair_ensure_nvml gx "$GXCT" || { pair_gx_gate_down; pair_die "PAIR_SERVE_NVML gx=$GXCT"; }
+locks=$(pair_torch_locks "$GXCT")
+if [ -n "$locks" ]; then
+  if [ "$(pair_torch_build_live "$GXCT")" = 0 ]; then
+    pair_gxsh "docker exec $GXCT sh -c 'rm -f /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock'" >/dev/null 2>&1
+    pair_step "PAIR_SERVE_TORCH_LOCK cleared=$(printf '%s' "$locks" | tr '\n' ',')"
+  else
+    pair_gx_gate_down
+    pair_die "PAIR_SERVE_TORCH_LOCK kept (a build or server is alive beside it): $(printf '%s' "$locks" | tr '\n' ' ')"
+  fi
+fi
+
+# The pack is 113 GiB and a previous server's memory is not returned the instant it exits, so the load
+# waits for the box to cover the pack plus the margin instead of failing the serve on a transient.
+PACK_MIB=$(pair_gxsh "docker exec $GXCT sh -c 'du -bc /cold/cold-L*.safetensors 2>/dev/null | tail -1'" 2>/dev/null | cut -f1)
+case "${PACK_MIB:-}" in ''|*[!0-9]*) PACK_MIB=0 ;; esac
+if [ "$PACK_MIB" -gt 0 ]; then
+  want=$(( PACK_MIB / 1048576 + LOAD_MARGIN ))
+  waited=0
+  while :; do
+    avail=$(pair_gxsh "docker exec $GXCT sh -c 'awk \"/MemAvailable/{print int(\\\$2/1024)}\" /proc/meminfo'" 2>/dev/null | tr -dc 0-9)
+    [ -n "${avail:-}" ] && [ "$avail" -ge "$want" ] && break
+    [ "$waited" -lt "${SERVE_MEM_WAIT_S:-180}" ] || { pair_gx_gate_down; pair_die "PAIR_SERVE_MEM avail=${avail:-?} want=$want (pack $((PACK_MIB/1048576)) + margin $LOAD_MARGIN MiB)"; }
+    sleep 10; waited=$(( waited + 10 ))
+  done
+  pair_step "PAIR_SERVE_MEM avail=${avail} want=$want waited=${waited}s"
+fi
+
 out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT \
       SEAM_GATE_DIR="$(dirname "$(pair_gx_gate_file)")" \
       SERVER_BUCKETS=$BUCKETS SEAM_SERVER_TIMEOUT=${SERVE_SERVER_TIMEOUT:-600} \

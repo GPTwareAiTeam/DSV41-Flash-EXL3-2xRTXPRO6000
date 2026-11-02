@@ -366,6 +366,14 @@ check("serving starts from `current`, refuses drift, and records the worker",
       and "pair_gx_foreign_server" in src("pair_serve.sh"), "")
 check("the gate test is in the battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate.sh")), "")
+# The smoke's two pre-load guards (NVML on both ends, a JIT lock nobody owns) are the difference between
+# a 30 s diagnosis and a lost ticket; the third job that loads a pack must not rediscover that.
+check("serving checks NVML on both ends and the torch lock before it loads",
+      "pair_ensure_nvml p7" in src("pair_serve.sh")
+      and "pair_ensure_nvml gx" in src("pair_serve.sh")
+      and "pair_torch_locks" in src("pair_serve.sh")
+      and src("pair_serve.sh").index("pair_gx_gate_take") < src("pair_serve.sh").index("pair_ensure_nvml p7"), "")
+
 # A GX command runs on the host unless it says docker exec, and the host has no /pair: a container path
 # passed to a bare pair_gxsh lookup reports files missing that are there, and a bare chown does nothing.
 # (2026-11-02: the cuda-exl3 build succeeded and the stamp said `no_so_in_release_tree`.)
