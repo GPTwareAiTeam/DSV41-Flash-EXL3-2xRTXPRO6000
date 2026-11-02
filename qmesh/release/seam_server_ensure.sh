@@ -413,7 +413,11 @@ seam_server_ensure() {
   [ "$stub" = 1 ] && args="--stub $args"
   # docker stops parsing options at the container name, so the -e pairs have to come *before* $CT:
   # "docker exec -d <ct> -e K=V cmd" runs a command literally called "-e".
-  local denv=""
+  # Only this script may start a server: worker_seam_server.py refuses to start unless SEAM_GATE_OK=1,
+  # and nothing else sets it. A script that launches the worker directly bypasses the gate check and
+  # the preflight (2026-11-02: three such scripts started workers around a held gate), so the marker
+  # makes that failure immediate and on the box instead of a pack loaded onto somebody else's claim.
+  local denv="-e SEAM_GATE_OK=1 "
   for kv in $SEAM_ENV; do denv="$denv-e $kv "; done
   seam_gxsh "docker exec -d $denv$CT bash -lc 'cd /src/exllamav3 && stdbuf -oL -e0 python3 -u qmesh/worker_seam_server.py $args $SEAM_EXTRA > $SEAM_LOG 2>&1'" || return 2
   local i

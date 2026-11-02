@@ -445,6 +445,8 @@ _disp = _ens[_ens.rindex('if [ "${BASH_SOURCE[0]}" = "$0" ]'):]
 check("the ensure exits with its real status",
       'seam_server_ensure "$@"' in _disp and "exit $?" in _disp and "|| exit 2" not in _disp,
       " | ".join(_disp.splitlines()))
+check("only the ensure can start a server: it marks the launch SEAM_GATE_OK=1",
+      'local denv="-e SEAM_GATE_OK=1 "' in _ens, "")
 check("the ensure only checks the claim, it never takes or drops it",
       not re.search(r"^\s*pair_gx_gate_(take|down)\b", _ens, re.M), "")
 check("the dead-holder rule lives in pair_lib too",

@@ -501,3 +501,11 @@ passes the real status through (`exit $?`), so a box-busy refusal no longer arri
 `server_timeout_or_died` after 900 s. The preflight names the holder as `server_in=<ct>:<pid>` and
 `mem_in=<ct> <MiB>` (`held_by=… top_mem=…`), and checks `gx-busy` before `gx-mem`: on 2026-11-02 the
 memory line fired first and blamed a full box when the pack and port belonged to `seam-gx2-4460`.
+
+The gate only binds launches that go through `seam_server_ensure.sh`, and three scripts in SeamRobust's
+tree start `worker_seam_server.py` directly (`dev_trace_decode.sh`, `seam_interleave_ab.sh`,
+`prod_rows_probe.sh`). So the launch carries a marker only this script sets: the ensure passes
+`-e SEAM_GATE_OK=1` on every docker exec, and the worker (in the seam tree, landing after
+`9fc3ca8a`) refuses to start without it, before it touches the pack or CUDA. A direct launch then
+fails immediately on the box instead of loading 113 GiB onto somebody else's claim; a release test
+asserts the marker is set here and nowhere else in the tree.
