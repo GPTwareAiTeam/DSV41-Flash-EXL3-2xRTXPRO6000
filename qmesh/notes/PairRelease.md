@@ -509,3 +509,9 @@ tree start `worker_seam_server.py` directly (`dev_trace_decode.sh`, `seam_interl
 `9fc3ca8a`) refuses to start without it, before it touches the pack or CUDA. A direct launch then
 fails immediately on the box instead of loading 113 GiB onto somebody else's claim; a release test
 asserts the marker is set here and nowhere else in the tree.
+
+The ticket's own restore path had the same hole from the other side: after a failed update it starts the
+previous release's server to put the box back the way it found it, and with the gate binding it would
+now be refused `gate_free`. `restore()` therefore claims the box itself (`restore-<pair>`, 15 min, no
+wait) before starting that server and drops the claim after; if somebody else holds the box it records
+`RESTORE_SERVER_SKIP` and leaves their load alone instead of queueing 113 GiB behind it.

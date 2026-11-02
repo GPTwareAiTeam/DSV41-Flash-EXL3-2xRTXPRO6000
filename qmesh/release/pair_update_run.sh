@@ -180,6 +180,14 @@ restore() {  # only on explicit failure, never from a trap
     local old_build
     old_build=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("build_id",""))' \
                 "$(pair_release_dir "$OLD_SHA")/RELEASE.json" 2>/dev/null)
+    # The restore server starts only if this ticket can claim the box: the ensure refuses a launch
+    # without a self/ancestor gate claim, and a box that somebody else has taken is exactly the case
+    # where the restored server must wait rather than load 113 GiB next to a running experiment.
+    if ! pair_gx_gate_take "restore-$PAIR" 15 0; then
+      pair_step "RESTORE_SERVER_SKIP pair=$PAIR (gx box is claimed: $(pair_gx_gate_state))"
+      pair_step "RESTORE_END pair=$PAIR"
+      return 0
+    fi
     pair_step "RESTORE_SERVER pair=$PAIR build=${old_build:-unknown}"
     GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT SERVER_BUCKETS=$BUCKETS \
       SEAM_SERVER_TIMEOUT=${RESTORE_TIMEOUT:-600} SEAM_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-1} \
@@ -187,6 +195,7 @@ restore() {  # only on explicit failure, never from a trap
       "$PAIR_SCRIPTS/seam_server_ensure.sh" --fresh --buckets "$BUCKETS" 2>&1 \
       | grep -E '^(SEAM_ENSURE|SEAM_SLACK|SEAM_SERVER_READY)' | sed 's/^/  /' | tee -a "$PAIR_LOG"
     pair_step "RESTORE_SERVER_DONE pair=$PAIR rc=${PIPESTATUS[0]}"
+    pair_gx_gate_down
   fi
   pair_step "RESTORE_END pair=$PAIR"
 }

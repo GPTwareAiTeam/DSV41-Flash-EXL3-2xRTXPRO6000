@@ -125,6 +125,10 @@ check("smoke prints the server log tail", "SMOKE_SERVER_TAIL" in sm, "")
 
 ur = src("pair_update_run.sh")
 check("update records whether the pair was serving", "UPDATE_SERVER_BEFORE" in ur, "")
+check("the restore server claims the box before it starts",
+      'pair_gx_gate_take "restore-$PAIR" 15 0' in ur
+      and ur.index('pair_gx_gate_take "restore-$PAIR"') < ur.index('seam_server_ensure.sh" --fresh')
+      and 'pair_gx_gate_down' in ur.split("restore() {")[1].split("\n}")[0], "")
 check("restore skips a server that never served", "RESTORE_SERVER_SKIP" in ur, "")
 
 # The canary gate: prod is reachable only through pair_promote.sh, and only for a sha dev proved by
