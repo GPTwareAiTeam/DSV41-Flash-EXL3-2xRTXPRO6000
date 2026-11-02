@@ -101,11 +101,29 @@ doc = {
     "written_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 os.makedirs(os.path.dirname(path), exist_ok=True)
-tmp = f"{path}.tmp.{os.getpid()}"
+# The admission record is not a receipt for the latest attempt: an ok file is what admits the sha to
+# prod, so a failed re-run of a release that already passed must not erase it (2026-11-02: a dev
+# re-smoke of the live release wrote ok=false over the admission prod had been promoted on). A failed
+# attempt is still recorded -- under its own build id -- and if there is no admission yet it takes the
+# plain name, so a promotion attempt sees exactly why the sha does not qualify.
+admitted = False
+if os.path.exists(path):
+    try:
+        admitted = bool(json.load(open(path)).get("ok"))
+    except Exception:                                                   # noqa: BLE001
+        admitted = False
+fate = "admission"
+if not doc["ok"] and admitted:
+    dest = path[:-5] + f".{build_id or 'failed'}.failed.json"
+    fate = "kept"
+else:
+    dest = path
+tmp = f"{dest}.tmp.{os.getpid()}"
 json.dump(doc, open(tmp, "w"), indent=2, sort_keys=True)
 open(tmp, "a").write("\n")
-os.replace(tmp, path)
-print(f"EVIDENCE {path} pair={pair} sha={sha[:12]} ok={doc['ok']} ids={ids_doc.get('n', 0)}")
+os.replace(tmp, dest)
+print(f"EVIDENCE {dest} pair={pair} sha={sha[:12]} ok={doc['ok']} ids={ids_doc.get('n', 0)}"
+      f" admission={fate}")
 PY
 }
 # Who else is on this pair: tickets in its queue (not our own) or a live client/server process in

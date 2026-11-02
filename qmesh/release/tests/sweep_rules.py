@@ -168,6 +168,13 @@ _ok = 'PAIR_UPDATED pair=$PAIR sha=$SHA build=$BUILD_ID check='
 check("update writes evidence before announcing",
       ur.index("evidence ok") < ur.index(_ok), "")
 check("failed update writes failed evidence", 'evidence failed "$*"' in ur, "")
+# An admission is a historical fact about the sha, not a receipt for the latest attempt: a dev re-smoke
+# that fails must not erase the ok file prod was promoted on (dev, 2026-11-02 03:21: a re-run of the live
+# release wrote ok=false over the admission, and the record prod refuses without was gone).
+check("a failed re-run never erases an admission",
+      "admitted = bool(json.load(open(path)).get(\"ok\"))" in ur
+      and '.failed.json' in ur and "admission=" in ur, "")
+
 
 def code_lines(text):
     return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]

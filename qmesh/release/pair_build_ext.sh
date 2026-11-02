@@ -204,9 +204,30 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
     sha_so=$(pair_gxsh "sha256sum '$REL/ext/exllamav3_ext/$(basename "$so")' 2>/dev/null" | cut -d' ' -f1)
   fi
   [ -n "$sha_so" ] || { pair_step "EXT_FAIL $side so_not_in_release_cache"; return 1; }
-  local torchv
-  torchv=$(side_docker "$side" exec "$ct" python3 -c 'import torch;print(torch.__version__)' 2>/dev/null | tail -1)
-  local stamp
+  # A cache that still has a build plan after the build is not a cache: the next client import runs
+  # ninja again -- inside a smoke, under a live server -- relinks the .so and leaves the stamp naming
+  # a binary nobody serves (2026-11-02: 27,513,952 -> 27,509,856 bytes, and EXT_NINJA_STALE right
+  # after a green build). Converge here, out of band, and stamp only what survives `ninja -n`.
+  local ndry tries=0
+  ninja_plan() {
+    side_docker "$side" exec "$ct" sh -c "cd $rel_c/ext/exllamav3_ext && ninja -n 2>&1" 2>/dev/null \
+      | grep -E '^\[' | head -3 | tr '\n' ';'
+  }
+  ndry=$(ninja_plan)
+  while [ -n "$ndry" ] && [ "$tries" -lt 2 ]; do
+    tries=$((tries + 1))
+    pair_step "EXT_NINJA_STALE $side run=$tries would_run=$ndry (running it out of band)"
+    side_docker "$side" exec "$ct" \
+      sh -c "cd $rel_c/ext/exllamav3_ext && nice -n 15 ninja -j$JOBS >/dev/null 2>&1" || true
+    if [ "$side" = p7 ]; then
+      sha_so=$(sha256sum "$REL/ext/exllamav3_ext/$(basename "$so")" 2>/dev/null | cut -d' ' -f1)
+    else
+      sha_so=$(pair_gxsh "sha256sum '$REL/ext/exllamav3_ext/$(basename "$so")' 2>/dev/null" | cut -d' ' -f1)
+    fi
+    [ -n "$sha_so" ] || { pair_step "EXT_FAIL $side so_vanished_after_ninja"; return 1; }
+    ndry=$(ninja_plan)
+  done
+  [ -z "$ndry" ] || { pair_step "EXT_NINJA_UNSTABLE $side would_run=$ndry"; return 1; }
   # One stamp per release per side, and on GX it carries the kernel too: a release whose cuda-exl3 was
   # not built looks identical otherwise (the .so is gitignored), and the smoke would be the first place
   # that noticed -- as a slow server instead of a missing build.
@@ -232,16 +253,7 @@ PY
     printf '%s\n' "$stamp" | pair_gxsh "cat > '$REL/ext/BUILD_STAMP.json'"
   fi
   pair_step "EXT_OK $side torch=$torchv arch=$archlist so=$(basename "$so") sha256=$sha_so${cxsha:+ cx=$cxname cx_sha256=$cxsha}"
-  # `ninja -n` in the cache: a non-empty build plan means a later runtime import would rebuild the
-  # extension *under a live server* (the SIGBUS that has taken pairs down), so say so now.
-  local ndry
-  ndry=$(side_docker "$side" exec "$ct" sh -c "cd $rel_c/ext/exllamav3_ext && ninja -n 2>&1" 2>/dev/null \
-         | grep -E '^\[' | head -3 | tr '\n' ';')
-  if [ -n "$ndry" ]; then
-    pair_step "EXT_NINJA_STALE $side ninja_would_run=$ndry"
-  else
-    pair_step "EXT_NINJA_CLEAN $side"
-  fi
+  pair_step "EXT_NINJA_CLEAN $side ninja_runs=$tries"
   return 0
 }
 
