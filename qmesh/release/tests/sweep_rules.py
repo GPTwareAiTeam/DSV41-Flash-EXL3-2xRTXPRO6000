@@ -119,8 +119,12 @@ check("client import is proven, not assumed",
 check("ext build runs the probe as a file, never on stdin",
       "python3 -u /tmp/pair_ext_probe.py" in be and "python3 -u -" not in be, "")
 
-check("client check uses the release's own cache",
-      "cd $link && TORCH_EXTENSIONS_DIR=$rel_c/ext" in be, "")
+check("client check uses the release's own cache, from a neutral cwd",
+      "cd /tmp && PYTHONPATH=$link TORCH_EXTENSIONS_DIR=$rel_c/ext" in be, "")
+
+check("the smoke's ext probe runs as a client would (neutral cwd, image env)",
+      "cd /tmp && timeout -k 5 ${SMOKE_EXT_PROBE_S:-60}" in src("pair_smoke.sh")
+      and "TORCH_CUDA_ARCH_LIST" not in src("pair_smoke.sh"), "")
 
 sm = src("pair_smoke.sh")
 check("smoke keeps the arm's bytes", "SMOKE_ARM_LOG" in sm, "")

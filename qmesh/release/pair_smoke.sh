@@ -167,10 +167,16 @@ fi
 # from page cache and the prefill fell from 790 to 351 rows/s on its first chunk (565.2 tok/s). Probe
 # both halves with the client's own import, short: a hit costs a second, a miss fails the ticket before
 # it loads a pack. The build that follows the failure is out of band (scripts/pair_build_ext.sh).
+# The probe has to be the client's import, not merely an import. Container env already carries
+# PYTHONPATH=/src/exllamav3, TORCH_EXTENSIONS_DIR=/pair/extcache and the right arch list per box
+# (12.0 P7, 12.1 GX) -- overriding the arch here made every GX probe a miss by construction. And the
+# cwd is /tmp, not /src/exllamav3: `python3 -c` resolves '' with getcwd(), which returns the release
+# src dir with symlinks resolved, so from there the probe builds the /pair spelling of the include
+# path while the arm and the server, both run as files, use the /src one.
 ext_probe() {  # <side> <container>
   local side=$1 ct=$2 cmd
-  cmd='cd /src/exllamav3 && TORCH_EXTENSIONS_DIR=/pair/extcache TORCH_CUDA_ARCH_LIST=12.0 \
-timeout -k 5 ${SMOKE_EXT_PROBE_S:-60} python3 -c "import exllamav3.ext as e; print(\"SMOKE_EXT_HIT\", e.exllamav3_ext.__file__)"'
+  cmd='cd /tmp && timeout -k 5 ${SMOKE_EXT_PROBE_S:-60} \
+python3 -c "import exllamav3.ext as e; print(\"SMOKE_EXT_HIT\", e.exllamav3_ext.__file__)"'
   if [ "$side" = p7 ]; then
     docker exec "$ct" sh -c "$cmd" 2>&1
   else

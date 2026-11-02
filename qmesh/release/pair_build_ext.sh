@@ -134,10 +134,14 @@ PYTHONPATH=$link TORCH_CUDA_ARCH_LIST=$archlist TORCH_EXTENSIONS_DIR=$rel_c/ext 
 EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u /tmp/pair_ext_probe.py
 rc=\$?
 # A plain client import -- no find_spec shim, env exactly as the image sets it -- must reuse what we
-# just built. If it recompiles, torch's version hash disagrees with the client's (build flags or the
-# include path spelling), and every real client pays that rebuild silently inside its own run.
+# just built. Run it from a neutral cwd with PYTHONPATH spelled like the container's: `python3 -c`
+# puts '' first on sys.path, importlib resolves '' with getcwd(), and getcwd() returns the release
+# src dir with its symlinks resolved -- so from $link the check compiled the /pair spelling while
+# every client script gets the /src one (2026-11-02 03:39Z, prod GX: EXT_CLIENT_MISS on a cache that
+# was correct). From /tmp, '' resolves to a directory that holds no exllamav3, and the import lands
+# on PYTHONPATH=/src/exllamav3 exactly as it does for the arm driver and the GX worker.
 if [ \$rc = 0 ]; then
-  cd $link && TORCH_EXTENSIONS_DIR=$rel_c/ext TORCH_CUDA_ARCH_LIST=$archlist \
+  cd /tmp && PYTHONPATH=$link TORCH_EXTENSIONS_DIR=$rel_c/ext \
     timeout \${EXT_CLIENT_TIMEOUT:-180} python3 -c 'import exllamav3.ext as e; print(\"EXT_CLIENT_HIT\", e.exllamav3_ext.__file__)'
   rc=\$?
 fi
