@@ -202,6 +202,12 @@ class SeamServer:
         # used is picked per call from WS_LADDER as far as the box's MemAvailable pays for it, so
         # this is a ceiling, not a promise. 0 = no split at all (one piece, whatever it costs).
         placement = json.load(open(placement_path))
+        # One line, before anything is loaded, naming the table this server's cold-local ids are
+        # positions in. The Hello advertises its sha (main), so a client on another table is
+        # refused; this line is what an operator reads to know *which* table that was.
+        print(f"SEAM_PLACEMENT path={(placement_path)} ranked={int(bool(placement.get('ranked')))} "
+              f"warm_4bpw={placement.get('warm_4bpw_experts', '-')} "
+              f"source_sha={(placement.get('source_sha256') or '-')[:12]}", flush=True)
         self.device = device
         self.stub = stub
         self.stream = None
@@ -259,11 +265,22 @@ class SeamServer:
                       f"- every layer will stay on the mixed-K module", flush=True)
         self._cx_layers: dict = {}
         self.layer_n: dict = {}
+        # Per layer, the file's own claim about its cold order: `warm_bpw` (the bitrate of each
+        # cold position) and `warm_4bpw_n` (the 4-bit group boundary). None for an unranked file.
+        self.layer_bpw_file: dict = {}
+        self.layer_4n_file: dict = {}
         config = Config.from_directory(model_dir)
         model = Model.from_config(config)
         for layer in range(NL):
-            cold = placement["layers"][str(layer)]["warm"]
+            layer_pl = placement["layers"][str(layer)]
+            cold = layer_pl["warm"]
             self.layer_n[layer] = len(cold)
+            # The ranked file puts every 4-bit cold expert before every 2-bit one and records that
+            # boundary; the shard says, per expert, which bitrate it was cut at. Both must name the
+            # same set and the same boundary, or the client's cold-local ids mean something else
+            # here than they mean there -- a silent id shift, not an error anywhere else.
+            self.layer_bpw_file[layer] = layer_pl.get("warm_bpw")
+            self.layer_4n_file[layer] = layer_pl.get("warm_4bpw_n")
             hit = None
             if self.preload and cold and DIRECT_PACK:
                 # Slabs first, then the shard's bytes into their slices: the layer's only copy of
@@ -291,6 +308,7 @@ class SeamServer:
                           f"avail_mib={avail0}->{avail1} swap_mib={swap0}->{_swap_used_mib()} "
                           f"rss_peak_mib={_rss_peak_mib()} cached_mib={_cached_mib()}",
                           flush=True)
+                    self._check_placement_groups(layer, cold, hit)
             if hit is None:
                 base = next(m for m in model.modules if m.key == f"layers.{layer}").mlp
                 self.layers[layer] = build_layer(base, cold, device)
@@ -345,6 +363,38 @@ class SeamServer:
             print(f"SEAM_PACK_KERNEL cudaexl3_layers={cx_n} mixedk_layers={NL - cx_n} "
                   f"of={NL} avail_mib={_avail_mib()} avail_min_mib={getattr(self, '_cx_avail_min', '?')} "
                   f"swap_mib={_swap_used_mib()} rss_peak_mib={_rss_peak_mib()}", flush=True)
+
+    def _check_placement_groups(self, layer, cold, hit):
+        """Assert the ranked file's cold order against the bitrate the shard was cut at.
+
+        `hit.groups` carries each expert's bitrate and its position in `cold`. The file promises
+        `cold[:warm_4bpw_n]` are exactly the 4-bit experts; a file reordered against a pack cut
+        from another table would still be self-consistent -- the client numbers its cold ids from
+        the same file, so nothing downstream can tell -- which is why the check lives here, where
+        the shard's own geometry is in hand.
+        """
+        bpw_file = self.layer_bpw_file.get(layer)
+        n_file = self.layer_4n_file.get(layer)
+        if not bpw_file or n_file is None:
+            return
+        got = [None] * len(cold)
+        for grp in hit.groups:
+            for pos in grp.source:
+                got[int(pos)] = int(grp.bits)
+        wrong = [i for i, b in enumerate(got) if b != bpw_file[i]]
+        n4 = sum(1 for b in got if b == 4)
+        if wrong or n4 != n_file:
+            print(f"SEAM_PLACEMENT_GROUPS layer={layer} MISMATCH n={len(cold)} "
+                  f"warm_4bpw_n={n_file} shard_4bpw={n4} "
+                  f"file={bpw_file[:n_file] + bpw_file[n_file:]} "
+                  f"shard={got} positions={wrong[:8]}", flush=True)
+            raise SystemExit(
+                f"placement/shard mismatch on layer {layer}: the file's warm order does not "
+                f"describe this pack (warm_4bpw_n={n_file}, {n4} 4-bit experts in the shard, "
+                f"{len(wrong)} cold positions at the wrong bitrate); refusing to load a pack "
+                f"under a table that numbers its experts differently")
+        print(f"SEAM_PLACEMENT_GROUPS layer={layer} n={len(cold)} warm_4bpw_n={n_file} "
+              f"groups4={n4} groups2={len(cold) - n4} ok=1", flush=True)
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
@@ -1330,7 +1380,10 @@ def main():
     global MOE_KERNEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default="/cold")
-    ap.add_argument("--placement", default="/cold/placement.exl3.json")
+    # The client resolves the same variable (qmesh/placement.py), so one export names the table on
+    # both halves of a pair; an explicit --placement still wins.
+    ap.add_argument("--placement", default=os.environ.get("SEAM_PLACEMENT",
+                                                           "/cold/placement.exl3.json"))
     ap.add_argument("--dev", default="rocep1s0f0")
     ap.add_argument("--gid", type=int, default=3)
     ap.add_argument("--port", type=int, default=47311)

@@ -261,6 +261,7 @@ def main():
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot
+    config.infer_params.moe_remote_warm = seam_placement.warm(placement)
     config.infer_params.remote_expert_host = {
         "host": os.environ.get("SEAM_PEER", "10.0.100.2"),
         "port": int(os.environ.get("SEAM_PORT", "47311")),

@@ -476,6 +476,15 @@ class BlockSparseMLP_CPU:
                     f"[{min(hot_ids)},{max(hot_ids)}] but the layer has {self.num_experts} experts: "
                     f"the placement file does not belong to this checkpoint (qmesh/placement.py "
                     f"picks the pack's own table; PLACEMENT overrides it)")
+            warm_ids = (getattr(ip, "moe_remote_warm", None) or {}).get(self.key)
+            if warm_ids is not None and sorted(list(hot_ids) + list(warm_ids)) != list(
+                    range(self.num_experts)):
+                # Same failure as load_cpu_split's permutation assert, but before the layer's
+                # weights are touched and before the module can send a single request.
+                raise RuntimeError(
+                    f"placement hot+warm for {self.key} is not a permutation of "
+                    f"0..{self.num_experts - 1} (hot {len(hot_ids)}, warm {len(warm_ids)}): "
+                    f"the warm list in the placement file disagrees with its hot list")
             split_k = self.num_experts - len(hot_ids)
         if split_k:
             assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
@@ -863,7 +872,21 @@ class BlockSparseMLP_CPU:
         perm = None
         if remote:
             hot = list(remote_hot[self.key])
-            cold = [e for e in range(self.num_experts) if e not in set(hot)]
+            # The cold order is the placement file's, not ascending: the server numbers its
+            # cold experts by their position in `layers.N.warm`, and every id the client sends
+            # is such a position, so the two lists must be the same list. Ascending agrees with
+            # the unranked file only; a ranked file puts all 4-bit cold experts first and would
+            # shift every id by one interleave. Assert instead of trusting either side.
+            warm = (getattr(ip, "moe_remote_warm", None) or {}).get(self.key)
+            cold = (list(warm) if warm is not None
+                    else [e for e in range(self.num_experts) if e not in set(hot)])
+            if sorted(hot + cold) != list(range(self.num_experts)):
+                raise RuntimeError(
+                    f"placement hot+warm for {self.key} is not a permutation of "
+                    f"0..{self.num_experts - 1} (hot {len(hot)}, cold {len(cold)}, "
+                    f"{'file warm list' if warm is not None else 'ascending fallback'}): the "
+                    f"placement file does not belong to this checkpoint, or its warm list "
+                    f"disagrees with its hot list")
             perm = hot + cold
             self._split_perm = perm
             self._split_seeded = True

@@ -73,6 +73,18 @@ def hot(placement):
     """The per-module hot list keyed the way the model's modules are: {"layers.N.ffn": [expert ids]}."""
     return {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
 
+def warm(placement):
+    """The per-module cold list **in the file's order**, keyed like hot().
+
+    The seam's cold-local ids are positions in the server's `layers.N.warm`, so the client must
+    number its cold experts the same way. Ascending order happened to agree with the unranked
+    file and silently stops agreeing with a reordered (ranked) one: every cold id then names a
+    different expert on the two sides, which the transport cannot detect. block_sparse_mlp_cpu
+    therefore prefers this list and asserts hot + warm is a permutation of 0..E-1.
+    """
+    return {f"layers.{layer}.ffn": v["warm"] for layer, v in placement["layers"].items()
+            if "warm" in v}
+
 
 def current_sha():
     """sha256 of the placement this process loaded, or None before any load."""

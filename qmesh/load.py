@@ -19,6 +19,7 @@ def load(max_history=5):
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot
+    config.infer_params.moe_remote_warm = seam_placement.warm(placement)
     config.infer_params.remote_expert_host = {"host": "null", "port": 0}
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens=4096, max_history=max_history)
