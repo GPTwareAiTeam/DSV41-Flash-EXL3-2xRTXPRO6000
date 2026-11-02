@@ -99,16 +99,24 @@ check_release() {
   return 5
 }
 gpu_busy() { [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i ${QGPUS:?QGPUS})" ]; }
-# running_owner: the live ticket that holds the box, empty when $RUNFILE is absent or its wrapper died.
-# A stale file is removed here so a killed ticket costs the queue one read, not a manual rm.
+# running_owner: the live ticket that holds the box, empty when $RUNFILE is absent or nothing that
+# belongs to it is alive. The marker names two pids: the wrapper (`pid=`) and the command it launched
+# (`cmd_pid=`, appended right after the launch). The box is held while *either* lives, because on
+# 2026-11-02 11:43 the wrapper was killed by the harness that owned its terminal while its
+# `setsid`'d command tree (pair_update_run → pair_smoke → pair_arm) kept running: the marker went
+# stale, the box looked free, and the next rank-01 ticket would have run beside a live release smoke.
+# A marker whose two pids are both gone is removed here, so a killed ticket costs one read, not a
+# manual rm.
 running_owner() {
-  local line pid
+  local line pid cpid
   [ -r "$RUNFILE" ] || return 0
   line=$(cat "$RUNFILE" 2>/dev/null)
   pid=$(printf '%s' "$line" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
-  [ -n "$pid" ] || { rm -f "$RUNFILE"; return 0; }
-  kill -0 "$pid" 2>/dev/null || { rm -f "$RUNFILE"; return 0; }
-  printf '%s' "$line"
+  cpid=$(printf '%s' "$line" | sed -n 's/.*cmd_pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then printf '%s' "$line"; return 0; fi
+  if [ -n "$cpid" ] && kill -0 "$cpid" 2>/dev/null; then printf '%s' "$line"; return 0; fi
+  rm -f "$RUNFILE"
+  return 0
 }
 release_running() {  # only the wrapper that wrote the marker may clear it
   local pid
@@ -116,7 +124,12 @@ release_running() {  # only the wrapper that wrote the marker may clear it
   [ "$pid" = "$$" ] && rm -f "$RUNFILE"
   return 0
 }
-trap 'rm -f "$ticket" "$GPU_RUN_STATUS"; release_running' EXIT
+# The wrapper is a supervisor: a hangup on its terminal must not take the queue's bookkeeping with
+# it. The command runs in its own session (setsid), so it does not receive the hangup either, and the
+# EXIT trap below is what stops it if the wrapper does go away for another reason.
+trap '' HUP
+trap 'if [ -n "${cpid:-}" ] && kill -0 "$cpid" 2>/dev/null; then kill -TERM -- -"$cpid" 2>/dev/null; fi
+      rm -f "$ticket" "$GPU_RUN_STATUS"; release_running' EXIT
 rank=$(grep -nx "$AGENT" "$PRIO" 2>/dev/null | cut -d: -f1); rank=${rank:-99}
 ticket="$Q/$(printf %02d "$rank")-$(date +%s%N)-$$-$AGENT"
 export GPU_RUN_STATUS="$Q/status-$AGENT-$$"
@@ -228,6 +241,10 @@ command -v -- "$1" >/dev/null 2>&1 || {
   printf 'TICKET_BAD_CMD argv0=%s not found (cwd=%s)\n' "$1" "$PWD" >&2; exit 2
 }
 _ticket_run "$@" & cpid=$!
+# The marker must outlive this wrapper: a wrapper killed by the harness that owns its terminal used
+# to leave a `pid=` that died with it while the command kept running (2026-11-02 11:43, a live smoke).
+# `cmd_pid` is what the queue tests after `pid`, so the box stays held by whoever is actually on it.
+{ [ -w "$RUNFILE" ] && printf 'cmd_pid=%s\n' "$cpid" >>"$RUNFILE"; } 2>/dev/null || true
 grace_until=0
 while kill -0 "$cpid" 2>/dev/null; do
   now=$(date +%s)

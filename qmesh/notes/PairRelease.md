@@ -767,3 +767,27 @@ both pairs run `d330dcf5`; the order below is the order they will be taken in.
    perplexity harness; `p7graph/prefill` (`5df31dd2`) is the P7 prefill profiler and the
    host/device timing correction. Both are recorded as tools in `EXL3_PORT_BACKLOG.md` items 9 and
    10 -- they measure the pairs, they are not runtime, and nothing about them queues.
+
+## The C hook is a release, and DRIFT must be able to see it (2026-11-02, planning only)
+
+`gxport2/cpp-compute` (`a995b10e`, the merged hook) plus the staged `SEAM_MOE_CPP_BOUND` 1 → 0 flip
+travels as **a fresh release cut from `tools/pair-release` after the merge**, then a dev re-canary,
+then prod -- the same door as every other change. It is never copied into a live release root: the
+hook is compiled C++ in `qmesh/native/`, so it moves `tree_digest`, and a release root whose bytes no
+longer match the digest it was cut with is not a release any more, it is a hot edit with a stamp.
+
+Before that release is cut, two gaps close, because today a pair could drift the hook invisibly:
+
+* `pair_sync_check.py` reads and hashes exactly one native artefact per side,
+  `qmesh/native/bin/libqmesh_expert_seam.<arch>.so` (`LIBSTAMP`/`LIBSHA`). The hook builds a second
+  `.so` (`libqmesh_moe_cpp.<arch>.so`) and nothing hashes it, so a release root carrying a stale or
+  missing hook still reads IN_SYNC. Add `CPPSTAMP`/`CPPSHA` next to the lib pair, same rule: a stamp
+  for *this* release sha and a `.so` hash that matches it on the box that built it. Until then the
+  check's answer covers the seam lib only, and the note in the header ("what must match is the
+  source every piece was built from") is not true of the hook.
+* The build side has to write that stamp: `pair_build_lib.sh` stamps the seam lib; the hook needs the
+  same treatment when the C-hook release is cut, in the same stage, with the arch it built for
+  (`sm_120` P7 / `sm_121` GX).
+
+Nothing here runs until the firmware hold lifts and both pairs are back on a release with an IN_SYNC
+verdict.
