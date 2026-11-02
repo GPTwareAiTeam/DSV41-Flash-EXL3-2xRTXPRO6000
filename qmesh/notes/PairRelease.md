@@ -63,6 +63,15 @@ the smoke -- which compares the build id the client reads with the one the serve
 a pair with byte-identical code mismatched. The adopted stamp is also checked against the commit: a
 digest or file count that does not describe `sha` is refused, not adopted.
 
+The stamp is sent **inside the ssh command** (base64), never on the ssh stdin: a redirect written
+outside `$(pair_gxsh …)` binds to the calling shell, and the remote `cat` then read the host's own
+stdin and wrote a 0-byte `RELEASE.json`. That is how gx2 came to hold an empty stamp for
+`9fc3ca8a` on 2026-11-02: dev smoked green (857.9 tok/s, ids `f96fc065…`) and then failed verify
+with `DRIFT release_json=missing`, which rolls `current` back. The cut now refuses to ship a stamp
+it cannot read back (`STAMP_EMPTY`/`STAMP_WRITE_FAILED`), refuses a gx stamp that is not
+byte-identical to the p7 one (`STAMP_MISMATCH`), and a later cut **repairs** an existing release
+whose stamp is 0 bytes (`STAMP_REPAIR`) without touching the tree.
+
 A release may also be a **merge** of a runtime branch into the release line, and that is how the
 server fixes arrive: `bd15ae60` merged `seam/session-multiclient` before release 1, and release 2 is
 the same merge for the compute lock (`39f07dc4`). The ancestry guard is what makes this deliberate
