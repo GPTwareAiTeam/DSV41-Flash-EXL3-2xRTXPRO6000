@@ -635,3 +635,31 @@ different releases. It also wrote its own `hardcap=` line after the wait loop; t
 computes `start`/`hard` before `setsid`, exports `GPU_TICKET_HARDCAP` and appends the line, so the
 claim's cap is the run's, not the ticket's creation time. A wrapper is read incrementally by bash, so
 it is replaced only between tickets, atomically (`cp -p` to `.new`, `bash -n`, `mv`, `cmp`).
+
+### Two caches, one code: the include-path spelling (2026-11-02)
+
+A stamp proves which artifact the build produced. It cannot prove the next client import reuses it,
+and that gap is not theoretical: `pair_ext_probe.py` was fed to `python3 -u -` on stdin, python put
+the **cwd** on `sys.path`, and `getcwd()` never returns a symlink -- so the probe compiled against
+`/pair/releases/<sha>/src/exllamav3` while every client, which runs a script and therefore keeps
+`PYTHONPATH=/src/exllamav3` on `sys.path`, compiled against `/src/exllamav3`. torch's version hash
+covers the include paths, so the two spellings are two caches: each side rebuilt all 145 units for
+the other. Three consequences, all seen tonight:
+
+* the release looked drifted right after a green build (`.so` 26de612b, stamp 3da8f935), because a
+  client import inside the smoke had relinked the artifact after the stamp was written;
+* the rebuild inside the smoke evicted the 113.65 GiB cold pack from page cache and the prefill's
+  first chunk came off disk at 351 rows/s instead of ~790 -- 565.2 tok/s, read as a release
+  regression when it was a cache regression;
+* a foreign job in the same container (`panel_ppl_4460.py`, Integrator-2's) rebuilt against the
+  other spelling while our build was in flight, so the two traded the cache back and forth.
+
+The probe is now copied to `/tmp` and run **by path** (`python3 -u /tmp/pair_ext_probe.py`), which is
+also how the arm driver and the ids driver are run, and the client import is re-checked after the
+build with `EXT_CLIENT_TIMEOUT` (180 s). On top of that a smoke no longer discovers a miss by
+measuring it: both halves import the extension the client's way *before* a pack is loaded, and a
+miss is `SMOKE_FAIL ext_client_miss <side> ct=<container>` with the build command to run out of
+band. `tests/sweep_rules.py` pins all three (probe by path, client check, probe before the load).
+The rule underneath: a cache is defined by the *client's* command line, not by the sources it was
+compiled from, so the builder has to run under the client's exact environment -- including which
+path spelling python got from `sys.path`.
