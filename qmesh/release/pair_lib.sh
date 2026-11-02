@@ -134,14 +134,45 @@ pair_gx_gate_file() {  # -> <queue dir>/gx{N}.gate, N from the GX container name
   local n=${GXCT#seam-gx}
   printf '%s\n' "${PAIR_GATE_DIR:-$PAIR_HOME/recipe-artifacts/gpu0-gx1/queue}/gx${n%%-*}.gate"
 }
-pair_p7_gpu_users() {  # <gpu index> -> "pid name" per compute process on that GPU; empty = idle
-  # A container create re-initialises nvidia-uvm for the whole host. On 2026-11-02 02:22 the dev
-  # recreate did exactly that while a client arm ran in someone's ad-hoc container on the same P7
-  # GPU: the arm died with "Can't initialize NVML", and that container could not get a GPU back
-  # without a restart. The queue serialises this pair's own tickets but cannot see a container that
-  # was started by hand, so anything that creates a container asks the GPU first.
-  nvidia-smi -i "${1:?gpu index}" --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \
-    | sed 's/[[:space:]]*$//' | grep -v '^$' || true
+pair_p7_gpu_users() {  # [gpu index...] -> "gpu<N> pid=<pid> <name>" per compute process; empty = idle
+  # A container create re-initialises the host's single nvidia-uvm instance even though the create
+  # names one card: on 2026-11-02 02:22 the dev recreate made a live CUDA process in someone's
+  # container die ("Can't initialize NVML: Unknown Error") while the host was healthy, and it did so
+  # with no module load and no Xid in kern.log -- the reset is the runtime's device hook, not a
+  # reload. The queue serialises this pair's own tickets but cannot see a container started by hand,
+  # so anything that creates a container asks the GPUs first, all of them, because the damage is not
+  # confined to the card it names.
+  local want=" ${*:-0 1 2} " idx uuid pid name
+  local -A ix=()
+  while IFS=', ' read -r idx uuid; do
+    [ -n "${uuid:-}" ] && ix[$uuid]=$idx
+  done < <(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null)
+  nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name --format=csv,noheader 2>/dev/null \
+  | while IFS=',' read -r uuid pid name; do
+      uuid=${uuid// /}; pid=${pid// /}; name=${name# }
+      idx=${ix[$uuid]:-?}
+      case "$want" in *" $idx "*) echo "gpu$idx pid=$pid ${name:-?}" ;; esac
+    done
+}
+
+pair_pid_in_container() {  # <pid> <container> -> 0 when that pid runs inside the named container
+  local cid
+  cid=$(docker inspect -f '{{.Id}}' "${2:?container}" 2>/dev/null) || return 1
+  [ -n "$cid" ] && grep -qs "$cid" "/proc/${1:?pid}/cgroup"
+}
+
+pair_gpu_foreign_users() {  # <gpu index...> <own container> -> users on those GPUs that are not its own
+  # The pair's own container may be executing something (a client from the pair's previous ticket);
+  # everything else on GPU0/1 is someone's job and a create would take their context with it.
+  local own=${!#} line p out=""
+  set -- "${@:1:$#-1}"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    p=${line#*pid=}; p=${p%% *}
+    pair_pid_in_container "$p" "$own" && continue
+    out="$out$line;"
+  done <<<"$(pair_p7_gpu_users "$@")"
+  printf '%s' "${out%;}"
 }
 
 pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until or a dead holder is free

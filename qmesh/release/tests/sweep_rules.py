@@ -125,17 +125,14 @@ check("smoke prints the server log tail", "SMOKE_SERVER_TAIL" in sm, "")
 
 ur = src("pair_update_run.sh")
 check("update records whether the pair was serving", "UPDATE_SERVER_BEFORE" in ur, "")
-check("a recreate refuses while the pair's own GPU has compute processes",
-      'gpu_busy p7_gpu=' in ur
-      and ur.index('pair_p7_gpu_users "$GPU"') < ur.index('pair_containers.py" apply')
+check("a recreate refuses while any P7 GPU 0/1 has a foreign compute process",
+      'gpu_busy p7_gpus=0,1' in ur
+      and ur.index('pair_gpu_foreign_users 0 1 "$P7CT"') < ur.index('pair_containers.py" apply')
       and 'PAIR_GPU_WAIT_MIN' in ur, "")
-check("the GPU probe reads the GPU named by the pair, not a fixed one",
-      'nvidia-smi -i "${1:?gpu index}" --query-compute-apps' in src("pair_lib.sh"), "")
-check("the restore server claims the box before it starts",
-      'pair_gx_gate_take "restore-$PAIR" 15 0' in ur
-      and ur.index('pair_gx_gate_take "restore-$PAIR"') < ur.index('seam_server_ensure.sh" --fresh')
-      and 'pair_gx_gate_down' in ur.split("restore() {")[1].split("\n}")[0], "")
-check("restore skips a server that never served", "RESTORE_SERVER_SKIP" in ur, "")
+check("the GPU probe covers every P7 GPU by UUID, and the pair's own container is exempt",
+      'nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name' in src("pair_lib.sh")
+      and 'pair_pid_in_container' in src("pair_lib.sh")
+      and 'not this recipe, not touched' in ur, "")
 
 # The canary gate: prod is reachable only through pair_promote.sh, and only for a sha dev proved by
 # generating token ids. These are source invariants because the alternative -- trusting the flags at

@@ -516,11 +516,16 @@ now be refused `gate_free`. `restore()` therefore claims the box itself (`restor
 wait) before starting that server and drops the claim after; if somebody else holds the box it records
 `RESTORE_SERVER_SKIP` and leaves their load alone instead of queueing 113 GiB behind it.
 
-A container create re-initialises `nvidia-uvm` for the whole host, so it is not a local act even when it
-targets one card. On 2026-11-02 02:22 the dev recreate's create killed a client arm that ran in an
-ad-hoc container on the same P7 GPU ("Can't initialize NVML: Unknown Error"), and that container never
-got a GPU back without a restart. The queue serialises this pair's own tickets but cannot see a
-container started by hand, so the recreate branch now asks the GPU itself
-(`pair_p7_gpu_users <index>`, `nvidia-smi -i <gpu> --query-compute-apps`) and refuses `gpu_busy` with
-the pids before it creates or renames anything, i.e. before the flip; `PAIR_GPU_WAIT_MIN` (default 0)
-covers an arm that is already ending.
+A container create invalidates live CUDA/UVM handles outside the new container, so it is not a local
+act even when it names one card. On 2026-11-02 02:22 the dev recreate's create killed a client arm in an
+ad-hoc container on the same P7 GPU ("Can't initialize NVML: Unknown Error"; host healthy, and the
+container recovered by itself, so no restart was needed). Measured cause: not a module reload and not
+a GPU reset -- kern.log has no NVRM line, no module load and no Xid at that second, and the `nvidia_uvm`
+refcount is unchanged -- it is the runtime's device hook (runc + libnvidia-container `configure` on the
+host's single UVM node) tearing down the UVM state the other container held. Hence the damage reaches
+every P7 GPU, including GPU2, which is not ours. The recreate branch now asks all three
+(`pair_p7_gpu_users [index...]`, `nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name` mapped to
+index by UUID) and refuses `gpu_busy p7_gpus=0,1 users=<pid name;...>` before it creates or renames
+anything, i.e. before the flip; processes inside the pair's own container are exempt
+(`pair_pid_in_container`), `PAIR_GPU_WAIT_MIN` (default 0) covers an arm that is already ending, and
+GPU2's users are reported as `UPDATE_GPU2_IN_USE` without ever being waited on or touched.
