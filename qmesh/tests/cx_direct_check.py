@@ -113,7 +113,7 @@ def main():
     ap.add_argument("--placement", default = os.environ.get("SEAM_PLACEMENT",
                                                           "/cold/placement.exl3.json"))
     ap.add_argument("--layers", default = "0,20,39")
-    ap.add_argument("--device", default = "cuda")
+    ap.add_argument("--device", default = "cuda:0")   # exl3_moe_max_concurrency needs an index
     ap.add_argument("--margin-mib", type = int, default = 7000,
                     help = "refuse to start below this MemAvailable: the check holds two layers")
     a = ap.parse_args()
@@ -129,6 +129,8 @@ def main():
     pl = json.load(open(placement))
     from exllamav3 import Config, Model
     device = torch.device(a.device)
+    if device.index is None:          # bare "cuda" reaches exl3_moe_max_concurrency(None)
+        device = torch.device(device.type, 0)
     config = Config.from_directory(a.model_dir)
     model = Model.from_config(config)
     rc = 0
