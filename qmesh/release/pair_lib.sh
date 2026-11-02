@@ -134,6 +134,16 @@ pair_gx_gate_file() {  # -> <queue dir>/gx{N}.gate, N from the GX container name
   local n=${GXCT#seam-gx}
   printf '%s\n' "${PAIR_GATE_DIR:-$PAIR_HOME/recipe-artifacts/gpu0-gx1/queue}/gx${n%%-*}.gate"
 }
+pair_p7_gpu_users() {  # <gpu index> -> "pid name" per compute process on that GPU; empty = idle
+  # A container create re-initialises nvidia-uvm for the whole host. On 2026-11-02 02:22 the dev
+  # recreate did exactly that while a client arm ran in someone's ad-hoc container on the same P7
+  # GPU: the arm died with "Can't initialize NVML", and that container could not get a GPU back
+  # without a restart. The queue serialises this pair's own tickets but cannot see a container that
+  # was started by hand, so anything that creates a container asks the GPU first.
+  nvidia-smi -i "${1:?gpu index}" --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null \
+    | sed 's/[[:space:]]*$//' | grep -v '^$' || true
+}
+
 pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until or a dead holder is free
   local f o p u; f=$(pair_gx_gate_file)
   [ -f "$f" ] || { echo free; return 0; }

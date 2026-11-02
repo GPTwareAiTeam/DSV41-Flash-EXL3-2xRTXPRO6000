@@ -125,6 +125,12 @@ check("smoke prints the server log tail", "SMOKE_SERVER_TAIL" in sm, "")
 
 ur = src("pair_update_run.sh")
 check("update records whether the pair was serving", "UPDATE_SERVER_BEFORE" in ur, "")
+check("a recreate refuses while the pair's own GPU has compute processes",
+      'gpu_busy p7_gpu=' in ur
+      and ur.index('pair_p7_gpu_users "$GPU"') < ur.index('pair_containers.py" apply')
+      and 'PAIR_GPU_WAIT_MIN' in ur, "")
+check("the GPU probe reads the GPU named by the pair, not a fixed one",
+      'nvidia-smi -i "${1:?gpu index}" --query-compute-apps' in src("pair_lib.sh"), "")
 check("the restore server claims the box before it starts",
       'pair_gx_gate_take "restore-$PAIR" 15 0' in ur
       and ur.index('pair_gx_gate_take "restore-$PAIR"') < ur.index('seam_server_ensure.sh" --fresh')

@@ -515,3 +515,12 @@ previous release's server to put the box back the way it found it, and with the 
 now be refused `gate_free`. `restore()` therefore claims the box itself (`restore-<pair>`, 15 min, no
 wait) before starting that server and drops the claim after; if somebody else holds the box it records
 `RESTORE_SERVER_SKIP` and leaves their load alone instead of queueing 113 GiB behind it.
+
+A container create re-initialises `nvidia-uvm` for the whole host, so it is not a local act even when it
+targets one card. On 2026-11-02 02:22 the dev recreate's create killed a client arm that ran in an
+ad-hoc container on the same P7 GPU ("Can't initialize NVML: Unknown Error"), and that container never
+got a GPU back without a restart. The queue serialises this pair's own tickets but cannot see a
+container started by hand, so the recreate branch now asks the GPU itself
+(`pair_p7_gpu_users <index>`, `nvidia-smi -i <gpu> --query-compute-apps`) and refuses `gpu_busy` with
+the pids before it creates or renames anything, i.e. before the flip; `PAIR_GPU_WAIT_MIN` (default 0)
+covers an arm that is already ending.

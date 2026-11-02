@@ -292,8 +292,20 @@ if [ "${PAIR_FLIP_ONLY:-0}" = 1 ]; then
       fail "containers do not exist: run scripts/pair_prepare.sh $PAIR $SHA first" ;;
     *" RECREATE "*)
       [ "${PAIR_ALLOW_RECREATE:-0}" = 1 ] || fail "the container spec changed: enqueue this release with --recreate (pair_promote.sh $SHA --recreate for prod) so the queue re-creates the containers; a flip-only ticket will not"
-      TS=$(date -u +%Y%m%dT%H%M%SZ)
       phase containers
+      # Refuse before anything is built or renamed: a create on a GPU that somebody is using kills
+      # their CUDA context (see pair_p7_gpu_users). PAIR_GPU_WAIT_MIN covers an arm that is already
+      # ending; the default 0 refuses at once and leaves the pair exactly as it was found.
+      gpu_users=$(pair_p7_gpu_users "$GPU")
+      if [ -n "$gpu_users" ]; then
+        for i in $(seq 1 $(( ${PAIR_GPU_WAIT_MIN:-0} * 6 ))); do
+          sleep 10
+          gpu_users=$(pair_p7_gpu_users "$GPU")
+          [ -z "$gpu_users" ] && break
+        done
+      fi
+      [ -z "$gpu_users" ] || fail "gpu_busy p7_gpu=$GPU users=$(printf '%s' "$gpu_users" | paste -sd';' -)"
+      TS=$(date -u +%Y%m%dT%H%M%SZ)
       status_write 100 "recreating containers (ts=$TS)"
       python3 "$HERE/pair_containers.py" apply "$PAIR" "$SHA" --ts "$TS" 2>&1 | sed 's/^/  /' | tee -a "$PAIR_LOG"
       rc=${PIPESTATUS[0]}
