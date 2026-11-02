@@ -88,8 +88,12 @@ start_stub() {   # $1 = extra server args, $2 = extra probe args
   alive=$(dx "kill -0 $pid 2>/dev/null && echo yes || echo no")
   [ "$alive" = yes ] || fail "server pid $pid is gone after the probe"
   rejects=$(dx "grep -ac 'SEAM_REJECT\|SEAM_QUEUE' $SRVLOG" 2>/dev/null | tr -dc 0-9)
-  say "SERVER_ALIVE pid=${pid} alive=${alive} reject_lines=${rejects:-0} probe_rc=${rc}"
+  datarej=$(dx "grep -ac 'stale-data-conn' $SRVLOG" 2>/dev/null | tr -dc 0-9)
+  say "SERVER_ALIVE pid=${pid} alive=${alive} reject_lines=${rejects:-0} stale_data=${datarej:-0} probe_rc=${rc}"
   [ "${rejects:-0}" -ge 5 ] || fail "expected >=5 rejected/queued control connections in the log, saw ${rejects:-0}"
+  # The 12 bad data hellos must have been refused, not ignored: this is the path that used to
+  # abort the process, and a silent no-op here would make the case above meaningless.
+  [ "${datarej:-0}" -ge 12 ] || fail "expected >=12 stale-data-conn rejections, saw ${datarej:-0}"
   dx "grep -aE 'Fatal Python error|Aborted|assert' $SRVLOG" | head -3 | sed 's/^/  LEAK /'
   dx "grep -aE 'Fatal Python error|Aborted|assert' $SRVLOG" | grep -q . && fail "server log shows a fatal error"
   [ "$rc" = 0 ] || fail "probe reported failures (rc=$rc)"

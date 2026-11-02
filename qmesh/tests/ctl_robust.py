@@ -224,6 +224,52 @@ def main(argv):
     time.sleep(1.5)
     check("status-after-vanished-client", hello(served, flags=CTL_FLAG_STATUS), ST_STATUS)
     check("session-after-vanished-client", hello(served), ST_OK)
+
+    # 9. A stranger on a *data* port, which is where the historical "qes: peer layout mismatch" came
+    #    from: the old server called fail() there and the process was gone. Start a session, then
+    #    hammer the bucket ports with a wrong-magic hello, a truncated hello, and a peer that resets
+    #    instead of closing. The server has to log each one as stale and keep the session alive.
+    try:
+        own = socket.create_connection((host, port), timeout=3.0)
+        own.sendall(hello(served))
+        o = REPLY.unpack(recv_reply(own))
+        n = o[5]                     # n_buckets: buckets[12] hold values, ports[12] follow them
+        dports = [p for p in o[7 + QES_MAX_BUCKETS:7 + 2 * QES_MAX_BUCKETS][:n] if p]
+        ok = o[2] == ST_OK and len(dports) == n
+        print(f"{'ok  ' if ok else 'FAIL'} data-peers: session status={o[2]} "
+              f"buckets={','.join(str(b) for b in o[7:7 + n])} "
+              f"ports={','.join(str(p) for p in dports)}")
+        fails += 0 if ok else 1
+        stray = [b"\x00" * 8,                                   # truncated
+                 b"QHE3" + b"\0" * 44,                         # right magic, wrong layout
+                 bytes(range(64))]                             # noise
+        reached = 0
+        for dp in dports:
+            for blob in stray:
+                try:
+                    s = socket.create_connection((host, dp), timeout=2.0)
+                    reached += 1
+                    s.sendall(blob)
+                    time.sleep(0.1)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    s.close()
+                except OSError as e:
+                    print(f"  note data-peers: port {dp}: {e}")
+        # Reaching the port is the point: a wrong port would make the whole case a no-op. The
+        # server logs one SEAM_REJECT reason=stale-data-conn per connection and the runner checks
+        # that the reject count grew, which is what proves they were refused rather than ignored.
+        ok = reached == len(dports) * len(stray)
+        print(f"{'ok  ' if ok else 'FAIL'} data-peers: {reached} of "
+              f"{len(dports) * len(stray)} bad hellos reached a bucket port")
+        fails += 0 if ok else 1
+        time.sleep(0.5)
+        own.close()
+    except (OSError, struct.error) as e:
+        print(f"FAIL data-peers: {e}")
+        fails += 1
+    time.sleep(1.0)
+    check("status-after-stray-data-peers", hello(served, flags=CTL_FLAG_STATUS), ST_STATUS)
+    check("session-after-stray-data-peers", hello(served), ST_OK)
     time.sleep(0.5)
 
     print("RESULT ctl_robust=" + ("pass" if fails == 0 else f"fail({fails})"))
