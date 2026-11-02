@@ -89,6 +89,7 @@ def main(argv):
     host = argv[1] if len(argv) > 1 else "127.0.0.1"
     port = int(argv[2]) if len(argv) > 2 else 47911
     served = [int(x) for x in (argv[3] if len(argv) > 3 else "1,6,64,8192").split(",")]
+    queue = len(argv) > 4 and argv[4] == "wait"   # server was started with --wait
     fails = 0
 
     def check(name, payload, want, want_msg=None, send_nothing=False):
@@ -149,35 +150,81 @@ def main(argv):
     time.sleep(0.5)
     check("status-after-three-sessions", hello(served, flags=CTL_FLAG_STATUS), ST_STATUS)
 
-    # 7. A client that arrives while somebody else's session is live must be refused with a
-    #    reason, and the live session must not be torn down by the refusal.
-    live = None
+    # 7. A client that arrives while somebody else's session is live. Without SEAM_WAIT=1 it must
+    #    be refused with ST_BUSY and the live session must survive the refusal; with the server's
+    #    --wait it must instead be told ST_QUEUED and then admitted with ST_OK on the same socket
+    #    once the live session ends. Both are one server lifetime and neither may be fatal, which
+    #    is what lets a prod pair and a dev pair share the box.
+    live = wait_sock = None
     try:
         live = socket.create_connection((host, port), timeout=3.0)
         live.sendall(hello(served))
-        live.settimeout(3.0)
         f = REPLY.unpack(recv_reply(live))
-        print(f"{'ok  ' if f[2] == ST_OK else 'FAIL'} busy: first session status={f[2]}")
-        if f[2] != ST_OK:
-            fails += 1
-        got = ask(host, port, hello(served))
-        if got is None:
-            print("FAIL busy: second client got no reply at all")
-            fails += 1
-        else:
-            status, msg, _ = got
-            ok = status == ST_BUSY and msg
-            print(f"{'ok  ' if ok else 'FAIL'} busy: status={status} msg={msg!r}")
-            if not ok:
+        ok = f[2] == ST_OK
+        print(f"{'ok  ' if ok else 'FAIL'} concurrent: first session status={f[2]}")
+        fails += 0 if ok else 1
+        if queue:
+            wait_sock = socket.create_connection((host, port), timeout=3.0)
+            wait_sock.sendall(hello(served, flags=CTL_FLAG_WAIT))
+            q = REPLY.unpack(recv_reply(wait_sock))
+            ok = q[2] == ST_QUEUED
+            qmsg = q[-1].split(b"\0", 1)[0].decode(errors="replace")
+            print(f"{'ok  ' if ok else 'FAIL'} concurrent: second client status={q[2]} "
+                  f"msg={qmsg!r}")
+            fails += 0 if ok else 1
+            live.close()
+            live = None
+            try:
+                a = REPLY.unpack(recv_reply(wait_sock, timeout=15.0))
+            except (OSError, struct.error) as e:
+                a = None
+                print(f"FAIL concurrent: queued client got no admission ({e})")
                 fails += 1
-    except OSError as e:
-        print(f"FAIL busy: connection error {e}")
+            if a is not None:
+                ok = a[2] == ST_OK
+                print(f"{'ok  ' if ok else 'FAIL'} concurrent: queued client admitted "
+                      f"status={a[2]} session={a[3]}")
+                fails += 0 if ok else 1
+        else:
+            got = ask(host, port, hello(served))
+            if got is None:
+                print("FAIL concurrent: second client got no reply at all")
+                fails += 1
+            else:
+                status, msg, _ = got
+                ok = status == ST_BUSY and bool(msg)
+                print(f"{'ok  ' if ok else 'FAIL'} concurrent: status={status} msg={msg!r}")
+                fails += 0 if ok else 1
+    except (OSError, struct.error) as e:
+        print(f"FAIL concurrent: {e}")
         fails += 1
     finally:
-        if live is not None:
-            live.close()
+        for s in (live, wait_sock):
+            if s is not None:
+                s.close()
     time.sleep(0.5)
-    check("status-after-busy-refusal", hello(served, flags=CTL_FLAG_STATUS), ST_STATUS)
+    check("status-after-concurrent", hello(served, flags=CTL_FLAG_STATUS), ST_STATUS)
+
+    # 8. A client that dies instead of closing: kill -9, a container stop, a dropped link. Its
+    #    control socket is reset (SO_LINGER 0), which is what the server sees from a vanished
+    #    peer, and the next client must still be served in the same lifetime.
+    try:
+        dead = socket.create_connection((host, port), timeout=3.0)
+        dead.sendall(hello(served))
+        d = REPLY.unpack(recv_reply(dead))
+        dead.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        dead.close()                      # RST, not FIN
+        ok = d[2] == ST_OK
+        print(f"{'ok  ' if ok else 'FAIL'} vanished-client: session started status={d[2]}, "
+              f"control socket reset")
+        fails += 0 if ok else 1
+    except (OSError, struct.error) as e:
+        print(f"FAIL vanished-client: {e}")
+        fails += 1
+    time.sleep(1.5)
+    check("status-after-vanished-client", hello(served, flags=CTL_FLAG_STATUS), ST_STATUS)
+    check("session-after-vanished-client", hello(served), ST_OK)
+    time.sleep(0.5)
 
     print("RESULT ctl_robust=" + ("pass" if fails == 0 else f"fail({fails})"))
     return 0 if fails == 0 else 1

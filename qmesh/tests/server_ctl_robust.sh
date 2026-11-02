@@ -63,45 +63,51 @@ if [ -n "$busy" ]; then
 fi
 
 docker cp "$HERE/ctl_robust.py" "$CT:/tmp/ctl_robust.py" >/dev/null || { say "COPY_FAILED"; exit 2; }
-
-say "STUB ctl=${PORT} buckets=${BUCKETS} dev=${DEV} gid=${GID} ct=${CT}"
-docker exec -d "$CT" bash -lc "cd $ROOT && exec python3 -u qmesh/worker_seam_server.py --stub \
-  --placement $PLACEMENT --dev $DEV --gid $GID --port $PORT --buckets $BUCKETS > $SRVLOG 2>&1"
-pid=""
-listening=0
-for _ in $(seq 1 60); do
-  pid=$(dx "pgrep -f '[w]orker_seam_server.py.*--stub' | head -1")
-  if dx "grep -aq SEAM_LISTEN $SRVLOG" 2>/dev/null; then listening=1; break; fi
-  [ -n "$pid" ] || break
+start_stub() {   # $1 = extra server args, $2 = extra probe args
+  dx "pkill -f '[w]orker_seam_server.py.*--stub' >/dev/null 2>&1; sleep 0.3; rm -f $SRVLOG"
+  say "STUB ctl=${PORT} buckets=${BUCKETS} dev=${DEV} gid=${GID} ct=${CT}$1"
+  docker exec -d "$CT" bash -lc "cd $ROOT && exec python3 -u qmesh/worker_seam_server.py --stub \
+    --placement $PLACEMENT --dev $DEV --gid $GID --port $PORT --buckets $BUCKETS $1 > $SRVLOG 2>&1"
+  pid=""
+  listening=0
+  for _ in $(seq 1 60); do
+    pid=$(dx "pgrep -f '[w]orker_seam_server.py.*--stub' | head -1")
+    if dx "grep -aq SEAM_LISTEN $SRVLOG" 2>/dev/null; then listening=1; break; fi
+    [ -n "$pid" ] || break
+    sleep 0.5
+  done
+  if [ "$listening" != 1 ]; then
+    say "STUB_DID_NOT_START (see $CT:$SRVLOG)"
+    dx "tail -6 $SRVLOG" | sed 's/^/  /'
+    exit 4
+  fi
+  say "STUB_PID pid=${pid}"
+  dx "python3 /tmp/ctl_robust.py 127.0.0.1 $PORT $BUCKETS $2" | sed 's/^/  /'
+  rc=${PIPESTATUS[0]}
+  # The server must still be the same live process, with every rejection logged rather than fatal.
+  alive=$(dx "kill -0 $pid 2>/dev/null && echo yes || echo no")
+  [ "$alive" = yes ] || fail "server pid $pid is gone after the probe"
+  rejects=$(dx "grep -ac 'SEAM_REJECT\|SEAM_QUEUE' $SRVLOG" 2>/dev/null | tr -dc 0-9)
+  say "SERVER_ALIVE pid=${pid} alive=${alive} reject_lines=${rejects:-0} probe_rc=${rc}"
+  [ "${rejects:-0}" -ge 5 ] || fail "expected >=5 rejected/queued control connections in the log, saw ${rejects:-0}"
+  dx "grep -aE 'Fatal Python error|Aborted|assert' $SRVLOG" | head -3 | sed 's/^/  LEAK /'
+  dx "grep -aE 'Fatal Python error|Aborted|assert' $SRVLOG" | grep -q . && fail "server log shows a fatal error"
+  [ "$rc" = 0 ] || fail "probe reported failures (rc=$rc)"
+  dx "pkill -f '[w]orker_seam_server.py.*--stub'" >/dev/null 2>&1
   sleep 0.5
-done
-if [ "$listening" != 1 ]; then
-  say "STUB_DID_NOT_START (see $CT:$SRVLOG)"
-  dx "tail -6 $SRVLOG" | sed 's/^/  /'
-  exit 4
-fi
-say "STUB_PID pid=${pid}"
+  left=$(dx "pgrep -f '[w]orker_seam_server.py.*--stub' | wc -l" | tr -dc 0-9)
+  [ "${left:-0}" = 0 ] || fail "stub still running after cleanup"
+}
 
-dx "python3 /tmp/ctl_robust.py 127.0.0.1 $PORT $BUCKETS" | sed 's/^/  /'
-rc=${PIPESTATUS[0]}
-
-# The server must still be the same live process, with every rejection logged rather than fatal.
-alive=$(dx "kill -0 $pid 2>/dev/null && echo yes || echo no")
-[ "$alive" = yes ] || fail "server pid $pid is gone after the probe"
-rejects=$(dx "grep -ac 'SEAM_REJECT\|SEAM_QUEUE' $SRVLOG" 2>/dev/null | tr -dc 0-9)
-say "SERVER_ALIVE pid=${pid} alive=${alive} reject_lines=${rejects:-0} probe_rc=${rc}"
-[ "${rejects:-0}" -ge 5 ] || fail "expected >=5 rejected/queued control connections in the log, saw ${rejects:-0}"
-dx "grep -aE 'Fatal Python error|Aborted|assert|exception' $SRVLOG" | head -3 | sed 's/^/  LEAK /'
-dx "grep -aE 'Fatal Python error|Aborted|assert' $SRVLOG" | grep -q . && fail "server log shows a fatal error"
-[ "$rc" = 0 ] || fail "probe reported failures (rc=$rc)"
-
-dx "pkill -f '[w]orker_seam_server.py.*--stub'" >/dev/null 2>&1
-sleep 0.5
-left=$(dx "pgrep -f '[w]orker_seam_server.py.*--stub' | wc -l" | tr -dc 0-9)
-[ "${left:-0}" = 0 ] || fail "stub still running after cleanup"
+# Two lifetimes, because the concurrent client has two legitimate outcomes and both have to be
+# survivable: refused (ST_BUSY, the default) and queued then admitted (--wait, SEAM_WAIT=1).
+say "== refuse mode"
+start_stub "" ""
+say "== queue mode"
+start_stub "--wait" "wait"
 
 if [ "$fails" = 0 ]; then
-  say "RESULT ctl_robust=pass stub_pid_survived=yes rejects=${rejects}"
+  say "RESULT ctl_robust=pass stub_pid_survived=yes modes=refuse,queue"
   exit 0
 fi
 say "RESULT ctl_robust=fail failures=${fails}"
