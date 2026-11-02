@@ -248,22 +248,54 @@ class SeamServer:
         # (qmesh/build_cudaexl3.sh) and a server started on a checkout without it would otherwise
         # die on the first request, deep inside compute()'s fail-stop.
         self.preload = PRELOAD_CX and MOE_KERNEL == "cudaexl3" and not stub
+        self._cx_cls = None
         if self.preload:
             try:
-                from qmesh import exl3_moe_cuda  # noqa: F401  (loads the vendor extension)
+                from qmesh.exl3_moe_cuda import CudaExl3Moe  # noqa: F401  (loads the extension)
+                self._cx_cls = CudaExl3Moe
             except Exception as e:
                 self.preload = False
                 print(f"SEAM_MOE_NOEXT preload=off err={type(e).__name__}: {e} "
                       f"- every layer will stay on the mixed-K module", flush=True)
         self._cx_layers: dict = {}
+        self.layer_n: dict = {}
         config = Config.from_directory(model_dir)
         model = Model.from_config(config)
         for layer in range(NL):
             cold = placement["layers"][str(layer)]["warm"]
-            base = next(m for m in model.modules if m.key == f"layers.{layer}").mlp
-            self.layers[layer] = build_layer(base, cold, device)
-            del base
-            torch.cuda.empty_cache()
+            self.layer_n[layer] = len(cold)
+            hit = None
+            if self.preload and cold and DIRECT_PACK:
+                # Slabs first, then the shard's bytes into their slices: the layer's only copy of
+                # its experts is the one the kernels read, so this costs the layer's cold bytes and
+                # cannot be refused for want of a second copy's worth of free memory.
+                t0 = time.perf_counter()
+                avail0, swap0 = _avail_mib(), _swap_used_mib()
+                try:
+                    hit = self._cx_cls.from_pack(self.pack_paths[layer], layer, cold, device,
+                                                 fadvise = self.fadvise)
+                except Exception as e:  # noqa: BLE001 - a bad shard must not lose the other 39
+                    hit = None
+                    print(f"SEAM_MOE_DIRECT_FAIL layer={layer} n={len(cold)} "
+                          f"err={type(e).__name__}: {e} - falling back to the per-expert module "
+                          f"path for this layer", flush=True)
+                if hit is not None:
+                    self._cx_layers[layer] = hit
+                    self.layers[layer] = (None, len(cold))
+                    avail1 = _avail_mib()
+                    prev = self.__dict__.get("_cx_avail_min", avail1)
+                    self._cx_avail_min = min(prev, avail1)
+                    print(f"SEAM_MOE_DIRECT layer={layer} n={len(cold)} groups={hit.describe()} "
+                          f"slab_mib={hit.nbytes() / 2**20:.0f} "
+                          f"read_ms={1e3 * (time.perf_counter() - t0):.0f} "
+                          f"avail_mib={avail0}->{avail1} swap_mib={swap0}->{_swap_used_mib()} "
+                          f"rss_peak_mib={_rss_peak_mib()} cached_mib={_cached_mib()}",
+                          flush=True)
+            if hit is None:
+                base = next(m for m in model.modules if m.key == f"layers.{layer}").mlp
+                self.layers[layer] = build_layer(base, cold, device)
+                del base
+                torch.cuda.empty_cache()
             # Host side of the same bill: the loader's CPU buffers for this layer are dead now, and
             # on a unified-pool box anything the kernel is holding on their behalf is swap the next
             # layer's cudaMalloc cannot use (see _trim_host). Reported per layer so a load that
@@ -276,12 +308,12 @@ class SeamServer:
                   f"avail_mib={_avail_mib()} cached_mib={_cached_mib()} "
                   f"rss_peak_mib={_rss_peak_mib()} swap_mib={_swap_used_mib()} "
                   f"host_rss_mib={host_rss} host_swap_mib={host_swap} host_trim_mib={released} "
-                  f"cached_dropped={int(dropped)}", flush=True)
+                  f"cached_dropped={int(dropped)} direct={int(hit is not None)}", flush=True)
             # Convert now, not on the first request for this layer: this is the only moment the
             # group transient fits (see PRELOAD_CX). _cx_moe prints SEAM_MOE_CX or SEAM_MOE_NOFIT
             # per layer, and a refusal leaves the layer on the mixed-K module, which is correct
             # because nothing of the module was released in that case.
-            if self.preload:
+            if self.preload and hit is None:
                 self._cx_moe(layer, self.layers[layer][0])
         # The CPU model and its config were only the factory: every layer module is built now and
         # owns its device tensors, and nothing else reads them (build_layer shares `config` and
@@ -498,7 +530,7 @@ class SeamServer:
         x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN))
         x = x.view(torch.bfloat16).to(self.device).half()
         ids_np = view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)
-        _check_ids(layer, rows, ids_np, ffn.num_experts)
+        _check_ids(layer, rows, ids_np, self.layer_n[layer])
         ids = torch.from_numpy(ids_np.astype(np.int64))
         w = torch.from_numpy(view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK).copy())
         w = w.view(torch.bfloat16).float()
@@ -507,10 +539,16 @@ class SeamServer:
         sel = ids.clamp_min(0).to(self.device)
         gw = torch.where(miss, torch.zeros_like(w), w).to(self.device).half()
         # Cold-expert kernel switch (MOE_KERNEL). cuda-exl3 wants a layer's experts of one bitrate
-        # stacked into one trellis instead of one module per expert; the restack happens on the
-        # first call for the layer and drops the per-expert copies, so the resident cost is one
-        # copy of the cold pack and not two. A layer that cannot restack stays on the module.
+        # stacked into one trellis instead of one module per expert; a direct-loaded layer is
+        # already in that layout (`SEAM_MOE_DIRECT`), and any other layer is restacked on its first
+        # call, which drops the per-expert copies so the resident cost is one copy of the cold pack
+        # and not two. A layer that cannot restack stays on the module.
         cx = self._cx_moe(layer, ffn) if MOE_KERNEL == "cudaexl3" else None
+        if cx is None and ffn is None:
+            # Unreachable by construction: a layer has either its module or its direct stack.
+            # Serving the previous call's bytes instead would look like a correct answer (see
+            # compute()), so name it and die.
+            raise RuntimeError(f"layer {layer}: no cold-expert kernel and no module to serve it")
         with torch.cuda.stream(self.stream):
             if cx is not None:
                 part = cx.forward(x, sel, gw)
@@ -537,6 +575,13 @@ class SeamServer:
         cx = self.__dict__.setdefault("_cx_layers", {})
         if layer in cx:
             return cx[layer]
+        if ffn is None:
+            # A direct-loaded layer is already converted and was cached before the load moved on,
+            # so a miss here means its module is gone and nothing replaced it. There is nothing to
+            # restack; name it rather than raising on `_cx_transient_mib(None)`.
+            cx[layer] = None
+            print(f"SEAM_MOE_NOLAYER layer={layer} - no module and no stacked copy", flush=True)
+            return None
         try:
             from qmesh.exl3_moe_cuda import (CudaExl3Moe, RestackBroken, transient_mib as
                                              _cx_transient_mib, _live_mib as _cx_cold_mib,
@@ -699,6 +744,13 @@ CX_MARGIN_MIB = int(os.environ.get("SEAM_CX_MARGIN_MIB", "1536"))
 # 1000 over 40 layers, 116223 right after layer 0). Deferring the restack to the first request is
 # what wedged GX1. SEAM_MOE_PRELOAD=0 restores that behaviour for a box measured to have slack.
 PRELOAD_CX = os.environ.get("SEAM_MOE_PRELOAD", "1") != "0"
+
+# Read each cold layer straight from its pack shard into the stacked layout instead of loading one
+# module per expert and restacking those (see CudaExl3Moe.from_pack). On, because the module path's
+# conversion needs a transient the last layers of a 113.65 GiB pack on a 121.6 GiB box do not have:
+# GX2 2026-11-02 refused layers 37-39 (`SEAM_MOE_NOFIT`) and landed on 37/3. SEAM_MOE_DIRECT=0 keeps
+# the module path for an A/B on one box.
+DIRECT_PACK = os.environ.get("SEAM_MOE_DIRECT", "1") != "0"
 
 
 def ws_mib_for(rows: int, ws_rows: int = 0) -> float:
