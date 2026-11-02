@@ -53,6 +53,14 @@ for side in p7 gx; do
       "prepare needs a container of this pair that is not serving"
 done
 
+# Report a container that cannot reach the driver; do not repair it here. Prepare runs out of band,
+# with no gate held, so a restart would kill whatever is running in it (2026-11-02). The ticket's smoke
+# restarts it once it owns the box.
+for side in p7 gx; do
+  ct=$([ "$side" = p7 ] && echo "$P7CT" || echo "$GXCT")
+  pair_nvml_ok "$side" "$ct" || echo "PREPARE_NVML_WARN $side ct=$ct (docker exec nvidia-smi -L fails; the ticket's smoke will restart it under the gate)" >&2
+done
+
 # ---- pack locality (refuse before cutting anything onto a wrong disk) ----------------------------
 # Owner rule 2026-11-02: an expert pack lives on the local drive of the box that serves it. A pack
 # reached over NFS (or through a symlink that lands on someone else's drive) makes serving speed

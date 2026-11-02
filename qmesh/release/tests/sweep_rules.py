@@ -222,6 +222,17 @@ def _tracked_release_trees():
 
 check("no extracted release tree is tracked inside the tooling tree",
       not _tracked_release_trees(), ",".join(_tracked_release_trees()[:3]))
+check("the smoke repairs a container that lost NVML, but only after it owns the box",
+      'pair_ensure_nvml p7 "$P7CT"' in src("pair_smoke.sh")
+      and 'pair_ensure_nvml gx "$GXCT"' in src("pair_smoke.sh")
+      and src("pair_smoke.sh").index("pair_gx_gate_take") < src("pair_smoke.sh").index("pair_ensure_nvml p7")
+      and 'PREPARE_NVML_WARN' in src("pair_prepare.sh")
+      and "docker restart" not in src("pair_prepare.sh"), "")
+check("a claim carries its host, and only a same-host pid may declare it dead",
+      "host=%s" in src("pair_lib.sh")
+      and 'hostname -s' in src("pair_lib.sh")
+      and 'flock' in src("pair_lib.sh")
+      and 'host=\([^ ]*\)' in src("seam_server_ensure.sh"), "")
 check("a dry run cannot declare a free GPU for a real ticket",
       '[ "$PAIR_DRY" = 1 ] && [ -n "${PAIR_DRY_GPU:-}" ]' in src("pair_update_run.sh"), "")
 check("a rehearsed cut keeps its seeded release stand-in",

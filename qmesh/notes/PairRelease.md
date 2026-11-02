@@ -10,6 +10,20 @@ This note describes the release system in `qmesh/release/` (branch `tools/pair-r
 into `/home/treadall/recipe-artifacts/gpu0-gx1/scripts/`). It answers one question per pair:
 **are both halves on the same release, and is that release the one we think it is?**
 
+## A container that lost its GPU is restarted, not recreated (2026-11-02)
+
+The 02:18 systemd daemon reload (an `nmcli connection modify` for the new MTU) re-derived the device
+cgroup of every *running* container on P7, GX1 and GX2 and dropped its GPU access. The containers stayed
+`Up`, the hosts were healthy, and their processes died on the next CUDA/NVML call: "Failed to initialize
+NVML: Unknown Error", then "No CUDA GPUs are available" from `torch.cuda.Stream`. That is the whole of
+the 02:22 and 02:26 failures -- not a module reload, not the UVM reset a create causes.
+
+`pair_nvml_ok <p7|gx> <ct>` asks the container itself; `pair_ensure_nvml` restarts it once and waits up to
+30 s for the driver to answer again. The smoke calls it for both containers *after* `pair_gx_gate_take`
+and before the memory wait: a restart kills whatever the container was doing, so it may only happen
+under the box's claim. `pair_prepare.sh` only reports (`PREPARE_NVML_WARN`): prepare runs out of band
+with nobody's claim, and a restart there is the same accident with a different trigger.
+
 ## One release, one tree, both halves
 
 ```

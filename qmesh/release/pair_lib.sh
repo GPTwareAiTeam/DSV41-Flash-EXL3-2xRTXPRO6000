@@ -155,6 +155,29 @@ pair_p7_gpu_users() {  # [gpu index...] -> "gpu<N> pid=<pid> <name>" per compute
     done
 }
 
+pair_nvml_ok() {  # <p7|gx> <ct> -> 0 when the container can still reach the driver
+  if [ "$1" = gx ]; then pair_gxsh "docker exec ${2:?ct} nvidia-smi -L" >/dev/null 2>&1
+  else docker exec "$2" nvidia-smi -L >/dev/null 2>&1; fi
+}
+
+pair_ensure_nvml() {  # <p7|gx> <ct> -> restarts the container once when its device permissions were lost
+  # A systemd daemon reload (2026-11-02 02:18, triggered by an nmcli MTU change) re-derives the device
+  # cgroup of every *running* container and drops its GPU access: NVML then answers "Unknown Error"
+  # and CUDA "No CUDA GPUs are available", while the host is healthy. A restart gives the container a
+  # fresh cgroup. This must run where the box's gate is held, because the restart kills whatever the
+  # container was doing -- the smoke calls it after pair_gx_gate_take, never before.
+  local i
+  pair_nvml_ok "$1" "$2" && return 0
+  if [ "$1" = gx ]; then pair_gxsh "docker restart $2" >/dev/null 2>&1
+  else docker restart "$2" >/dev/null 2>&1; fi
+  for i in $(seq 1 15); do
+    if pair_nvml_ok "$1" "$2"; then echo "PAIR_NVML_RESTART $1 ct=$2 after=$((i * 2))s"; return 0; fi
+    sleep 2
+  done
+  echo "PAIR_NVML_FAIL $1 ct=$2 (device permissions lost by a systemd/toolkit reload; restart did not restore NVML)" >&2
+  return 1
+}
+
 pair_pid_in_container() {  # <pid> <container> -> 0 when that pid runs inside the named container
   local cid
   cid=$(docker inspect -f '{{.Id}}' "${2:?container}" 2>/dev/null) || return 1
@@ -175,40 +198,52 @@ pair_gpu_foreign_users() {  # <gpu index...> <own container> -> users on those G
   printf '%s' "${out%;}"
 }
 
-pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until or a dead holder is free
-  local f o p u; f=$(pair_gx_gate_file)
+pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until or a dead local holder is free
+  local f o p u h; f=$(pair_gx_gate_file)
   [ -f "$f" ] || { echo free; return 0; }
   o=$(sed -n 's/^owner=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   p=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   u=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  h=$(sed -n 's/.*host=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   case "${u:-}" in ''|*[!0-9]*) echo "foreign_bad_gate ${o:-?}"; return 0 ;; esac
   if [ "$u" -lt "$(date +%s)" ]; then echo free; return 0; fi
-  # A killed job leaves its claim behind. Every claim is written by a process on this host, so a pid
-  # that is gone means nobody is holding the box; without this a killed job locked the GX for its
-  # whole until and the next smoke waited its 20 minutes out.
-  if [ -n "${p:-}" ] && ! kill -0 "$p" 2>/dev/null; then echo free; return 0; fi
+  # A killed job leaves its claim behind, and every claim this pair writes comes from this host, so a
+  # pid that is gone means nobody is holding the box (without this, a killed job wedged the GX for its
+  # whole until). Only on this host, though: a claim written on another box, or from inside a container
+  # whose /proc is a different namespace, carries a pid this shell cannot see, and `kill -0` on it does
+  # not mean the holder is dead. On 2026-11-02 02:26:47 a runner read a live claim, could not see the
+  # holder's pid from where it ran, called it dead and took the box while a load was in flight. A claim
+  # without a host line predates the field and is this host's.
+  if [ -n "${p:-}" ] && [ "${h:-$(hostname -s)}" = "$(hostname -s)" ] && ! kill -0 "$p" 2>/dev/null
+  then echo free; return 0; fi
   echo "${o:-?} until=$u"
 }
-pair_gx_gate_up() {  # <label> <minutes>
+pair_gx_gate_up() {  # <label> <minutes> -> atomic; never replaces a claim that is still held
   local f; f=$(pair_gx_gate_file)
   [ "$PAIR_DRY" = 1 ] && return 0
   mkdir -p "$(dirname "$f")" || return 1
-  printf 'owner=%s pid=%s until=%s\n' "$1" "$$" "$(( $(date +%s) + ${2:-60} * 60 ))" >"$f"
+  (
+    # The claim is a lock, so "is it free" and "write it" have to be one step: two jobs that both read
+    # free and then write in turn both believe they own the box.
+    command -v flock >/dev/null 2>&1 && exec 9>"$f.lock" && flock -w 20 9
+    [ "$(pair_gx_gate_state)" = free ] || exit 3
+    printf 'owner=%s pid=%s host=%s until=%s\n' "${1:?label}" "$$" "$(hostname -s)" \
+      "$(( $(date +%s) + ${2:-60} * 60 ))" >"$f" || exit 4
+  ) || return 1
 }
 pair_gx_gate_take() {  # <label> <minutes> <wait_minutes> -> 0 claimed, 1 still someone else's
-  local st waited=0 limit=$(( ${3:-0} * 6 ))
+  local waited=0 limit=$(( ${3:-0} * 6 ))
   while :; do
-    st=$(pair_gx_gate_state)
-    case "$st" in
-      free) pair_gx_gate_up "$1" "$2"; return 0 ;;
-    esac
+    if pair_gx_gate_up "$1" "$2"; then return 0; fi
     [ "$waited" -lt "$limit" ] || return 1
     sleep 10; waited=$((waited + 1))
   done
 }
-pair_gx_gate_down() {  # drop the claim only if the line is still this process's
-  local f; f=$(pair_gx_gate_file)
+pair_gx_gate_down() {  # drop the claim only if the line is still this process's, on this host
+  local f h; f=$(pair_gx_gate_file)
   [ "$PAIR_DRY" = 1 ] && return 0
+  h=$(sed -n 's/.*host=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  [ "${h:-$(hostname -s)}" = "$(hostname -s)" ] || return 0
   [ "$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)" = "$$" ] && rm -f "$f"
   return 0
 }

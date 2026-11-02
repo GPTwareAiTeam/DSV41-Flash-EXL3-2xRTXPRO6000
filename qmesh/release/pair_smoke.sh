@@ -118,6 +118,12 @@ smoke_exit() {
 trap smoke_exit EXIT
 echo "SMOKE_GATE owner=smoke-$PAIR until=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$(pair_gx_gate_file)")"
 
+# A container can be alive and still be unable to reach the GPU (its device cgroup was re-derived by a
+# systemd reload). Check both ends now that the box is ours; a restart is the fix and it costs seconds,
+# while discovering it inside the worker's init costs the whole ticket.
+pair_ensure_nvml p7 "$P7CT" || fail "nvml p7=$P7CT"
+pair_ensure_nvml gx "$GXCT" || fail "nvml gx=$GXCT"
+
 echo "SMOKE_MEM_BEFORE $(gx_mem)"
 
 # A previous server's memory is not returned the instant its process exits: on 2026-11-02 the smoke

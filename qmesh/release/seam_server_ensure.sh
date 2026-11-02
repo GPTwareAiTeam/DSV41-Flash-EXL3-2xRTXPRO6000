@@ -102,7 +102,7 @@ seam_gate_is_ancestor() {  # <pid> -> 0 when it is this process or one of its an
 }
 seam_gate_check() {  # -> 0 allowed; prints PREFLIGHT_FAIL gate_* and returns 3 otherwise
   [ "$SEAM_GATE_REQUIRED" = 1 ] || return 0
-  local f o p u now
+  local f o p u h now
   f=$(seam_gate_file)
   if [ ! -f "$f" ]; then
     echo "PREFLIGHT_FAIL gate_free owner=none file=$f host=$GX (take the gate before loading: gx${CT#seam-gx} is shared)"
@@ -111,6 +111,7 @@ seam_gate_check() {  # -> 0 allowed; prints PREFLIGHT_FAIL gate_* and returns 3 
   o=$(sed -n 's/^owner=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   p=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   u=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  h=$(sed -n 's/.*host=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   now=$(date +%s)
   case "${u:-}" in
     ''|*[!0-9]*)
@@ -124,7 +125,10 @@ seam_gate_check() {  # -> 0 allowed; prints PREFLIGHT_FAIL gate_* and returns 3 
   if seam_gate_is_ancestor "${p:-}"; then
     return 0
   fi
-  if [ -z "${p:-}" ] || ! kill -0 "$p" 2>/dev/null; then
+  # The pid is only evidence on the host that wrote the claim: a claim from another box (or from a
+  # container whose /proc is a different namespace) carries a pid this shell cannot see, and calling
+  # that stale is how a live claim got overwritten on 2026-11-02 02:26:47.
+  if [ -z "${p:-}" ] || { [ "${h:-$(hostname -s)}" = "$(hostname -s)" ] && ! kill -0 "$p" 2>/dev/null; }; then
     echo "PREFLIGHT_FAIL gate_stale owner=${o:-?} pid=${p:-none} (that process is gone; take the gate again)"
     return 3
   fi
