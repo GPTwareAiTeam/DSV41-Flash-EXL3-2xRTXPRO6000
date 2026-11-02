@@ -350,6 +350,10 @@ class CudaExl3Moe:
         Expert `e` of the checkpoint stores its gate as `w1`, its up projection as `w3` and its
         down projection as `w2` (exllamav3's own key mapping), in the layout the kernels here
         consume: trellis (in/16, out/16, words) int16, suh half (in), svh half (out).
+        A member's `source` is its position in `cold_ids`, exactly as `__init__` labels the module's
+        experts: the ids this layer receives are local to the cold set (`_check_ids` bounds them by
+        len(cold)), and `remap` is indexed by them. The shard's keys, by contrast, are the
+        checkpoint's global expert ids, which is why the two are carried separately.
         """
         dev = torch.device(device or "cuda")
         shard = _Shard(path, fadvise = fadvise)
@@ -357,8 +361,8 @@ class CudaExl3Moe:
         self.device = dev
         self.num_experts = len(cold_ids)
         try:
-            by_key: dict[tuple[int, int, int], list[tuple[int, int, int, int, int]]] = {}
-            for e in cold_ids:
+            by_key: dict[tuple[int, int, int], list[tuple[int, int, int, int, int, int]]] = {}
+            for local_i, e in enumerate(cold_ids):
                 g, u, d = _pack_names(layer, e)
                 kt, nt, w13 = shard.shape(g + ".trellis")
                 _, nt_u, w13u = shard.shape(u + ".trellis")
@@ -369,15 +373,15 @@ class CudaExl3Moe:
                 if shard.codebook(u) != cb or shard.codebook(d) != cb:
                     raise ValueError(f"expert {e}: gate/up/down codebooks differ")
                 by_key.setdefault((int(w13), int(w2), cb), []).append(
-                    (int(e), int(kt), int(nt), int(k2t), int(n2t)))
+                    (int(local_i), int(e), int(kt), int(nt), int(k2t), int(n2t)))
             # Geometry of the whole layer, from any expert (they share hidden/inter).
             first = by_key[sorted(by_key)[0]][0]
-            self.hidden = 16 * first[1]
-            self.inter = 16 * first[2]
+            self.hidden = 16 * first[2]
+            self.inter = 16 * first[3]
             self.groups: list[Group] = []
             stage = _Stage(dev)
             for key, members in sorted(by_key.items()):
-                _, gkt, gnt, gk2t, gn2t = members[0]
+                _, _, gkt, gnt, gk2t, gn2t = members[0]
                 e_n = len(members)
                 grp = Group(*_bits_frac(key[0]), key[2])
                 grp.n_experts = e_n
@@ -389,10 +393,10 @@ class CudaExl3Moe:
                                            dtype = torch.int16, device = dev)
                 grp.suh2 = torch.empty((e_n, 1, 16 * gk2t), dtype = torch.half, device = dev)
                 grp.svh2 = torch.empty((e_n, 16 * gn2t), dtype = torch.half, device = dev)
-                for i, (expert, skt, snt, sk2t, sn2t) in enumerate(members):
+                for i, (src, expert, skt, snt, sk2t, sn2t) in enumerate(members):
                     if (skt, snt, sk2t, sn2t) != (gkt, gnt, gk2t, gn2t):
-                        raise ValueError(f"expert {expert}: tile geometry differs inside one "
-                                         f"bitrate group")
+                        raise ValueError(f"expert {src} (checkpoint {expert}): tile geometry "
+                                         f"differs inside one bitrate group")
                     g, u, d = _pack_names(layer, expert)
                     shard.read_into(g + ".trellis", grp.trellis13[i, :, :gnt], stage)
                     shard.read_into(u + ".trellis", grp.trellis13[i, :, gnt:], stage)

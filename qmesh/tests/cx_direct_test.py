@@ -83,10 +83,21 @@ def main():
     from qmesh.exl3_moe_cuda import CB_3INST, CB_MUL1, CudaExl3Moe
 
     layer, kt, nt, w13, w2 = 5, 4, 3, 64, 32
+    # The cold set is a *subset* of the checkpoint's experts, and the pack keys carry the checkpoint's
+    # global ids (verified against the real 4460 shard: `layers.5.ffn.experts.<global>.w1.trellis`).
+    # The ids the server receives are local to this subset, so a layer whose cold list is not
+    # 0,1,2,... is the normal case -- layer 5 of the real pack has 254 ids between 0 and 383.
+    # Global ids here are deliberately non-contiguous, out of order, and interleaved with the
+    # groups, so `source` (local) and the shard key (global) can not be confused silently:
+    #   local 0 = global 11 (MUL1), local 1 = global 3 (MUL1),
+    #   local 2 = global 40 (3INST), local 3 = global 17 (3INST).
+    cold = [11, 3, 40, 17]
+    shape_of = {11: (CB_MUL1, w13, w2), 3: (CB_MUL1, w13, w2),
+                40: (CB_3INST, 84, 52), 17: (CB_3INST, 84, 52)}
     src = {}
     tensors = []
-    for e, cb, words, dw in ((0, CB_MUL1, w13, w2), (1, CB_MUL1, w13, w2),
-                             (2, CB_3INST, 84, 52)):
+    for e in cold:
+        cb, words, dw = shape_of[e]
         for name, t in _expert(layer, e, kt, nt, words, dw, cb):
             src[name] = t
             tensors.append((name, t))
@@ -98,19 +109,23 @@ def main():
     path = os.path.join(tmp, "cold-L05.safetensors")
     _write_shard(path, tensors)
 
-    hit = CudaExl3Moe.from_pack(path, layer, [0, 1, 2], device = "cpu")
+    hit = CudaExl3Moe.from_pack(path, layer, cold, device = "cpu")
     assert hit.hidden == 16 * kt, hit.hidden
     assert hit.inter == 16 * nt, hit.inter
-    assert hit.num_experts == 3
+    assert hit.num_experts == 4
     assert len(hit.groups) == 2, hit.describe()
     m1, m3 = hit.groups
     assert (m1.bits, m1.frac, m1.cb, m1.n_experts) == (4, False, CB_MUL1, 2), hit.describe()
-    assert (m3.bits, m3.frac, m3.cb, m3.n_experts) == (5, True, CB_3INST, 1), hit.describe()
-    assert m1.source == [0, 1] and m3.source == [2], (m1.source, m3.source)
-    assert m1.remap.tolist() == [0, 1, -1] and m3.remap.tolist() == [-1, -1, 0], \
-        (m1.remap.tolist(), m3.remap.tolist())
+    assert (m3.bits, m3.frac, m3.cb, m3.n_experts) == (5, True, CB_3INST, 2), hit.describe()
+    # `source` labels the experts of this group as the layer's forward sees them: positions in
+    # `cold`, i.e. the same labels `__init__` gives the module's per-expert list. A global id here
+    # (11 or 40 on a 4-expert layer) would index `remap` out of bounds on the device.
+    assert m1.source == [0, 1] and m3.source == [2, 3], (m1.source, m3.source)
+    assert m1.remap.tolist() == [0, 1, -1, -1], m1.remap.tolist()
+    assert m3.remap.tolist() == [-1, -1, 0, 1], m3.remap.tolist()
+    assert m1.remap.dtype == torch.int64 and m1.remap.numel() == len(cold)
 
-    def check(grp, i, expert):
+    def check(grp, i, expert):  # i = position in the group, expert = global checkpoint id
         p = f"layers.{layer}.ffn.experts.{expert}"
         assert torch.equal(grp.trellis13[i, :, :nt], src[p + ".w1.trellis"]), "gate trellis"
         assert torch.equal(grp.trellis13[i, :, nt:], src[p + ".w3.trellis"]), "up trellis"
@@ -122,18 +137,22 @@ def main():
         assert torch.equal(grp.suh2[i, 0], src[p + ".w2.suh"]), "down suh"
         assert torch.equal(grp.svh2[i], src[p + ".w2.svh"]), "down svh"
 
-    check(m1, 0, 0)
-    check(m1, 1, 1)
-    check(m3, 0, 2)
+    # Group order is sorted by key, member order is the order of `cold`: slot 0 of the MUL1 group is
+    # global 11 (first in `cold`), slot 1 is global 3. Reading by `source` would swap them.
+    check(m1, 0, 11)
+    check(m1, 1, 3)
+    check(m3, 0, 40)
+    check(m3, 1, 17)
     assert hit.nbytes() == sum(g.nbytes() for g in hit.groups) and hit.nbytes() > 0
     # A missing expert is a load-time error, not a silently shorter layer.
     try:
-        CudaExl3Moe.from_pack(path, layer, [0, 7], device = "cpu")
+        CudaExl3Moe.from_pack(path, layer, [11, 7], device = "cpu")
     except KeyError as e:
         assert "experts.7.w1.trellis" in str(e), e
     else:
         raise AssertionError("a missing expert id was accepted")
-    print(f"CX_DIRECT_TEST ok groups={hit.describe()} slab_mib={hit.nbytes() / 2**20:.3f} "
+    print(f"CX_DIRECT_TEST ok groups={hit.describe()} cold={cold} source={m1.source}+{m3.source} "
+          f"remap={m1.remap.tolist()}/{m3.remap.tolist()} slab_mib={hit.nbytes() / 2**20:.3f} "
           f"hidden={hit.hidden} inter={hit.inter}")
 
 if __name__ == "__main__":

@@ -62,12 +62,21 @@ def check_layer(model, placement, model_dir, layer, device):
         print(f"CXD_MISMATCH layer={layer} geometry ref={(ref.hidden, ref.inter, ref.num_experts)} "
               f"direct={(got.hidden, got.inter, got.num_experts)}")
         ok = False
+    # `source` must be positions in the layer's cold list (what the forward's ids are), not the pack's
+    # global expert ids: `remap` is indexed by source, so a global id is an out-of-bounds index_put on
+    # the device, i.e. a context-killing assert in a fail-stop server. Cheap to verify before the
+    # group keys are compared, which would otherwise report this as a mysterious "grouping" mismatch.
+    for g in got.groups:
+        if g.source and max(g.source) >= got.num_experts:
+            print(f"CXD_MISMATCH layer={layer} source_out_of_range n={got.num_experts} "
+                  f"source={g.source} (global ids leaked into source)")
+            ok = False
     key = lambda g: (g.bits, g.frac, g.cb, tuple(g.source))
     ref_groups = {key(g): g for g in ref.groups}
     got_groups = {key(g): g for g in got.groups}
     if sorted(ref_groups) != sorted(got_groups):
         print(f"CXD_MISMATCH layer={layer} grouping ref={sorted(ref_groups)} "
-              f"direct={sorted(got_groups)}")
+              f"direct={sorted(got_groups)} cold={cold[:8]}{'...' if len(cold) > 8 else ''}")
         return False
     for k in sorted(ref_groups):
         a, b = ref_groups[k], got_groups[k]
@@ -88,6 +97,7 @@ def check_layer(model, placement, model_dir, layer, device):
             ok = False
     if ok:
         print(f"CXD_OK layer={layer} n={len(cold)} groups={got.describe()} "
+              f"source={[len(g.source) for g in got.groups]} "
               f"slab_mib={got.nbytes() / 2**20:.0f} module_build_ref_ms={1e3 * t_ref:.0f} "
               f"direct_ms={1e3 * t_direct:.0f} avail_mib={avail0}->{_avail_mib()} "
               f"peak_mib={ref.nbytes() / 2**20 + got.nbytes() / 2**20:.0f}", flush=True)

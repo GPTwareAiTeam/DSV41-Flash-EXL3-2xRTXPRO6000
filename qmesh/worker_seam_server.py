@@ -729,12 +729,17 @@ WS_AUTO = os.environ.get("SEAM_WS_ROWS_AUTO", "1") != "0"
 # raises it (SEAM_SWAP_WARN_MIB=N) instead of pinning the ladder for the rest of the run.
 SWAP_WARN_MIB = int(os.environ.get("SEAM_SWAP_WARN_MIB", "512"))
 
-# Floor the cuda-exl3 restack has to leave on the box besides its own peak (see _cx_moe). 1.5 GiB is
-# the headroom a loaded GX actually has left (slab + workspace + CUDA context); a conversion that
-# eats into it swaps the 113.65 GiB pack out page by page, and on GB10 that stalls the whole host,
-# not just this process (GX1, 2026-11-01 16:44). Set SEAM_CX_MARGIN_MIB=0 only to measure a restack
-# on a box you are willing to lose.
-CX_MARGIN_MIB = int(os.environ.get("SEAM_CX_MARGIN_MIB", "1536"))
+# Floor a *restack* has to leave on the box besides its own peak (see _cx_moe). 1.5 GiB is the
+# headroom a loaded GX actually has left (slab + workspace + CUDA context); a conversion that eats
+# into it swaps the 113.65 GiB pack out page by page, and on GB10 that stalls the whole host, not
+# just this process (GX1, 2026-11-01 16:44). It is a per-layer refusal test, not a global policy:
+# layer N is restacked when avail - need >= margin, so N refuses every layer whose need + N exceeds
+# avail, and the count of refused layers moves with N (measured on GX2, 2026-11-02, 4460 pack:
+# N=1536 leaves 2, N=2600 leaves 3; the layers are 37-39, the last ~2.7-3.1 GiB of a 113.65 GiB load).
+# Since SEAM_MOE_DIRECT (see exl3_moe_cuda.from_pack) the normal load path does not restack at all --
+# it reads each layer straight out of the pack, needs no transient, and never consults this floor --
+# so the margin now only gates the per-layer fallback taken when from_pack fails. Set
+# SEAM_CX_MARGIN_MIB=0 only to measure a restack on a box you are willing to lose.
 
 # Convert each cold layer to the cuda-exl3 kernel as it loads, on by default when that kernel is
 # the one in use. The conversion needs one layer's cold bytes *plus* its largest bitrate group
