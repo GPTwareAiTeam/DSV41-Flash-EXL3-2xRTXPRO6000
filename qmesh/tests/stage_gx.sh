@@ -38,7 +38,7 @@ for f in qmesh/worker_seam_server.py qmesh/placement.py qmesh/native/qes.py \
 done
 # The libraries are built in the container, so their shas are the container's business; print them so
 # a log can be matched against the run that produced a number.
-ssh -o BatchMode=yes "$GX" "docker exec $CT bash -lc 'cd $CTWT/qmesh/native/bin 2>/dev/null && sha256sum *.so *.aarch64.so 2>/dev/null | cut -c1-16,65-'" \
-  | sed 's/^/STAGE lib sha=/' || true
+ssh -o BatchMode=yes "$GX" "docker exec $CT bash -lc 'cd $CTWT/qmesh/native/bin && sha256sum * 2>/dev/null'" \
+  | awk 'NF == 2 {printf "STAGE lib %s sha=%.16s\n", $2, $1}'
 [ "$bad" = 0 ] || exit 2
 echo "STAGE OK host=$GX ct=$CT tree=$CTWT"
