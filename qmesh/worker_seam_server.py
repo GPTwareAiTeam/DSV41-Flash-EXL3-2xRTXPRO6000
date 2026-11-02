@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import ctypes
+import gc
 import json
 import os
 import sys
@@ -37,6 +39,13 @@ from qmesh.native import qes
 # exllamav3 is imported inside SeamServer.__init__: its module import JIT-builds exllamav3_ext
 # (minutes on a cold cache, and it blocks on the torch extension baton), which a --stub server
 # must never pay for - the wire/protocol baseline has to come up on a box whose GPU is busy.
+
+# libc handle for malloc_trim(0): the only way Python can hand glibc's freed arenas back to the
+# kernel (see _trim_host). Absent on a musl box, where the trim is simply skipped.
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except OSError:  # noqa: BLE001 - a missing libc handle costs the trim, not the server
+    _LIBC = None
 
 HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
@@ -250,13 +259,18 @@ class SeamServer:
             self.layers[layer] = build_layer(base, cold, device)
             del base
             torch.cuda.empty_cache()
-            # The layer's file-backed pages were only ever a staging copy: drop them so the cache
-            # does not take memory the next layer (or a 4096-row workspace) needs.
+            # Host side of the same bill: the loader's CPU buffers for this layer are dead now, and
+            # on a unified-pool box anything the kernel is holding on their behalf is swap the next
+            # layer's cudaMalloc cannot use (see _trim_host). Reported per layer so a load that
+            # leaks is visible in the log rather than in somebody's swap census afterwards.
+            released = _trim_host()
+            host_rss, host_swap = _host_rss_swap_mib()
             dropped = _drop_page_cache(self.pack_paths[layer]) if self.fadvise else False
             print(f"layer {layer}: {len(cold)} cold experts, "
                   f"{torch.cuda.memory_allocated(device) / 2**30:.2f} GiB "
                   f"avail_mib={_avail_mib()} cached_mib={_cached_mib()} "
                   f"rss_peak_mib={_rss_peak_mib()} swap_mib={_swap_used_mib()} "
+                  f"host_rss_mib={host_rss} host_swap_mib={host_swap} host_trim_mib={released} "
                   f"cached_dropped={int(dropped)}", flush=True)
             # Convert now, not on the first request for this layer: this is the only moment the
             # group transient fits (see PRELOAD_CX). _cx_moe prints SEAM_MOE_CX or SEAM_MOE_NOFIT
@@ -264,6 +278,23 @@ class SeamServer:
             # because nothing of the module was released in that case.
             if self.preload:
                 self._cx_moe(layer, self.layers[layer][0])
+        # The CPU model and its config were only the factory: every layer module is built now and
+        # owns its device tensors, and nothing else reads them (build_layer deepcopies `base`). The
+        # trim below is what hands the loader's arenas back, so the pack's 113.5 GiB is the only
+        # thing a loaded server reserves -- 3.44 GiB of VmSwap after a load was this staging, and
+        # the owner cannot run swap off while the server keeps asking for it.
+        del model, config
+        released = _trim_host()
+        host_rss, host_swap = _host_rss_swap_mib()
+        host_anon = _proc_status_mib(("RssAnon",))[0]
+        print(f"SEAM_HOST_MEM phase=load_done rss_mib={host_rss} swap_mib={host_swap} "
+              f"anon_mib={host_anon} trim_mib={released} avail_mib={_avail_mib()} "
+              f"box_swap_mib={_swap_used_mib()}", flush=True)
+        # Which mappings still hold the host bill, biggest first: an empty list means the trim
+        # returned everything and the pack is the only thing the box gave up.
+        for size_mib, swap_mib, rss_mib in _anon_maps():
+            print(f"SEAM_HOST_MAP size_mib={size_mib} swap_mib={swap_mib} "
+                  f"rss_mib={rss_mib}", flush=True)
         cx_n = sum(1 for v in self._cx_layers.values() if v is not None)
         if self._cx_layers:
             print(f"SEAM_PACK_KERNEL cudaexl3_layers={cx_n} mixedk_layers={NL - cx_n} "
@@ -449,7 +480,9 @@ class SeamServer:
 
     def _forward_piece(self, layer, ffn, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """One mixed-K forward of `rows` rows straight out of, and back into, the pinned slab."""
-        x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN).copy())
+        # Same argument on the way in: the C proxy owns these bytes until this hook returns, so the
+        # H2D can read them in place instead of staging a rows*HIDDEN*2 copy (117 MiB at 8192 rows).
+        x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN))
         x = x.view(torch.bfloat16).to(self.device).half()
         ids_np = view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)
         _check_ids(layer, rows, ids_np, ffn.num_experts)
@@ -472,8 +505,14 @@ class SeamServer:
                 part = ffn.forward(x.view(1, rows, HIDDEN),
                                    {"external_selected": sel, "external_weights": gw})
         self.stream.synchronize()
-        view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = \
-            part.view(rows, HIDDEN).float().cpu().numpy()
+        # Device -> the client's pinned slab, in place. The obvious form of this line --
+        # `slab[:] = part.float().cpu().numpy()` -- allocates a fresh rows*HIDDEN*4 CPU tensor per
+        # call (235 MiB at 8192 rows) and glibc keeps those mmaps in its arenas long after the
+        # copy, so a prefill paid ~50 GiB of host churn on a box whose headroom is measured in
+        # hundreds of MiB. Wrapping the slab with from_numpy makes it the destination itself.
+        out_host = torch.from_numpy(
+            view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN))
+        out_host.copy_(part.view(rows, HIDDEN))
 
     def _cx_moe(self, layer, ffn):
         """The layer's cuda-exl3 adapter, built on first use (see _forward_piece).
@@ -706,6 +745,83 @@ def _swap_used_mib() -> int:
     # SWAP_WARN_MIB` raised TypeError. On a stub that kills the server before SEAM_LISTEN; on a real
     # load it kills it *after* the 153 s pack load. Caught by the 2026-11-01 failstop slot.
     return (total - free) // 1024
+
+
+def _proc_status_mib(fields) -> tuple:
+    """`(VmRSS, VmSwap, ...)` of this process, MiB, -1 per unreadable field."""
+    seen = {}
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                key = line.split(":", 1)[0]
+                if key in fields:
+                    seen[key] = int(line.split()[1]) // 1024
+    except OSError:
+        return tuple(-1 for _ in fields)
+    return tuple(seen.get(key, -1) for key in fields)
+
+
+def _host_rss_swap_mib() -> tuple:
+    """(resident, swapped) host memory of this process, MiB.
+
+    On a GX the pack is device memory of a unified pool, so these two numbers are the whole host
+    bill the server has any business holding: the pinned client slabs plus a live interpreter. A
+    load that ends with GiBs here has left Python/glibc staging behind (see _trim_host)."""
+    return _proc_status_mib(("VmRSS", "VmSwap"))
+
+
+def _trim_host() -> int:
+    """Hand freed CPU staging back to the OS. Returns MiB released (0 = nothing was stale).
+
+    The loader reads every tensor of a ~2.9 GiB safetensors file through a CPU buffer and copies it
+    into the unified pool; Python and glibc free those buffers into their arenas, but glibc only
+    returns an arena to the kernel when it is trimmed, so the process keeps GiBs of dead staging -
+    which the kernel evicts to swap as soon as the pack fills the pool (GX1 2026-11-02:
+    3.44 GiB VmSwap, 2.88 GiB of it one anonymous mapping, 0.76 GiB resident). gc.collect() drops
+    the Python objects, malloc_trim(0) releases the arenas; together they are the difference
+    between "the box has headroom" and "every expert call takes page faults"."""
+    before = _host_rss_swap_mib()
+    gc.collect()
+    try:
+        _LIBC.malloc_trim(0)
+    except Exception:  # noqa: BLE001 - a libc without malloc_trim must not fail a load
+        pass
+    after = _host_rss_swap_mib()
+    # A mapping's swap entries go with the mapping, so this delta is memory the box really has back.
+    return max(0, (before[0] + before[1]) - (after[0] + after[1]))
+
+
+def _anon_maps(min_mib: int = 64, top: int = 4) -> list:
+    """Largest anonymous mappings of this process, [(size_mib, swap_mib, rss_mib), ...].
+
+    This is the answer to "why is a loaded server in swap": the pack is device memory, so any big
+    anonymous mapping here is host staging that survived the load. Printed right after _trim_host
+    so a load that still keeps GiBs names the mapping instead of costing another reload to find."""
+    maps = []
+    size = rss = swap = None
+    try:
+        with open("/proc/self/smaps") as fh:
+            for line in fh:
+                if "-" in line.split(" ", 1)[0] and len(line.split()) >= 5:
+                    if size is not None and size > min_mib * 1024 and (swap or rss):
+                        maps.append((size // 1024, swap // 1024, (rss or 0) // 1024))
+                    # Anonymous = no pathname (6th field) and not a device mapping (/dev/..., [heap]).
+                    fields = line.split()
+                    anon = len(fields) == 5
+                    size = 0 if anon else None
+                    rss = swap = 0
+                elif size is not None:
+                    key = line.split(":", 1)[0]
+                    if key == "Size":
+                        size = int(line.split()[1])
+                    elif key == "Rss":
+                        rss = int(line.split()[1])
+                    elif key == "Swap":
+                        swap = int(line.split()[1])
+    except OSError:
+        return []
+    maps.sort(reverse=True)
+    return maps[:top]
 
 
 def _drop_page_cache(path: str) -> bool:
