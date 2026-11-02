@@ -234,6 +234,14 @@ Verify is read-only and runs before the build guards in both builders: a flip-on
 while GX is still loading a server and while other builds own the box, and neither has anything to
 do with reading a stamp. `pair_build_ext.sh verify` needs `pair_ext_stamp_check.py` (one definition
 of "this stamp names this build").
+`pair_canary.sh <pair> <sha>` is the ticket that finishes a half-prepared release and flips it in one
+claim (the GX native lib may only be built under the box's claim, and two rank-01 tickets cannot be
+ordered against each other). Its **first** step, before it builds anything, is
+`CANARY_RELINK <side> <ct> -> /pair/current/src` on both halves: a build points `/src/exllamav3` at
+the release it is compiling, and a build that is killed never reaches its own `EXIT` trap, so the
+container can be left importing a tree that `current` does not name (dev GX, 2026-11-02 16:23Z:
+`pair_check dev` = GX DRIFT). The repair belongs inside a ticket, never in an operator's shell --
+that is the same door the owner closed for code, and it leaves an audit line in the queue log.
 
 For prod, the prepare has to happen in a container that is **not serving**: create `seam-p7-prod` /
 `seam-gx1-prod` fresh and prepare there, while the arms that are running keep their own containers.
@@ -297,12 +305,15 @@ on a network filesystem, and holds the pack's symlinks to the same rule. It runs
 `tests/pack_disk.py` pins the refusals.
 
 The P7 containers used to be handed `/mnt/data12` so the 4460 hot pack's links could be resolved;
-that mount is gone from both P7 specs, so the containers no longer see the 12 TB drive. A spec
-change is the one thing a flip-only ticket will not do on its own: `plan` reports a `RECREATE`, and
-the ticket stops unless it was queued with `--recreate` (`pair_promote.sh <sha> --recreate` for
-prod), which is the only path that sets `PAIR_ALLOW_RECREATE=1`. The ticket then re-creates from the
-spec inside the queue, renaming the old container to `<name>.bak-<ts>` -- never a hand-written
-`docker rm`, and dev still goes first.
+that mount is gone from both P7 specs, so the containers no longer see the 12 TB drive. A live mount
+the spec no longer names is reported by `plan` as `advisory:mount:-<dst>=<src>` (in the summary form
+`advisory=mount:-…`) and changes nothing: a removal could only be applied by re-creating the
+container, and the owner's rule is that an existing container is never re-created or renamed. So the
+flip proceeds `UPDATE_CONTAINERS pair=<pair> unchanged (prepared)` and the mount stays on the
+container it was given to; `PAIR_ALLOW_RECREATE=1` does not re-create it either. `tests/flip_only.sh`
+pins exactly that (it used to assert the opposite until 2026-11-02). What still stops a flip-only
+ticket is a `RECREATE` -- an image, env, security, shm or gpu difference, i.e. a container that
+cannot do the job.
 
 ## Incidents that shaped these guards
 
