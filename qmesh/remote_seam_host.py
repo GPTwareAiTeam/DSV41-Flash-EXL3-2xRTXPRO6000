@@ -67,7 +67,8 @@ _MARK = os.environ.get("EXL3_SEAM_MARK", "0") == "1"
 # The first few layers of the first chunk are enough: the order is the same for all 40
 _MARK_LAYERS = int(os.environ.get("EXL3_SEAM_MARK_LAYERS", "4"))
 _MARK_MIN_ROWS = int(os.environ.get("EXL3_SEAM_MARK_MIN_ROWS", "512"))
-_marks = {}     # layer -> {"issue": ev, "payload": ev, "hot0": ev, "hot1": ev, "collect": ev}
+_marks = {}     # layer -> {"route"/"hot0"/"hot1"/"collect"/"payload": ev, +"_s": stream ptr, +"_h": host ns}
+_base_ev = None     # first timeline event of the process, so the dump can print absolute device ms
 _prof_rows = {}     # (bucket, n) -> [(host_ns_0, host_ns_1, ev0, ev1)]
 
 
@@ -114,6 +115,18 @@ def _mark_dump():
         ids = " ".join(f"{k}={m[k + '_s']:x}" for k in ("route", "hot0", "hot1", "collect", "payload")
                        if k + "_s" in m)
         print(f"[SEAMMARK] {layer:5d} streams {ids}", flush = True)
+        # Absolute device ms since the first event of the process, and the host time each point was
+        # enqueued. A gap that exists on the device but not on the host is queued work between the
+        # two points; a gap on the host that is not on the device is the host running ahead.
+        h0 = m.get("route_h")
+        keys = ("route", "issue", "payload", "hot0", "hot1", "collect")
+        abs_ms = " ".join(f"{k}={_base_ev.elapsed_time(m[k]):.2f}"
+                          for k in keys if k in m and _base_ev is not None)
+        host_us = " ".join(f"{k}={((m[k + '_h'] - h0) / 1e3 if h0 is not None else 0):.0f}"
+                           for k in keys if k + "_h" in m)
+        # A device gap with no host gap is queued work between the two points; the reverse is the
+        # host running ahead of the device.
+        print(f"[SEAMMARK] {layer:5d} abs {abs_ms}  host_us {host_us}", flush = True)
 
 
 if _PROF:
@@ -466,8 +479,7 @@ class RemoteSeamHost:
             # Recorded on the wire stream, right behind the publish kernel: this is when the
             # request is complete in the slab and the proxy thread can put it on the wire. On the
             # caller's stream it would say the same thing only in the copies-on-compute order.
-            _marks[layer_idx]["payload"] = self._record_ev(wire)
-            _marks[layer_idx]["payload_s"] = wire.cuda_stream
+            self._mark_ev(layer_idx, "payload", wire)
         return (pos, n, bucket, xp, idp, wp, seam, t0, ev0)
 
     @staticmethod
@@ -563,16 +575,14 @@ class RemoteSeamHost:
             # The point the copies are allowed to start from, on the stream that owns the routing.
             # Recorded before the issue loop, so its gap to hot0 is the caller's own hand-off in
             # both arms -- the copy itself included only when the copies ride this stream.
-            _marks[layer_idx]["route"] = self._record_ev(p.stream)
-            _marks[layer_idx]["route_s"] = p.stream.cuda_stream
+            self._mark_ev(layer_idx, "route", p.stream)
         while p.next < len(p.plan) and len(p.inflight) < self.ns:
             s, e, _ = p.plan[p.next]
             p.inflight.append(self._issue_piece(p.layer, s, p.x[s:e], p.ids[s:e], p.w[s:e],
                                                 n_cold, p.dev_index))
             p.next += 1
         if mk:
-            _marks[layer_idx]["issue"] = self._record_ev(p.stream)
-            _marks[layer_idx]["issue_s"] = p.stream.cuda_stream
+            self._mark_ev(layer_idx, "issue", p.stream)
         if not _OVERLAP:
             return self.submit_collect(p)
         return p
@@ -588,8 +598,7 @@ class RemoteSeamHost:
             return handle
         p = handle
         if _MARK and p.layer in _marks:
-            _marks[p.layer]["collect"] = self._record_ev(p.stream)
-            _marks[p.layer]["collect_s"] = p.stream.cuda_stream
+            self._mark_ev(p.layer, "collect", p.stream)
         while p.next < len(p.plan):
             while len(p.inflight) >= self.ns:
                 self._collect_piece(p.layer, p.inflight.pop(0), p.out, p.stream)
@@ -603,10 +612,21 @@ class RemoteSeamHost:
 
     @staticmethod
     def _record_ev(stream):
+        global _base_ev
         ev = torch.cuda.Event(enable_timing = True)
         ev.record(stream)
-
+        if _MARK and _base_ev is None:
+            _base_ev = ev
         return ev
+
+    def _mark_ev(self, layer_idx, key, stream):
+        """One timeline point: the device event, the stream it was recorded on, and the host time it
+        was enqueued at. The dump prints all three, because a device gap with no host gap is queued
+        work between the two points while a host gap with no device gap is the host running ahead."""
+        m = _marks.setdefault(layer_idx, {})
+        m[key] = self._record_ev(stream)
+        m[key + "_s"] = stream.cuda_stream
+        m[key + "_h"] = time.perf_counter_ns()
 
     def mark(self, layer_idx, label):
         """Caller-side timestamp for the timeline (EXL3_SEAM_MARK): block_sparse_mlp marks the start
@@ -614,9 +634,7 @@ class RemoteSeamHost:
         stream, so the gaps to the seam's own events are device order and not host order."""
         if not _MARK or layer_idx not in _marks or label in _marks[layer_idx]:
             return
-        s = torch.cuda.current_stream()
-        _marks[layer_idx][label] = self._record_ev(s)
-        _marks[layer_idx][label + "_s"] = s.cuda_stream
+        self._mark_ev(layer_idx, label, torch.cuda.current_stream())
 
     def submit_prefill(self, layer_idx, y, selected, weights, n_cold = None):
         """Single-phase form for callers with nothing to overlap (benches, the CPU host's streamed
