@@ -53,6 +53,15 @@ for side in p7 gx; do
       "prepare needs a container of this pair that is not serving"
 done
 
+# ---- pack locality (refuse before cutting anything onto a wrong disk) ----------------------------
+# Owner rule 2026-11-02: an expert pack lives on the local drive of the box that serves it. A pack
+# reached over NFS (or through a symlink that lands on someone else's drive) makes serving speed
+# depend on the network, so it is refused here -- before a release is cut or a library built -- and
+# again by the smoke, which is the last gate before `current` moves.
+pack_out=$(python3 "$HERE/pair_pack_disk.py" "$PAIR" 2>&1); pack_rc=$?
+printf '%s\n' "$pack_out" | sed 's/^/  /'
+[ "$pack_rc" = 0 ] || pair_die "PREPARE_FAILED $PAIR phase=packs rc=$pack_rc (a pack is not on the serving box's own disk)"
+
 # ---- 1. cut (or reuse an existing release of this sha) -------------------------------------------
 cut_out=$("$HERE/pair_cut.sh" "$PAIR" $SHA_ARG 2>&1)
 cut_rc=$?

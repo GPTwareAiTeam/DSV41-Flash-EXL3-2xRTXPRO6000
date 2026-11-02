@@ -269,13 +269,32 @@ if [ "${PAIR_FLIP_ONLY:-0}" = 1 ]; then
   pair_step "UPDATE_RELEASE pair=$PAIR sha=${SHA:0:12} build=$BUILD_ID (prepared out of band)"
   plan_out=$(python3 "$HERE/pair_containers.py" plan "$PAIR" 2>&1)
   printf '%s\n' "$plan_out" | sed 's/^/  /' | tee -a "$PAIR_LOG" >/dev/null
-  # Any delta at all: a flip-only ticket may not create, wire or re-create a container, and a plan line
-  # is the statement that one of those is needed (RECREATE for a container that exists, CREATE for one
-  # that does not). Matching only RECREATE let a pair with no containers at all walk straight through.
+  # Any delta at all: a flip-only ticket may not cut, wire or re-create a container on its own, and a
+  # plan line is the statement that one of those is needed (RECREATE for a container that exists,
+  # CREATE for one that does not). Matching only RECREATE once let a pair with no containers at all
+  # walk straight through, so both are checked every time.
+  #
+  # The one exception is a spec change the operator queued deliberately with --recreate: the ticket
+  # then builds the containers from the spec (same apply path as a full update, old container renamed
+  # to <name>.bak-<ts>) and keeps going into the flip and the smoke, which is what proves the new
+  # spec. Nothing else may set PAIR_ALLOW_RECREATE.
   case "$plan_out" in
-    *" CREATE "*|*" RECREATE "*) fail "containers are not prepared: run scripts/pair_prepare.sh $PAIR $SHA first" ;;
+    *" CREATE "*)
+      fail "containers do not exist: run scripts/pair_prepare.sh $PAIR $SHA first" ;;
+    *" RECREATE "*)
+      [ "${PAIR_ALLOW_RECREATE:-0}" = 1 ] || fail "the container spec changed: enqueue this release with --recreate (pair_promote.sh $SHA --recreate for prod) so the queue re-creates the containers; a flip-only ticket will not"
+      TS=$(date -u +%Y%m%dT%H%M%SZ)
+      phase containers
+      status_write 100 "recreating containers (ts=$TS)"
+      python3 "$HERE/pair_containers.py" apply "$PAIR" "$SHA" --ts "$TS" 2>&1 | sed 's/^/  /' | tee -a "$PAIR_LOG"
+      rc=${PIPESTATUS[0]}
+      [ "$rc" = 0 ] || fail "containers apply rc=$rc"
+      pair_step "UPDATE_CONTAINERS pair=$PAIR recreated ts=$TS"
+      ;;
+    *)
+      pair_step "UPDATE_CONTAINERS pair=$PAIR unchanged (prepared)"
+      ;;
   esac
-  pair_step "UPDATE_CONTAINERS pair=$PAIR unchanged (prepared)"
   lib_out=$("$HERE/pair_build_lib.sh" verify "$PAIR" "$SHA" --side both 2>&1); lib_rc=$?
   printf '%s\n' "$lib_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
   [ "$lib_rc" = 0 ] || fail "lib verify rc=$lib_rc (run scripts/pair_prepare.sh $PAIR $SHA)"

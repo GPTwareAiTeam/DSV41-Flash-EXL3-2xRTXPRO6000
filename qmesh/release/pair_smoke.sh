@@ -89,6 +89,16 @@ if [ "$PAIR_DRY" = 1 ]; then
   exit 0
 fi
 
+# The pack check runs before the GX gate (and only for a real smoke: DRY above never reads a
+# filesystem). It costs a second and it reads the spec and the pack tree, so a pack that is not on the
+# serving box's own disk is refused without a server start or a GPU second. PAIR_PACK_DISK=0 skips it
+# (tests whose stub ssh has no filesystem to resolve).
+if [ "${PAIR_PACK_DISK:-1}" = 1 ]; then
+  pack_out=$(python3 "$HERE/pair_pack_disk.py" "$PAIR" 2>&1); pack_rc=$?
+  printf '%s\n' "$pack_out" | sed 's/^/  /'
+  [ "$pack_rc" = 0 ] || fail "pack_disk rc=$pack_rc (a pack is not on the serving box's own disk)"
+fi
+
 # The smoke owns the GX box until this gate expires: it loads the pack and measures avail_mib, and an
 # experiment that loads or unloads a pack next to it turns every number below into a measurement of two
 # jobs at once. A foreign claim is waited out (SMOKE_GATE_WAIT_MIN, then the smoke gives up rather than

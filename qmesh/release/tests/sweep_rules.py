@@ -378,5 +378,52 @@ check("a cut refuses stamps that differ between the sides", "STAMP_MISMATCH" in 
 check("an existing release with an empty stamp is repaired", "STAMP_REPAIR" in _cut, "")
 
 
+# Owner rule 2026-11-02: an expert pack lives on the local drive of the box that serves it. The P7
+# containers used to be handed /mnt/data12 (the 12 TB drive) so that the hot pack's links could be
+# resolved; a pack reached that way makes serving speed depend on the network, and the GX half reads
+# that same drive over NFS. The rule is two source invariants and one behaviour:
+#   * no P7 spec mounts /mnt -- the mount is gone from both pairs' specs;
+#   * prepare and smoke both run the checker (a check only one path remembers is not a gate);
+#   * the spec change lands through a queued ticket (--recreate), never by hand.
+import json as _json
+for _pair, _ct in (("prod", "seam-p7-prod"), ("dev", "seam-p7-dev")):
+    _sp = _json.load(open(os.path.join(HERE, "containers", f"{_pair}-p7.json")))
+    _mt = _sp.get("mounts") or []
+    check(f"{_pair}'s P7 spec mounts nothing from /mnt",
+          not any(s.startswith("/mnt") or d.startswith("/mnt") for s, d in _mt), str(_mt))
+    check(f"{_pair}'s P7 spec mounts the drive itself at /models",
+          any(d == "/models" and s == "/models" for s, d in _mt), str(_mt))
+check("prepare gates on the pack's disk before it cuts",
+      "pair_pack_disk.py" in src("pair_prepare.sh")
+      and src("pair_prepare.sh").index("pair_pack_disk.py") < src("pair_prepare.sh").index("pair_cut.sh"),
+      "")
+check("the smoke gates on the pack's disk too",
+      "pair_pack_disk.py" in src("pair_smoke.sh") and 'fail "pack_disk' in src("pair_smoke.sh"), "")
+check("the pack check is a tested file",
+      os.path.exists(os.path.join(HERE, "tests", "pack_disk.py")), "")
+_pd = src("pair_pack_disk.py")
+check("the pack check names the P7 drive as the allowed root",
+      'PAIR_PACK_P7_ROOT", "/models/dsv41"' in _pd, "")
+check("the pack check refuses /mnt and /net on the GX side",
+      '("/mnt", "/net")' in _pd, "")
+check("the pack check refuses a network filesystem",
+      '"nfs"' in _pd and "remote_fs(" in _pd, "")
+check("the smoke skips the pack probe when the harness has no filesystem",
+      "PAIR_PACK_DISK=0" in src("tests/smoke_memory.sh") and "PAIR_PACK_DISK=0" in src("tests/memory_fail.sh"), "")
+
+# A spec change cannot reach a running pair any other way: the flip-only ticket refuses a RECREATE
+# plan unless the operator queued it with --recreate, and then the ticket itself re-creates from the
+# spec inside the queue (old container renamed, never removed). Without this branch the mount could
+# only be dropped by hand, which is exactly what the owner forbade.
+_pu = src("pair_update.sh")
+check("--recreate is the only thing that permits a recreate",
+      _pu.count("PAIR_ALLOW_RECREATE=1") == 1 and "--recreate) FLIP_ONLY=1; RECREATE=1" in _pu, "")
+check("the flip-only ticket refuses a spec change it was not asked to apply",
+      'PAIR_ALLOW_RECREATE:-0' in ur and "--recreate" in ur, "")
+check("the flip-only ticket re-creates through the containers tool",
+      ur.count("pair_containers.py\" apply") >= 2 and "UPDATE_CONTAINERS pair=$PAIR recreated" in ur, "")
+check("promote can carry the same permission",
+      "--recreate) RECREATE=1" in src("pair_promote.sh") and 'cmd+=(--recreate)' in src("pair_promote.sh"), "")
+
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
 sys.exit(1 if fails else 0)

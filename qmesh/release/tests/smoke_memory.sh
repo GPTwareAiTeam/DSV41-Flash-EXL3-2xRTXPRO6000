@@ -19,7 +19,7 @@ cp "$HERE/stub_ssh.sh" "$WORK/bin/stub_ssh"; chmod +x "$WORK/bin/stub_ssh"
 printf '{"build_id":"sm-demo","seam":{"fingerprint":"fp:dry","proto":"3"}}' > "$WORK/pair/releases/$SHA/RELEASE.json"
 cd "$REL"
 export PAIR_ROOT_OVERRIDE="$WORK/pair" PAIR_STATE_OVERRIDE="$WORK/pairs" PAIR_SSH="$WORK/bin/stub_ssh" \
-       PAIR_QUEUE="$WORK/noq" PAIR_GATE_DIR="$WORK/noq"
+       PAIR_QUEUE="$WORK/noq" PAIR_GATE_DIR="$WORK/noq" PAIR_PACK_DISK=0
 # The GX gate lives next to the live queue, not in PAIR_QUEUE: without PAIR_GATE_DIR this stub smoke
 # waited out the real dev smoke's claim (SMOKE_GATE_WAIT_MIN, 20 min) before it could fail -- the
 # battery looked hung on 2026-11-02 while dev was actually running.

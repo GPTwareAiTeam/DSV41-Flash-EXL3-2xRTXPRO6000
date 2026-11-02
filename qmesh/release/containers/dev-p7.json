@@ -6,7 +6,6 @@
   "cmd": ["infinity"],
   "mounts": [
     ["__PAIR_ROOT__", "/pair"],
-    ["/mnt/data12/models/exl3", "/mnt/data12/models/exl3"],
     ["/models", "/models"],
     ["/usr/local/cuda", "/opt/cuda"],
     ["/home/treadall/recipe-artifacts", "/artifacts"]

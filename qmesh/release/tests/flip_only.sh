@@ -63,7 +63,7 @@ want "no sha refused" "PAIR_UPDATE_FAILED pair=$PAIR phase=prepared why=PAIR_FLI
 
 # 2. containers that are not wired yet: prepare's job, never the ticket's
 out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
-want "unwired containers refused" "containers are not prepared" "$out"
+want "unwired containers refused" "containers do not exist: run scripts/pair_prepare.sh" "$out"
 want_not "no container created by the ticket" "CREATE $PAIR" "$out"
 
 # 3. wired containers, but the ext stamp of another build
@@ -92,6 +92,41 @@ want_not "flip-only builds nothing" "LIB_BUILD" "$out"
 want_not "flip-only builds no ext" "EXT_BUILD" "$out"
 [ "$rc" = 0 ] && echo "OK   prepared exit=0" || { echo "FAIL prepared exit=$rc"; fails=$((fails + 1)); }
 
+# 5. A container spec delta -- here the /mnt/data12 mount the owner removed from the P7 specs -- is
+#    the one delta a flip ticket may apply, and only when the operator asked for it with --recreate.
+#    The live container is given the old mount, exactly what plan reads on the real boxes.
+python3 - "$WORK/state/state.json" "$PAIR" <<'PY'
+import json, sys
+p, pair = sys.argv[1], sys.argv[2]
+st = json.load(open(p))
+for name in st:
+    if name.startswith("seam-p7-") and name.endswith("-" + pair):
+        st[name]["Mounts"].append({"Source": "/mnt/data12/models/exl3",
+                                   "Destination": "/mnt/data12/models/exl3"})
+json.dump(st, open(p, "w"))
+PY
+out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
+want "a spec delta nobody queued stops the flip" "PAIR_UPDATE_FAILED pair=$PAIR phase=prepared" "$out"
+want "and the ticket names --recreate" "--recreate" "$out"
+want_not "and it touches no container" "UPDATE_CONTAINERS pair=$PAIR recreated" "$out"
+[ "$rc" != 0 ] && echo "OK   spec delta exit=$rc" || { echo "FAIL spec delta exited 0"; fails=$((fails + 1)); }
+out=$(PAIR_FLIP_ONLY=1 PAIR_ALLOW_RECREATE=1 run "$SHA"); rc=$?
+want "a queued --recreate re-creates from the spec" "UPDATE_CONTAINERS pair=$PAIR recreated ts=" "$out"
+want "and the release still lands" "PAIR_UPDATED_DRY pair=$PAIR sha=$SHA" "$out"
+[ "$rc" = 0 ] && echo "OK   recreate exit=$rc" || { echo "FAIL recreate exit=$rc"; fails=$((fails + 1)); }
+python3 - "$WORK/state/state.json" "$PAIR" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+pair = sys.argv[2]
+p7 = [n for n in st if n.startswith("seam-p7-") and n.endswith("-" + pair) and ".bak-" not in n]
+old = [n for n in st if n.startswith("seam-p7-") and ".bak-" in n]
+mnt = [m for n in p7 for m in st[n]["Mounts"] if m["Destination"].startswith("/mnt")]
+ok = len(p7) == 1 and len(old) == 1 and not mnt
+print(("OK   " if ok else "FAIL ") + "the new P7 container keeps no /mnt mount, the old one is renamed"
+      + ("" if ok else f" (p7={p7} bak={old} mnt={mnt})"))
+sys.exit(0 if ok else 1)
+PY
+[ $? = 0 ] || fails=$((fails + 1))
 echo "RESULT $([ "$fails" = 0 ] && echo PASS || echo FAIL) fails=$fails"
 rm -rf "$WORK"
 [ "$fails" = 0 ]

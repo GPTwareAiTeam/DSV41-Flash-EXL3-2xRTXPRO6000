@@ -156,6 +156,15 @@ def plan_side(cfg, side):
     for src, dst in want["mounts"]:
         if got["mounts"].get(dst) != src:
             why.append(f"mount:{dst}={got['mounts'].get(dst) or '-'} want={src}")
+    # A mount the spec no longer names is drift, not history. The P7 containers were once given the
+    # 12 TB /mnt/data12 drive; the owner's pack rule (2026-11-02: packs live on the serving box's own
+    # disk) drops it from the spec. Comparing only the wanted mounts made that removal invisible --
+    # plan said "unchanged" and the next flip would have kept the drive in place. An extra live mount
+    # is reported here and leaves only when the container is recreated at a queued update.
+    wanted_dst = {dst for _src, dst in want["mounts"]}
+    for dst, src in sorted(got["mounts"].items()):
+        if dst not in wanted_dst:
+            why.append(f"mount:+{dst}={src}")
     for k, v in want["env"].items():
         if got["env"].get(k) != v:
             why.append(f"env:{k}={got['env'].get(k) or '-'} want={v}")

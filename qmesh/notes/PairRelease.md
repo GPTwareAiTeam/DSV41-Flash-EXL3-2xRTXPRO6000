@@ -141,7 +141,9 @@ the ticket kept the pair's GPU idle the whole time. So the work is split:
    what the prepare left (`pair_build_lib.sh verify`, `pair_build_ext.sh verify`, and `plan` must
    show no `RECREATE`), then flips, smokes, writes refs, the manifest and runs `pair_check.sh`. A
    missing or foreign stamp stops it at `phase=prepared`, with "run pair_prepare.sh <pair> <sha>",
-   before anything is flipped.
+   before anything is flipped. The one delta a flip ticket can be allowed to apply is a container
+   spec change: with `--recreate` it re-creates from the spec inside the queue (see "A pack lives on
+   the drive that serves it"); without it, a `RECREATE` stops the ticket.
 
 Verify is read-only and runs before the build guards in both builders: a flip-only ticket verifies
 while GX is still loading a server and while other builds own the box, and neither has anything to
@@ -191,6 +193,31 @@ The order is therefore: `pair_prepare.sh dev <sha>` (out of band) → `pair_upda
 --flip-only` → wait for `PAIR_UPDATED … ids=n>` → `pair_prepare.sh prod <sha>` in the fresh,
 non-serving prod containers → `pair_promote.sh <sha>` (which re-checks dev, the seam fingerprint and
 the evidence, then queues the prod ticket).
+
+## A pack lives on the drive that serves it
+
+Owner rule, 2026-11-02: the expert packs are on the local drive of the box that serves them --
+P7 hot packs under `/models/dsv41` on the P7's 4 TB NVMe, GX cold packs on the GX box's own disk,
+and `cuda-exl3` weights under GX1's `/mnt/data10` and P7's `/mnt/data12`. Nothing a pair serves with
+is reached over the network: GX1 mounts `/mnt/data10` and `/mnt/data12` from P7 over NFS, so a pack
+under `/mnt` there is P7's disk read across the wire, and every decode step waits on it.
+
+`pair_pack_disk.py <pair>` is the check, and it reads the spec the pair actually runs
+(`containers/<pair>-<side>.json`), so it cannot drift from what the containers mount. It refuses a
+P7 spec that mounts `/mnt`, a `/models` that is not the drive itself, a pack, placement profile or
+symlink that resolves outside `/models/dsv41`, and any of those on a network filesystem
+(`nfs*`, `cifs`, `9p`, `sshfs`, …); on the GX it refuses a `/cold` source under `/mnt` or `/net`, or
+on a network filesystem, and holds the pack's symlinks to the same rule. It runs in
+`pair_prepare.sh` (before the cut) and again in `pair_smoke.sh` (before the GX gate), and
+`tests/pack_disk.py` pins the refusals.
+
+The P7 containers used to be handed `/mnt/data12` so the 4460 hot pack's links could be resolved;
+that mount is gone from both P7 specs, so the containers no longer see the 12 TB drive. A spec
+change is the one thing a flip-only ticket will not do on its own: `plan` reports a `RECREATE`, and
+the ticket stops unless it was queued with `--recreate` (`pair_promote.sh <sha> --recreate` for
+prod), which is the only path that sets `PAIR_ALLOW_RECREATE=1`. The ticket then re-creates from the
+spec inside the queue, renaming the old container to `<name>.bak-<ts>` -- never a hand-written
+`docker rm`, and dev still goes first.
 
 ## Incidents that shaped these guards
 

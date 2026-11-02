@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # pair_update.sh -- queue an update of one pair, to land right after the job that is running now.
 #
-#   pair_update.sh <pair> [sha] [--max-min N] [--flip-only]
+#   pair_update.sh <pair> [sha] [--max-min N] [--flip-only] [--recreate]
 #
 # --flip-only: the release was already cut, wired and built out of band by pair_prepare.sh, so the
 # ticket only flips `current`, restarts the server, smokes and verifies (minutes, not the hour a
 # torch JIT build takes). Without it the ticket still does everything itself.
+#
+# --recreate: the container spec changed (2026-11-02: the P7 containers no longer mount the 12 TB
+# drive, because a pack lives on the serving box's own disk), so the ticket is allowed one recreate.
+# Implies --flip-only: the release is prepared as usual, and the queue is where a container is
+# re-built from its spec -- never an operator with docker rm. The old container is renamed to
+# <name>.bak-<ts>, so the flip is still recoverable by hand if the smoke fails.
 #
 # prod is not addressable from here directly: it is promoted only through pair_promote.sh, which
 # requires the exact sha to have passed on dev (a PAIR_UPDATED evidence file with a smoke that
@@ -27,11 +33,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 PAIR_ARG=${1:?usage: pair_update.sh <pair> [sha] [--max-min N]}
 shift
-SHA=""; MINS=${PAIR_UPDATE_MAX_MIN:-120}; FLIP_ONLY=${PAIR_FLIP_ONLY:-0}
+SHA=""; MINS=${PAIR_UPDATE_MAX_MIN:-120}; FLIP_ONLY=${PAIR_FLIP_ONLY:-0}; RECREATE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --max-min) MINS=$2; shift ;;
     --flip-only) FLIP_ONLY=1 ;;
+    --recreate) FLIP_ONLY=1; RECREATE=1 ;;
     -*) pair_die "unknown flag $1" ;;
     *) SHA=$1 ;;
   esac
@@ -55,6 +62,12 @@ if [ "$PAIR" = prod ]; then
   gate=$(pair_canary_gate "$SHA" "$ev")
   [ "$gate" = ok ] || pair_die "dev canary for ${SHA:0:12} does not qualify: $gate ($ev)"
   pair_step "UPDATE_CANARY pair=$PAIR sha=${SHA:0:12} dev_evidence=$ev ok"
+fi
+if [ "$RECREATE" = 1 ]; then
+  # The permission travels in the environment of the queued ticket: the queue is the only place a
+  # container is built from its spec, and the ticket is the only process that holds it.
+  export PAIR_ALLOW_RECREATE=1
+  pair_step "UPDATE_RECREATE pair=$PAIR allowed (spec changed; the ticket re-creates once)"
 fi
 
 pair_ensure_priority PairUpdate
