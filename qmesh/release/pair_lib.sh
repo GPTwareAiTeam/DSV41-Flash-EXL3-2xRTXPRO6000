@@ -408,7 +408,12 @@ pair_server_stop() {  # stops the recorded worker if it is still the one that wa
   # pre-anchoring record could have left in the pidfile must not be TERMed again.
   case "$live" in
     python3\ -u\ qmesh/worker_seam_server.py*) ;;
-    *) printf 'SERVER_STOP_SKIP pid=%s (gone or not the worker: %s)\n' "$pid" "$(printf '%s' "${live:0:60}")"; rm -f "$f"; return 0 ;;
+    *) if [ -n "$live" ]; then
+         printf 'SERVER_STOP_SKIP pid=%s (not the worker: %s)\n' "$pid" "$(printf '%s' "${live:0:60}")"
+       else
+         printf 'SERVER_STOP_SKIP pid=%s (gone or not the worker)\n' "$pid"
+       fi
+       rm -f "$f"; return 0 ;;
   esac
   # Stopping is a lifecycle event on the box: it belongs inside the claim that protects it. A job that
   # does not hold the gate can stop a server it can not then reload -- on 2026-11-02 07:53 that is how

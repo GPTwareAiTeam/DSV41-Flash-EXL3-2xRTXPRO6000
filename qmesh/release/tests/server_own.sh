@@ -23,7 +23,9 @@ cat > "$WORK/bin/stub_ssh" <<'EOS'
 cmd=${!#}
 echo "$cmd" >> "$STUB_LOG"
 case "$cmd" in
-  "docker exec "*"pgrep -f 'python3 -u qmesh/worker_seam_server.py' | head -1"*)
+  # pair_server_record anchors the pattern (^) since 2026-11-02 so a wrapper process cannot come back
+  # from head -1; the stub follows the caller, not the other way round.
+  "docker exec "*"pgrep -f '^python3 -u qmesh/worker_seam_server.py' | head -1"*)
     printf '%s\n' "${STUB_PID:-}" ;;
   *"/proc/"*"/cmdline"*)
     pid=$(printf '%s' "$cmd" | sed -n 's#.*/proc/\([0-9][0-9]*\)/cmdline.*#\1#p')

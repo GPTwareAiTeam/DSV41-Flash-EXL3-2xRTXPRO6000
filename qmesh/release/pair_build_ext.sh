@@ -117,7 +117,7 @@ build_side() {
   # inside their own run, with the server already loaded (the SIGBUS case). So /src/exllamav3 is
   # pointed at this release for the length of the build and put back afterwards; nothing else runs in
   # the container (the server and compiler guards above saw to that).
-  local link=/src/exllamav3 back build_src=$rel_c/src
+  local link=/src/exllamav3 back build_src=$rel_c/src now
   back=$(side_docker "$side" exec "$ct" sh -c "readlink $link" 2>/dev/null)
   if [ -n "$back" ]; then
     # The probe is copied in and run as a *file*. Run from stdin, python puts the cwd on sys.path,
@@ -160,6 +160,17 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u /tmp/pair_ext_pr
           < "$HERE/pair_ext_probe.py" 2>&1); rc=$?
   fi
   [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$out" >> "$PAIR_LOG"
+
+  # The link is put back by the parent, not only by the container-side trap. `trap … EXIT` runs only if
+  # that bash reaches EXIT: on 2026-11-02 the canary's GX build was killed mid-flight and left
+  # seam-gx2-dev wired at an unflipped release -- pair_check read GX DRIFT, and every client in it
+  # would have imported a tree that is not `current`. This process is outside the container and
+  # outside whatever killed it, so it restores whatever the build's rc, and says where the link went.
+  if [ -n "$back" ]; then
+    side_docker "$side" exec "$ct" sh -c "ln -sfn $back $link" >/dev/null 2>&1
+    now=$(side_docker "$side" exec "$ct" sh -c "readlink -f $link" 2>/dev/null)
+    pair_step "EXT_LINK_RESTORE $side -> ${now:-?} (was $back)"
+  fi
   # rc=124 from the client check means it started compiling: the cache is not what a client asks for.
   if [ "$rc" = 124 ] && printf '%s' "$out" | grep -q '^EXT_BUILD_OK '; then
     pair_step "EXT_FAIL $side EXT_CLIENT_MISS client_import_rebuilds cache=$rel_c/ext (include path or flags differ from the image's client env)"

@@ -689,3 +689,40 @@ band. `tests/sweep_rules.py` pins all three (probe by path, client check, probe 
 The rule underneath: a cache is defined by the *client's* command line, not by the sources it was
 compiled from, so the builder has to run under the client's exact environment -- including which
 path spelling python got from `sys.path`.
+
+## One integration owner, one door to the pairs (2026-11-02)
+
+The owner's complaint on 2026-11-02 was not about a bad measurement: every release that day reached
+the pairs the same way -- a live worktree (`/home/treadall/recipe-seam-robust`, branch
+`seam/session-multiclient`) mounted into an ad-hoc container -- so the pairs ran code that no release
+had cut, no canary had passed and no promote had flipped. The rule that follows from it is about
+*who may merge*, and it is not a formality: `tools/pair-release` is the only branch a release is ever
+cut from, so a commit that is not on it cannot reach a pair, and a commit that is on it can.
+
+* Only the **integration owner** merges into `tools/pair-release`. Nobody else commits there, and
+  nobody merges their own work in on the owner's behalf.
+* Every other worker commits on **their own branch** and hands over a sha. SeamRobust works on
+  `seam/session-multiclient`; GxPort2 on `gxport2/*`. A live worktree is a workbench, never a source
+  of runtime code for a pair.
+* The owner merges with `--no-ff` (one merge commit per hand-over, all ancestors verifiable),
+  diffs the merge against the handed-over sha (`git diff <sha> <merge>` must be empty for runtime
+  files), and only then cuts the release. Anything that needs to change on the way in goes back to
+  the branch that owns it.
+* A release then travels by release only: `pair_prepare.sh` out of band, one queued ticket that
+  flips and smokes the canary, dev first, and prod only for the sha dev passed. There is no second
+  path -- not a mount, not a `docker cp`, not a hot edit in a running container's tree.
+
+Heads when this was written (2026-11-02, 11:35 local):
+
+| branch | head | what it is |
+| --- | --- | --- |
+| `tools/pair-release` | `c543dadc` | the release branch; dev canary `d330dcf5` is its parent |
+| `seam/session-multiclient` | `b84f1a81` | merged as `d330dcf5`; three later commits (`6852d901`, `92f27583`, `e9cb08c8`) are NOT merged and NOT validated |
+| `gxport2/cpp-compute` | `51afa401` | GX transport work, not merged |
+| `gxport2/large-m` | `3ee60f98` | not merged |
+| `gxport2/next` | `b2d0ed0d` | not merged |
+
+The merge that made `d330dcf5` is the shape to copy: 31 files, +3359/−44, seven commits, verified as
+ancestors of the merge, and `git diff b84f1a81 d330dcf5` empty for the runtime tree. The rule for
+the next hand-over is the same: the sibling says "sha, branch, what it changes, what you must not
+run it without"; the owner merges, cuts, and queues.

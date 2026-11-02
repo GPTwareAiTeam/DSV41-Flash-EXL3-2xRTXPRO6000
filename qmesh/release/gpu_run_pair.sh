@@ -30,6 +30,14 @@ set -u
 AGENT=${1:?agent}; MAXMIN=${2:?minutes}; shift 2
 BASE=${QBASE:?QBASE}
 Q=$BASE/gpu_queue; LOCK=$BASE/gpu.lock; PRIO=$BASE/gpu_priority.txt; LOG=$BASE/gpu_queue.log
+# $BASE/running names the ticket whose command is alive right now. A ticket file in $Q is not evidence
+# of that: the wrapper removes it on exit, but between phases -- a GX-only bench, a JIT build, the
+# prepare before the claim -- the P7 GPU is idle, so gpu_busy() is false and the ticket's own file is
+# the only other trace. A later rank-01 entry sorts *below* the running ticket's name and becomes
+# head, which is how three tickets ran side by side on 2026-11-02 (PairUpdate 11:20:43 and CanaryB84
+# 11:22:07 beside G6Bound; SeamRobust 11:24:09 beside CanaryB84). Rank orders the WAITERS and must
+# never preempt: a head ticket starts only when no other ticket's wrapper is alive.
+RUNFILE=$BASE/running
 EXTEND_MAX_MIN=${EXTEND_MAX_MIN:-10}; HARD_CAP_MIN=${HARD_CAP_MIN:-$((MAXMIN + 30))}; GRACE_SEC=${GRACE_SEC:-90}
 mkdir -p "$Q"
 log() { echo "$(date +%T) $*" >> "$LOG"; }
@@ -91,12 +99,29 @@ check_release() {
   return 5
 }
 gpu_busy() { [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i ${QGPUS:?QGPUS})" ]; }
+# running_owner: the live ticket that holds the box, empty when $RUNFILE is absent or its wrapper died.
+# A stale file is removed here so a killed ticket costs the queue one read, not a manual rm.
+running_owner() {
+  local line pid
+  [ -r "$RUNFILE" ] || return 0
+  line=$(cat "$RUNFILE" 2>/dev/null)
+  pid=$(printf '%s' "$line" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+  [ -n "$pid" ] || { rm -f "$RUNFILE"; return 0; }
+  kill -0 "$pid" 2>/dev/null || { rm -f "$RUNFILE"; return 0; }
+  printf '%s' "$line"
+}
+release_running() {  # only the wrapper that wrote the marker may clear it
+  local pid
+  pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$RUNFILE" 2>/dev/null | head -1)
+  [ "$pid" = "$$" ] && rm -f "$RUNFILE"
+  return 0
+}
+trap 'rm -f "$ticket" "$GPU_RUN_STATUS"; release_running' EXIT
 rank=$(grep -nx "$AGENT" "$PRIO" 2>/dev/null | cut -d: -f1); rank=${rank:-99}
 ticket="$Q/$(printf %02d "$rank")-$(date +%s%N)-$$-$AGENT"
 export GPU_RUN_STATUS="$Q/status-$AGENT-$$"
 GRANT="$Q/extend-$AGENT"
 touch "$ticket"; rm -f "$GPU_RUN_STATUS"
-trap 'rm -f "$ticket" "$GPU_RUN_STATUS"' EXIT
 log "queued $AGENT rank=$rank pid=$$"
 while :; do
   # drop tickets whose owner process is gone
@@ -109,6 +134,19 @@ while :; do
   # waiters running different script versions must agree on the head or the queue deadlocks.
   head=$(ls "$Q" | grep -E '^[0-9]' | sort | head -n1)
   if [ "$Q/$head" = "$ticket" ]; then
+    # Being head is not permission to run: the ticket ahead of us may still be executing a command that
+    # keeps no P7 process (a GX bench, a JIT build, the prepare before it takes the claim), and then
+    # gpu_busy() is false while the box is very much in use. Its wrapper is alive, and that is what
+    # $RUNFILE records. rank orders the waiters; it never preempts a running ticket.
+    owner=$(running_owner)
+    if [ -n "$owner" ]; then
+      if [ "$owner" != "${last_owner:-}" ]; then
+        log "wait $AGENT head=rank$rank running=$(printf '%s' "$owner" | cut -d' ' -f1-2)"
+        last_owner=$owner
+      fi
+      sleep 5; continue
+    fi
+    last_owner=""
     # The release guard forks ssh and docker and can spend 90 s doing it. It must not run with the
     # queue lock held: `exec 9>lock` gives every child of the holder the same open description, and a
     # flock survives the holder -- on 2026-11-02 at 09:03 a holder died inside it and the queue stayed
@@ -125,7 +163,11 @@ while :; do
     exec 9>"$LOCK"
     flock 9
     head=$(ls "$Q" | grep -E '^[0-9]' | sort | head -n1)
-    if [ "$Q/$head" = "$ticket" ] && ! gpu_busy; then
+    # Two heads read the same marker: whoever writes it first runs, the other goes back to waiting.
+    # Writing it inside the lock is what makes "the box is free" and "I am the one running" one step.
+    if [ "$Q/$head" = "$ticket" ] && ! gpu_busy && [ -z "$(running_owner)" ]; then
+      printf 'agent=%s pid=%s start=%s ticket=%s\n' "$AGENT" "$$" "$(date +%s)" \
+        "$(basename "$ticket")" > "$RUNFILE.tmp" && mv -f "$RUNFILE.tmp" "$RUNFILE"
       flock -u 9
       exec 9>&-
       break

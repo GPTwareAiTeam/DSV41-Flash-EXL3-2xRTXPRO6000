@@ -40,6 +40,36 @@ while [ $# -gt 0 ]; do
 done
 pair_load "$PAIR_ARG"
 
+# A prepare must never leave a pair container wired away from `current`. The ext build has to point
+# /src/exllamav3 at the release it is building for the cache path to match a client's import path, and
+# on 2026-11-02 the canary's GX build was killed mid-flight: the restore was a trap inside the
+# container's `bash -lc`, so seam-gx2-dev stayed wired at the unflipped release and pair_check read GX
+# DRIFT with nothing able to import /pair/current/src. The build restores from its parent process now,
+# and this runs on every exit of prepare -- success, refusal, kill of the build -- as the last word.
+relink_current() {
+  local side ct want got
+  for side in p7 gx; do
+    case "${SIDES:-both}" in both|"$side") ;; *) continue ;; esac
+    ct=$([ "$side" = p7 ] && echo "$P7CT" || echo "$GXCT")
+    if [ "$side" = p7 ]; then
+      want=$(docker exec "$ct" readlink -f /pair/current/src 2>/dev/null)
+      got=$(docker exec "$ct" sh -c 'if [ -L /src/exllamav3 ]; then ln -sfn /pair/current/src /src/exllamav3; fi; readlink -f /src/exllamav3' 2>/dev/null)
+    else
+      want=$(pair_gxsh "docker exec $ct readlink -f /pair/current/src 2>/dev/null")
+      got=$(pair_gxsh "docker exec $ct sh -c 'if [ -L /src/exllamav3 ]; then ln -sfn /pair/current/src /src/exllamav3; fi; readlink -f /src/exllamav3' 2>/dev/null")
+    fi
+    if [ -z "$want" ]; then
+      pair_step "RELINK_SKIP $side $ct (no /pair/current/src: unpromoted pair, nothing to restore)"
+    elif [ "$got" = "$want" ]; then
+      pair_step "RELINK $side $ct -> $got"
+    else
+      pair_step "RELINK_MISMATCH $side $ct want=$want got=${got:-?}"
+    fi
+  done
+  return 0
+}
+trap relink_current EXIT
+
 # ---- guards --------------------------------------------------------------------------------------
 python3 "$HERE/pair_containers.py" guard "$PAIR" || exit 2
 for side in p7 gx; do

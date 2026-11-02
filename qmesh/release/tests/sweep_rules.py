@@ -113,7 +113,14 @@ def src(name):
 be = src("pair_build_ext.sh")
 check("ext built through the client path (/src/exllamav3)",
       "ln -sfn $rel_c/src $link" in be and "PYTHONPATH=$link" in be, "")
-check("ext build restores the link afterwards", "trap 'ln -sfn $back $link' EXIT" in be, "")
+# The container-side trap cannot be the guarantee: it does not run when the build is killed (2026-11-02,
+# dev GX left wired at an unflipped release). The parent puts the link back after the exec returns,
+# and prepare re-asserts /pair/current/src on every exit, so a dead build cannot drift a container.
+check("ext build restores the link afterwards, from the parent",
+      "trap 'ln -sfn $back $link' EXIT" in be and "EXT_LINK_RESTORE" in be
+      and be.index("EXT_LINK_RESTORE") > be.index('bash -lc "$inner"'), "")
+check("prepare re-asserts /pair/current/src however it exits",
+      "trap relink_current EXIT" in src("pair_prepare.sh"), "")
 check("client import is proven, not assumed",
       "EXT_CLIENT_HIT" in be and "EXT_CLIENT_MISS" in be and "EXT_CLIENT_TIMEOUT" in be, "")
 check("ext build runs the probe as a file, never on stdin",
@@ -889,6 +896,56 @@ _qn_left = [f for f in os.listdir(_qn_dir) if not f.startswith("status-")] if os
 check("a ticket queued from inside a ticket is refused and leaves no entry behind",
       _r.returncode == 2 and "TICKET_NESTED" in (_r.stdout + _r.stderr) and not _qn_left,
       "rc=%s left=%s %s" % (_r.returncode, _qn_left, (_r.stdout + _r.stderr).strip()[:160]))
+
+# Rank orders the WAITERS; it must never preempt a running ticket. The head rule alone made the queue
+# unsafe: a later rank-01 entry sorts below the running ticket's name and becomes head, and a ticket
+# between phases keeps no P7 process, so gpu_busy() is false. Measured 2026-11-02: PairUpdate 11:20:43
+# and CanaryB84 11:22:07 started beside G6Bound, SeamRobust's headroom 11:24:09 beside CanaryB84.
+# This runs the wrapper for real (stub nvidia-smi, no ssh) around the exact shape: rank-99 ticket
+# running a `sleep` with nothing on the GPU, then a rank-01 ticket queued behind it.
+_qd = _tf.mkdtemp(prefix="queueserial")
+_qbin = os.path.join(_qd, "bin"); os.makedirs(_qbin)
+with open(os.path.join(_qbin, "nvidia-smi"), "w") as _f:
+    _f.write("#!/bin/sh\nexit 0\n")
+os.chmod(os.path.join(_qbin, "nvidia-smi"), 0o755)
+_qbase = os.path.join(_qd, "q"); os.makedirs(os.path.join(_qbase, "gpu_queue"))
+with open(os.path.join(_qbase, "gpu_priority.txt"), "w") as _f:
+    _f.write("High\nLow\n")            # High = rank 01, so its ticket name sorts below Low's
+_qenv = dict(os.environ, QBASE=_qbase, QGPUS="0", PAIR_CHECK_SKIP="1",
+             PATH=_qbin + ":" + os.environ.get("PATH", ""))
+for _k in ("GPU_TICKET_HARDCAP", "GPU_RUN_STATUS", "PAIR_CHECK_FORCE"):
+    _qenv.pop(_k, None)
+_qlog = os.path.join(_qbase, "gpu_queue.log")
+_mark = os.path.join(_qd, "high-ran")
+_low = _sp.Popen(["bash", os.path.join(HERE, "gpu_run_pair.sh"), "Low", "1", "sh", "-c", "sleep 20"],
+                 env=_qenv, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+_t0 = __import__("time").time()
+while __import__("time").time() - _t0 < 20:
+    if os.path.exists(_qlog) and "start Low" in open(_qlog).read():
+        break
+    __import__("time").sleep(0.2)
+_runfile = os.path.join(_qbase, "running")
+_marker = open(_runfile).read() if os.path.exists(_runfile) else ""
+check("a started ticket names itself in $BASE/running", "agent=Low pid=" in _marker, _marker.strip())
+_high = _sp.Popen(["bash", os.path.join(HERE, "gpu_run_pair.sh"), "High", "1",
+                   "sh", "-c", "echo ran > %s" % _mark],
+                  env=_qenv, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+__import__("time").sleep(8)
+_log = open(_qlog).read() if os.path.exists(_qlog) else ""
+check("a rank-01 ticket does not start beside a live rank-99 ticket with an idle GPU",
+      not os.path.exists(_mark) and "wait High head=rank1 running=agent=Low" in _log,
+      "ran=%s log=%s" % (os.path.exists(_mark), _log.strip().splitlines()[-3:]))
+_low.wait(timeout=60)
+try:
+    _high.wait(timeout=90)
+except _sp.TimeoutExpired:
+    _high.kill()
+check("...and it starts as soon as that ticket's command exits",
+      os.path.exists(_mark) and not os.path.exists(_runfile),
+      "ran=%s running_file=%s" % (os.path.exists(_mark), os.path.exists(_runfile)))
+check("a running marker is never left behind",
+      not os.path.exists(_runfile) and not (os.path.exists(_runfile + ".tmp")), "")
+_sh.rmtree(_qd, ignore_errors=True)
 
 _sh.rmtree(_gd, ignore_errors=True)
 check("the ensure gate has its own battery",
