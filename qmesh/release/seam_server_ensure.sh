@@ -41,6 +41,10 @@ GX_DEV=${GX_DEV:-rocep1s0f0}
 GX_GID=${GX_GID:-3}
 PORT=${PORT:-47311}
 SEAM_LOG=${SEAM_LOG:-/tmp/seam_server.log}
+# Where the previous server log is copied before a start truncates it. Empty disables the copy; the
+# pair scripts set it to <pair state>/logs (pair_lib.sh), so every load -- smoke, update, serve,
+# restore -- leaves behind the record its successor would otherwise destroy.
+SEAM_LOG_ARCHIVE=${SEAM_LOG_ARCHIVE:-}
 SERVER_BUCKETS=${SERVER_BUCKETS:-1,6,64,256,2048}
 SEAM_SERVER_TIMEOUT=${SEAM_SERVER_TIMEOUT:-900}
 SEAM_LEGACY_GRACE=${SEAM_LEGACY_GRACE:-60}    # s to wait for SEAM_SERVER_READY after LOADED
@@ -77,6 +81,27 @@ SEAM_GATE_REQUIRED=${SEAM_GATE_REQUIRED:-1}
 
 seam_gxsh() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$GX" "$1"; }
 seam_gxct() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$GX" "docker exec $CT bash -lc '$1'"; }
+# ---- server log archive ----------------------------------------------------------------------
+# Every start below ends in `rm -f $SEAM_LOG`, and that log carries the only per-load record of
+# which layers the cuda-exl3 restack refused (`SEAM_MOE_NOFIT layer=N`). Those lines decide whether
+# two ids digests are comparable at all: on 2026-11-02 the canary drew 38/2 on one load and 39/1 on
+# the next, produced two different digests, and the 38/2 log was already gone, so the difference
+# could not be attributed. Copy is best effort by design -- a pair must never stay loaded because an
+# archive write failed -- and it never overwrites: the destination names the load and its time.
+seam_archive_log() {
+  local dir=${SEAM_LOG_ARCHIVE:-} bytes build ts dest
+  [ -n "$dir" ] || return 0
+  bytes=$(seam_gxct "wc -c < $SEAM_LOG 2>/dev/null" 2>/dev/null | tr -dc '0-9')
+  [ "${bytes:-0}" -gt 0 ] || return 0
+  build=$(seam_gxct "grep -o \"build=[A-Za-z0-9._-]*\" $SEAM_LOG 2>/dev/null | head -1 | cut -d= -f2" 2>/dev/null |
+          tr -dc 'A-Za-z0-9._-')
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  mkdir -p "$dir" 2>/dev/null || return 0
+  dest=$dir/server-${build:-unknown}-$ts.log
+  seam_gxsh "docker exec $CT bash -lc 'cat $SEAM_LOG'" > "$dest" 2>/dev/null || { rm -f "$dest"; return 0; }
+  [ -s "$dest" ] || { rm -f "$dest"; return 0; }
+  echo "SEAM_LOG_ARCHIVED build=${build:-unknown} bytes=$(wc -c < "$dest") dest=$dest"
+}
 # Anchored: the "docker exec ... bash -lc '... python3 -u qmesh/worker_seam_server.py ...'" wrapper also
 # carries the script name in its argv, so an unanchored match counts every server twice.
 seam_pids()  { seam_gxct "pgrep -fc \"^python3 -u qmesh/worker_seam_server.py\"" 2>/dev/null | tr -dc 0-9; }
@@ -411,6 +436,9 @@ seam_server_ensure() {
       echo "SEAM_ENSURE state=error auto-buckets-unreadable host=$GX" >&2; return 2; }
     [ -n "$req" ] || { echo "SEAM_ENSURE state=error auto-buckets-empty" >&2; return 2; }
   fi
+  # The bytes about to be deleted are the previous load's only record of its restack (and of its
+  # SEAM_PACK_KERNEL line); keep them next to the pair's logs before the fresh worker starts.
+  seam_archive_log
   seam_gxct "rm -f $SEAM_LOG"
   # torch's JIT build holds <torch_extensions>/<pyver>/<name>/lock and removes it on a normal exit.
   # A worker killed mid-build -- our own pkill above, or a launch that died because the container had
@@ -493,7 +521,7 @@ seam_server_stop() {
   fi
   # The log outlives the process, so a dead server's READY line would make seam_ready (and every
   # caller that trusts it without checking the pid) believe the cold experts are still up.
-  [ "$(seam_pids)" = "0" ] && seam_gxct "rm -f $SEAM_LOG" >/dev/null 2>&1
+  [ "$(seam_pids)" = "0" ] && { seam_archive_log; seam_gxct "rm -f $SEAM_LOG" >/dev/null 2>&1; }
   [ "$(seam_pids)" = "0" ]
 }
 

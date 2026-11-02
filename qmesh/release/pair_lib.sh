@@ -77,6 +77,12 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   PAIR_STATE_DIR=$PAIR_STATE/$PAIR
   PAIR_MANIFEST=$PAIR_STATE/$PAIR.json
   export PAIR_STATE_DIR PAIR_MANIFEST
+  # Every server start truncates the container's log, and that log is the only per-load record of
+  # which layers the cuda-exl3 restack refused; seam_server_ensure copies it here first. Without it
+  # two ids digests can differ across loads with no way to tell whether the layer set differed too
+  # (2026-11-02, canary 38/2 vs 39/1).
+  SEAM_LOG_ARCHIVE=${SEAM_LOG_ARCHIVE:-$PAIR_STATE_DIR/logs}
+  export SEAM_LOG_ARCHIVE
 }
 
 # The server half's environment as ONE string: the shipping config every number in the notes was

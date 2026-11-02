@@ -259,8 +259,12 @@ echo "SMOKE_MEM_SERVER $(gx_mem)"
 # whose build stage skipped that imports nothing, prints SEAM_MOE_NOEXT and serves every layer on the
 # mixed-K module -- correct output at a fraction of the rate, i.e. exactly the kind of release that
 # must not reach a pair. On a memory-tight box a few layers may legitimately refuse the restack
-# (SEAM_MOE_NOFIT); the validated run had 2 of 40, so allow up to a tenth and no more.
-kernel=$(pair_gxsh "docker exec $GXCT sh -c \"grep -E '^(SEAM_MOE_NOEXT|SEAM_PACK_KERNEL)' /tmp/seam_server.log | tail -3\"" 2>/dev/null)
+# (SEAM_MOE_NOFIT); the validated run had 2 of 40, so allow up to a tenth and no more. The NOFIT
+# lines are read and printed because they name *which* layers went to the mixed-K module, and on
+# this box the same release draws 38/2 on one load and 39/1 on the next -- an ids digest is only
+# comparable with another smoke whose list matches (2026-11-02, canary: 38/2 -> 0c9bbe87, 39/1 ->
+# f96fc065). The log itself survives in pairs/<pair>/logs/server-<build>-<ts>.log.
+kernel=$(pair_gxsh "docker exec $GXCT sh -c \"grep -E '^(SEAM_MOE_NOEXT|SEAM_MOE_NOFIT|SEAM_PACK_KERNEL)' /tmp/seam_server.log | tail -12\"" 2>/dev/null)
 printf '%s\n' "$kernel" | grep -v '^$' | sed 's/^/SMOKE_KERNEL /'
 case "$kernel" in
   *SEAM_MOE_NOEXT*) fail "moe_kernel_missing $(printf '%s' "$kernel" | grep -m1 SEAM_MOE_NOEXT | cut -c1-240)" ;;
@@ -273,6 +277,13 @@ fi
 if [ $((cx_n * 10)) -lt $((nl_n * 9)) ]; then
   fail "moe_kernel_mostly_mixedk cudaexl3_layers=$cx_n mixedk_layers=$mx_n of=$nl_n (the release's cuda-exl3 fits fewer layers than it did when it was validated)"
 fi
+
+# Which layers this load refused, in one line the ticket can carry: cx/mixedk counts from the
+# PACK_KERNEL summary and the layer indices from the NOFIT lines. Two smokes with different
+# nofit_layers were served by different kernels, so their ids are not comparable whatever the
+# release says.
+mixed_layers=$(printf '%s\n' "$kernel" | sed -n 's/^SEAM_MOE_NOFIT[^0-9]*\([0-9][0-9]*\).*/\1/p' | paste -sd, -)
+echo "SMOKE_KERNEL_MIX cx_layers=$cx_n mixedk_layers=$mx_n nofit_layers=${mixed_layers:-none}"
 
 # The box's own verdict on the load, on every smoke: avail after the pack, the swap the load pushed
 # to, and the slack the server reserved. A pair that passes here with 1.4 GiB and 3.7 GiB of swap is a
@@ -355,6 +366,13 @@ if [ "$ids_n" -gt 0 ]; then
   ids_commit=$(printf '%s\n' "$ids_lines" | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
   echo "SMOKE_ARM_IDS_TOTAL n=$ids_n sha256=$ids_commit"
 fi
+# The layer set travels with the ids: the ids json is what a later prod smoke cross-checks against,
+# and a digest change caused by a restack has to be distinguishable from one caused by the release.
+echo "SMOKE_ARM_IDS_KERNEL cx_layers=$cx_n mixedk_layers=$mx_n nofit_layers=${mixed_layers:-none}"
+case "$ARM_IDS_OUT" in
+  *.json) printf 'cx_layers=%s mixedk_layers=%s nofit_layers=%s\n' \
+                 "$cx_n" "$mx_n" "${mixed_layers:-none}" > "${ARM_IDS_OUT%.json}.kernel.txt" 2>/dev/null || true ;;
+esac
 if [ "$ids_n" -le 0 ] && [ "${SMOKE_IDS_OPTIONAL:-0}" != 1 ]; then
   fail "arm_no_ids (no ARM_IDS line from the driver; a release that cannot report ids cannot be promoted, SMOKE_IDS_OPTIONAL=1 skips this)"
 fi
