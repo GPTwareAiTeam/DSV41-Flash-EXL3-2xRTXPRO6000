@@ -228,6 +228,9 @@ check("a JIT lock left by a dead build is cleared, and only when nothing alive o
           < src("seam_server_ensure.sh").index("stale torch build lock")
       and 'pair_torch_locks' in src("pair_smoke.sh")
       and 'pair_torch_build_live' in src("pair_smoke.sh"), "")
+check("the busy-box probe neither counts stubs nor its own wrapper",
+      '--stub' in src("pair_lib.sh")
+      and 'worker_seam_server[.]py' in src("pair_lib.sh"), "")
 check("a busy box is refused before anything is cut or re-created",
       'pair_gx_foreign_server' in src("pair_update_run.sh")
       and src("pair_update_run.sh").index("pair_gx_foreign_server")
@@ -558,6 +561,44 @@ finally:
 check("the pack check reads the spec's mounts raw so a bad mount is a report, not an abort",
       "spec_mounts(" in src("pair_pack_disk.py") and "pc.spec(cfg, \"p7\")" not in src("pair_pack_disk.py")
       and "pc.spec(cfg, \"gx\")" not in src("pair_pack_disk.py"), "")
+lib = src("pair_lib.sh")
+check("a box claim outside a queue ticket is refused, not taken",
+      "PAIR_GATE_REFUSED outside_ticket" in lib and "pair_ticket_hardcap" in src("pair_lib.sh"),
+      "")
+check("a claim never runs past the ticket's hard cap",
+      "PAIR_GATE_REFUSED ticket_hardcap_passed" in lib and "PAIR_GATE_CLAMP" in lib, "")
+# Both halves run for real: the same claim that a ticket may take is refused from a shell with no
+# ticket in its ancestry, and inside one it is clamped to the cap the wrapper exported.
+import subprocess as _sp, tempfile as _tf, shutil as _sh
+_gd = _tf.mkdtemp(prefix="gategate")
+_env = dict(os.environ, PAIR_GATE_DIR=_gd, PAIR_QUEUE_ROOT="/tmp/sweepq", PAIR_QUEUE="/tmp/sweepq")
+for _k in ("GPU_RUN_STATUS", "GPU_TICKET_HARDCAP"):
+    _env.pop(_k, None)
+_probe = ('. /home/treadall/recipe-pair-release/qmesh/release/pair_lib.sh 2>/dev/null || '
+          '. "$(dirname "$0")/pair_lib.sh"; printf "%s\n" "claim_outside_$?"; exit 0')
+_r = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; pair_gx_gate_up outsider 30; echo "rc=$?"; '
+              'ls "%s" 2>/dev/null' % (HERE, _gd)],
+             env=_env, capture_output=True, text=True)
+check("gate_up refuses outside a ticket and writes no claim",
+      "rc=5" in _r.stdout and ".gate" not in _r.stdout and "PAIR_GATE_REFUSED outside_ticket" in _r.stderr,
+      (_r.stdout + _r.stderr).strip()[:200])
+_env["GPU_TICKET_HARDCAP"] = str(1)
+_r = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; pair_gx_gate_up pastcap 30; echo "rc=$?"' % HERE],
+             env=_env, capture_output=True, text=True)
+check("an expired ticket's cap refuses the claim",
+      "rc=5" in _r.stdout and "ticket_hardcap_passed" in _r.stderr, (_r.stdout + _r.stderr).strip()[:200])
+_env["GPU_TICKET_HARDCAP"] = str(int(__import__("time").time()) + 600)
+_r = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; pair_gx_gate_up clamps 120; echo "rc=$?"; '
+              'cat "%s"/*.gate 2>/dev/null' % (HERE, _gd)],
+             env=_env, capture_output=True, text=True)
+_until = re.search(r"until=(\d+)", _r.stdout or "")
+check("a claim longer than the ticket is clamped to its cap",
+      "rc=0" in _r.stdout and _until and int(_until.group(1)) <= int(_env["GPU_TICKET_HARDCAP"]),
+      (_r.stdout + _r.stderr).strip()[:200])
+check("the wrapper hands its hard cap to the ticket's children",
+      "export GPU_TICKET_HARDCAP=$hard" in src("gpu_run_pair.sh")
+      and "hardcap=%s" in src("gpu_run_pair.sh"), "")
+_sh.rmtree(_gd, ignore_errors=True)
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

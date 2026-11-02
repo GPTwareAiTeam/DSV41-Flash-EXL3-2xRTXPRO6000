@@ -23,6 +23,41 @@ server of this pair is alive, and after the preflight has refused a live `nvcc`/
 `SEAM_ENSURE stale torch build lock(s): <paths>`. The smoke checks the same two globs before it starts
 the server and says `SMOKE_TORCH_LOCK cleared=…`, or `kept` when something alive could own the lock.
 
+## A box claim belongs to a queue ticket, and ends with it (2026-11-02)
+
+`pair_gx_gate_take` writes `<queue>/gx<N>.gate` with `until=<epoch>`, and for its whole life every
+other job on that box waits on that epoch. Two ways to make the promise wrong, both seen today:
+
+* taken outside the queue. GxPort2 held `gx2.gate` from 07:47 to 08:13Z from a shell that no ticket
+  owned; when the Integrator ticket came due behind it, it failed rather than wait out a claim
+  nothing was going to release early. `pair_gx_gate_up` now refuses with
+  `PAIR_GATE_REFUSED outside_ticket …` (rc 5) unless the caller is inside a queue ticket.
+* taken past the ticket's own hard cap. The queue kills a job at `hardcap`, so a claim with a later
+  `until` is an orphan by construction. `pair_ticket_hardcap` reads the cap the wrapper exports
+  (`GPU_TICKET_HARDCAP`, mirrored as a `hardcap=<epoch>` line in the ticket file) and `gate_up`
+  clamps `until` to it (`PAIR_GATE_CLAMP`), or refuses outright when the cap has already passed
+  (`PAIR_GATE_REFUSED ticket_hardcap_passed`). A ticket from a wrapper that predates the line is
+  capped at its own start + 100 min, the queue's ceiling, which can only be smaller than the real
+  cap.
+
+`pair_gx_gate_take` propagates the refusal (rc 5) instead of waiting for a claim it may not take.
+`tests/sweep_rules.py` runs all three cases for real: refused outside a ticket (and no file
+written), refused on an expired cap, clamped inside a live one.
+
+## A pair container's torch cache belongs to its release (2026-11-02)
+
+`containers/*.json` sets `TORCH_EXTENSIONS_DIR=<root>/extcache`, and the cache is per release. Running
+a *different* tree inside a pair container therefore does not "just import": torch regenerates
+`build.ninja` from that tree and rebuilds into the release's cache, and the next link replaces the
+release's `.so` with one built from the wrong sources while `BUILD_STAMP.json` still names the old
+commit. `qmesh/tests/server_gate.sh` did this to dev's release at 07:46-07:52 (125 objects rebuilt as
+root, `build.ninja` full of the scratch path); the fix was `pair_build_ext.sh dev 9fc3ca8a --side p7`,
+which rebuilds the ext from the release tree and refreshes the stamp together.
+
+The test now refuses that combination instead: when `TORCH_EXTENSIONS_DIR` carries a `BUILD_STAMP.json`
+whose `source_sha` is not the tree's `HEAD`, it exits 2 with the two hashes rather than importing. A
+scratch tree pays its own JIT build in a private directory.
+
 ## A busy box is refused before the ticket mutates anything (2026-11-02)
 
 At 02:41 a dev ticket re-created P7 and flipped a release, then its smoke refused with

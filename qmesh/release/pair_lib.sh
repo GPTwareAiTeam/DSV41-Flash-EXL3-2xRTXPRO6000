@@ -218,9 +218,56 @@ pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until or 
   then echo free; return 0; fi
   echo "${o:-?} until=$u"
 }
+pair_ticket_hardcap() {  # -> epoch the calling queue ticket must be off this box by; fails outside one
+  # A claim is a promise about the box's future ("I will be gone by until"). Only a queue ticket can
+  # make that promise: it runs under a hard cap, and the pair queue is the one place that bounds a
+  # job's life. A claim taken outside one -- an agent's ad hoc bench, a script run by hand -- has no
+  # owner that will end it: GxPort2 held gx2.gate from 07:47 to 08:13Z on 2026-11-02 with a claim
+  # minted outside any ticket, and the Integrator ticket that came due behind it failed.
+  local q t pid i v w
+  if [ -n "${GPU_TICKET_HARDCAP:-}" ]; then printf '%s' "$GPU_TICKET_HARDCAP"; return 0; fi
+  q=$PAIR_QUEUE/$PAIR/gpu_queue
+  pid=$$
+  for i in $(seq 1 20); do
+    case "${pid:-}" in ''|*[!0-9]*) break ;; esac
+    [ "$pid" -gt 1 ] || break
+    # Tickets are named <rank>-<ns>-<pid>-<Agent>; the wrapper that owns this process wrote one.
+    t=$(ls "$q"/[0-9][0-9]-*-"$pid"-* 2>/dev/null | head -1)
+    if [ -n "$t" ]; then
+      v=$(sed -n 's/^hardcap=\([0-9][0-9]*\)$/\1/p' "$t" 2>/dev/null | head -1)
+      if [ -n "$v" ]; then printf '%s' "$v"; return 0; fi
+      # A ticket started by a wrapper that predates the hardcap line: the queue's ceiling is 100 min
+      # from the start of the ticket, and a claim may never be longer than that, so use it as the cap
+      # (the ticket's real hard cap can only be smaller, never larger).
+      w=$(stat -c %W "$t" 2>/dev/null) || w=$(stat -c %Y "$t" 2>/dev/null) || w=$(date +%s)
+      printf '%s' "$(( w + 100 * 60 ))"; return 0
+    fi
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
 pair_gx_gate_up() {  # <label> <minutes> -> atomic; never replaces a claim that is still held
-  local f; f=$(pair_gx_gate_file)
+  local f cap until now; f=$(pair_gx_gate_file)
   [ "$PAIR_DRY" = 1 ] && return 0
+  now=$(date +%s)
+  if ! cap=$(pair_ticket_hardcap); then
+    echo "PAIR_GATE_REFUSED outside_ticket label=${1:-?}: a box claim may only be taken inside a" \
+         "queue ticket (queue/run_dev.sh|run_prod.sh); re-run the job through the queue" >&2
+    return 5
+  fi
+  case "$cap" in ''|*[!0-9]*)
+    echo "PAIR_GATE_REFUSED bad_hardcap label=${1:-?} cap=$cap" >&2; return 5 ;;
+  esac
+  until=$(( now + ${2:-60} * 60 ))
+  if [ "$until" -gt "$cap" ]; then
+    # The claim must end with the ticket that took it, never after it: a claim past the cap is an
+    # orphan the next ticket waits on.
+    if [ "$cap" -le "$now" ]; then
+      echo "PAIR_GATE_REFUSED ticket_hardcap_passed label=${1:-?} cap=$cap now=$now" >&2; return 5
+    fi
+    echo "PAIR_GATE_CLAMP label=${1:-?} asked_min=${2:-60} until=$until cap=$cap" >&2
+    until=$cap
+  fi
   mkdir -p "$(dirname "$f")" || return 1
   (
     # The claim is a lock, so "is it free" and "write it" have to be one step: two jobs that both read
@@ -228,13 +275,15 @@ pair_gx_gate_up() {  # <label> <minutes> -> atomic; never replaces a claim that 
     command -v flock >/dev/null 2>&1 && exec 9>"$f.lock" && flock -w 20 9
     [ "$(pair_gx_gate_state)" = free ] || exit 3
     printf 'owner=%s pid=%s host=%s until=%s\n' "${1:?label}" "$$" "$(hostname -s)" \
-      "$(( $(date +%s) + ${2:-60} * 60 ))" >"$f" || exit 4
+      "$until" >"$f" || exit 4
   ) || return 1
 }
-pair_gx_gate_take() {  # <label> <minutes> <wait_minutes> -> 0 claimed, 1 still someone else's
-  local waited=0 limit=$(( ${3:-0} * 6 ))
+pair_gx_gate_take() {  # <label> <minutes> <wait_minutes> -> 0 claimed, 1 still someone else's, 5 refused
+  local waited=0 limit=$(( ${3:-0} * 6 )) rc
   while :; do
-    if pair_gx_gate_up "$1" "$2"; then return 0; fi
+    pair_gx_gate_up "$1" "$2"; rc=$?
+    [ "$rc" = 0 ] && return 0
+    [ "$rc" = 5 ] && return 5
     [ "$waited" -lt "$limit" ] || return 1
     sleep 10; waited=$((waited + 1))
   done
@@ -288,14 +337,16 @@ pair_torch_locks() {  # <ct> -- JIT build locks a dead process left in the conta
   pair_gxsh "docker exec $1 sh -c 'for f in /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock; do [ -e \"\$f\" ] && echo \"\$f\"; done'" 2>/dev/null
 }
 pair_torch_build_live() {  # <ct> -- how many compilers or servers are alive there right now
-  pair_gxsh "docker exec $1 sh -c 'pgrep -fc \"(^|/)(nvcc|cicc|ninja)( |\$)|worker_seam_server\" || true'" 2>/dev/null | tr -dc 0-9
+  pair_gxsh "docker exec $1 sh -c 'pgrep -fc \"(^|/)(nvcc|cicc|ninja)( |\$)|worker_seam_server[.]py\" || true'" 2>/dev/null | tr -dc 0-9
 }
 pair_gx_foreign_server() {  # "server_in=<ct>:<pid>" for a pack load in a container that is not this pair's
   # One pack load per box is the rule, and the load is what costs 116 GiB and 3 minutes. Our own
   # container is excluded by name; a worker in anybody else's is somebody's work, and a ticket that
   # flipped a release before noticing it is a ticket that mutates a busy pair (2026-11-02 02:41).
   [ "$PAIR_DRY" = 1 ] && return 0
-  pair_gxsh "for c in \$(docker ps --format '{{.Names}}'); do [ \"\$c\" = '$GXCT' ] && continue; p=\$(docker exec \"\$c\" pgrep -f 'python3 -u qmesh/worker_seam_server.py' 2>/dev/null | head -1); [ -n \"\$p\" ] && echo \"server_in=\$c:\$p\"; done" 2>/dev/null
+  # A --stub worker is skipped: it returns before the pack and before CUDA (SeamServer.__init__), so it
+  # costs the box nothing and must not be read as "the box is busy" (SeamRobust's ctl test starts one).
+  pair_gxsh "for c in \$(docker ps --format '{{.Names}}'); do [ \"\$c\" = '$GXCT' ] && continue; p=\$(docker exec \"\$c\" sh -c 'for pid in \$(pgrep -f \"python3 -u qmesh/worker_seam_server[.]py\" 2>/dev/null); do tr \"\\0\" \" \" < /proc/\$pid/cmdline 2>/dev/null | grep -q -- --stub || { echo \$pid; break; }; done' 2>/dev/null | head -1); [ -n \"\$p\" ] && echo \"server_in=\$c:\$p\"; done" 2>/dev/null
 }
 pair_server_stop() {  # stops the recorded worker if it is still the one that was recorded
   local f pid build live out

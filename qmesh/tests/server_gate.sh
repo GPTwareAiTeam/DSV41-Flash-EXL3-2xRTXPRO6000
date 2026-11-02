@@ -29,6 +29,25 @@ ok()  { echo "OK   $1"; }
 bad() { echo "FAIL $1"; printf '%s\n' "$2" | tail -6 | sed 's/^/     /'; fails=$((fails + 1)); }
 
 cd "$ROOT" || exit 2
+# A tree that is not the release whose torch cache is in TORCH_EXTENSIONS_DIR must never import under
+# that cache: torch would rebuild the objects from this tree and relink the release's .so, leaving a
+# binary that no longer matches BUILD_STAMP.json (2026-11-02: this test did that to dev's release and
+# cost a rebuild). Refuse instead of silently rebuilding, and say which release the cache belongs to.
+if [ -n "${TORCH_EXTENSIONS_DIR:-}" ] && [ -f "$(dirname "$TORCH_EXTENSIONS_DIR")/BUILD_STAMP.json" ]; then
+  cache_sha=$("$PY" - "$(dirname "$TORCH_EXTENSIONS_DIR")/BUILD_STAMP.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("source_sha", ""))
+PY
+)
+  tree_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)
+  if [ "$cache_sha" != "$tree_sha" ]; then
+    echo "SKIP server_gate.sh: TORCH_EXTENSIONS_DIR=$TORCH_EXTENSIONS_DIR belongs to release" \
+         "${cache_sha:-?}, the tree under test is ${tree_sha:-<not a git checkout>}:" \
+         "a foreign tree would relink the release's .so. Point TORCH_EXTENSIONS_DIR at a scratch" \
+         "dir (the accepted case then pays a full JIT build) or run it in that release's tree."
+    exit 2
+  fi
+fi
 if ! "$PY" -c 'import torch' 2>/dev/null; then
   echo "SKIP server_gate.sh: $PY has no torch (run it in a client/server container: PY=python3)"
   exit 0

@@ -85,9 +85,16 @@ while :; do
   fi
   sleep 5
 done
+start=$(date +%s); deadline=$((start + MAXMIN * 60)); hard=$((start + HARD_CAP_MIN * 60))
+# The hard cap is part of the ticket's contract, not just this loop's business: pair_gx_gate_take
+# refuses a claim taken outside a ticket and never lets one run past the ticket's cap, so hand the
+# number to the command and write it into the ticket file (a claim taken by a child reads it from
+# either). A claim past the cap is exactly the orphan that made the Integrator ticket fail on
+# 2026-11-02 after GxPort2 held gx2.gate 26 minutes from outside the queue.
+export GPU_TICKET_HARDCAP=$hard
+printf 'hardcap=%s\n' "$hard" >>"$ticket" 2>/dev/null
 log "start $AGENT max=${MAXMIN}m hardcap=${HARD_CAP_MIN}m load=$(cut -d" " -f1 /proc/loadavg)"
 setsid "$@" & cpid=$!
-start=$(date +%s); deadline=$((start + MAXMIN * 60)); hard=$((start + HARD_CAP_MIN * 60))
 grace_until=0
 while kill -0 "$cpid" 2>/dev/null; do
   now=$(date +%s)
