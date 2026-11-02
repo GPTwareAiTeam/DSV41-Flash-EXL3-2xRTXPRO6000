@@ -768,6 +768,16 @@ _r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "T", "1", "scripts/pair_prepa
 check("a ticket whose command is one quoted string is refused before the GPU",
       _r.returncode == 2 and "TICKET_BAD_CMD argv0=" in (_r.stdout + _r.stderr),
       "rc=%s %s" % (_r.returncode, (_r.stdout + _r.stderr).strip()[:200]))
+# The guard resolves argv[0] the way the shell does, so a ticket that starts with a PATH command is
+# accepted: `bash <script>` is a real form (GxPort2 documents `queue/run_dev.sh <Ag> 45 bash $0`).
+_tmp = os.path.join(_gd, "t.sh")
+with open(_tmp, "w") as _fh:
+    _fh.write("#!/bin/sh\nexit 0\n")
+_r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "T", "1", "bash", _tmp],
+             env=dict(_e, QBASE=os.path.join(_gd, "q")), capture_output=True, text=True, timeout=60)
+check("a ticket that starts with a PATH command (bash <script>) is accepted",
+      _r.returncode != 2 and "TICKET_BAD_CMD" not in (_r.stdout + _r.stderr),
+      "rc=%s %s" % (_r.returncode, (_r.stdout + _r.stderr).strip()[:200]))
 _sh.rmtree(_gd, ignore_errors=True)
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")

@@ -130,10 +130,12 @@ case "$1" in
   *' '*|'') log "TICKET_BAD_CMD argv0=\"$1\" hint=pass the command as separate words, not one quoted string"
             printf 'TICKET_BAD_CMD argv0=%s\n' "$1" >&2; exit 2 ;;
 esac
-if [ ! -x "$1" ]; then
-  log "TICKET_BAD_CMD argv0=\"$1\" hint=argv[0] must be an executable file (cwd is $PWD)"
-  printf 'TICKET_BAD_CMD argv0=%s not executable (cwd=%s)\n' "$1" "$PWD" >&2; exit 2
-fi
+# argv[0] may be a path or a PATH name: `bash $0`, `python3 …`, `env FOO=1 …` are all legitimate
+# tickets. `command -v` resolves both; an `[ -x "$1" ]` here would reject every PATH name.
+command -v -- "$1" >/dev/null 2>&1 || {
+  log "TICKET_BAD_CMD argv0=\"$1\" hint=argv[0] must be an executable file or a command on PATH (cwd is $PWD)"
+  printf 'TICKET_BAD_CMD argv0=%s not found (cwd=%s)\n' "$1" "$PWD" >&2; exit 2
+}
 setsid "$@" & cpid=$!
 grace_until=0
 while kill -0 "$cpid" 2>/dev/null; do
