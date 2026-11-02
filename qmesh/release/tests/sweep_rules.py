@@ -263,6 +263,14 @@ check("every GX job claims the box through the helper",
       and "pair_gx_gate_down() {" in src("pair_lib.sh"), "")
 check("the gate test is in the battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate.sh")), "")
+# A GX command runs on the host unless it says docker exec, and the host has no /pair: a container path
+# passed to a bare pair_gxsh lookup reports files missing that are there, and a bare chown does nothing.
+# (2026-11-02: the cuda-exl3 build succeeded and the stamp said `no_so_in_release_tree`.)
+check("GX host commands never take a container path",
+      not any("rel_c" in l and "pair_gxsh" in l and "docker exec" not in l
+              for l in code_lines(src("pair_build_ext.sh")))
+      and not any("rel_c" in l and "pair_gxsh" in l and "docker exec" not in l
+                  for f in ("pair_smoke.sh", "pair_update_run.sh") for l in code_lines(src(f))), "")
 
 
 

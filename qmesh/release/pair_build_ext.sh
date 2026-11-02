@@ -181,13 +181,16 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
       pair_step "CX_FAIL gx rc=$rc $(printf '%s' "$cxout" | grep -E 'Error|error:|FAILED|Assertion' | tail -3 | tr '\n' ' ')"
       return 1
     fi
-    cxso=$(pair_gxsh "ls -1 $rel_c/src/vendor/cuda-exl3/src/cuda_exl3/_C*.so 2>/dev/null | head -1")
+    # rel_c is a path INSIDE the container; the host half of this script has no /pair, so a lookup (or
+    # a chown) run through pair_gxsh without docker exec reports the kernel missing on a build that just
+    # succeeded -- and the chown would silently do nothing, leaving root-owned files in the release.
+    cxso=$(pair_gxsh "docker exec $(printf %q "$ct") ls -1 $rel_c/src/vendor/cuda-exl3/src/cuda_exl3/_C*.so 2>/dev/null | head -1")
     [ -n "$cxso" ] || { pair_step "CX_FAIL gx no_so_in_release_tree"; return 1; }
     cxname=$(basename "$cxso")
-    cxsha=$(pair_gxsh "sha256sum '$cxso'" 2>/dev/null | cut -d' ' -f1)
+    cxsha=$(pair_gxsh "docker exec $(printf %q "$ct") sha256sum '$cxso'" 2>/dev/null | cut -d' ' -f1)
     [ -n "$cxsha" ] || { pair_step "CX_FAIL gx so_unreadable so=$cxname"; return 1; }
     # built as root inside the container; the host user stamps and later prunes the tree
-    pair_gxsh "chown -R $(id -u):$(id -g) $rel_c/src/vendor/cuda-exl3" >/dev/null 2>&1 || true
+    pair_gxsh "docker exec $(printf %q "$ct") chown -R $(id -u):$(id -g) $rel_c/src/vendor/cuda-exl3" >/dev/null 2>&1 || true
     pair_step "CX_OK gx so=$cxname sha256=$cxsha arch=12.1"
   fi
 
