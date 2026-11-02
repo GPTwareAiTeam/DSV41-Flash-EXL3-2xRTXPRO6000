@@ -45,6 +45,10 @@ def _default_allocator_settings():
         setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None) \
             or torch.cuda.memory._set_allocator_settings
         setter("expandable_segments:True")
+        # No getter exists for allocator settings, and the memory reports need to say whether this
+        # actually took effect: the env var was unset (that is why we are here), so record the call
+        # itself for MEMB/ENGINE lines to print.
+        os.environ["EXL3_EXPANDABLE_SEGMENTS_ACTIVE"] = "1"
     except Exception:
         pass
 

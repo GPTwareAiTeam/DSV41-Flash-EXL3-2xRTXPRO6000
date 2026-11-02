@@ -385,6 +385,16 @@ def engine_report(model, cache, generator, title: str):
           f"torch_allocated={gib(torch.cuda.memory_allocated(DEVICE)):.3f} "
           f"non_torch={(total - free - torch.cuda.memory_reserved(DEVICE)) / G:.3f} "
           f"free={gib(free):.3f}", flush = True)
+    # The allocator's own view, once per report: `active` is memory torch believes is in use (a per-shape
+    # cache shows up here as growth that never comes back), `inactive_split` is freed-and-split memory
+    # that only exists without expandable segments. Read together with the chunk limiter's room_MiB these
+    # say whether a shrunken grant is caused by live growth or by the pool's shape history.
+    st = torch.cuda.memory_stats(DEVICE)
+    print(f"MEMB_ALLOC {title} expandable={os.environ.get('EXL3_EXPANDABLE_SEGMENTS_ACTIVE', 'env' if os.environ.get('PYTORCH_CUDA_ALLOC_CONF') else 'off')} "
+          f"active={gib(st.get('active_bytes.all.current', 0)):.3f} "
+          f"inactive_split={(st.get('inactive_split_bytes.all.current', 0)) / G:.3f} "
+          f"segments={int(st.get('segment.all.current', 0))} "
+          f"reserved={gib(torch.cuda.memory_reserved(DEVICE)):.3f}", flush = True)
 
 
 def peaks(title: str, base_alloc: int):
