@@ -40,5 +40,14 @@ done
 # a log can be matched against the run that produced a number.
 ssh -o BatchMode=yes "$GX" "docker exec $CT bash -lc 'cd $CTWT/qmesh/native/bin && sha256sum * 2>/dev/null'" \
   | awk 'NF == 2 {printf "STAGE lib %s sha=%.16s\n", $2, $1}'
+# The library is built in the container from the .cu on disk, so after a stage it can legitimately
+# be one revision behind (a comment or a stderr line costs no behaviour, and rebuilding it changes
+# the build id for every container sharing the tree). Say which it is: BUILD_INFO records the sha the
+# lib was compiled from, and a log that shows state=stale next to a passing run tells the next reader
+# that the source on disk is newer on purpose, not that the stage silently failed.
+cu=$(sha256sum "$SRC/qmesh/native/qmesh_expert_seam.cu" | cut -c1-16)
+built=$(ssh -o BatchMode=yes "$GX" "docker exec $CT cat $CTWT/qmesh/native/bin/BUILD_INFO.aarch64" 2>/dev/null |
+  sed -n 's/^cu_sha256_full=//p' | cut -c1-16)
+echo "STAGE lib_src seam_cu=$cu built_from=${built:-unknown} state=$([ "$cu" = "$built" ] && echo match || echo stale)"
 [ "$bad" = 0 ] || exit 2
 echo "STAGE OK host=$GX ct=$CT tree=$CTWT"
