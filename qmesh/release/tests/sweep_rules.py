@@ -824,6 +824,34 @@ _r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "T", "1", "bash", _tmp],
 check("a ticket that starts with a PATH command (bash <script>) is accepted",
       _r.returncode != 2 and "TICKET_BAD_CMD" not in (_r.stdout + _r.stderr),
       "rc=%s %s" % (_r.returncode, (_r.stdout + _r.stderr).strip()[:200]))
+# The lock must not be held by anything but the wrapper's own head check. A ticket command inherits
+# the wrapper's fds, so a ticket that slept (or an ssh under the release guard) while fd 9 was open
+# kept the flock's open description alive after its wrapper died: at 09:03 on 2026-11-02 the queue
+# stayed write-locked with no owner and three agents waited in `flock 9` until they were killed by
+# hand. Executed, not grepped: start a ticket that tries to take the lock from inside its own body,
+# and require it to succeed.
+_qb = os.path.join(_gd, "q2")
+os.makedirs(os.path.join(_qb, "gpu_queue"), exist_ok=True)
+_bin = os.path.join(_gd, "bin"); os.makedirs(_bin, exist_ok=True)
+with open(os.path.join(_bin, "nvidia-smi"), "w") as _fh:
+    _fh.write("#!/bin/sh\nexit 0\n")   # empty compute-apps list: the box reads free
+os.chmod(os.path.join(_bin, "nvidia-smi"), 0o755)
+_lk = os.path.join(_gd, "lockprobe.sh")
+with open(_lk, "w") as _fh:
+    _fh.write("#!/bin/sh\nflock -n %s -c 'echo lock_free' || echo lock_held\n" % os.path.join(_qb, "gpu.lock"))
+os.chmod(_lk, 0o755)
+_r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "LockProbe", "1", "sh", _lk],
+             env=dict(_e, QBASE=_qb, QGPUS="0", PATH=_bin + ":" + os.environ["PATH"]),
+             capture_output=True, text=True, timeout=120)
+check("a ticket command can take the queue lock its wrapper released",
+      "lock_free" in (_r.stdout + _r.stderr), (_r.stdout + _r.stderr).strip()[:200])
+_wrap = src("gpu_run_pair.sh")
+_locked = _wrap.split('exec 9>"$LOCK"')[1].split("flock -u 9")[0]
+check("the wrapper closes the lock descriptor before it starts a ticket",
+      "exec 9>&-" in _wrap
+      and _wrap.index('check_release "$@"') < _wrap.index('exec 9>"$LOCK"')
+      and "check_release" not in _locked, _locked.strip()[:200])
+
 _sh.rmtree(_gd, ignore_errors=True)
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")

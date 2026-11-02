@@ -99,16 +99,29 @@ while :; do
   # waiters running different script versions must agree on the head or the queue deadlocks.
   head=$(ls "$Q" | grep -E '^[0-9]' | sort | head -n1)
   if [ "$Q/$head" = "$ticket" ]; then
-    exec 9>"$LOCK"
-    flock 9
-    gpu_busy || {
-      check_release "$@"; grc=$?
-      [ "$grc" = 0 ] && break
-      flock -u 9
+    # The release guard forks ssh and docker and can spend 90 s doing it. It must not run with the
+    # queue lock held: `exec 9>lock` gives every child of the holder the same open description, and a
+    # flock survives the holder -- on 2026-11-02 at 09:03 a holder died inside it and the queue stayed
+    # write-locked with no live owner at all, so three waiters (my ServerUp, SeamRobust's acceptance,
+    # GxPort2's G6) sat in `flock 9` until their wrappers were killed by hand. So: guard first, lock
+    # afterwards for nothing but the head re-read and the busy check, then release and close 9 --
+    # a ticket command that inherits the description must never be able to keep a lock alive.
+    gpu_busy && { sleep 5; continue; }
+    check_release "$@"; grc=$?
+    if [ "$grc" != 0 ]; then
       log "refused $AGENT release_check_rc=$grc (not started)"
       exit "$grc"
-    }
+    fi
+    exec 9>"$LOCK"
+    flock 9
+    head=$(ls "$Q" | grep -E '^[0-9]' | sort | head -n1)
+    if [ "$Q/$head" = "$ticket" ] && ! gpu_busy; then
+      flock -u 9
+      exec 9>&-
+      break
+    fi
     flock -u 9
+    exec 9>&-
   fi
   sleep 5
 done
