@@ -34,7 +34,7 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   [ -r "$conf" ] || pair_die "config not readable: $conf"
   line=$(awk -v p="$p" '!/^#/ && NF && $1==p {print; exit}' "$conf")
   [ -n "$line" ] || pair_die "pair '$p' is not in $conf"
-  read -r PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN <<<"$line"
+  read -r PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS <<<"$line"
   PAIR_ROOT=${PAIR_ROOT_OVERRIDE:-$PAIR_ROOT}
   # A relative root puts every release, log and stamp wherever the caller happened to stand: a
   # stubbed harness once grew four full source trees inside that repository way.
@@ -48,7 +48,20 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   # so 3072 passes by ~1150 MiB and the box still lands at the wall: the margin can only refuse a
   # dirtier box, it cannot make GX2 fit (qmesh/notes/PairRelease.md).
   LOAD_MARGIN=${LOAD_MARGIN:-2048}
-  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN
+  # WS_ROWS: the row piece a server is asked to take per call, pinned by the pair rather than left
+  # to a per-image default. 1024 is the measured shape on both loaded GX boxes (512-row pieces cost
+  # -7/-22% and a single 4096 costs 224-326 ms p50 with 3-5 s tails), and the picker that would
+  # choose it adapts by itself only when a box has ~1 GiB of headroom, which neither has. "auto"
+  # hands the decision back to whatever server binary the release ships.
+  WS_ROWS=${WS_ROWS:-1024}
+  if [ "$WS_ROWS" = auto ]; then
+    WS_ENV=""
+  else
+    # AUTO=0 is the other half of the pin: without it a picker may widen the piece under memory
+    # pressure on its own, and the pair would no longer run the shape its numbers were taken on.
+    WS_ENV="SEAM_WS_ROWS=$WS_ROWS SEAM_WS_ROWS_AUTO=0"
+  fi
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
   PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}

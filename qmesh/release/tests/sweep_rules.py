@@ -225,6 +225,18 @@ check("every server start carries the margin",
       src("pair_smoke.sh").count("SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN") == 1
       and src("pair_update_run.sh").count("SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN") == 1, "")
 
+# The piece size a server takes per call is a release property, not a per-image default: 1024 rows
+# is the shape every number on this line was measured on, and a picker that widens it when memory
+# frees would put the pair on an unmeasured shape by itself (512 costs -7/-22%, 4096 has 3-5 s
+# tails). The pair states the number; both starts pin it and switch the picker off.
+check("the piece size is the pair's number, pinned",
+      pc.load_conf("dev")["ws_rows"] == "1024"
+      and pc.load_conf("prod")["ws_rows"] == "1024"
+      and 'WS_ENV="SEAM_WS_ROWS=$WS_ROWS SEAM_WS_ROWS_AUTO=0"' in src("pair_lib.sh"), "")
+check("every server start pins the piece size",
+      src("pair_smoke.sh").count("$WS_ENV") == 1
+      and src("pair_update_run.sh").count("$WS_ENV") == 1, "")
+
 
 
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

@@ -175,7 +175,7 @@ restore() {  # only on explicit failure, never from a trap
     pair_step "RESTORE_SERVER pair=$PAIR build=${old_build:-unknown}"
     GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT SERVER_BUCKETS=$BUCKETS \
       SEAM_SERVER_TIMEOUT=${RESTORE_TIMEOUT:-600} SEAM_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-2} \
-      SEAM_ENV="SEAM_BUILD_ID=$old_build SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN" \
+      SEAM_ENV="SEAM_BUILD_ID=$old_build SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN $WS_ENV" \
       "$PAIR_SCRIPTS/seam_server_ensure.sh" --fresh --buckets "$BUCKETS" 2>&1 \
       | grep -E '^(SEAM_ENSURE|SEAM_SLACK|SEAM_SERVER_READY)' | sed 's/^/  /' | tee -a "$PAIR_LOG"
     pair_step "RESTORE_SERVER_DONE pair=$PAIR rc=${PIPESTATUS[0]}"

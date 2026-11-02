@@ -420,3 +420,18 @@ work, `c011674d`) is merged as its own change; if it turns out to need the lock,
 `git revert 2e4eec4b` (a re-merge of the same branch would otherwise be a no-op, because git still
 counts `3c361e8f` as an ancestor). Cutting an unreleased tree is free; flipping a pair onto one is
 not.
+
+### The piece size is a pair setting, not an image default
+
+`pairs.conf` gained a `ws_rows` column (both pairs 1024). `pair_load` turns it into `WS_ENV`
+(`SEAM_WS_ROWS=1024 SEAM_WS_ROWS_AUTO=0`), and both places that start a server -- the smoke and
+the failed-update restore -- pass `$WS_ENV` inside `SEAM_ENV`, so no start can drift to whatever
+the image happens to default to. `ws_rows=auto` is the escape hatch: it sends nothing and leaves
+the choice to the released server binary.
+
+Why pin at all: 1024 rows is the shape every number on this line was measured on. 512-row pieces
+cost -7%/-22% (32k/65k tok/s) against `1d5d49f7`; a single 4096-row piece runs 224-326 ms p50 with
+3-5 s tails. 2048 would be 1.4x faster on the GX cold-expert path (115 ms vs 164 ms for 8x1024)
+but wants ~1 GiB of GX headroom and neither box has it while paging. A picker may adapt to that on
+its own, which is exactly why `AUTO=0` is the other half of the pin: the pair has to run the shape
+its numbers were taken on, not the one the server judges affordable this minute.
