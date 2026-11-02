@@ -159,12 +159,23 @@ check("an update ticket carries a command",
       'cmd=("$HERE/pair_update_run.sh"' in src("pair_update.sh"), "")
 check("an empty ticket is refused, not queued",
       "no command given" in src("pair_lib.sh"), "")
-check("the smoke grants no wider than it exercises",
-      "SMOKE_BUCKETS=${SMOKE_BUCKETS:-1,6,64}" in src("pair_smoke.sh")
-      and "--buckets $SMOKE_BUCKETS" in src("pair_smoke.sh"), "")
-check("smoke asks for two payload slots", "SMOKE_SLAB_SLOTS:-2" in sm, "")
+# The smoke is the canary for what ships, so its server gets the pair's own grant -- not less: with
+# only 1,6,64 the 32k prefill would be served in 64-row chunks and the rate gate would measure a shape
+# no pair runs. What it must not do is ask for a bucket it never fills, so the prefill phase has to be
+# deep enough to reach the widest bucket of both pairs.
+check("the smoke grants the pair's own buckets",
+      "SMOKE_BUCKETS=${SMOKE_BUCKETS:-$BUCKETS}" in sm
+      and "--buckets $SMOKE_BUCKETS" in sm, "")
+_depth = [l for l in code_lines(sm) if l.startswith("SMOKE_PREFILL_DEPTH=")][0]
+_depth = int(_depth.split(":-")[1].rstrip("}").rstrip('"'))
+check("the smoke's prefill is deep enough to fill the widest bucket it grants",
+      all(_depth >= int(pc.load_conf(q)["buckets"].split(",")[-1]) for q in ("prod", "dev")),
+      f"depth={_depth} " + str([pc.load_conf(q)["buckets"] for q in ("prod", "dev")]))
+# One payload slot is the shipping shape (seam_server_ensure.sh's own default, and the slab the validated
+# server printed); a second is only memory. The rollback has to start the server the same way.
+check("the smoke asks for the shipping slot count", "SMOKE_SLAB_SLOTS:-1" in sm, "")
 check("smoke passes the slot count to the ensure", "SEAM_SLAB_SLOTS=$SMOKE_SLAB_SLOTS" in sm, "")
-check("the rollback serves the same slots", "SEAM_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-2}" in ur, "")
+check("the rollback serves the same slots", "SEAM_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-1}" in ur, "")
 check("nothing sets the slower wide-dispatch tier",
       not any("EXL3_MOE_FUSED_ROWS_WIDE" in l
               for f in ("pair_arm.sh", "pair_env.sh", "pair_smoke.sh", "pair_update_run.sh")
@@ -221,21 +232,25 @@ check("the client half is told which build it runs",
 check("the load margin is the pair's number, not the worker's default",
       pc.load_conf("dev")["load_margin"] == "3072"
       and pc.load_conf("prod")["load_margin"] == "2560", "")
-check("every server start carries the margin",
-      src("pair_smoke.sh").count("SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN") == 1
-      and src("pair_update_run.sh").count("SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN") == 1, "")
-
-# The piece size a server takes per call is a release property, not a per-image default: 1024 rows
-# is the shape every number on this line was measured on, and a picker that widens it when memory
-# frees would put the pair on an unmeasured shape by itself (512 costs -7/-22%, 4096 has 3-5 s
-# tails). The pair states the number; both starts pin it and switch the picker off.
+# The server's environment is a release property in three parts -- the load margin, the MOE kernel with
+# its memory margin, and the piece size with the picker off -- and it used to be written out at each
+# start. Two copies is how the rollback once restarted a server with the worker's own defaults while the
+# smoke used the pair's numbers; there is one builder (pair_server_env in pair_lib.sh) and both starts
+# call it, so a knob cannot reach one and not the other.
+check("the server environment has one definition",
+      "pair_server_env() {" in src("pair_lib.sh")
+      and '%s %s %s\' "$1" "$LOAD_MARGIN" "$MOE_ENV" "$WS_ENV"' in src("pair_lib.sh")
+      and "SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1" in "\n".join(code_lines(src("pair_lib.sh")))
+      and "SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB" in "\n".join(code_lines(src("pair_lib.sh"))), "")
+check("both server starts use that definition",
+      sm.count('SEAM_ENV="$(pair_server_env ') == 1
+      and ur.count('SEAM_ENV="$(pair_server_env ') == 1
+      and not any("SEAM_LOAD_MARGIN_MIB=" in l or "SEAM_WS_ROWS=" in l
+                  for f in ("pair_smoke.sh", "pair_update_run.sh") for l in code_lines(src(f))), "")
 check("the piece size is the pair's number, pinned",
       pc.load_conf("dev")["ws_rows"] == "1024"
       and pc.load_conf("prod")["ws_rows"] == "1024"
       and 'WS_ENV="SEAM_WS_ROWS=$WS_ROWS SEAM_WS_ROWS_AUTO=0"' in src("pair_lib.sh"), "")
-check("every server start pins the piece size",
-      src("pair_smoke.sh").count("$WS_ENV") == 1
-      and src("pair_update_run.sh").count("$WS_ENV") == 1, "")
 
 
 

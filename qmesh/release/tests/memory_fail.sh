@@ -29,8 +29,10 @@ for arch in x86_64 aarch64; do
     "$(sha256sum "$so" | cut -d' ' -f1)" > "$so.stamp"
 done
 printf 'ext\n' > "$REL_DIR/ext/exllamav3_ext.so"
-printf '{"build_id":"%s","source_sha":"%s","sha256":"%s"}' "$BID" "$SHA" \
-  "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" > "$REL_DIR/ext/BUILD_STAMP.json"
+# both halves of the GX stamp: the torch extension and the per-checkout cuda-exl3 kernel
+printf '{"build_id":"%s","source_sha":"%s","sha256":"%s","cx":{"build_id":"%s","source_sha":"%s","arch_list":["12.1"],"sha256":"cx-mem","so":"_C.so","built_at":"2026-11-01T00:00:00Z"}}' \
+  "$BID" "$SHA" "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" "$BID" "$SHA" \
+  > "$REL_DIR/ext/BUILD_STAMP.json"
 
 fails=0
 want() {  # <case> <expected-substring> <log>

@@ -6,7 +6,7 @@
   "cmd": ["infinity"],
   "mounts": [
     ["__PAIR_ROOT__", "/pair"],
-    ["/home/treadall/exl3-cold-pack", "/cold"]
+    ["/home/treadall/exl3-cold-pack-4460", "/cold"]
   ],
   "env": {
     "CUDA_HOME": "/usr/local/cuda",

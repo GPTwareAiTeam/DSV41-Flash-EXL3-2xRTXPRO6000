@@ -174,8 +174,8 @@ restore() {  # only on explicit failure, never from a trap
                 "$(pair_release_dir "$OLD_SHA")/RELEASE.json" 2>/dev/null)
     pair_step "RESTORE_SERVER pair=$PAIR build=${old_build:-unknown}"
     GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT SERVER_BUCKETS=$BUCKETS \
-      SEAM_SERVER_TIMEOUT=${RESTORE_TIMEOUT:-600} SEAM_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-2} \
-      SEAM_ENV="SEAM_BUILD_ID=$old_build SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN $WS_ENV" \
+      SEAM_SERVER_TIMEOUT=${RESTORE_TIMEOUT:-600} SEAM_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-1} \
+      SEAM_ENV="$(pair_server_env "${old_build:-}")" \
       "$PAIR_SCRIPTS/seam_server_ensure.sh" --fresh --buckets "$BUCKETS" 2>&1 \
       | grep -E '^(SEAM_ENSURE|SEAM_SLACK|SEAM_SERVER_READY)' | sed 's/^/  /' | tee -a "$PAIR_LOG"
     pair_step "RESTORE_SERVER_DONE pair=$PAIR rc=${PIPESTATUS[0]}"
@@ -347,6 +347,31 @@ SMOKE_ROW=$row
 SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS_TOTAL n=\([0-9]*\) sha256=\([0-9a-f]*\).*/n=\1 sha256=\2/p' | head -1)
 [ -n "$SMOKE_IDS" ] || SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS .* n=\([0-9]*\) sha256=\([0-9a-f]*\).*/n=\1 sha256=\2/p' | head -1)
 pair_step "UPDATE_SMOKE pair=$PAIR $row ${SMOKE_IDS:-ids=none}"
+
+# prod's decode ids must equal the ids dev's smoke of this same sha produced: same packs, same code,
+# so the engine has to emit the same tokens on both boxes. The gate already refuses a sha dev never
+# passed; this refuses one where prod's own smoke did not reproduce dev's ids -- a different pack
+# placement, a silently swapped pack, or a client that came up on another checkpoint. Both numbers are
+# kept whatever happens, since an ids mismatch is the only record of which side moved.
+if [ "$PAIR" = prod ] && [ -n "$SMOKE_IDS" ]; then
+  dev_ids=$(python3 - "$PAIR_STATE/dev/evidence/$SHA.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+ids = (doc.get("smoke") or {}).get("ids") or {}
+n, digest = ids.get("n"), ids.get("sha256")
+if isinstance(n, int) and digest:
+    print(f"n={n} sha256={digest}")
+PY
+)
+  case "$dev_ids" in
+    "") pair_step "UPDATE_IDS_CROSSCHECK pair=prod skipped (dev evidence for $SHA records no ids)" ;;
+    "$SMOKE_IDS") pair_step "UPDATE_IDS_CROSSCHECK pair=prod ok $SMOKE_IDS" ;;
+    *) fail "ids_mismatch prod=$SMOKE_IDS dev=$dev_ids" ;;
+  esac
+fi
 
 # the smoke row is the release's reference row: same release must reproduce it (pair_ref.sh)
 python3 - "$PAIR_STATE_DIR/refs-$SHA.json" "$SHA" "$BUILD_ID" "$REL" "$row" <<'PY' | tee -a "$PAIR_LOG"

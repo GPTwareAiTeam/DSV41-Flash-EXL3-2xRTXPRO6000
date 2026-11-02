@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
-# pair_smoke.sh -- prove a pair can serve one decode row on the release it is wired to.
+# pair_smoke.sh -- prove a pair can serve one decode row AND one 32k prefill on the release it is
+# wired to, on the kernel and piece size it ships.
 #
 #   pair_smoke.sh <pair> [sha]
 #
 # What it does, in order, with a bound on every wait:
 #   1. records the GX box's memory before the load (MemAvailable, swap),
-#   2. starts the seam server from the release (seam_server_ensure --fresh), with SEAM_BUILD_ID set so
-#      the SEAM_SERVER_LOADED line names the release that is actually running,
-#   3. records the memory *after* the pack is loaded and the slack the ensure script reports -- on
-#      GX2 a 113.5 GiB pack leaves ~1 GiB, and a server that dies of that has to be caught here, not
-#      in the middle of someone's arm,
-#   4. runs one decode row through the P7 client half and checks it produced tokens and that the wire
-#      did not answer `peer layout mismatch` / `remote invalid request`,
-#   5. prints SMOKE_OK or SMOKE_FAIL <reason> and exits 0/1.
+#   2. starts the seam server from the release (seam_server_ensure --fresh) with the pair's shipping
+#      server env (pair_lib.sh: cuda-exl3 preload, load margin, pinned piece size) and SEAM_BUILD_ID
+#      set, so the SEAM_SERVER_LOADED line names the release that is actually running,
+#   3. refuses a server that came up without the cuda-exl3 kernel -- SEAM_MOE_NOEXT means the vendored
+#      extension was not built into this release and every layer runs the mixed-K module at a
+#      fraction of the rate -- and one where too few layers could be restacked,
+#   4. records the memory *after* the pack is loaded and the slack the ensure script reports -- on GX2
+#      a 116 GiB pack leaves ~1.4 GiB, and a server that dies of that has to be caught here, not in
+#      the middle of someone's arm,
+#   5. runs one decode row through the P7 client half and checks it produced tokens and ids and that
+#      the wire did not answer `peer layout mismatch` / `remote invalid request`,
+#   6. runs one 32k prefill arm and gates its rate and aborts (dev: the owner's canary bar; prod: what
+#      the same release measured on prod's own hardware),
+#   7. prints SMOKE_OK or SMOKE_FAIL <reason> and exits 0/1.
 #
 # A server that never prints READY is reported as `server_timeout` (never waited on indefinitely):
 # the bound comes from SMOKE_SERVER_TIMEOUT and is enforced by seam_server_ensure itself.
@@ -30,21 +37,33 @@ REL=$(pair_release_dir "$SHA")
 BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' "$REL/RELEASE.json" 2>/dev/null)
 [ -n "$BUILD_ID" ] || { echo "SMOKE_FAIL no_build_id"; exit 1; }
 
-SMOKE_SERVER_TIMEOUT=${SMOKE_SERVER_TIMEOUT:-600}
-SMOKE_ARM_TIMEOUT=${SMOKE_ARM_TIMEOUT:-300}
+SMOKE_SERVER_TIMEOUT=${SMOKE_SERVER_TIMEOUT:-900}
+SMOKE_ARM_TIMEOUT=${SMOKE_ARM_TIMEOUT:-600}
+SMOKE_PREFILL_TIMEOUT=${SMOKE_PREFILL_TIMEOUT:-1800}
 SMOKE_NEW=${SMOKE_NEW:-8}
-SMOKE_CACHE_TOKENS=${SMOKE_CACHE_TOKENS:-4096}
+# The shipping cache: 1M tokens of FP4 KV. A smoke that runs with a smaller cache tests a different
+# memory shape than the pair serves.
+SMOKE_CACHE_TOKENS=${SMOKE_CACHE_TOKENS:-1048576}
 SMOKE_SLACK_GATE=${SMOKE_SLACK_GATE:-0}          # 1 = a thin slack refuses the release (see notes)
-# Payload slots per handle. Two is what the wide grant was measured with: the split prefill needs a
-# second slot to pipeline into, and seam_server_ensure.sh only passes --slab-slots to a release whose
-# worker knows the flag (proto 3). One slot still works on an old release, just without pipelining.
-SMOKE_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-2}
-# The grant the smoke server is given. The server reserves workspace for its widest bucket even
-# when nobody asks for it -- 294 MiB at 2048 rows against ~9 MiB at 64 -- and on a box whose pack
-# leaves ~1 GiB free that reservation is the difference between a smoke and a paging wall. The
-# smoke never asks for more than 64 rows, so it does not grant more. Prod still serves the wide
-# list from pairs.conf.
-SMOKE_BUCKETS=${SMOKE_BUCKETS:-1,6,64}
+# Payload slots per handle. One is what the validated run used: a second slot is only needed to
+# pipeline a split prefill, and on GX2 (~1.4 GiB free after the load) the extra slab is what a paging
+# wall costs. seam_server_ensure.sh only passes --slab-slots to a worker that knows the flag.
+SMOKE_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-1}
+# The grant the smoke server is given: the pair's own list (pairs.conf). Workspace for a bucket nobody
+# asks for still comes out of the box (242 MiB slab at 8192 rows), so the smoke grants exactly what
+# the pair grants -- otherwise it would pass a release on a config nobody serves.
+#
+# The prefill gate. dev is the canary and carries the owner's bar: 32k tokens in one arm at >= 800
+# tok/s with no abort (the validated release did 837.6). prod's own hardware measured 796.2 tok/s on
+# the same release, so its bar is that number minus a smoke's worth of noise; a prod smoke that lands
+# near dev's is the promotion confirming the copy, not a different instrument.
+SMOKE_BUCKETS=${SMOKE_BUCKETS:-$BUCKETS}
+SMOKE_PREFILL_DEPTH=${SMOKE_PREFILL_DEPTH:-32768}
+if [ "$PAIR" = dev ]; then
+  SMOKE_PREFILL_MIN_TPS=${SMOKE_PREFILL_MIN_TPS:-800}
+else
+  SMOKE_PREFILL_MIN_TPS=${SMOKE_PREFILL_MIN_TPS:-760}
+fi
 ENSURE=${SEAM_ENSURE:-}
 if [ -z "$ENSURE" ]; then
   for c in "$PAIR_SCRIPTS/seam_server_ensure.sh" "$HERE/seam_server_ensure.sh"; do
@@ -61,9 +80,11 @@ gx_mem() {  # prints "avail_mib=<n> swap_free_mib=<n> swap_total_mib=<n>"
 }
 
 if [ "$PAIR_DRY" = 1 ]; then
-  echo "DRY ensure: ${ENSURE:-<not found>} GX=$GX CT=$GXCT GX_GID=$GX_GID PORT=$PORT SEAM_BUILD_ID=$BUILD_ID SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT $ENSURE --fresh --buckets $SMOKE_BUCKETS"
+  echo "DRY ensure: ${ENSURE:-<not found>} GX=$GX CT=$GXCT GX_GID=$GX_GID PORT=$PORT SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT SEAM_ENV='$(pair_server_env "$BUILD_ID")' $ENSURE --fresh --buckets $SMOKE_BUCKETS"
   echo "DRY arm: $HERE/pair_arm.sh $PAIR --rows 1 --max-new $SMOKE_NEW --cache-tokens $SMOKE_CACHE_TOKENS"
+  echo "DRY prefill: $HERE/pair_arm.sh $PAIR --prefill $SMOKE_PREFILL_DEPTH --timeout $SMOKE_PREFILL_TIMEOUT"
   echo "SMOKE_ROW i=0 new_tokens=$SMOKE_NEW text_sha256=dry"
+  echo "SMOKE_PREFILL depth=$SMOKE_PREFILL_DEPTH tok_per_s=dry aborted=0"
   echo "SMOKE_OK"
   exit 0
 fi
@@ -73,7 +94,7 @@ pair_step "SMOKE_SERVER_START pair=$PAIR ct=$GXCT build=$BUILD_ID buckets=$SMOKE
 srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT \
           SERVER_BUCKETS=$SMOKE_BUCKETS SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT \
           SEAM_SLACK_GATE=$SMOKE_SLACK_GATE SEAM_SLAB_SLOTS=$SMOKE_SLAB_SLOTS \
-          SEAM_ENV="SEAM_BUILD_ID=$BUILD_ID SEAM_LOAD_MARGIN_MIB=$LOAD_MARGIN $WS_ENV" \
+          SEAM_ENV="$(pair_server_env "$BUILD_ID")" \
           "$ENSURE" --fresh --buckets "$SMOKE_BUCKETS" 2>&1)
 srv_rc=$?
 [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$srv_out" >> "$PAIR_LOG"
@@ -115,6 +136,31 @@ case "$loaded" in
   *) fail "server_build_mismatch loaded=${loaded:-none} want=$BUILD_ID" ;;
 esac
 echo "SMOKE_MEM_SERVER $(gx_mem)"
+
+# The kernel the server actually serves on. cuda-exl3 is imported from the release's vendored tree
+# (qmesh/exl3_moe_cuda.py), whose .so is untracked and therefore has to be built per cut: a release
+# whose build stage skipped that imports nothing, prints SEAM_MOE_NOEXT and serves every layer on the
+# mixed-K module -- correct output at a fraction of the rate, i.e. exactly the kind of release that
+# must not reach a pair. On a memory-tight box a few layers may legitimately refuse the restack
+# (SEAM_MOE_NOFIT); the validated run had 2 of 40, so allow up to a tenth and no more.
+kernel=$(pair_gxsh "docker exec $GXCT sh -c \"grep -E '^(SEAM_MOE_NOEXT|SEAM_PACK_KERNEL)' /tmp/seam_server.log | tail -3\"" 2>/dev/null)
+printf '%s\n' "$kernel" | grep -v '^$' | sed 's/^/SMOKE_KERNEL /'
+case "$kernel" in
+  *SEAM_MOE_NOEXT*) fail "moe_kernel_missing $(printf '%s' "$kernel" | grep -m1 SEAM_MOE_NOEXT | cut -c1-240)" ;;
+esac
+kv=$(printf '%s\n' "$kernel" | sed -n 's/^SEAM_PACK_KERNEL .*cudaexl3_layers=\([0-9]*\) mixedk_layers=\([0-9]*\) of=\([0-9]*\).*/\1 \2 \3/p' | tail -1)
+read -r cx_n mx_n nl_n <<<"$kv"
+if [ -z "${nl_n:-}" ]; then
+  fail "moe_kernel_unknown $(printf '%s' "$kernel" | tail -1 | cut -c1-240)"
+fi
+if [ $((cx_n * 10)) -lt $((nl_n * 9)) ]; then
+  fail "moe_kernel_mostly_mixedk cudaexl3_layers=$cx_n mixedk_layers=$mx_n of=$nl_n (the release's cuda-exl3 fits fewer layers than it did when it was validated)"
+fi
+
+# The box's own verdict on the load, on every smoke: avail after the pack, the swap the load pushed
+# to, and the slack the server reserved. A pair that passes here with 1.4 GiB and 3.7 GiB of swap is a
+# pair whose next failure will look like a CUDA abort (2026-11-01 16:44, GX1).
+printf '%s\n' "$srv_out" | grep -E '^SEAM_SERIAL|^SEAM_SLACK|^SEAM_SERVER_SLAB' | sed 's/^/SMOKE_SERVER /'
 
 pair_step "SMOKE_ARM pair=$PAIR rows=1 new=$SMOKE_NEW"
 # The arm's own log: a client that hangs (a silent JIT rebuild, a stale lock baton, a seam handshake
@@ -201,4 +247,43 @@ fi
 if [ "$ids_n" -le 0 ] && [ "${SMOKE_IDS_OPTIONAL:-0}" != 1 ]; then
   fail "arm_no_ids (no ARM_IDS line from the driver; a release that cannot report ids cannot be promoted, SMOKE_IDS_OPTIONAL=1 skips this)"
 fi
+# The prefill arm: the number the owner's canary bar is stated in. One load, one 32k prompt, one
+# chunked prefill through the release's seam pieces, engine tok/s as reported by the same driver the
+# 837.6/908.0 were taken with. Tokens without a rate (an aborted arm) can not pass: the abort is the
+# failure mode this exists to catch, so both are read from the same line.
+pair_step "SMOKE_PREFILL pair=$PAIR depth=$SMOKE_PREFILL_DEPTH min_tps=$SMOKE_PREFILL_MIN_TPS timeout=${SMOKE_PREFILL_TIMEOUT}s"
+echo "SMOKE_MEM_PREFILL_BEFORE $(gx_mem)"
+pf_log=$PAIR_STATE_DIR/logs/smoke-prefill-$PAIR-$(date -u +%Y%m%dT%H%M%SZ).log
+mkdir -p "$(dirname "$pf_log")" 2>/dev/null || true
+pf_out=$(ARM_IDS_OUT="" "$HERE/pair_arm.sh" "$PAIR" --prefill "$SMOKE_PREFILL_DEPTH" \
+         --timeout "$SMOKE_PREFILL_TIMEOUT" 2>&1)
+pf_rc=$?
+printf '%s\n' "$pf_out" > "$pf_log" 2>/dev/null || true
+[ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$pf_out" >> "$PAIR_LOG"
+pf_line=$(printf '%s\n' "$pf_out" | sed -n "s/^PREFILL_ARM depth=$SMOKE_PREFILL_DEPTH .*/&/p" | tail -1)
+if [ "$pf_rc" != 0 ] || [ -z "$pf_line" ]; then
+  echo "SMOKE_PREFILL_LOG $pf_log"
+  server_tail
+  case "$(printf '%s\n' "$pf_out")" in
+    *"out of memory"*|*"OutOfMemory"*|*"Cannot allocate memory"*|*"unspecified launch failure"*)
+      fail "memory prefill rc=$pf_rc $(printf '%s' "$pf_out" | grep -m1 -iE 'out of memory|OutOfMemory|Cannot allocate memory|unspecified launch failure' | cut -c1-200)" ;;
+  esac
+  fail "prefill rc=$pf_rc $(printf '%s\n' "$pf_out" | grep -m1 -E 'Traceback|Error|error|MEM_ABORT' | cut -c1-300)"
+fi
+pf_kv=$(printf '%s\n' "$pf_line" | tr ' ' '\n' | sed -n 's/^\(tok_per_s\|aborted\|prefill_s\|shrunk\)=//p' | tr '\n' ' ')
+pf_tps=$(printf '%s\n' "$pf_line" | sed -n 's/.*tok_per_s=\([0-9.]*\).*/\1/p')
+pf_ab=$(printf '%s\n' "$pf_line" | sed -n 's/.*aborted=\([0-9]*\).*/\1/p')
+echo "SMOKE_PREFILL_LOG $pf_log"
+echo "SMOKE_PREFILL depth=$SMOKE_PREFILL_DEPTH ${pf_kv% } line_rc=0"
+echo "SMOKE_MEM_PREFILL_AFTER $(gx_mem)"
+[ "${pf_ab:-1}" = 0 ] || fail "prefill_aborted depth=$SMOKE_PREFILL_DEPTH aborted=$pf_ab line=$pf_line"
+case "$(printf '%s\n' "$pf_out")" in
+  *"SEAM_COMPUTE_FAIL"*)
+    fail "prefill_compute_fail $(printf '%s' "$pf_out" | grep -m1 SEAM_COMPUTE_FAIL | cut -c1-240)" ;;
+esac
+[ -n "${pf_tps:-}" ] || fail "prefill_no_rate depth=$SMOKE_PREFILL_DEPTH line=$pf_line"
+# awk, not test: tok/s is fractional and the gate is a real threshold, not a string compare.
+awk -v got="$pf_tps" -v want="$SMOKE_PREFILL_MIN_TPS" 'BEGIN { exit !(got + 0 >= want + 0) }' \
+  || fail "prefill_slow depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS"
+echo "SMOKE_PREFILL_OK depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS aborts=0"
 echo "SMOKE_OK $PAIR $SHA $BUILD_ID"

@@ -61,13 +61,29 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
     # pressure on its own, and the pair would no longer run the shape its numbers were taken on.
     WS_ENV="SEAM_WS_ROWS=$WS_ROWS SEAM_WS_ROWS_AUTO=0"
   fi
-  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV
+  # MOE_ENV: the kernel the GX half serves the cold experts on. cuda-exl3 restacks a layer's cold
+  # experts per bitrate group and is preloaded while the pack loads; without it (a release cut
+  # without the vendored extension built -- its .so is untracked, so every cut needs
+  # qmesh/build_cudaexl3.sh) the worker prints SEAM_MOE_NOEXT and every layer stays on the mixed-K
+  # module, at a fraction of the measured rate. The smoke refuses to call such a release verified.
+  # SEAM_CX_MARGIN_MIB is what must stay free after the load for the restack + workspace (the
+  # worker's own default; the validated numbers were taken with it).
+  CX_MARGIN_MIB=${CX_MARGIN_MIB:-1536}
+  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB"
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
   PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}
   PAIR_STATE_DIR=$PAIR_STATE/$PAIR
   PAIR_MANIFEST=$PAIR_STATE/$PAIR.json
   export PAIR_STATE_DIR PAIR_MANIFEST
+}
+
+# The server half's environment as ONE string: the shipping config every number in the notes was
+# taken on. Every starter (the smoke, the restore path, an operator) passes this and nothing else, so
+# a server can not come up on a different kernel or piece size than the pair serves.
+pair_server_env() {  # <build_id> -> "SEAM_BUILD_ID=… SEAM_LOAD_MARGIN_MIB=… <MOE_ENV> <WS_ENV>"
+  printf 'SEAM_BUILD_ID=%s SEAM_LOAD_MARGIN_MIB=%s %s %s' "$1" "$LOAD_MARGIN" "$MOE_ENV" "$WS_ENV"
 }
 
 pair_arch_for() {  # <sm_120|sm_121> -> x86_64|aarch64  (lib name per side)
