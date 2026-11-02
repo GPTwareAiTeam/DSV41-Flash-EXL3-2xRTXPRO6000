@@ -252,8 +252,11 @@ if [ "${PAIR_FLIP_ONLY:-0}" = 1 ]; then
   pair_step "UPDATE_RELEASE pair=$PAIR sha=${SHA:0:12} build=$BUILD_ID (prepared out of band)"
   plan_out=$(python3 "$HERE/pair_containers.py" plan "$PAIR" 2>&1)
   printf '%s\n' "$plan_out" | sed 's/^/  /' | tee -a "$PAIR_LOG" >/dev/null
+  # Any delta at all: a flip-only ticket may not create, wire or re-create a container, and a plan line
+  # is the statement that one of those is needed (RECREATE for a container that exists, CREATE for one
+  # that does not). Matching only RECREATE let a pair with no containers at all walk straight through.
   case "$plan_out" in
-    *RECREATE*) fail "containers are not prepared: run scripts/pair_prepare.sh $PAIR $SHA first" ;;
+    *" CREATE "*|*" RECREATE "*) fail "containers are not prepared: run scripts/pair_prepare.sh $PAIR $SHA first" ;;
   esac
   pair_step "UPDATE_CONTAINERS pair=$PAIR unchanged (prepared)"
   lib_out=$("$HERE/pair_build_lib.sh" verify "$PAIR" "$SHA" --side both 2>&1); lib_rc=$?

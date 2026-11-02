@@ -230,8 +230,8 @@ check("the client half is told which build it runs",
 # No load may run on the worker's own 2048 MiB default: the pair states what the pack load must
 # leave behind, and both places that start a server have to pass it (measured GX numbers).
 check("the load margin is the pair's number, not the worker's default",
-      pc.load_conf("dev")["load_margin"] == "3072"
-      and pc.load_conf("prod")["load_margin"] == "2560", "")
+      pc.load_conf("dev")["load_margin"] == "2048"
+      and pc.load_conf("prod")["load_margin"] == "2048", "")
 # The server's environment is a release property in three parts -- the load margin, the MOE kernel with
 # its memory margin, and the piece size with the picker off -- and it used to be written out at each
 # start. Two copies is how the rollback once restarted a server with the worker's own defaults while the

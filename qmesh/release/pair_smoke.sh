@@ -101,6 +101,28 @@ trap pair_gx_gate_down EXIT
 echo "SMOKE_GATE owner=smoke-$PAIR until=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$(pair_gx_gate_file)")"
 
 echo "SMOKE_MEM_BEFORE $(gx_mem)"
+
+# A previous server's memory is not returned the instant its process exits: on 2026-11-02 the smoke
+# started 40 s after an experiment had stopped, read avail 116726 MiB, and the worker refused a load
+# of 116220+3072; minutes later the same box read 120254. Nothing about the release was wrong, and the
+# ticket failed on a transient. So before asking the worker, wait for the box to come back: poll until
+# MemAvailable covers the pack plus the load margin, up to SMOKE_MEM_WAIT_S. The pack size is read from
+# the pack the server will actually load (the worker's own need is the same sum of the same files).
+PACK_MIB=$(pair_gxsh "docker exec $GXCT sh -c 'du -bc /cold/cold-L*.safetensors 2>/dev/null | tail -1'" 2>/dev/null | cut -f1)
+case "${PACK_MIB:-}" in ''|*[!0-9]*) PACK_MIB=0 ;; esac
+if [ "$PACK_MIB" -gt 0 ]; then
+  PACK_MIB=$(( PACK_MIB / 1048576 ))
+  want=$(( PACK_MIB + LOAD_MARGIN ))
+  waited=0
+  while :; do
+    mem=$(gx_mem); avail=$(printf '%s' "$mem" | sed -n 's/.*avail_mib=\([0-9]*\).*/\1/p')
+    [ "${avail:-0}" -ge "$want" ] && break
+    [ "$waited" -ge "${SMOKE_MEM_WAIT_S:-120}" ] && break
+    echo "SMOKE_MEM_WAIT waited=${waited}s avail_mib=$avail want_mib=$want $(printf '%s' "$mem" | sed 's/^avail_mib=[0-9]* //')"
+    sleep 10; waited=$(( waited + 10 ))
+  done
+  echo "SMOKE_MEM_READY avail_mib=${avail:-0} want_mib=$want pack_mib=$PACK_MIB margin_mib=$LOAD_MARGIN waited=${waited}s"
+fi
 pair_step "SMOKE_SERVER_START pair=$PAIR ct=$GXCT build=$BUILD_ID buckets=$SMOKE_BUCKETS timeout=${SMOKE_SERVER_TIMEOUT}s"
 srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT \
           SERVER_BUCKETS=$SMOKE_BUCKETS SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT \
