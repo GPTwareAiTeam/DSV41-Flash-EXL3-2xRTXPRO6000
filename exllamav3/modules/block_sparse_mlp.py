@@ -1192,6 +1192,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         cpu_pending = None
         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
+            # Timeline only (qmesh/remote_seam_host.mark, EXL3_SEAM_MARK=1): the seam records when the
+            # issue's copies went out, this says where the GPU experts it overlaps began and ended
+            _mark = getattr(self.cpu_host, "mark", None)
+            if _mark is not None:
+                _mark(self.cpu_layer_idx, "hot0")
 
         if self.cpu_offload:
             final_hidden_states, cpu_pending = self.cpu_offload_issue(

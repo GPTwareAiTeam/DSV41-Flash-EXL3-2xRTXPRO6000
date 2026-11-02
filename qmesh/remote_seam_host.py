@@ -50,6 +50,24 @@ _ID_TRACE = os.environ.get("SEAM_ID_TRACE", "0") == "1"
 # share; 0 waits for the reply inside submit_issue, which is what the transport did before, so the
 # same build can measure both orders.
 _OVERLAP = os.environ.get("SEAM_OVERLAP", "1") == "1"
+# SEAM_COPY_STREAM=1 (default) moves a request's wire copies off the caller's stream: qes_issue
+# only enqueues (header H2D, x/ids/w D2H, publish kernel), so they can ride a stream of their own
+# that waits on an event recorded right after the routing that produced their inputs. On the
+# caller's stream the P7's own expert kernels queued behind ~1.5 ms of PCIe copies per layer, so
+# neither the GX's receive nor the hot experts started until the copies were done. 0 keeps the
+# single-stream order for measurement, and graph capture always uses it (see _wire_stream).
+_COPY = os.environ.get("SEAM_COPY_STREAM", "1") == "1"
+# EXL3_SEAM_MARK=1 records CUDA events at one prefill chunk's issue, at the caller's hot-expert span
+# (block_sparse_mlp marks that with SeamProxy.mark, because only the module knows where its own expert
+# kernels begin) and at the collect, then prints their device-side timestamps relative to the issue.
+# That is the timeline the question "does the GX start receiving before the P7's hot experts" needs.
+# issue/hot0/hot1/collect are on the caller's stream, payload is on the wire stream, so every gap is
+# stream order on both sides and no reading is a host-timing artefact.
+_MARK = os.environ.get("EXL3_SEAM_MARK", "0") == "1"
+# The first few layers of the first chunk are enough: the order is the same for all 40
+_MARK_LAYERS = int(os.environ.get("EXL3_SEAM_MARK_LAYERS", "4"))
+_MARK_MIN_ROWS = int(os.environ.get("EXL3_SEAM_MARK_MIN_ROWS", "512"))
+_marks = {}     # layer -> {"issue": ev, "payload": ev, "hot0": ev, "hot1": ev, "collect": ev}
 _prof_rows = {}     # (bucket, n) -> [(host_ns_0, host_ns_1, ev0, ev1)]
 
 
@@ -68,8 +86,36 @@ def _prof_dump():
               f"{dv * 1e3 / max(n, 1):10.2f}", flush = True)
 
 
+def _mark_dump():
+    if not _marks:
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    print("[SEAMMARK] layer  issue_to_payload  issue_to_hot0  hot_span  hot1_to_collect  "
+          "issue_to_collect   (ms of device time)", flush = True)
+    for layer in sorted(_marks):
+        m = _marks[layer]
+        if not all(k in m for k in ("issue", "hot0", "hot1", "collect")):
+            continue
+        t0 = m["issue"]
+        # payload is recorded on the wire stream (the copies + publish of this layer's request), so
+        # a value well below issue_to_hot0 is the GX starting to receive before the P7's hot
+        # experts rather than after them.
+        pay = (f"{t0.elapsed_time(m['payload']):17.3f}" if "payload" in m else
+               f"{'n/a (same stream)':>17}")
+        print(f"[SEAMMARK] {layer:5d} {pay} "
+              f"{t0.elapsed_time(m['hot0']):14.3f} "
+              f"{m['hot0'].elapsed_time(m['hot1']):9.3f} "
+              f"{m['hot1'].elapsed_time(m['collect']):16.3f} "
+              f"{t0.elapsed_time(m['collect']):16.3f}", flush = True)
+
+
 if _PROF:
     atexit.register(_prof_dump)
+if _MARK:
+    atexit.register(_mark_dump)
 
 class _Prefill:
     """One layer call's seam work in flight, from submit_issue to submit_collect.
@@ -150,6 +196,9 @@ class RemoteSeamHost:
         self.slots = 1
         self.ns = 1
         self._splits = set()
+        # One wire stream per device (see _wire_stream): the copies and the publish ride it so the
+        # caller's stream reaches its own expert kernels without them. Created on first use.
+        self._cstreams = {}
         # Persistent per-(device, bucket) staging for the wire tensors (see _stage). These are the
         # only device buffers qes_issue reads, and they are never freed, so the copies it enqueues
         # can never race an allocation that reuses the same block.
@@ -329,13 +378,34 @@ class RemoteSeamHost:
         ev.record(torch.cuda.current_stream(dev))
         self._trace_prev[key] = (pre, caller, staged, ev, layer_idx, n)
 
+    def _wire_stream(self, dev):
+        """Stream the request's copies ride, or None to keep them on the caller's stream.
+
+        Everything qes_issue enqueues for a request (the header H2D, the D2H copies of x/ids/w and
+        the publish kernel that makes the slot visible to the proxy thread) is stream-ordered on
+        the stream it is handed, and it never waits on the host. Handing it the caller's stream put
+        those copies in front of the layer's own expert kernels, so the P7's hot compute began only
+        after they finished; on this stream they run beside it, and the request is on the wire as
+        soon as the routing that produced it is done.
+
+        Graph capture keeps the single-stream order: a stream that took part in no capture cannot
+        wait on an event recorded inside one, and the capture bakes the stream of the copies it
+        records. Decode is captured, prefill is not, and only prefill has copies worth moving."""
+        if not _COPY or torch.cuda.is_current_stream_capturing():
+            return None
+        idx = dev.index or 0
+        cs = self._cstreams.get(idx)
+        if cs is None:
+            with torch.cuda.device(dev):
+                cs = torch.cuda.Stream(device = dev)
+            self._cstreams[idx] = cs
+        return cs
+
     def _issue_piece(self, layer_idx, pos, x, ids, w, n_cold, dev_index):
         """Stages one micro-batch to the smallest granted bucket >= its rows, puts it on the wire,
         and returns the in-flight record _collect_piece consumes. Nothing waits here: the split
         from collect is the whole point, because the caller's own expert kernels run next."""
         n = x.shape[0]
-        bucket, xp, idp, wp = self._stage(layer_idx, x, ids, w)
-        seam = self._seam(bucket, dev_index)
         stream = torch.cuda.current_stream(x.device)
         prof = _PROF and n <= _PROF_MAX_ROWS and not torch.cuda.is_current_stream_capturing()
         t0 = ev0 = None
@@ -343,6 +413,26 @@ class RemoteSeamHost:
             ev0 = torch.cuda.Event(enable_timing = True)
             ev0.record(stream)
             t0 = time.perf_counter_ns()
+        cs = self._wire_stream(x.device)
+        if cs is None:
+            bucket, xp, idp, wp = self._stage(layer_idx, x, ids, w)
+            wire = stream
+        else:
+            # The routing outputs are ready where the caller's stream stands now; the staging
+            # writes and the transport's own copies follow on the wire stream, and the caller's
+            # stream does not wait for them (only submit_collect does, through the reply).
+            cs.wait_event(self._record_ev(stream))
+            with torch.cuda.stream(cs):
+                bucket, xp, idp, wp = self._stage(layer_idx, x, ids, w)
+            # These are views of the caller's routing buffers, allocated on the caller's stream and
+            # read on the wire stream: without this the allocator may hand their block to the next
+            # layer while the copy that reads them is still queued, and the wire would carry
+            # another layer's routing (the failure _stage's per-bucket buffers were introduced
+            # for, 2026-11-01, one stream later).
+            for t in (x, ids, w):
+                t.record_stream(cs)
+            wire = cs
+        seam = self._seam(bucket, dev_index)
         try:
             if _ID_TRACE:
                 # Host-side only: a readback of ids here would sync the stream and hide the very
@@ -352,12 +442,12 @@ class RemoteSeamHost:
                 # only way the transport's per-request device-to-host copy can read a newer
                 # request's bytes.
                 print(f"SEAM_ID_STAGE layer={layer_idx} rows={n} bucket={bucket} n_cold={n_cold} "
-                      f"stream=0x{stream.cuda_stream:x} "
+                      f"stream=0x{stream.cuda_stream:x} wire=0x{wire.cuda_stream:x} "
                       f"capturing={int(torch.cuda.is_current_stream_capturing())} "
                       f"x=0x{x.data_ptr():x} ids=0x{ids.data_ptr():x} idp=0x{idp.data_ptr():x}",
                       file = sys.stderr, flush = True)
             seam.issue(layer_idx, xp.data_ptr(), idp.data_ptr(), wp.data_ptr(),
-                       stream.cuda_stream, n_cold or 0)
+                       wire.cuda_stream, n_cold or 0)
         except RuntimeError:
             # The transport refused this request (e.g. an id its own cold set cannot hold): the
             # proxy's "qes:" line names layer, slot, values and cold count. The stack says which
@@ -368,6 +458,11 @@ class RemoteSeamHost:
                       file = sys.stderr, flush = True)
                 traceback.print_stack()
             raise
+        if _MARK and layer_idx in _marks and "payload" not in _marks[layer_idx]:
+            # Recorded on the wire stream, right behind the publish kernel: this is when the
+            # request is complete in the slab and the proxy thread can put it on the wire. On the
+            # caller's stream it would say the same thing only in the copies-on-compute order.
+            _marks[layer_idx]["payload"] = self._record_ev(wire)
         return (pos, n, bucket, xp, idp, wp, seam, t0, ev0)
 
     @staticmethod
@@ -448,6 +543,15 @@ class RemoteSeamHost:
         out = (torch.empty(plan[0][2], HIDDEN, dtype = torch.float32, device = x.device)
                if len(plan) == 1 else
                torch.empty(rows, HIDDEN, dtype = torch.float32, device = x.device))
+        # Arm the timeline before the first issue: _issue_piece records the request's payload event
+        # on the wire stream, and that only happens for the layers the report is about.
+        mk = _MARK and _OVERLAP and rows >= _MARK_MIN_ROWS and layer_idx < _MARK_LAYERS
+        if mk:
+            # A new chunk starts at layer 0: drop the previous chunk's timestamps so the report is one
+            # chunk's order and not a mixture of 13 (the chunk loop re-enters layer 0 every time)
+            if layer_idx == 0:
+                _marks.clear()
+            _marks.setdefault(layer_idx, {})
         p = _Prefill(self, layer_idx, x, ids, w, n_cold, plan, out, rows,
                      torch.cuda.current_stream(x.device), x.device.index or 0)
         while p.next < len(p.plan) and len(p.inflight) < self.ns:
@@ -455,6 +559,8 @@ class RemoteSeamHost:
             p.inflight.append(self._issue_piece(p.layer, s, p.x[s:e], p.ids[s:e], p.w[s:e],
                                                 n_cold, p.dev_index))
             p.next += 1
+        if mk:
+            _marks[layer_idx]["issue"] = self._record_ev(p.stream)
         if not _OVERLAP:
             return self.submit_collect(p)
         return p
@@ -469,6 +575,8 @@ class RemoteSeamHost:
             # Already a finished tensor: SEAM_OVERLAP=0 submitted and waited in one call.
             return handle
         p = handle
+        if _MARK and p.layer in _marks:
+            _marks[p.layer]["collect"] = self._record_ev(p.stream)
         while p.next < len(p.plan):
             while len(p.inflight) >= self.ns:
                 self._collect_piece(p.layer, p.inflight.pop(0), p.out, p.stream)
@@ -479,6 +587,20 @@ class RemoteSeamHost:
         while p.inflight:
             self._collect_piece(p.layer, p.inflight.pop(0), p.out, p.stream)
         return p.out[:p.rows]
+
+    @staticmethod
+    def _record_ev(stream):
+        ev = torch.cuda.Event(enable_timing = True)
+        ev.record(stream)
+        return ev
+
+    def mark(self, layer_idx, label):
+        """Caller-side timestamp for the timeline (EXL3_SEAM_MARK): block_sparse_mlp marks the start
+        and end of the GPU experts it runs between an issue and its collect. Recorded on the calling
+        stream, so the gaps to the seam's own events are device order and not host order."""
+        if not _MARK or layer_idx not in _marks or label in _marks[layer_idx]:
+            return
+        _marks[layer_idx][label] = self._record_ev(torch.cuda.current_stream())
 
     def submit_prefill(self, layer_idx, y, selected, weights, n_cold = None):
         """Single-phase form for callers with nothing to overlap (benches, the CPU host's streamed

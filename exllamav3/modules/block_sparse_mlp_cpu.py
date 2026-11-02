@@ -698,6 +698,11 @@ class BlockSparseMLP_CPU:
         enqueues a flag wait ahead of the readback, so the add consumes the worker's output
         exactly when it is ready). Fused handles add in place straight from the pinned slot
         (or skip the readback entirely for a job with no CPU-resident picks)."""
+        _mark = getattr(self.cpu_host, "mark", None)
+        if _mark is not None and cpu_pending is not None:
+            # Timeline only (EXL3_SEAM_MARK=1): the GPU experts and the shared expert that ran under
+            # the seam's request are done; the collect the seam records next starts after this point
+            _mark(self.cpu_layer_idx, "hot1")
         if cpu_pending is not None:
             if isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
                 f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
