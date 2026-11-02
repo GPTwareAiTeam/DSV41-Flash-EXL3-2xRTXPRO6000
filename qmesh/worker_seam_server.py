@@ -740,6 +740,7 @@ SWAP_WARN_MIB = int(os.environ.get("SEAM_SWAP_WARN_MIB", "512"))
 # it reads each layer straight out of the pack, needs no transient, and never consults this floor --
 # so the margin now only gates the per-layer fallback taken when from_pack fails. Set
 # SEAM_CX_MARGIN_MIB=0 only to measure a restack on a box you are willing to lose.
+CX_MARGIN_MIB = int(os.environ.get("SEAM_CX_MARGIN_MIB", "1536"))
 
 # Convert each cold layer to the cuda-exl3 kernel as it loads, on by default when that kernel is
 # the one in use. The conversion needs one layer's cold bytes *plus* its largest bitrate group
