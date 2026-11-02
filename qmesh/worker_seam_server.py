@@ -490,25 +490,30 @@ def slab_mib(buckets, slots = 1) -> float:
     return total / 2**20
 
 
-# Measured, not predicted: --ws-probe on the dev pair with the 113.65 GiB pack resident gave
-# 301 MiB of transient device memory at 2048 rows, 602 at 4096 and 1202 at 8192, i.e. 147 KiB per
-# row, and the slab is on top of that (slab_mib). A request served in ws_rows pieces pays this for
-# ws_rows, not for the bucket, so a big bucket is a wire/call-count decision, not a workspace one.
-WS_KIB_PER_ROW = 147
+# Host memory one piece of `rows` needs on top of the pack, KiB per row. Two measurements, both on
+# a box with the 4460 pack resident: --ws-probe reported 301 MiB of transient device memory at 2048
+# rows (147 KiB/row), but the host's MemAvailable fell by ~467 MiB across a window of ten 2048-row
+# calls on GX2, i.e. ~233 KiB/row once the staging the device side shares with the host is counted.
+# MemAvailable is what the picker can read, so the host figure is the one that governs; 235 KiB/row
+# still clears the 2048-row rung on GX2 with a full pack (566 MiB against ~1220 available) and
+# leaves it unreachable on GX1 (461-653 available, the box is already 3 GiB into swap).
+WS_KIB_PER_ROW = 235
 
 # Piece-size ladder for _forward. A request served in N pieces makes N passes over the layer's
 # resident cold experts, so the per-row cost falls with piece size until the transient workspace
-# stops fitting: on GX2 with the 4460 pack resident, 8192 rows, one layer at a time, p50 per row
-# was 18.8 us at 1024-row pieces, 12.5-13.8 at 2048, and 14.7 for a single 4096-row piece on a
-# clean box - but 166 us/row (680 ms) for the same 4096 rows once MemAvailable had fallen to
-# ~340 MiB, and 521 us/row with 1.3 GiB of swap traffic for one 8192-row piece. 2048 is the
-# measured best, so it is both the default ceiling and the top rung; the smaller rungs are what a
-# box that is already paging gets instead of a swap storm.
-WS_LADDER = (2048, 1024, 512)
-# Headroom the picker insists on beyond the piece's own workspace before it will take a rung: the
-# piece's transient is not the only thing racing for the last GiB (slab, CUDA context, the page
-# cache of a 113.65 GiB pack), and being one rung too big costs a 4x stall, not 10%.
-WS_GUARD_MIB = int(os.environ.get("SEAM_WS_GUARD_MIB", "320"))
+# stops fitting. Measured on GX2 with the 4460 pack resident, one layer at a time, p50 per row:
+#   8192 rows  layer 0 : 1024 -> 18.5 us, 2048 -> 12.8 us, 4096 -> 27.4 us (+3.2 s p99)
+#   8192 rows  layer 20: 1024 -> 19.9 us, 2048 -> 13.8 us, 4096 -> 39.8 us (+4.8 s p99)
+#   4096 rows  layer 0 : 1024 -> 28.1 us, 2048 -> 12.6 us
+#   4096 rows  layer 20: 1024 -> 19.9 us, 2048 -> 13.5 us
+# and a single 8192-row piece needs 4.3 s a call and wrote 1.3 GiB of swap in ten calls. So 2048 is
+# both the default ceiling and the top rung, and 1024 is the floor: GX1 measured 220 ms per 8192-row
+# call in 512-row pieces against 154-169 in 1024s, so a 512 rung only ever bought a slower box.
+WS_LADDER = (2048, 1024)
+# Headroom the picker insists on beyond the piece's own workspace: the piece's transient is not the
+# only thing racing for the last GiB (slab, CUDA context, the page cache of a 113.65 GiB pack), and
+# being one rung too big costs a 4x stall, not 10%.
+WS_GUARD_MIB = int(os.environ.get("SEAM_WS_GUARD_MIB", "96"))
 # Extra headroom demanded before a request moves *up* a rung, so a box sitting near a threshold
 # holds its choice instead of alternating piece sizes call after call.
 WS_HYST_MIB = int(os.environ.get("SEAM_WS_HYST_MIB", "128"))
