@@ -231,10 +231,14 @@ case "$arm_out" in
     fail "wire_mismatch $(printf '%s' "$arm_out" | grep -m1 -E 'peer layout mismatch|remote invalid request' | cut -c1-300)" ;;
 esac
 
-row=$(printf '%s\n' "$arm_out" | python3 - <<'PY'
+# The rows are read from the arm's log, not from a pipe: the script itself arrives on stdin (`python3 -`
+# plus a heredoc), so a `... | python3 - <<'PY'` hands the parser an empty stdin after the heredoc has
+# been consumed as source -- and this check then reported "arm_no_tokens NONE" for an arm whose log
+# held a full 8-token row with ids (23:29:19 on dev). The log is the bytes that get kept anyway.
+row=$(python3 - "$ARM_LOG" <<'PY'
 import hashlib, json, sys
 rows = []
-for line in sys.stdin:
+for line in open(sys.argv[1], errors="replace"):
     line = line.strip()
     if not (line.startswith("{") and line.endswith("}")):
         continue

@@ -50,11 +50,16 @@ if [ -z "$ref" ]; then
     *) ref=$(mktemp) ;;
   esac
 fi
-printf '%s\n' "$arm_out" | python3 - "$ref" "$SHA" "$BUILD_ID" "$SEAM" <<'PY'
+# Data by path: `python3 - <<'PY'` already owns stdin with the script, so a piped arm_out read as empty
+# here and every reference was written with rows=[] -- a reference that proves nothing (same fault as
+# the arm-row check in pair_smoke.sh, found 2026-11-02).
+ref_rows=$(mktemp "${TMPDIR:-/tmp}/pairref.XXXXXX")
+printf '%s\n' "$arm_out" > "$ref_rows"
+python3 - "$ref_rows" "$ref" "$SHA" "$BUILD_ID" "$SEAM" <<'PY'
 import datetime, hashlib, json, sys
-out, sha, build_id, seam = sys.argv[1:5]
+rows_path, out, sha, build_id, seam = sys.argv[1:6]
 rows = []
-for line in sys.stdin:
+for line in open(rows_path, errors="replace"):
     line = line.strip()
     if not (line.startswith("{") and line.endswith("}")):
         continue
@@ -73,6 +78,11 @@ with open(out, "w") as fh:
     fh.write("\n")
 print(f"REF {doc['rows'][0]['i'] if rows else '-'} rows={len(rows)} sha={sha[:8]} seam={seam} file={out}")
 PY
+rm -f "$ref_rows"
+# An empty reference is not a reference: promotion compares rows against it, and rows=[] would match a
+# release that decoded nothing. Fail here, where the arm's own log is still around to say why.
+[ -s "$ref" ] && grep -q '"rows": \[' "$ref" && ! grep -q '"rows": \[\]' "$ref" \
+  || { echo "REF_FAIL no rows in the arm output (see the arm log for ARM_JOB_ERROR)"; exit 2; }
 
 if [ -z "$COMPARE" ]; then
   exit 0
