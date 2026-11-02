@@ -115,6 +115,12 @@ echo "RELJSON $(tr -d '\n' < "$rel/RELEASE.json" 2>/dev/null)"
 echo "LIBSTAMP $(tr -d '\n' < "$tree/qmesh/native/bin/%(lib)s.%(arch)s.so.stamp" 2>/dev/null)"
 echo "LIBSHA $(sha256sum "$tree/qmesh/native/bin/%(lib)s.%(arch)s.so" 2>/dev/null | cut -d' ' -f1)"
 echo "EXTSTAMP $(tr -d '\n' < "$rel/ext/BUILD_STAMP.json" 2>/dev/null)"
+# The stamp is an identity, not a receipt: it says which sources the build was started from. The
+# binary is what the container imports, and a stray client import from another tree rebuilds it in
+# place (2026-11-02: a probe build's 27,513,952-byte .so became the client's 27,509,856-byte one and
+# the pair still read IN_SYNC). Hash the artifact, not just the stamp.
+echo "EXTSHA $(sha256sum "$rel/ext/exllamav3_ext/exllamav3_ext.so" 2>/dev/null | cut -d' ' -f1)"
+echo "CXSHA $(sha256sum "$tree"/vendor/cuda-exl3/src/cuda_exl3/_C*.so 2>/dev/null | cut -d' ' -f1 | head -1)"
 if [ "$probe_ct" = 1 ]; then
 echo "CT_STATE $(docker inspect -f '{{.State.Running}}' "$ct" 2>/dev/null)"
 echo "CT_ENV $(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$ct" 2>/dev/null | grep -E '^(TORCH_EXTENSIONS_DIR|PYTHONPATH|TORCH_CUDA_ARCH_LIST)=' | sort | tr '\n' ' ')"
@@ -257,6 +263,14 @@ def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
         # the stamp records arch_list as the list torch takes, so compare against the one-entry list
         if ext.get("arch_list") != [manifest[side]["cuda_arch"]]:
             problems.append(f"ext_arch={ext.get('arch_list')} want={[manifest[side]['cuda_arch']]}")
+        # ...and the artifact the stamp names must still be the one in the cache
+        ext_sha = state.get("EXTSHA") or ""
+        if not ext.get("sha256"):
+            problems.append("ext_stamp_no_sha")
+        elif not ext_sha:
+            problems.append("ext_so=unreadable")
+        elif ext.get("sha256") != ext_sha:
+            problems.append(f"ext_so={ext_sha[:8]} want={str(ext.get('sha256'))[:8]}")
         # cuda-exl3 is gitignored and built per checkout, so the GX stamp has to name it: without it
         # the release would verify clean and then serve every layer on the mixed-K module.
         if side == "gx":
@@ -270,6 +284,9 @@ def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
                     problems.append(f"cx_source={str(cx.get('source_sha'))[:8]} want={sha[:8]}")
                 if cx.get("arch_list") != [manifest[side]["cuda_arch"]]:
                     problems.append(f"cx_arch={cx.get('arch_list')} want={[manifest[side]['cuda_arch']]}")
+                cx_sha = state.get("CXSHA") or ""
+                if cx.get("sha256") and cx_sha and cx["sha256"] != cx_sha:
+                    problems.append(f"cx_so={cx_sha[:8]} want={str(cx['sha256'])[:8]}")
 
     # 6. the container must be wired to the pair root, not to some tree somebody copied into it
     if skip_ct:

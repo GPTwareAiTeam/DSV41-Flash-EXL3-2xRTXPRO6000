@@ -414,6 +414,59 @@ check("a cut refuses a stamp it cannot read back",
 check("a cut refuses stamps that differ between the sides", "STAMP_MISMATCH" in _cut, "")
 check("an existing release with an empty stamp is repaired", "STAMP_REPAIR" in _cut, "")
 
+# The stamp and the binary are two files. A build in place (a stray client import from another tree)
+# rewrites the .so and leaves the stamp intact, so the pair reads IN_SYNC while the container serves
+# an artifact no build produced: on 2026-11-02 a probe build's 27,513,952-byte .so became the client's
+# 27,509,856-byte one and pair_check still printed OK. Both hashes are now compared against the
+# stamp -- the remote probe stubbed, the comparison real.
+_json = __import__("json")
+_spec2 = importlib.util.spec_from_file_location("psc", os.path.join(HERE, "pair_sync_check.py"))
+psc = importlib.util.module_from_spec(_spec2); _spec2.loader.exec_module(psc)
+_sha = "9fc3ca8aa8388340e324507aae237c40c1019a29"
+_bid = "dev-9fc3ca8aa838-20261102T035748Z"
+_root = "/pair"
+_paths = ["a.py"]
+_ref = {p: p for p in _paths}
+_mf = {"pair": "dev", "release_sha": _sha, "build_id": _bid, "_paths": _paths,
+       "p7": {"container": "seam-p7-dev", "arch": "x86_64", "root": _root, "sm": "sm_120",
+              "cuda_arch": "12.0"},
+       "gx": {"container": "seam-gx2-dev", "arch": "aarch64", "root": _root, "sm": "sm_121",
+              "cuda_arch": "12.1"}}
+def _state(side, **over):
+    st = {"LIVE": _root + "/releases/" + _sha, "EXT_LIVE": _root + "/releases/" + _sha + "/ext",
+          "RELJSON": _json.dumps({"sha": _sha, "build_id": _bid}),
+          "LIBSTAMP": _json.dumps({"build_id": _bid, "source_sha": _sha, "sha256": "aa"}),
+          "LIBSHA": "aa",
+          "EXTSTAMP": _json.dumps({"build_id": _bid, "source_sha": _sha,
+                                   "arch_list": [_mf[side]["cuda_arch"]], "sha256": "beef"}),
+          "EXTSHA": "beef"}
+    if side == "gx":
+        st["EXTSTAMP"] = _json.dumps({"build_id": _bid, "source_sha": _sha,
+                                      "arch_list": ["12.1"], "sha256": "beef",
+                                      "cx": {"build_id": _bid, "source_sha": _sha,
+                                             "arch_list": ["12.1"], "sha256": "cafe"}})
+        st["CXSHA"] = "cafe"
+    st.update(over)
+    return st
+def _check_side(side, st):
+    psc.side_state = lambda m, s, remote, skip_ct=False, skip_srv=False: (st, dict(_ref), "")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = psc.check_side(_mf, side, dict(_ref), True, skip_ct=True, skip_srv=True)
+    return ok, buf.getvalue()
+_ok, _out = _check_side("p7", _state("p7"))
+check("a cache whose .so is the stamp's .so verifies", _ok, _out.strip()[-120:])
+_ok, _out = _check_side("p7", _state("p7", EXTSHA="26de612b"))
+check("a cache rebuilt under its stamp is DRIFT, not IN_SYNC",
+      not _ok and "ext_so=26de612b want=beef" in _out, _out.strip()[-160:])
+_ok, _out = _check_side("p7", _state("p7", EXTSHA=""))
+check("an unreadable ext .so is DRIFT", not _ok and "ext_so=unreadable" in _out, _out.strip()[-160:])
+_ok, _out = _check_side("gx", _state("gx"))
+check("a gx cache whose artifacts are the stamp's verifies", _ok, _out.strip()[-120:])
+_ok, _out = _check_side("gx", _state("gx", CXSHA="0bad"))
+check("a cuda-exl3 .so rebuilt under its stamp is DRIFT",
+      not _ok and "cx_so=0bad want=cafe" in _out, _out.strip()[-160:])
+
 
 # Owner rule 2026-11-02: an expert pack lives on the local drive of the box that serves it. The P7
 # containers used to be handed /mnt/data12 (the 12 TB drive) so that the hot pack's links could be
