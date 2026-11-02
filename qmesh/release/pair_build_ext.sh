@@ -241,7 +241,17 @@ PY
   return 0
 }
 
+# The GX half claims the box: the ext and the cuda-exl3 build are both CPU-heavy next to whatever else
+# has a pack loaded there, and a load that lands mid-compile kills it. A foreign claim is waited out
+# (GX_GATE_WAIT_MIN); ours expires on its own, so a killed build cannot leave the box claimed.
 rc=0
+case "$SIDES" in
+  both|gx)
+    if ! pair_gx_gate_take "build_ext-$PAIR" $(( (EXT_TIMEOUT + 900) / 60 )) "${GX_GATE_WAIT_MIN:-20}"; then
+      pair_die "GX_GATE_BUSY $GXCT $(pair_gx_gate_state): the box is claimed by another job"
+    fi
+    trap pair_gx_gate_down EXIT ;;
+esac
 case "$SIDES" in
   both) build_side p7 || rc=1; [ "$rc" = 0 ] && { build_side gx || rc=1; } ;;
   p7) build_side p7 || rc=1 ;;

@@ -251,6 +251,18 @@ check("the piece size is the pair's number, pinned",
       pc.load_conf("dev")["ws_rows"] == "1024"
       and pc.load_conf("prod")["ws_rows"] == "1024"
       and 'WS_ENV="SEAM_WS_ROWS=$WS_ROWS SEAM_WS_ROWS_AUTO=0"' in src("pair_lib.sh"), "")
+# One pack per GX box. A build and a smoke both load or hammer that box, so both must claim it through
+# the take helper (which reads a foreign claim and waits); writing the file directly would let two jobs
+# believe they own the box, which is what collided on 2026-11-02.
+check("every GX job claims the box through the helper",
+      any("pair_gx_gate_take " in l for l in code_lines(src("pair_build_ext.sh")))
+      and any("pair_gx_gate_take " in l for l in code_lines(src("pair_smoke.sh")))
+      and not any("pair_gx_gate_up " in l
+                  for f in ("pair_build_ext.sh", "pair_smoke.sh") for l in code_lines(src(f)))
+      and "pair_gx_gate_state() {" in src("pair_lib.sh")
+      and "pair_gx_gate_down() {" in src("pair_lib.sh"), "")
+check("the gate test is in the battery",
+      os.path.exists(os.path.join(HERE, "tests", "gx_gate.sh")), "")
 
 
 

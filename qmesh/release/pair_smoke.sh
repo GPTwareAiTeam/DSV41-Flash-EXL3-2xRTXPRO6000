@@ -89,6 +89,17 @@ if [ "$PAIR_DRY" = 1 ]; then
   exit 0
 fi
 
+# The smoke owns the GX box until this gate expires: it loads the pack and measures avail_mib, and an
+# experiment that loads or unloads a pack next to it turns every number below into a measurement of two
+# jobs at once. A foreign claim is waited out (SMOKE_GATE_WAIT_MIN, then the smoke gives up rather than
+# measure on a shared box); ours is self-expiring, so a killed smoke frees the box.
+if ! pair_gx_gate_take "smoke-$PAIR" $(( (SMOKE_SERVER_TIMEOUT + SMOKE_ARM_TIMEOUT + SMOKE_PREFILL_TIMEOUT) / 60 + 15 )) "${SMOKE_GATE_WAIT_MIN:-20}"; then
+  echo "SMOKE_GATE_BUSY $(pair_gx_gate_state)"
+  fail "gx_busy $(pair_gx_gate_state)"
+fi
+trap pair_gx_gate_down EXIT
+echo "SMOKE_GATE owner=smoke-$PAIR until=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$(pair_gx_gate_file)")"
+
 echo "SMOKE_MEM_BEFORE $(gx_mem)"
 pair_step "SMOKE_SERVER_START pair=$PAIR ct=$GXCT build=$BUILD_ID buckets=$SMOKE_BUCKETS timeout=${SMOKE_SERVER_TIMEOUT}s"
 srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT \

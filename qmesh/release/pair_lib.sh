@@ -123,6 +123,49 @@ pair_gxstdin() {
   fi
 }
 
+# ---- GX box gate ---------------------------------------------------------------------------------
+# A GX box carries one cold pack and one server, and two kinds of job want it: a release build (or a
+# release smoke) and an experiment that has the pack loaded. They must not overlap -- a compile next to
+# a loaded pack moves avail_mib by hundreds of MiB, which both OOM-kills builds and blurs a measurement
+# that is about avail_mib. So the box is claimed the way the GPU is: a file, advisory and self-expiring,
+# "<owner> pid=… until=<epoch>". A missing file, or a past `until`, means free, so a crashed job cannot
+# wedge a box, and a reader never has to trust that the writer cleaned up.
+pair_gx_gate_file() {  # -> <queue dir>/gx{N}.gate, N from the GX container name (seam-gx2-dev -> 2)
+  local n=${GXCT#seam-gx}
+  printf '%s\n' "${PAIR_GATE_DIR:-$PAIR_HOME/recipe-artifacts/gpu0-gx1/queue}/gx${n%%-*}.gate"
+}
+pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until is free
+  local f o u; f=$(pair_gx_gate_file)
+  [ -f "$f" ] || { echo free; return 0; }
+  o=$(sed -n 's/^owner=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  u=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  case "${u:-}" in ''|*[!0-9]*) echo "foreign_bad_gate ${o:-?}"; return 0 ;; esac
+  if [ "$u" -lt "$(date +%s)" ]; then echo free; else echo "${o:-?} until=$u"; fi
+}
+pair_gx_gate_up() {  # <label> <minutes>
+  local f; f=$(pair_gx_gate_file)
+  [ "$PAIR_DRY" = 1 ] && return 0
+  mkdir -p "$(dirname "$f")" || return 1
+  printf 'owner=%s pid=%s until=%s\n' "$1" "$$" "$(( $(date +%s) + ${2:-60} * 60 ))" >"$f"
+}
+pair_gx_gate_take() {  # <label> <minutes> <wait_minutes> -> 0 claimed, 1 still someone else's
+  local st waited=0 limit=$(( ${3:-0} * 6 ))
+  while :; do
+    st=$(pair_gx_gate_state)
+    case "$st" in
+      free) pair_gx_gate_up "$1" "$2"; return 0 ;;
+    esac
+    [ "$waited" -lt "$limit" ] || return 1
+    sleep 10; waited=$((waited + 1))
+  done
+}
+pair_gx_gate_down() {  # drop the claim only if the line is still this process's
+  local f; f=$(pair_gx_gate_file)
+  [ "$PAIR_DRY" = 1 ] && return 0
+  [ "$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)" = "$$" ] && rm -f "$f"
+  return 0
+}
+
 # ---- release identity ---------------------------------------------------------------------------
 pair_release_dir() {  # <sha|sha-prefix> -> release dir; a prefix resolves only when it is unambiguous
   local d=$PAIR_ROOT/releases/$1 m
