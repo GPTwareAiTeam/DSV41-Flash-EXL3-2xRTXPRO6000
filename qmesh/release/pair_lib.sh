@@ -337,8 +337,13 @@ pair_current_sha() {  # <root> [remote 1] -> sha the `current` symlink points at
 # mistaken for it; the pair's own P7 container is the only place the client can be.
 pair_server_pidfile() { echo "$PAIR_STATE_DIR/server-$PAIR.pid"; }
 pair_server_record() {  # <build id> -- records the worker this ticket's ensure started
+  # Anchored on the worker's own argv. The launcher is `docker exec -d … bash -lc 'cd … && stdbuf …
+  # python3 -u qmesh/worker_seam_server.py …'`, and *two* processes can carry that string: the
+  # shell/timeout/stdbuf wrapper before it execs, and the worker itself. An unanchored pgrep made
+  # head -1 return the wrapper, so the stop below TERMed a shell and orphaned the process holding the
+  # pack (2026-11-02, pid 3297 wrapper / 3305 worker, 116 GiB left behind).
   local pid
-  pid=$(pair_gxsh "docker exec $GXCT pgrep -f 'python3 -u qmesh/worker_seam_server.py' | head -1" 2>/dev/null)
+  pid=$(pair_gxsh "docker exec $GXCT pgrep -f '^python3 -u qmesh/worker_seam_server.py' | head -1" 2>/dev/null)
   case "${pid:-}" in ''|*[!0-9]*) return 1 ;; esac
   printf 'pair=%s build=%s pid=%s at=%s\n' "$PAIR" "$1" "$pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     > "$(pair_server_pidfile)"
@@ -367,9 +372,11 @@ pair_server_stop() {  # stops the recorded worker if it is still the one that wa
   build=$(sed -n 's/.* build=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   [ -n "$pid" ] || return 0
   live=$(pair_gxsh "docker exec $GXCT sh -c 'tr \"\\0\" \" \" < /proc/$pid/cmdline 2>/dev/null'" 2>/dev/null)
+  # The cmdline has to *be* the worker's, not merely mention the script: a wrapper pid that a
+  # pre-anchoring record could have left in the pidfile must not be TERMed again.
   case "$live" in
-    *worker_seam_server.py*) ;;
-    *) printf 'SERVER_STOP_SKIP pid=%s (gone or not the worker)\n' "$pid"; rm -f "$f"; return 0 ;;
+    python3\ -u\ qmesh/worker_seam_server.py*) ;;
+    *) printf 'SERVER_STOP_SKIP pid=%s (gone or not the worker: %s)\n' "$pid" "$(printf '%s' "${live:0:60}")"; rm -f "$f"; return 0 ;;
   esac
   out=$(pair_gxsh "docker exec $GXCT kill -TERM $pid && echo sent" 2>/dev/null)
   if [ "${out:-}" = sent ]; then

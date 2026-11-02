@@ -275,19 +275,28 @@ def cmd_plan(cfg, quiet=False):
     return rc
 
 
+WORKER_RE = "^python3 -u qmesh/worker_seam_server.py"
+
+
 def stop_our_server(cfg):
-    """Stop only OUR pair's server; never touch another container's processes."""
+    """Stop only OUR pair's server; never touch another container's processes.
+
+    The pattern is anchored on the worker's own argv. The container starts it as
+    `bash -lc 'cd /src/exllamav3 && stdbuf … python3 -u qmesh/worker_seam_server.py …'`, and while
+    the wrapper exists its cmdline mentions the script too — an unanchored match stops the wrapper and
+    leaves the worker holding the pack (2026-11-02: pid 3297 wrapper, 3305 worker).
+    """
     ct = cfg["gxct"]
-    rc, out, _ = docker(cfg, "gx", ["exec", ct, "pgrep", "-c", "worker_seam_server.py"])
+    rc, out, _ = docker(cfg, "gx", ["exec", ct, "pgrep", "-c", WORKER_RE])
     try:
         n = int(out.strip() or 0)
     except ValueError:
         n = 0
     if n:
         print(f"STOP_SERVER {ct} pids={n}")
-        docker(cfg, "gx", ["exec", ct, "pkill", "-TERM", "-f", "worker_seam_server.py"])
+        docker(cfg, "gx", ["exec", ct, "pkill", "-TERM", "-f", WORKER_RE])
         for _ in range(30):
-            rc, out, _ = docker(cfg, "gx", ["exec", ct, "pgrep", "-c", "worker_seam_server.py"])
+            rc, out, _ = docker(cfg, "gx", ["exec", ct, "pgrep", "-c", WORKER_RE])
             if (out.strip() or "0") == "0":
                 break
             subprocess.run(["sleep", "1"])

@@ -292,7 +292,23 @@ check("the smoke reads the worker's own refusal, not the wrapper's rc",
 
 check("a failed smoke stops the server it started",
       "RESTORE_SERVER_STOP" in src("pair_update_run.sh")
-      and "pkill -f worker_seam_server.py" in src("pair_update_run.sh"), "")
+      and "'^python3 -u qmesh/worker_seam_server.py'" in src("pair_update_run.sh"), "")
+
+# 2026-11-02: the worker is launched as `bash -lc 'cd /src/exllamav3 && stdbuf … python3 -u
+# qmesh/worker_seam_server.py …'`, so while the wrapper lives its cmdline mentions the script and an
+# unanchored pgrep/pkill reaches it first. Recording that pid and TERMing it stops a shell and orphans
+# the process holding 116 GiB of pack. Every site that records or stops a server must anchor on the
+# worker's own argv; the counts that only ask "is anything serving" may over-match.
+_stops = []
+for _n in ("pair_lib.sh", "pair_containers.py", "pair_update_run.sh", "seam_server_ensure.sh",
+           "pair_smoke.sh", "pair_build_ext.sh"):
+    for _l in src(_n).splitlines():
+        if "worker_seam_server" in _l and "pkill" in _l and "^python3" not in _l:
+            _stops.append(_n)
+        if "pair_server_record" in _l and "pgrep" in _l and "^python3" not in _l:
+            _stops.append(_n)
+check("a server stop or record is anchored on the worker's argv, never the launcher's",
+      not _stops, ",".join(sorted(set(_stops))))
 
 # A released tree carries no .git and its container carries no SEAM_BUILD_ID, so qes.build_id()
 # answered "unknown" and the session handshake accepted a mixed pair on proto alone (2026-11-01).

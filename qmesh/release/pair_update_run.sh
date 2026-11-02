@@ -189,7 +189,9 @@ restore() {  # only on explicit failure, never from a trap
     # started a server from the release under test; leaving it loaded holds the pack (116 GiB) and
     # blocks the next attempt exactly like a leak would. On success the server stays up: there it is
     # the update's own result, not leftover state.
-    if pair_gxsh "docker exec $GXCT pkill -f worker_seam_server.py" >/dev/null 2>&1; then
+    # Anchored: the launcher's shell carries the script name in its cmdline, and stopping the shell
+    # leaves the worker holding the pack -- the leak this line exists to prevent.
+    if pair_gxsh "docker exec $GXCT pkill -f '^python3 -u qmesh/worker_seam_server.py'" >/dev/null 2>&1; then
       pair_step "RESTORE_SERVER_STOP pair=$PAIR (the failed smoke's server stopped; none was serving before)"
     else
       pair_step "RESTORE_SERVER_SKIP pair=$PAIR (no server was serving before this update)"

@@ -389,7 +389,9 @@ seam_server_ensure() {
     fi
   fi
   [ "$fresh" = 1 ] && echo "SEAM_ENSURE state=restarting (--fresh)"
-  seam_gxct "pkill -f worker_seam_server.py" >/dev/null 2>&1
+  # Anchored, like seam_pids: the launcher's shell carries the script name in its cmdline until it
+  # execs, and an unanchored stop TERMed the shell and left the worker holding the pack.
+  seam_gxct "pkill -f '^python3 -u qmesh/worker_seam_server.py'" >/dev/null 2>&1
   sleep 3
   if [ "$(seam_pids)" -ge 1 ]; then
     echo "SEAM_ENSURE state=error old server still alive" >&2; return 2
@@ -478,11 +480,12 @@ seam_server_ensure() {
 }
 
 seam_server_stop() {
-  seam_gxct "pkill -f worker_seam_server.py" >/dev/null 2>&1
+  # Same anchoring as above: stop the worker, not the shell that spawned it.
+  seam_gxct "pkill -f '^python3 -u qmesh/worker_seam_server.py'" >/dev/null 2>&1
   local i
   for i in $(seq 1 30); do [ "$(seam_pids)" = "0" ] && break; sleep 1; done
   if [ "$(seam_pids)" != "0" ]; then
-    seam_gxct "pkill -9 -f worker_seam_server.py" >/dev/null 2>&1; sleep 2
+    seam_gxct "pkill -9 -f '^python3 -u qmesh/worker_seam_server.py'" >/dev/null 2>&1; sleep 2
   fi
   # The log outlives the process, so a dead server's READY line would make seam_ready (and every
   # caller that trusts it without checking the pid) believe the cold experts are still up.
