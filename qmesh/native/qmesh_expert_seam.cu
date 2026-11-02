@@ -48,6 +48,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -68,7 +69,28 @@ namespace {
  * one slot (protocol v3 layout). */
 constexpr int ROWS_MAX = 8192;
 constexpr size_t LINE = 64;
-constexpr uint64_t WAIT_TIMEOUT_NS = 30ull * 1000 * 1000 * 1000;
+/* How long a response may be outstanding before the slot is declared dead. 30 s is the right
+ * default for a healthy seam, but a GX that is genuinely working - a first call that has to page a
+ * cold layer in, a restack that runs inside the request - blows through it, and the client then calls
+ * a live server "the seam transport is dead" and abandons the run. SEAM_ACK_TIMEOUT_S raises it for
+ * such a run without changing what a hung transport looks like. */
+uint64_t env_ack_timeout_ns() {
+  const char* v = getenv("SEAM_ACK_TIMEOUT_S");
+  if (!v || !*v) return 30ull * 1000 * 1000 * 1000;
+  errno = 0;
+  char* end = nullptr;
+  unsigned long long s = strtoull(v, &end, 10);
+  if (errno || end == v || (*end && *end != ' ') || s < 1 || s > 3600) {
+    fprintf(stderr, "qes: SEAM_ACK_TIMEOUT_S=%s ignored (want whole seconds, 1..3600)\n", v);
+    return 30ull * 1000 * 1000 * 1000;
+  }
+  return (uint64_t)s * 1000ull * 1000ull * 1000ull;
+}
+const uint64_t WAIT_TIMEOUT_NS = env_ack_timeout_ns();
+/* How long a re-issue may wait for the server to acknowledge the slot's previous request before
+ * the transport is declared stuck. The wait only happens when the caller has more requests in
+ * flight than there are slots. */
+constexpr uint64_t SLOT_ACK_TIMEOUT_NS = 30ull * 1000 * 1000 * 1000;
 
 /* Control channel: negotiation hello/reply and the data-handshake guard words. */
 constexpr uint32_t CTL_MAGIC = 0x32534551u;        /* "QES2" */
@@ -190,9 +212,25 @@ Geometry geometry(int rows, int slots) {
 struct SlotHdr {
   uint32_t magic; /* SLOT_MAGIC */
   uint32_t layer; /* QES_NL range */
-  uint32_t rows;  /* must equal the bucket the handle was opened with */
-  uint32_t pad;
-  uint64_t pad2[6]; /* keep the header one 64 B line */
+  uint32_t rows;  /* rows this request really carries: 1..the bucket the handle was opened with.
+                     The bucket sizes the slab, the wire geometry and the RDMA transfer; the compute
+                     follows this field, so a 2560-row prefill chunk served by a 4096-row handle is a
+                     2560-row compute on the GX and a 2560-row response. */
+  uint32_t n_cold; /* client: cold experts the ids were clamped to, 0 = not supplied. The server
+                      ignores it; the client's proxy checks the payload against it before sending
+                      (see client_proxy), so an out-of-range id never reaches QES_ROLE_SERVER's
+                      placement check as an unexplained fail-stop. */
+  /* The seq this header was written for, i.e. the value publish_kernel will put in F_REQ. The
+   * header is a host write and its payload copies are GPU work, so a slot that the client started
+   * to reuse before the proxy had posted the previous request carried a *new* header over the old
+   * payload: the proxy then checked the old ids against the new layer's cold set and refused a
+   * request the caller never sent (2026-11-01, "id 268 past a cold count of 254"). Both proxies now
+   * require this word to equal the seq they are handling, which turns that mix into a named
+   * failure instead of a wrong answer. publish_kernel rewrites it on the device to the value it
+   * puts in F_REQ, so a captured graph replays with a matching seq instead of the capture-time one
+   * (a replayed layer publishes F_REQ = 2, 3, ... while its baked header would still say 1). */
+  uint64_t seq;
+  uint64_t pad2[5]; /* keep the header one 64 B line */
 };
 
 /* Data handshake, exchanged on a data port once per (session, bucket). */
@@ -367,9 +405,16 @@ int tcp_connect_wait(const char* ip, int port, int timeout_ms, const char** why)
 /* ---- device kernels ---- */
 
 /* Bump the request seq. Single writer, GPU side. release.sys orders it after the
- * request copies for the CPU proxy. */
-__global__ void publish_kernel(uint64_t* seq) {
+ * request copies for the CPU proxy.
+ *
+ * The header's seq field is written first, from the same value: a captured graph replays this kernel
+ * but not the host code that filled the header, so a baked header would keep the capture-time seq
+ * while F_REQ climbs on every replay and both proxies would refuse a correct request. `hdr_seq`
+ * points at SlotHdr::seq in the slot's header line; the release store to F_REQ below is the doorbell,
+ * so the field is visible to the proxy before it reads the payload. */
+__global__ void publish_kernel(uint64_t* seq, uint64_t* hdr_seq) {
   uint64_t v = *seq + 1;
+  asm volatile("st.release.sys.u64 [%0], %1;" :: "l"(hdr_seq), "l"(v) : "memory");
   asm volatile("st.release.sys.u64 [%0], %1;" :: "l"(seq), "l"(v) : "memory");
 }
 
@@ -385,7 +430,7 @@ __global__ void publish_kernel(uint64_t* seq) {
  * "no response ... within 30 s". A dead seam must hand the caller NaN (isfinite() false), never
  * plausible rows. */
 __global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, uint32_t* fail,
-                            float* resp, int n_floats) {
+                            float* resp, int n_floats, uint64_t timeout_ns) {
   uint64_t want = *req_seq;
   uint64_t t0, now;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
@@ -394,7 +439,7 @@ __global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, u
     asm volatile("ld.acquire.sys.u64 %0, [%1];" : "=l"(got) : "l"(resp_seq) : "memory");
     if (got >= want) return;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-    if (now - t0 > WAIT_TIMEOUT_NS) {
+    if (now - t0 > timeout_ns) {
       asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(fail), "r"(1u) : "memory");
       const float nan = __int_as_float(0x7fc00000);
       for (int i = threadIdx.x; i < n_floats; i += blockDim.x) resp[i] = nan;
@@ -414,6 +459,10 @@ struct qes_handle {
   ibv_mr* mr = nullptr;
   ibv_port_attr port_attr{};
   uint8_t* slab = nullptr; /* pinned, mapped host */
+  /* One pinned header line per layer (QES_NL lines). qes_issue copies the header into the slot from
+   * here instead of writing it, so a captured graph's replay carries the header of the layer it is
+   * replaying rather than the last layer that wrote that slot on the host. */
+  uint8_t* hdr_stage = nullptr;
   int slots = 1;           /* payload slots in this slab (in-flight requests per handle) */
   size_t slab_bytes = 0, stride = 0, req_len = 0, resp_len = 0, resp_off = 0;
   size_t ids_off = 0, w_off = 0;
@@ -427,12 +476,23 @@ struct qes_handle {
   std::atomic<uint64_t> calls{0};
   std::thread proxy;
   uint64_t handled[QES_MAX_SLOTS] = {}; /* proxy-owned: last seq forwarded/answered per slot */
+  /* Client-owned: the seq this client last wrote into each slot. The reuse rule used the GPU-written
+   * F_REQ, which reads 0 until publish_kernel has actually executed, so a slot could look unused
+   * while its first request was still queued and be overwritten before the proxy ever forwarded it.
+   * This counter is advanced by the issuing thread and is therefore never behind the bytes. */
+  uint64_t issued[QES_MAX_SLOTS] = {};
   /* Client side: requests in flight, oldest first. One layer may have several (a prefill chunk
    * split into micro-batches), so collect() pairs with the oldest request of that layer. */
   struct Pending {
     int layer = -1, slot = -1;
   } pending[QES_MAX_SLOTS];
   int n_pending = 0, next_slot = 0;
+  /* QES_DUMP_IDS: pinned mirror of the ids argument of the request being issued. The proxy dumps
+   * the slab bytes it forwards; this is the same copy taken straight from the caller's tensor, so
+   * a dump line that already shows an out-of-range id separates a client value bug (the tensor
+   * was wrong, or the allocator had recycled it while the copy was still queued) from a transport
+   * bug (the copy landed, the wire did not carry it). */
+  int32_t* dump_src = nullptr;
   qes_server_fn server_fn = nullptr; /* optional compute hook (server role) */
   void* server_ctx = nullptr;
   struct qes_client_session* owner = nullptr; /* client handles are unlinked on destroy */
@@ -577,8 +637,18 @@ bool post_payload(qes_handle* h, size_t off, uint32_t len) {
             role_name(h->role), h->tcp_port, h->rows, off, len,
             (unsigned long long)(h->remote_base + off), h->remote_rkey, h->slab_bytes);
   ibv_send_wr* bad = nullptr;
-  if (ibv_post_send(h->qp, &wr, &bad)) {
-    set_err("ibv_post_send payload failed (port=%d rows=%d)", h->tcp_port, h->rows);
+  const int rc = ibv_post_send(h->qp, &wr, &bad);
+  if (rc) {
+    /* The errno is the diagnosis: ENOMEM is a full SQ (the proxy posted more than the queue
+     * drains), EINVAL an sge the driver refused (lkey or addr+len outside the registered slab),
+     * and ENOTSUP an opcode the QP was not built for. Name the sge too, so a log says which. */
+    fprintf(stderr,
+            "qes: ibv_post_send payload failed (port=%d rows=%d off=%zu len=%u slab=%zu): %s "
+            "(%d)\n",
+            h->tcp_port, h->rows, off, len, h->slab_bytes, strerror(rc), rc);
+    fflush(stderr);
+    set_err("ibv_post_send payload failed (port=%d rows=%d off=%zu len=%u slab=%zu): %s",
+            h->tcp_port, h->rows, off, len, h->slab_bytes, strerror(rc));
     return false;
   }
   return true;
@@ -604,18 +674,25 @@ bool post_flag(qes_handle* h, size_t remote_off, uint64_t seq) {
             role_name(h->role), h->tcp_port, h->rows, remote_off, (unsigned long long)seq,
             (unsigned long long)(h->remote_base + remote_off), h->remote_rkey, h->slab_bytes);
   ibv_send_wr* bad = nullptr;
-  if (ibv_post_send(h->qp, &wr, &bad)) {
-    set_err("ibv_post_send flag failed (port=%d rows=%d)", h->tcp_port, h->rows);
+  const int rc = ibv_post_send(h->qp, &wr, &bad);
+  if (rc) {
+    fprintf(stderr, "qes: ibv_post_send flag failed (port=%d rows=%d off=%zu seq=%llu): %s (%d)\n",
+            h->tcp_port, h->rows, remote_off, (unsigned long long)seq, strerror(rc), rc);
+    fflush(stderr);
+    set_err("ibv_post_send flag failed (port=%d rows=%d off=%zu seq=%llu): %s", h->tcp_port,
+            h->rows, remote_off, (unsigned long long)seq, strerror(rc));
     return false;
   }
   return true;
 }
 
-void server_compute(qes_handle* h, int slot, int L) {
+/* The no-hook server path (stub benches): out[r][j] = float(x[r][j]) + (layer + 1) over the request's
+ * own `rows` rows, not the bucket's. */
+void server_compute(qes_handle* h, int slot, int L, int rows) {
   const float add = (float)(L + 1);
   const uint16_t* x = (const uint16_t*)(h->slab + off_req(h, slot));
   float* out = (float*)(h->slab + off_resp(h, slot));
-  const int n = h->rows * QES_HIDDEN;
+  const int n = rows * QES_HIDDEN;
   for (int i = 0; i < n; i++) {
     uint32_t bits = (uint32_t)x[i] << 16;
     float f;
@@ -630,8 +707,178 @@ void server_compute(qes_handle* h, int slot, int L) {
             (unsigned long long)(h->remote_base + off_resp(h, slot)));
 }
 
+/* QES_DUMP_IDS only: the tuples this client has already forwarded. A refusal that matches a tuple
+ * forwarded earlier for the same slot is a stale payload (the proxy read the slot before, or
+ * instead of, this request's copy); a refusal that matches nothing is a value only the current
+ * request could have produced, i.e. the caller's. Small calls only, and the callers gate the whole
+ * thing on the dump, so the compute path never touches it. */
+struct WirePast {
+  uint32_t layer, slot;
+  uint64_t seq;
+  int n;
+  int32_t ids[QES_TOPK * 2];
+};
+constexpr int WIRE_PAST = 16;
+WirePast g_wire_past[WIRE_PAST];
+int g_wire_past_n = 0;
+
+void wire_past_record(qes_handle* h, int slot, uint64_t seq, const int32_t* ids, int n) {
+  if (n > QES_TOPK * 2) return;
+  WirePast& p = g_wire_past[g_wire_past_n++ % WIRE_PAST];
+  const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, slot));
+  p.layer = hdr->layer;
+  p.slot = (uint32_t)slot;
+  p.seq = seq;
+  p.n = n;
+  memcpy(p.ids, ids, (size_t)n * sizeof(int32_t));
+}
+
+/* Newest forwarded tuple for this slot other than `skip_seq`, or nullptr. `skip` walks past that
+ * many hits. The request being checked is already in the ring when the check runs (dump_wire_ids
+ * records it first), so without `skip_seq` every refusal matched itself n/n and reported
+ * STALE_PAYLOAD. */
+const WirePast* wire_past_find(int slot, int skip, uint64_t skip_seq) {
+  for (int r = 0; r < g_wire_past_n && r < WIRE_PAST; r++) {
+    const WirePast& p = g_wire_past[(g_wire_past_n - 1 - r) % WIRE_PAST];
+    if ((int)p.slot != slot) continue;
+    if (p.seq == skip_seq) continue;
+    if (skip-- > 0) continue;
+    return &p;
+  }
+  return nullptr;
+}
+
+/* QES_DUMP_IDS=1: print the bytes this proxy is about to forward, per request, for calls small
+ * enough that the values are readable. The proxy is the last point where the wire payload exists
+ * as the client's own memory, and it costs a host read of memory it already owns, so this can run
+ * on a live client without changing anything it measures. It exists because the worker's audit
+ * (SEAM_IDS) can only say what arrived: pairing the two shows whether an id that the worker
+ * rejects was sent by the client or mangled on the way, which is the difference between a client
+ * value bug and a transport bug. */
+bool dump_ids() {
+  static const bool on = std::getenv("QES_DUMP_IDS") && atoi(std::getenv("QES_DUMP_IDS")) != 0;
+  return on;
+}
+
+void dump_wire_ids(qes_handle* h, int slot, uint64_t seq) {
+  if (!dump_ids() || h->rows > 8) return;
+  const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, slot));
+  const int32_t* ids = (const int32_t*)(h->slab + off_req(h, slot) + h->ids_off);
+  const int n = h->rows * QES_TOPK;
+  const uint16_t* w = (const uint16_t*)(h->slab + off_req(h, slot) + h->w_off);
+  const uint16_t* x = (const uint16_t*)(h->slab + off_req(h, slot));
+  auto bf16f = [](uint16_t v) {
+    uint32_t u = (uint32_t)v << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+  };
+  fprintf(stderr,
+          "SEAM_WIRE_IDS port=%d rows=%u slot=%d seq=%llu layer=%u hdr_rows=%u n_cold=%u n=%d "
+          "ids=[",
+          h->tcp_port, h->rows, slot, (unsigned long long)seq, hdr->layer, hdr->rows,
+          hdr->n_cold, n);
+  for (int i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", ids[i]);
+  fprintf(stderr, "] w=[");
+  for (int i = 0; i < n; i++) fprintf(stderr, "%s%.6g", i ? " " : "", bf16f(w[i]));
+  fprintf(stderr, "] x0=%.6g x1=%.6g", bf16f(x[0]), bf16f(x[1 % QES_HIDDEN]));
+  /* The same ids taken from the caller's tensor at issue time (qes_issue): equal to the slab ids
+   * above means the bytes the proxy forwards are the bytes the caller handed over. The weights and
+   * the first hidden values ride in the same payload, so they say whether the request as a whole is
+   * the router's output for this layer or a pad/stale slot (weight 0 where a pick should be). */
+  if (h->dump_src) {
+    const int32_t* src = h->dump_src + (size_t)slot * n;
+    fprintf(stderr, " src=[");
+    for (int i = 0; i < n; i++) fprintf(stderr, "%s%d", i ? " " : "", src[i]);
+    fprintf(stderr, "]");
+  }
+  /* What this slot carried the last time it was forwarded. A refusal whose ids equal this tuple
+   * is the transport re-reading an old payload; one that differs is the caller's own value. */
+  const WirePast* prev = wire_past_find(slot, 0, seq);
+  if (prev) {
+    fprintf(stderr, " prev=[layer=%u seq=%llu ids=", prev->layer, (unsigned long long)prev->seq);
+    for (int i = 0; i < prev->n; i++) fprintf(stderr, "%s%d", i ? " " : "", prev->ids[i]);
+    fprintf(stderr, "]");
+  }
+  wire_past_record(h, slot, seq, ids, n);
+  fprintf(stderr, "\n");
+  fflush(stderr);
+}
+
 /* Client proxy: forwards every new request seq in any slot. The slot's header (layer, rows) is
  * part of the payload, so the proxy posts the header and the payload in one WRITE. */
+/* The last point before an id leaves this process: the bytes the NIC is about to send, read on the
+ * proxy thread once the GPU's release publish has made them visible. A check on the issue path would
+ * have to sync the stream, and a sync hides the failure it is looking for (2026-11-01: the failing
+ * runs stop reproducing as soon as anything reads the ids back there), so it lives here where the
+ * compute path pays nothing.
+ * QES_ROLE_SERVER checks the same thing against its own placement and aborts the *process* on a
+ * mismatch, which costs a full cold-pack reload (~150 s). Catching it on the sending side keeps the
+ * server alive and names the request that would have killed it. */
+bool client_check_ids(qes_handle* h, int slot, uint64_t seq) {
+  const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, slot));
+  const int32_t n_cold = (int32_t)hdr->n_cold;
+  if (n_cold <= 0) return true; /* the caller supplied no bound: nothing to check against */
+  const int32_t* ids = (const int32_t*)(h->slab + off_req(h, slot) + h->ids_off);
+  /* Only the rows this request carries are checked. The slot is laid out for the bucket, so when
+   * rows < bucket the tail still holds the previous request's ids - real bytes from another
+   * request, which can be outside this layer's cold set for reasons that have nothing to do with
+   * the caller (measured 2026-11-01: three stale picks at bucket 6 killed a decode handle after
+   * 120 good requests, once the request carried its own 2-5 rows instead of padding to the
+   * bucket). Scanning h->rows is what the padded protocol could do; it is wrong the moment a
+   * partial request exists. */
+  const int n = (int)hdr->rows * QES_TOPK;
+  int bad = 0, first_at = -1, first_id = 0;
+  for (int k = 0; k < n; k++) {
+    if (ids[k] >= -1 && ids[k] < n_cold) continue;
+    if (!bad++) {
+      first_at = k;
+      first_id = ids[k];
+    }
+  }
+  if (!bad) return true;
+  fprintf(stderr,
+          "qes: NOT SENT: client ids out of range on rows=%u bucket=%u port=%d layer=%u slot=%d "
+          "seq=%llu handled=%llu fresp=%llu: %d of %d pick(s) outside [-1,%d), first at %d: %d. The "
+          "caller handed the seam an id its own cold set cannot hold, so the server's placement "
+          "for this layer would index out of range; the request is dropped and this handle is "
+          "taken down instead of the server.\n",
+          hdr->rows, h->rows, h->tcp_port, hdr->layer, slot, (unsigned long long)seq,
+          (unsigned long long)h->handled[slot],
+          (unsigned long long)load_acq(h->slab, off_fresp(h, slot)), bad, n, n_cold, first_at,
+          first_id);
+  if (dump_ids()) {
+    /* Same bytes as a tuple this slot already forwarded -> the payload is stale, not the caller's
+     * value; nothing matches -> the caller produced it and the id space (first/n_cold) is the
+     * suspect. Prints the two closest candidates for a partial match. */
+    for (int skip = 0; skip < 2; skip++) {
+      const WirePast* p = wire_past_find(slot, skip, seq);
+      if (!p) break;
+      int same = 0;
+      for (int i = 0; i < n && i < p->n; i++) same += ids[i] == p->ids[i];
+      fprintf(stderr,
+              "qes: id history slot=%d prev_layer=%u prev_seq=%llu matched=%d/%d ids=[", slot,
+              p->layer, (unsigned long long)p->seq, same, n);
+      for (int i = 0; i < p->n; i++) fprintf(stderr, "%s%d", i ? " " : "", p->ids[i]);
+      fprintf(stderr, "]%s\n", same == n ? " STALE_PAYLOAD" : "");
+    }
+    fflush(stderr);
+  }
+  /* A dropped request must not be mistaken for a computed one, and the caller copies the response
+   * as soon as the ack lands: poison the response and raise the fail word *before* releasing the
+   * ack, or the GPU thread races the NaN loop and hands the caller the slot's stale (zero) bytes.
+   * The handle is dead either way, so the next seam call raises through seam_dead_check. */
+  float* resp = (float*)(h->slab + off_resp(h, slot));
+  for (size_t k = 0; k < h->resp_len / sizeof(float); k++) resp[k] = __builtin_nanf("");
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n((uint32_t*)(h->slab + off_fail(h, slot)), 2u, __ATOMIC_RELEASE);
+  __atomic_store_n((uint64_t*)(h->slab + off_fresp(h, slot)), load_acq(h->slab, off_freq(h, slot)),
+                   __ATOMIC_RELEASE);
+  h->dead.store(true);
+  h->running.store(false);
+  return false;
+}
+
 /* A response that never came leaves the GPU waiter with no escape hatch, so wait_kernel raises the
  * slot's fail word instead of trapping. Pick it up here, print it once, and take the handle down
  * the same way a CQ error does: the session fails with a Python exception, not a sticky CUDA error. */
@@ -655,8 +902,61 @@ void client_proxy(qes_handle* h) {
     for (int i = 0; i < h->slots; i++) {
       uint64_t r = load_acq(h->slab, off_freq(h, i));
       if (r > h->handled[i]) {
-        if (!post_payload(h, off_hdr(h, i), (uint32_t)(LINE + h->req_len))) return;
-        if (!post_flag(h, off_freq(h, i), r)) return;
+        /* The flag says "seq r is ready", the header says which layer/rows/n_cold that seq is. They
+         * are written by different engines (GPU kernel, caller's thread), so a slot that was reused
+         * under a request that had not been forwarded yet shows one request's ids next to another's
+         * layer. That is the only way a caller's own translate can look wrong here, and forwarding
+         * it would compute one layer with another's cold ids: drop it and name the mix. */
+        const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, i));
+        /* rows is the request's real row count, bounded by the handle's bucket: it is not an equality
+         * test any more (see SlotHdr::rows), but a header that claims more rows than the slab was
+         * opened for, or none at all, is still a header from another world. */
+        if (hdr->magic != SLOT_MAGIC || hdr->rows == 0 || hdr->rows > (uint32_t)h->rows ||
+            hdr->seq != r) {
+          fprintf(stderr,
+                  "qes: NOT SENT: slot %d on rows=%u port=%d announced seq=%llu but its header says "
+                  "magic=0x%08x layer=%u rows=%u seq=%llu n_cold=%u: header and payload in that slot "
+                  "come from different requests, so the ids would be checked against another layer's "
+                  "cold set. The request is dropped and this handle is taken down instead of the "
+                  "server.\n",
+                  i, h->rows, h->tcp_port, (unsigned long long)r, hdr->magic, hdr->layer, hdr->rows,
+                  (unsigned long long)hdr->seq, hdr->n_cold);
+          fflush(stderr);
+          float* resp = (float*)(h->slab + off_resp(h, i));
+          for (size_t k = 0; k < h->resp_len / sizeof(float); k++) resp[k] = __builtin_nanf("");
+          __atomic_thread_fence(__ATOMIC_RELEASE);
+          __atomic_store_n((uint32_t*)(h->slab + off_fail(h, i)), 3u, __ATOMIC_RELEASE);
+          __atomic_store_n((uint64_t*)(h->slab + off_fresp(h, i)), r, __ATOMIC_RELEASE);
+          h->dead.store(true);
+          h->running.store(false);
+          return;
+        }
+        dump_wire_ids(h, i, r);
+        if (!client_check_ids(h, i, r)) return;
+        /* Only the request's own rows go on the wire. The slot is laid out for the bucket, so x, ids
+         * and w sit at bucket offsets and cannot be one WR for a partial request: the header and the
+         * x prefix are contiguous, ids and w are posted separately. Same QP, same thread, and the
+         * flag below is posted after them, so the peer sees the rows before it sees the seq (RC
+         * completes in order), exactly as with the single bucket-sized WR this replaces. */
+        const uint32_t rows = hdr->rows;
+        const bool sent =
+            post_payload(h, off_hdr(h, i), (uint32_t)(LINE + (size_t)rows * QES_HIDDEN * 2)) &&
+            post_payload(h, off_req(h, i) + h->ids_off, rows * QES_TOPK * 4) &&
+            post_payload(h, off_req(h, i) + h->w_off, rows * QES_TOPK * 2) &&
+            post_flag(h, off_freq(h, i), r);
+        if (!sent) {
+          /* A WR the verbs layer rejects (SQ full, lkey or length outside this handle's registered
+           * slab) leaves the request unsent and unretried, so this slot would spin its fail word
+           * for WAIT_TIMEOUT_NS and every later issue would wait SLOT_ACK_TIMEOUT_NS for an ack
+           * that can never come. Fail the handle here, like a CQ error: the next qes_issue or
+           * qes_collect raises instead of stalling the GPU behind an ack gate. */
+          h->dead.store(true);
+          h->running.store(false);
+          return;
+        }
+        /* Forwarded exactly once: `handled` is the last seq this proxy put on the wire, so the
+         * next iteration cannot post the same slot again. Re-posting it until the SQ fills is how
+         * one lost request became "ibv_post_send payload failed" on prod, measured 2026-11-01. */
         h->handled[i] = r;
         h->calls.fetch_add(1, std::memory_order_relaxed);
       }
@@ -674,11 +974,16 @@ void server_proxy(qes_handle* h) {
       uint64_t r = load_acq(h->slab, off_freq(h, i));
       if (r <= h->handled[i]) continue;
       const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, i));
-      if (hdr->magic != SLOT_MAGIC || hdr->rows != (uint32_t)h->rows ||
-          hdr->layer >= (uint32_t)QES_NL) {
+      /* rows is the request's own row count (SlotHdr::rows): the bucket bounds it, and everything
+       * below - the module call, the response - is sized by it, so the padding a big bucket leaves at
+       * the end of a prefill chunk costs the GX nothing. */
+      if (hdr->magic != SLOT_MAGIC || hdr->rows == 0 || hdr->rows > (uint32_t)h->rows ||
+          hdr->layer >= (uint32_t)QES_NL || hdr->seq != r) {
         fprintf(stderr,
-                "qes: bad request header slot=%d magic=0x%08x layer=%u rows=%u want_rows=%d\n", i,
-                hdr->magic, hdr->layer, hdr->rows, h->rows);
+                "qes: bad request header slot=%d magic=0x%08x layer=%u rows=%u want_rows=%d "
+                "seq=%llu want_seq=%llu\n",
+                i, hdr->magic, hdr->layer, hdr->rows, h->rows, (unsigned long long)hdr->seq,
+                (unsigned long long)r);
         fflush(stderr);
         h->dead.store(true);
         h->running.store(false);
@@ -686,11 +991,12 @@ void server_proxy(qes_handle* h) {
       }
       const int L = (int)hdr->layer;
       const uint8_t* req = h->slab + off_req(h, i);
+      const int rows = (int)hdr->rows;
       if (h->server_fn) {
-        h->server_fn(h->server_ctx, L, h->rows, req, (const int32_t*)(req + h->ids_off),
+        h->server_fn(h->server_ctx, L, rows, req, (const int32_t*)(req + h->ids_off),
                      req + h->w_off, (float*)(h->slab + off_resp(h, i)));
       } else {
-        server_compute(h, i, L);
+        server_compute(h, i, L, rows);
       }
       if (qes_trace())
         fprintf(stderr,
@@ -698,8 +1004,17 @@ void server_proxy(qes_handle* h) {
                 "off_resp=%zu req_len=%zu resp_len=%zu slab=%zu\n",
                 h->tcp_port, h->rows, L, i, (unsigned long long)r, off_req(h, i), off_resp(h, i),
                 h->req_len, h->resp_len, h->slab_bytes);
-      if (!post_payload(h, off_resp(h, i), (uint32_t)h->resp_len)) return;
-      if (!post_flag(h, off_fresp(h, i), r)) return;
+      /* Only the answered rows travel back: the client's collect copies the same count, so the
+       * bucket's tail in either slab is never read (see qes_collect). */
+      if (!post_payload(h, off_resp(h, i), (uint32_t)((size_t)rows * QES_HIDDEN * 4)) ||
+          !post_flag(h, off_fresp(h, i), r)) {
+        /* One client's slot could not be answered: take this handle down so the session thread
+         * ends it (SEAM_SESSION_END reason=qp-error) and the server goes back to accepting the
+         * next client, instead of leaving a proxy that will never answer again. */
+        h->dead.store(true);
+        h->running.store(false);
+        return;
+      }
       h->handled[i] = r;
       h->calls.fetch_add(1, std::memory_order_relaxed);
     }
@@ -880,6 +1195,14 @@ void stop_handle(qes_handle* h) {
   if (h->owns_slab && h->slab) {
     cudaFreeHost(h->slab);
     h->slab = nullptr;
+  }
+  if (h->hdr_stage) {
+    cudaFreeHost(h->hdr_stage);
+    h->hdr_stage = nullptr;
+  }
+  if (h->dump_src) {
+    cudaFreeHost(h->dump_src);
+    h->dump_src = nullptr;
   }
   if (h->owns_pd && h->pd) {
     ibv_dealloc_pd(h->pd);
@@ -1063,6 +1386,21 @@ extern "C" qes_handle* qes_client_handle(qes_client_session* s, const char* dev_
     return nullptr;
   }
   memset(h->slab, 0, h->slab_bytes);
+  if (cudaHostAlloc(&h->hdr_stage, (size_t)QES_NL * sizeof(SlotHdr),
+                    cudaHostAllocPortable) != cudaSuccess) {
+    set_err("qes_client_handle: cudaHostAlloc %zu bytes for the header stage failed",
+            (size_t)QES_NL * sizeof(SlotHdr));
+    stop_handle(h);
+    return nullptr;
+  }
+  memset(h->hdr_stage, 0, (size_t)QES_NL * sizeof(SlotHdr));
+  if (dump_ids() && h->rows <= 8) {
+    /* Small pinned mirror, one slice per slot, so the dump can show the ids argument itself next
+     * to the slab bytes the proxy forwards (see qes_handle::dump_src). */
+    if (cudaHostAlloc(&h->dump_src, (size_t)h->slots * h->rows * QES_TOPK * 4,
+                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess)
+      h->dump_src = nullptr;
+  }
 
   int n = 0;
   ibv_device** list = ibv_get_device_list(&n);
@@ -1366,6 +1704,17 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   const uint32_t my_psn = (uint32_t)(lrand48() & 0xffffff);
   Hello mine = make_hello(h, ss->id, my_psn);
   Hello peer{};
+  /* A rejected or unreadable hello closes the connection, so say why before we do. A bare close
+   * leaves the peer in recv() until its own timeout, and that is how an unexpected client's knock
+   * showed up as "data handshake failed: Resource temporarily unavailable" instead of as the real
+   * difference: our hello carries our session id, rows, slots and port, so the peer's check_hello
+   * turns the mismatch into one line ("peer session mismatch sid=... peer_sid=..."). Best effort -
+   * the knocker may already be gone, and sending 96 bytes into a socket nobody reads cannot block
+   * (the fd also carries SO_SNDTIMEO = DATA_HELLO_TIMEOUT_S). */
+  auto say_goodbye = [&]() {
+    const char* ignored = "";
+    xfer(fd, &mine, sizeof(mine), true, &ignored);
+  };
   /* Order matters here: read the client's hello, reach RTR+RTS, and only then answer with ours.
    * The client posts its first payload write as soon as our hello arrives and its own RTR+RTS is
    * done, so our QP must already be past INIT at that moment. A request that reaches a QP still in
@@ -1377,6 +1726,7 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   if (!ok) {
     set_err_quiet("seam session %u: data handshake on port %d (rows=%d) failed: %s", ss->id, port,
                   ep.rows, why);
+    say_goodbye();
     close(fd);
     stop_handle(h);
     if (stale) *stale = true;
@@ -1386,6 +1736,7 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   if (!check_hello(peer, ep.rows, s->slots, port, ss->id, why2, sizeof(why2))) {
     set_err_quiet("seam session %u from %s: rejected data connection on port %d: %s", ss->id,
                   ss->ip, port, why2);
+    say_goodbye();
     close(fd);
     stop_handle(h);
     if (stale) *stale = true;
@@ -1393,6 +1744,7 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   }
   if (!qp_connect(h, peer, my_psn, &why)) {
     set_err("seam session %u: %s (port=%d rows=%d)", ss->id, why, port, ep.rows);
+    say_goodbye();
     close(fd);
     stop_handle(h);
     return nullptr;
@@ -2035,8 +2387,12 @@ int seam_dead_check(qes_handle* h, const char* what) {
   return -5;
 }
 
+/* rows_used: how many of the bucket's rows this request carries, or <= 0 for the whole bucket. The
+ * bucket sizes the slab, the RDMA regions and every offset; the copies here, the compute on the
+ * peer and the response follow rows_used (see SlotHdr::rows). A prefill chunk that the grant puts
+ * in a 4096-row bucket while it only has 2560 rows therefore costs 2560 rows of wire and compute. */
 extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int32_t* ids,
-                         const void* w_bf16, cudaStream_t stream) {
+                         const void* w_bf16, cudaStream_t stream, int n_cold, int rows_used) {
   if (!h || h->role != QES_ROLE_CLIENT || layer < 0 || layer >= QES_NL) return -1;
   if (int rc = seam_dead_check(h, "issue")) return rc;
   if (h->n_pending >= h->slots) {
@@ -2044,34 +2400,86 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
             h->n_pending, h->rows, h->slots);
     return -4;
   }
+  /* Pick a free slot whose previous request the server has already answered. `pending` alone is not
+   * enough: the entry leaves `pending` when the collect is only *enqueued*, so the slot's staging
+   * bytes may still be the ones the NIC is reading while the next request's device-to-host copies
+   * land on top of them (a 24-byte id copy interleaving with the payload the proxy is posting put
+   * another layer's cold ids on the wire, measured 2026-11-01). The server reads the payload before
+   * it posts the response, so `fresp >= issued` proves the old bytes are free.
+   * `issued`, not the slab's F_REQ: F_REQ is bumped by a kernel on the caller's stream, so it still
+   * reads 0 for a request the GPU has not reached yet, and the slot was then reused under a request
+   * that had never been forwarded at all. */
+  /* Under graph capture this host code runs once per layer and its result is baked: on every replay
+   * the baked slot, the baked copies and the baked publish run again, but nothing here does. The
+   * ack test therefore cannot be part of the decision -- nothing has executed yet, so F_RESP still
+   * reads 0 and after `slots` layers every slot would look busy (a capture with `slots`=4 stopped at
+   * layer 4 and would have waited out SLOT_ACK_TIMEOUT_NS). What stays valid is the rest of the rule:
+   * `pending` is host state, and at replay the captured requests are stream-ordered, so a slot that
+   * the capture had already closed cannot be reused by an earlier replayed layer. */
+  int cap_status = 0;
+  const bool capturing =
+      stream &&
+      cudaStreamIsCapturing(stream, (cudaStreamCaptureStatus*)&cap_status) == cudaSuccess &&
+      cap_status == (int)cudaStreamCaptureStatusActive;
   int slot = -1;
-  for (int k = 0; k < h->slots && slot < 0; k++) {
-    const int cand = (h->next_slot + k) % h->slots;
-    bool used = false;
-    for (int p = 0; p < h->n_pending; p++)
-      if (h->pending[p].slot == cand) used = true;
-    if (!used) slot = cand;
-  }
-  if (slot < 0) {
-    set_err("qes_issue: no free slot on rows=%d (slots=%d, in_flight=%d)", h->rows, h->slots,
-            h->n_pending);
-    return -4;
+  const int64_t t0 = now_ns();
+  for (;;) {
+    for (int k = 0; k < h->slots && slot < 0; k++) {
+      const int cand = (h->next_slot + k) % h->slots;
+      bool used = false;
+      for (int p = 0; p < h->n_pending; p++)
+        if (h->pending[p].slot == cand) used = true;
+      if (used) continue;
+      const uint64_t mine = h->issued[cand];
+      if (!capturing && mine && load_acq(h->slab, off_fresp(h, cand)) < mine) continue;
+      slot = cand;
+    }
+    if (slot >= 0) break;
+    if (h->dead.load(std::memory_order_relaxed)) return seam_dead_check(h, "issue");
+    if (now_ns() - t0 > SLOT_ACK_TIMEOUT_NS) {
+      set_err("qes_issue: rows=%d port=%d: every slot is still unacknowledged after %llu s "
+              "(in_flight=%d, slots=%d): the seam transport is stuck",
+              h->rows, h->tcp_port, (unsigned long long)(SLOT_ACK_TIMEOUT_NS / 1000000000ull),
+              h->n_pending, h->slots);
+      return -4;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
   SlotHdr hdr{};
   hdr.magic = SLOT_MAGIC;
   hdr.layer = (uint32_t)layer;
-  hdr.rows = (uint32_t)h->rows;
-  memcpy(h->slab + off_hdr(h, slot), &hdr, sizeof(hdr));
-  /* The header is a CPU write; order it before the GPU-side publish that lets the proxy forward
-   * the payload (the NIC only sends it once the whole payload, header included, is visible). */
-  std::atomic_thread_fence(std::memory_order_release);
-  uint8_t* req = h->slab + off_req(h, slot);
-  if (cudaMemcpyAsync(req, x_bf16, (size_t)h->rows * QES_HIDDEN * 2, cudaMemcpyDeviceToHost, stream))
+  const int nrows = rows_used > 0 && rows_used <= h->rows ? rows_used : h->rows;
+  hdr.rows = (uint32_t)nrows;
+  hdr.n_cold = n_cold > 0 ? (uint32_t)n_cold : 0u;
+  /* The seq publish_kernel is about to produce for this slot (it does `*F_REQ + 1`). Both proxies
+   * compare it against the seq they are handling, so a header that does not belong to the payload
+   * is caught here instead of being computed with the wrong layer's ids. The value here only has to
+   * be right for the eager path; publish_kernel rewrites the field on the device (see SlotHdr::seq),
+   * which is what a replayed graph needs. */
+  hdr.seq = load_acq(h->slab, off_freq(h, slot)) + 1;
+  /* Copied to the slot instead of memcpy'd into it: the destination is the wire, and under graph
+   * capture a host memcpy here happens once at capture time, so the slot would carry whatever layer
+   * last wrote it while the replay's payloads belong to the layer being replayed (measured
+   * 2026-11-01: "layer=19 slot=3 ... 268" -- layer 19's header over a layer 4/5 request, 268 being
+   * that layer's cold count). One pinned stage line per layer keeps the replayed copy this layer's
+   * own bytes, and the copy is stream-ordered ahead of the publish below. */
+  memcpy(h->hdr_stage + (size_t)layer * sizeof(SlotHdr), &hdr, sizeof(hdr));
+  if (cudaMemcpyAsync(h->slab + off_hdr(h, slot), h->hdr_stage + (size_t)layer * sizeof(SlotHdr),
+                      sizeof(SlotHdr), cudaMemcpyHostToDevice, stream))
     return -2;
-  if (cudaMemcpyAsync(req + h->ids_off, ids, (size_t)h->rows * QES_TOPK * 4,
+  uint8_t* req = h->slab + off_req(h, slot);
+  if (cudaMemcpyAsync(req, x_bf16, (size_t)nrows * QES_HIDDEN * 2, cudaMemcpyDeviceToHost, stream))
+    return -2;
+  if (cudaMemcpyAsync(req + h->ids_off, ids, (size_t)nrows * QES_TOPK * 4,
                       cudaMemcpyDeviceToHost, stream))
     return -2;
-  if (cudaMemcpyAsync(req + h->w_off, w_bf16, (size_t)h->rows * QES_TOPK * 2,
+  /* Same stream, same source pointer, and before the publish below: if the slab copy above is what
+   * the wire carries, this mirror says whether the caller's tensor already held that value. */
+  if (h->dump_src &&
+      cudaMemcpyAsync(h->dump_src + (size_t)slot * h->rows * QES_TOPK, ids,
+                      (size_t)nrows * QES_TOPK * 4, cudaMemcpyDeviceToHost, stream))
+    return -2;
+  if (cudaMemcpyAsync(req + h->w_off, w_bf16, (size_t)nrows * QES_TOPK * 2,
                       cudaMemcpyDeviceToHost, stream))
     return -2;
   if (qes_trace())
@@ -2080,8 +2488,14 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
             "req_len=%zu slab=%zu\n",
             h->tcp_port, h->rows, layer, slot, off_hdr(h, slot), off_req(h, slot), h->req_len,
             h->slab_bytes);
-  publish_kernel<<<1, 1, 0, stream>>>((uint64_t*)(h->slab + off_freq(h, slot)));
+  publish_kernel<<<1, 1, 0, stream>>>(
+      (uint64_t*)(h->slab + off_freq(h, slot)),
+      (uint64_t*)(h->slab + off_hdr(h, slot) + offsetof(SlotHdr, seq)));
   if (cudaGetLastError() != cudaSuccess) return -3;
+  /* Only after the publish is queued: this is what a later issue reads to decide the slot is free.
+   * A captured issue leaves it alone: its baked seq is not the one the replay will publish, and the
+   * slot's real state is read from F_RESP once the graph runs. */
+  if (!capturing) h->issued[slot] = hdr.seq;
   h->pending[h->n_pending].layer = layer;
   h->pending[h->n_pending].slot = slot;
   h->n_pending++;
@@ -2089,7 +2503,10 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
   return 0;
 }
 
-extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream) {
+/* rows: the row count of the request being collected (the same value qes_issue was given), or <= 0
+ * for the whole bucket. Only those rows are copied out: the peer answered exactly that many, so the
+ * rest of the slot's response region holds an older request's rows and must not reach the caller. */
+extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream, int rows) {
   if (!h || h->role != QES_ROLE_CLIENT || layer < 0 || layer >= QES_NL) return -1;
   if (int rc = seam_dead_check(h, "collect")) return rc;
   int idx = -1;
@@ -2101,14 +2518,16 @@ extern "C" int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_
     return -1;
   }
   const int slot = h->pending[idx].slot;
+  const int nrows = rows > 0 && rows <= h->rows ? rows : h->rows;
+  const size_t resp_bytes = (size_t)nrows * QES_HIDDEN * 4;
   // A whole warp is enough to poison a timed-out response quickly (resp_len/4 up to ~10M floats for
   // the largest bucket) and costs nothing on the answered path, where the loop is never entered.
   wait_kernel<<<1, 32, 0, stream>>>((const uint64_t*)(h->slab + off_freq(h, slot)),
                                     (const uint64_t*)(h->slab + off_fresp(h, slot)),
                                     (uint32_t*)(h->slab + off_fail(h, slot)),
                                     (float*)(h->slab + off_resp(h, slot)),
-                                    (int)(h->resp_len / sizeof(float)));
-  if (cudaMemcpyAsync(out_f32, h->slab + off_resp(h, slot), h->resp_len, cudaMemcpyHostToDevice,
+                                    (int)(resp_bytes / sizeof(float)), WAIT_TIMEOUT_NS);
+  if (cudaMemcpyAsync(out_f32, h->slab + off_resp(h, slot), resp_bytes, cudaMemcpyHostToDevice,
                       stream))
     return -2;
   for (int p = idx; p + 1 < h->n_pending; p++) h->pending[p] = h->pending[p + 1];

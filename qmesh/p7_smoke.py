@@ -13,16 +13,17 @@ os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 import torch
 
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
+from qmesh import placement as seam_placement
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
-PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
+PLACEMENT = seam_placement.resolve(CHECKPOINT)   # the pack's table, else $PLACEMENT, else the repo default
 REMOTE_HOST = os.environ.get("REMOTE_HOST", "10.0.100.2")
 REMOTE_PORT = int(os.environ.get("REMOTE_PORT", "29517"))
 
 
 def main():
-    placement = json.load(open(PLACEMENT))
-    hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
+    placement, _path, _sha = seam_placement.load(CHECKPOINT)
+    hot = seam_placement.hot(placement)
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot

@@ -24,7 +24,7 @@ TOPK = 6
 NL = 40
 ROLE_CLIENT = 0
 ROLE_SERVER = 1
-PROTO_VERSION = 3
+PROTO_VERSION = 4
 MAX_BUCKETS = 12
 MAX_SLOTS = 8   # QES_MAX_SLOTS: payload slots in flight per handle
 BUILD_LEN = 40
@@ -118,11 +118,14 @@ def _lib():
     lib.qes_server_free.argtypes = [ctypes.c_void_p]
     lib.qes_status.restype = ctypes.c_int
     lib.qes_status.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(Nego)]
+    # Trailing `rows` on both calls: the request's real row count (0 = the handle's whole bucket).
+    # The bucket sizes the slab; the copies, the peer's compute and the response follow `rows`.
     lib.qes_issue.restype = ctypes.c_int
     lib.qes_issue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-                              ctypes.c_void_p, ctypes.c_void_p]
+                              ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     lib.qes_collect.restype = ctypes.c_int
-    lib.qes_collect.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+    lib.qes_collect.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                ctypes.c_int]
     lib.qes_destroy.restype = None
     lib.qes_destroy.argtypes = [ctypes.c_void_p]
     return lib
@@ -261,17 +264,27 @@ class Seam:
         self.rows = int(bucket)   # bucket == request rows, kept for the old call sites
         self.device_ordinal = int(device_ordinal)
 
-    def issue(self, layer, x_ptr, ids_ptr, w_ptr, stream_ptr):
+    def issue(self, layer, x_ptr, ids_ptr, w_ptr, stream_ptr, n_cold: int = 0, rows: int = 0):
+        """n_cold is the layer's cold-expert count on this placement: the client proxy refuses to
+        send an id outside [-1, n_cold) instead of letting the server's placement check abort the
+        server process. 0 = unknown, no check.
+
+        rows is how many of this handle's bucket rows the request really carries (0 = all of them).
+        The peer computes that many rows and answers that many, so a prefill chunk smaller than the
+        granted bucket pays for its own rows only; see SlotHdr::rows."""
         if not self._h:
             raise RuntimeError("seam handle is closed")
-        rc = lib().qes_issue(self._h, layer, x_ptr, ids_ptr, w_ptr, stream_ptr)
+        rc = lib().qes_issue(self._h, layer, x_ptr, ids_ptr, w_ptr, stream_ptr, int(n_cold),
+                             int(rows))
         if rc:
             raise RuntimeError(f"qes_issue layer={layer} rc={rc}: {last_error()}")
 
-    def collect(self, layer, out_ptr, stream_ptr):
+    def collect(self, layer, out_ptr, stream_ptr, rows: int = 0):
+        """rows must be the row count the matching issue() carried (0 = the whole bucket): only
+        those rows are copied out of the response, which is all the peer answered."""
         if not self._h:
             raise RuntimeError("seam handle is closed")
-        rc = lib().qes_collect(self._h, layer, out_ptr, stream_ptr)
+        rc = lib().qes_collect(self._h, layer, out_ptr, stream_ptr, int(rows))
         if rc:
             raise RuntimeError(f"qes_collect layer={layer} rc={rc}: {last_error()}")
 

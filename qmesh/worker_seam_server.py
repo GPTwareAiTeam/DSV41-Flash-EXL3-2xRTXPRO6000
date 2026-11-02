@@ -42,6 +42,61 @@ HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
 NL = qes.NL
 
+# Per-call audit of the cold ids the client sent (see _check_ids). Logged for calls up to this many
+# rows: small calls are where a bad id shows, and the log stays quiet for prefill-sized buckets.
+_IDS_LOG_MAX = int(os.environ.get("SEAM_IDS_LOG_MAX_ROWS", "6"))
+
+# Printed ids for a rejected request: the whole array for small calls (the values are the
+# diagnosis), capped for big ones. 8b2674f9 dropped this line while adding MOE_KERNEL below and
+# left its use in _check_ids behind, so every compute raised NameError and the server fail-stopped
+# on its first request (2026-11-01 17:31 GX2). That is the worst shape of bug this file can carry:
+# it lives on the rejection path, so only a healthy run reaches it, and taking the box down is the
+# opposite of what the check is for.
+_IDS_BAD_MAX = int(os.environ.get("SEAM_IDS_BAD_MAX_ROWS", "64"))
+
+# Cold-expert kernel (see _forward_piece). "cudaexl3" runs a layer through cuda-exl3's MoE gemm
+# (vendor/cuda-exl3), "mixedk" through exllamav3's mixed-K module. cuda-exl3 is the default: it is
+# faster in every bucket measured on GX2 (layer 5, 268 cold experts) -- 16.9 / 30.2 / 54.9 / 103.6
+# ms at 512 / 2048 / 4096 / 8192 rows against 30.3 / 41.3 / - / 145.3 for the module -- but it needs
+# one restack per layer into per-bitrate trellis stacks on first use, which also drops the
+# per-expert copies. A layer whose restack raises is served by the module from then on.
+MOE_KERNEL = os.environ.get("SEAM_MOE_KERNEL", "cudaexl3")
+
+# Read at import so a renamed or dropped constant stops the server before it serves anyone. The
+# 17:31 NameError resolved only when a client's first forward reached the audit, which cost that
+# client 30 s of timeouts and the box a full reload; the same mistake here costs one start.
+assert _IDS_LOG_MAX >= 0 and _IDS_BAD_MAX >= 0 and MOE_KERNEL in ("cudaexl3", "mixedk"), \
+    "cold-id audit caps and the kernel name must resolve at import"
+
+
+def _check_ids(layer, rows, ids, num_experts):
+    """Audit one request's cold ids on the host, straight from the pinned slab (no device work).
+
+    Contract with the client: 0 <= id < num_experts addresses this layer's cold expert `id`, and a
+    negative id means "this pick is not cold on this layer" (the caller maps it to local expert 0
+    with weight 0, so it contributes exact zeros). A positive id outside the range is a client bug,
+    and computing with it reads past the module's expert tables inside a fused launch; the illegal
+    access then surfaces layers later, at whatever call next synchronises, which is why the
+    rows=6 death of 2026-11-01 has no explanation in its own log. So the range is enforced here,
+    where the ids arrive, and every small call is logged in full so the same run can rule the ids
+    in or out instead of guessing at the launch.
+    """
+    if rows <= 0 or ids.size == 0:
+        return
+    lo, hi = int(ids.min()), int(ids.max())
+    neg = int((ids < 0).sum())
+    bad = int((ids >= num_experts).sum())
+    if rows <= _IDS_LOG_MAX:
+        print(f"SEAM_IDS layer={layer} rows={rows} n={ids.size} min={lo} max={hi} "
+              f"miss={neg} n_cold={num_experts}", flush=True)
+    if bad:
+        if ids.size <= _IDS_BAD_MAX * TOPK:
+            print(f"SEAM_IDS_BAD layer={layer} rows={rows} n_cold={num_experts} "
+                  f"ids={ids.reshape(-1).tolist()}", flush=True)
+        raise RuntimeError(f"cold ids out of range: {bad} of {ids.size} picks in [{lo},{hi}] "
+                           f"for {num_experts} cold experts on layer {layer}, largest bad id "
+                           f"{int(ids[ids >= num_experts][:8].max())}")
+
 
 def build_layer(base, cold_ids, device):
     """Subset the layer's routed-expert module to `cold_ids` (checkpoint expert ids, ordered).
@@ -74,6 +129,16 @@ class SeamServer:
         # fail_after: testing hook for the fail-stop below - raise on call N+1. 0 = never.
         self.fail_after = int(fail_after or 0)
         self.seen = 0
+        # One compute at a time. The C proxy calls this hook from a thread per open handle, and a
+        # client with several row buckets keeps several handles (1/6/64...) with one request in
+        # flight each, so two threads can be inside _forward at once: the pinned-slab pointers are
+        # per handle, but the module (its _buf_get scratch, its fused row buffers) and the one CUDA
+        # stream are not. The Python-side tensor bookkeeping of the two calls then interleaves while
+        # the other thread sits in stream.synchronize() or .cpu() with the GIL released - the same
+        # scratch buffer is rebuilt under a kernel that is still reading it. That is a CUDA illegal
+        # access / launch failure inside the GX compute, i.e. exactly the "6-row" deaths of
+        # 2026-11-01, and it cannot be seen by a single-handle benchmark (that is serialized).
+        self.compute_lock = threading.Lock()
         # ws_rows: serve each request in pieces of at most this many rows, so the peak device
         # workspace follows ws_rows instead of the row bucket (see _forward). 0 = one piece.
         placement = json.load(open(placement_path))
@@ -96,7 +161,12 @@ class SeamServer:
                            for layer in range(NL)]
         sizes = [os.path.getsize(p) if os.path.exists(p) else 0 for p in self.pack_paths]
         self.pack_mib = sum(sizes) / 2**20
-        margin = int(os.environ.get("SEAM_LOAD_MARGIN_MIB", "1024"))
+        # 2048, not 1024: the load itself costs ~1100-1300 MiB above the pack (page cache, the
+        # Config/Model parse, the expert tensors' transient copies), and compute needs >= ~1600 MiB
+        # post-load. A 1024 margin let GX2 land at avail 1177 / swapped 3766 and die on its first
+        # forward (2026-11-01, "unspecified launch failure" at rows=1). The starter should set this
+        # explicitly per box (GX2 is the tighter one); this default only stops a bare start.
+        margin = int(os.environ.get("SEAM_LOAD_MARGIN_MIB", "2048"))
         avail = _avail_mib()
         if not sizes[0]:
             print(f"SEAM_NO_PACK dir={model_dir} - expected cold-L00.safetensors", flush=True)
@@ -113,6 +183,18 @@ class SeamServer:
               f"fadvise={int(self.fadvise)} swapped_mib={_swap_used_mib()}", flush=True)
 
         self.stream = torch.cuda.Stream(device=device)
+        # The kernel has to be importable before the load starts: vendor/cuda-exl3 is built per box
+        # (qmesh/build_cudaexl3.sh) and a server started on a checkout without it would otherwise
+        # die on the first request, deep inside compute()'s fail-stop.
+        self.preload = PRELOAD_CX and MOE_KERNEL == "cudaexl3" and not stub
+        if self.preload:
+            try:
+                from qmesh import exl3_moe_cuda  # noqa: F401  (loads the vendor extension)
+            except Exception as e:
+                self.preload = False
+                print(f"SEAM_MOE_NOEXT preload=off err={type(e).__name__}: {e} "
+                      f"- every layer will stay on the mixed-K module", flush=True)
+        self._cx_layers: dict = {}
         config = Config.from_directory(model_dir)
         model = Model.from_config(config)
         for layer in range(NL):
@@ -126,7 +208,20 @@ class SeamServer:
             dropped = _drop_page_cache(self.pack_paths[layer]) if self.fadvise else False
             print(f"layer {layer}: {len(cold)} cold experts, "
                   f"{torch.cuda.memory_allocated(device) / 2**30:.2f} GiB "
-                  f"avail_mib={_avail_mib()} cached_dropped={int(dropped)}", flush=True)
+                  f"avail_mib={_avail_mib()} cached_mib={_cached_mib()} "
+                  f"rss_peak_mib={_rss_peak_mib()} swap_mib={_swap_used_mib()} "
+                  f"cached_dropped={int(dropped)}", flush=True)
+            # Convert now, not on the first request for this layer: this is the only moment the
+            # group transient fits (see PRELOAD_CX). _cx_moe prints SEAM_MOE_CX or SEAM_MOE_NOFIT
+            # per layer, and a refusal leaves the layer on the mixed-K module, which is correct
+            # because nothing of the module was released in that case.
+            if self.preload:
+                self._cx_moe(layer, self.layers[layer][0])
+        cx_n = sum(1 for v in self._cx_layers.values() if v is not None)
+        if self._cx_layers:
+            print(f"SEAM_PACK_KERNEL cudaexl3_layers={cx_n} mixedk_layers={NL - cx_n} "
+                  f"of={NL} avail_mib={_avail_mib()} avail_min_mib={getattr(self, '_cx_avail_min', '?')} "
+                  f"swap_mib={_swap_used_mib()} rss_peak_mib={_rss_peak_mib()}", flush=True)
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
@@ -149,13 +244,24 @@ class SeamServer:
             if self.fail_after and self.seen > self.fail_after:
                 raise RuntimeError(f"injected compute failure on call {self.seen} (--fail-after "
                                    f"{self.fail_after})")
-            self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+            # The lock covers the whole forward, not just one piece: a request served in ws_rows
+            # pieces still builds its scratch between pieces, and the pieces of two requests must
+            # not interleave inside the module.
+            with self.compute_lock:
+                self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
         except Exception as e:  # noqa: BLE001 - see the docstring: no safe local recovery
             print(f"SEAM_COMPUTE_FAIL layer={layer} rows={rows} err={type(e).__name__}: {e} "
                   f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()} "
                   f"dev_{_dev_mem_mib()} "
                   f"calls={sum(len(v) for v in _times.values())} "
                   f"- exiting: a server that cannot compute must not answer", flush=True)
+            # The message above names the *calling* shape; only the traceback names the frame that
+            # raised. A CUDA illegal access surfaces at the next host sync (a `.tolist()`, a copy to
+            # host), so the frame is regularly several layers away from the kernel that faulted -
+            # without this, "rows=6" is the only evidence and it can be the wrong call entirely.
+            import traceback
+            for line in traceback.format_exc().rstrip().splitlines():
+                print(f"SEAM_COMPUTE_TRACE {line}", flush=True)
             sys.stderr.flush()
             os._exit(70)
         else:
@@ -189,27 +295,107 @@ class SeamServer:
         ffn, _ = self.layers[layer]
         step = self.ws_rows if 0 < self.ws_rows < rows else rows
         for r0 in range(0, rows, step):
-            self._forward_piece(ffn, min(step, rows - r0),
+            self._forward_piece(layer, ffn, min(step, rows - r0),
                                 x_ptr + r0 * HIDDEN * 2, ids_ptr + r0 * TOPK * 4,
                                 w_ptr + r0 * TOPK * 2, out_ptr + r0 * HIDDEN * 4)
 
-    def _forward_piece(self, ffn, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
+    def _forward_piece(self, layer, ffn, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """One mixed-K forward of `rows` rows straight out of, and back into, the pinned slab."""
         x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN).copy())
         x = x.view(torch.bfloat16).to(self.device).half()
-        ids = torch.from_numpy(view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK).astype(np.int64))
+        ids_np = view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)
+        _check_ids(layer, rows, ids_np, ffn.num_experts)
+        ids = torch.from_numpy(ids_np.astype(np.int64))
         w = torch.from_numpy(view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK).copy())
         w = w.view(torch.bfloat16).float()
 
         miss = ids < 0
         sel = ids.clamp_min(0).to(self.device)
         gw = torch.where(miss, torch.zeros_like(w), w).to(self.device).half()
+        # Cold-expert kernel switch (MOE_KERNEL). cuda-exl3 wants a layer's experts of one bitrate
+        # stacked into one trellis instead of one module per expert; the restack happens on the
+        # first call for the layer and drops the per-expert copies, so the resident cost is one
+        # copy of the cold pack and not two. A layer that cannot restack stays on the module.
+        cx = self._cx_moe(layer, ffn) if MOE_KERNEL == "cudaexl3" else None
         with torch.cuda.stream(self.stream):
-            part = ffn.forward(x.view(1, rows, HIDDEN),
-                               {"external_selected": sel, "external_weights": gw})
+            if cx is not None:
+                part = cx.forward(x, sel, gw)
+            else:
+                part = ffn.forward(x.view(1, rows, HIDDEN),
+                                   {"external_selected": sel, "external_weights": gw})
         self.stream.synchronize()
         view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = \
             part.view(rows, HIDDEN).float().cpu().numpy()
+
+    def _cx_moe(self, layer, ffn):
+        """The layer's cuda-exl3 adapter, built on first use (see _forward_piece).
+
+        None means "this layer stays on the mixed-K module", and it is cached as such: a restack
+        that failed once (an unstackable bitrate/frac mix, a broken extension) would fail on every
+        call, and the client must not pay that exception per request.
+        """
+        cx = self.__dict__.setdefault("_cx_layers", {})
+        if layer in cx:
+            return cx[layer]
+        try:
+            from qmesh.exl3_moe_cuda import (CudaExl3Moe, RestackBroken, transient_mib as
+                                             _cx_transient_mib, _live_mib as _cx_cold_mib,
+                                             peak_mib as _cx_peak_mib)
+        except Exception as e:
+            # No vendored extension on this box: the layer keeps its module copy, and saying so once
+            # is better than dying inside compute()'s fail-stop on the first request.
+            cx[layer] = None
+            print(f"SEAM_MOE_NOEXT layer={layer} err={type(e).__name__}: {e} "
+                  f"- serving this layer from the mixed-K module", flush=True)
+            return None
+        # One group's stacked tensors are allocated before any expert of that group is copied into
+        # them, and the group's sources are freed before the next group starts, so a conversion on
+        # an already-resident layer needs exactly `transient_mib` of free memory, not the layer's
+        # size plus that (the sources are resident and already excluded from MemAvailable). On GB10
+        # the pack and the device share one 121 GiB pool, and a cudaMalloc that cannot be satisfied
+        # there does not fail cleanly: it pages the pack out and wedges the host (GX1 2026-11-01
+        # 16:44, needing 5.4 GiB against 1.32 GiB available). Refuse up front when the transient
+        # plus the floor does not fit, so the layer stays on the mixed-K module and the box lives.
+        need = _cx_transient_mib(ffn)
+        avail = _avail_mib()
+        # Lowest MemAvailable seen at any conversion, reported with the load summary: a refusal or a
+        # near miss during the load is then evidence about the host (another process, page cache),
+        # not about the layer, which always costs the same at the same point in the load.
+        if avail >= 0:
+            prev = self.__dict__.get("_cx_avail_min", avail)
+            self._cx_avail_min = min(prev, avail)
+        if avail >= 0 and need + CX_MARGIN_MIB > avail:
+            cx[layer] = None
+            print(f"SEAM_MOE_NOFIT layer={layer} need_mib={need:.0f} avail_mib={avail} "
+                  f"margin_mib={CX_MARGIN_MIB} cold_mib={_cx_cold_mib(ffn):.0f} "
+                  f"peak_mib={_cx_peak_mib(ffn):.0f} "
+                  f"- restack would page the pack out; serving this layer from the mixed-K module",
+                  flush=True)
+            return None
+        t0 = time.perf_counter()
+        avail0, swap0 = _avail_mib(), _swap_used_mib()
+        try:
+            hit = CudaExl3Moe(ffn, self.device)
+        except RestackBroken as e:
+            # The streaming restack frees each expert's source as it lands in the stack, so a
+            # failure after the first group leaves this layer with no per-expert copy to fall back
+            # on. Serving it from the mixed-K module would answer with stale or partial bytes, which
+            # is the failure mode this server is fail-stop about (see compute()): name it and die.
+            raise RuntimeError(f"cuda-exl3 restack of layer {layer} failed after source tensors "
+                               f"were released ({e}); the layer has no fallback copy") from e
+        except Exception as e:
+            cx[layer] = None
+            print(f"SEAM_MOE_FALLBACK layer={layer} err={type(e).__name__}: {e} "
+                  f"- serving this layer from the mixed-K module", flush=True)
+            return None
+        torch.cuda.empty_cache()
+        cx[layer] = hit
+        print(f"SEAM_MOE_CX layer={layer} groups={hit.describe()} "
+              f"stacked_mib={hit.nbytes() / 2**20:.0f} build_ms={1e3 * (time.perf_counter() - t0):.0f} "
+              f"avail_mib={avail0}->{_avail_mib()} swap_mib={swap0}->{_swap_used_mib()} "
+              f"rss_peak_mib={_rss_peak_mib()} cached_mib={_cached_mib()} "
+              f"alloc_gib={torch.cuda.memory_allocated(self.device) / 2**30:.2f}", flush=True)
+        return hit
 
 
 _times: dict = {}
@@ -266,6 +452,22 @@ WS_KIB_PER_ROW = 147
 # a box that is already over its head before the first request.
 SWAP_WARN_MIB = 512
 
+# Floor the cuda-exl3 restack has to leave on the box besides its own peak (see _cx_moe). 1.5 GiB is
+# the headroom a loaded GX actually has left (slab + workspace + CUDA context); a conversion that
+# eats into it swaps the 113.65 GiB pack out page by page, and on GB10 that stalls the whole host,
+# not just this process (GX1, 2026-11-01 16:44). Set SEAM_CX_MARGIN_MIB=0 only to measure a restack
+# on a box you are willing to lose.
+CX_MARGIN_MIB = int(os.environ.get("SEAM_CX_MARGIN_MIB", "1536"))
+
+# Convert each cold layer to the cuda-exl3 kernel as it loads, on by default when that kernel is
+# the one in use. The conversion needs one layer's cold bytes *plus* its largest bitrate group
+# transiently (see exl3_moe_cuda._stack_group); with the full pack resident a GX has ~1.0 GiB
+# MemAvailable and a 2.74 GiB layer therefore cannot convert, while the same layer costs nothing
+# during the load because MemAvailable is still 116 GiB there (GX2, 2026-11-01: avail_mib 120079 ->
+# 1000 over 40 layers, 116223 right after layer 0). Deferring the restack to the first request is
+# what wedged GX1. SEAM_MOE_PRELOAD=0 restores that behaviour for a box measured to have slack.
+PRELOAD_CX = os.environ.get("SEAM_MOE_PRELOAD", "1") != "0"
+
 
 def ws_mib_for(rows: int, ws_rows: int = 0) -> float:
     """Transient device workspace the cold-expert forward needs for a request, MiB."""
@@ -278,6 +480,28 @@ def _avail_mib() -> int:
     try:
         for line in open("/proc/meminfo"):
             if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
+
+def _rss_peak_mib() -> int:
+    """VmHWM of this process, MiB: the peak the restack drove the resident pack to."""
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
+
+def _cached_mib() -> int:
+    """Cached (page cache) on this box, MiB: what a conversion can borrow before the pack swaps."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("Cached:"):
                 return int(line.split()[1]) // 1024
     except OSError:
         pass
@@ -584,6 +808,7 @@ def ws_tier_check(server, rows, tiers):
 
 
 def main():
+    global MOE_KERNEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default="/cold")
     ap.add_argument("--placement", default="/cold/placement.exl3.json")
@@ -592,17 +817,22 @@ def main():
     ap.add_argument("--port", type=int, default=47311)
     ap.add_argument("--stub", action="store_true",
                     help="answer every request with zeros (wire/protocol baseline, no expert compute)")
-    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,256"),
+    ap.add_argument("--buckets", default=os.environ.get("SERVER_BUCKETS", "1,6,64,256,2048"),
                     help="row buckets this server can serve (ascending, one port per bucket from "
                          "--port+1). Clients request a subset; the superset default means one "
                          "long-lived server serves every benchmark arm without a reload. The largest "
-                         "bucket is the per-call row limit the client splits prefill on, so it is "
-                         "paid twice: protocol v3 staging is ~30.2 KiB pinned per row per slot, and "
-                         "the cold-expert forward needs ~147 KiB per row of transient device memory "
-                         "(measured: 301 MiB at 2048 rows, 602 at 4096, 1202 at 8192). With the "
-                         "113.65 GiB pack resident a GB10 has 733-876 MiB left, so 2048 rows is the "
-                         "largest bucket that fits with a margin; a bigger bucket needs --ws-rows to "
-                         "cap the workspace, and the fit is printed as ws_mib in SEAM_SERVER_SLAB.")
+                         "bucket is the per-call row limit the client splits prefill on, and that is "
+                         "what prefill throughput rides on: a 64-row chunk pays the ~40 ms fixed cost "
+                         "of one GX layer call, a 2048-row chunk pays it once for 32x the rows "
+                         "(28.5 us/row at 2048 vs 78 us/row at 512, measured on GX2). The bucket is "
+                         "paid twice: protocol v3 staging is ~30.2 KiB pinned per row per slot "
+                         "(61 MiB for 2048 at one slot, 122 at two), and the cold-expert forward "
+                         "needs ~147 KiB per row of transient device memory (measured: 301 MiB at "
+                         "2048 rows, 602 at 4096, 1202 at 8192). With a 113.65 GiB pack resident a "
+                         "GB10 has 0.7-1.4 GiB left, so 2048 is the largest bucket that fits with a "
+                         "margin (the fit is printed as slab_mib/ws_mib/fits in SEAM_SERVER_SLAB); a "
+                         "bigger bucket needs --ws-rows to cap the workspace, and a tighter box "
+                         "should serve 1024.")
     ap.add_argument("--slab-slots", type = int,
                     default = int(os.environ.get("SEAM_SLAB_SLOTS", "1")),
                     help="payload slots per bucket (1..8): how many requests one client handle may "
@@ -647,7 +877,15 @@ def main():
                     help = "test hook: raise inside the compute hook on call N+1 (stub servers "
                            "included), to prove that a failing compute fails the client instead of "
                            "handing it the previous call's bytes. 0 = never.")
+    ap.add_argument("--moe-kernel", default = MOE_KERNEL, choices = ("cudaexl3", "mixedk"),
+                    help = "cold-expert kernel: cudaexl3 (default) runs each layer on "
+                           "vendor/cuda-exl3's MoE gemm after a one-off restack into per-bitrate "
+                           "trellis stacks; mixedk keeps exllamav3's mixed-K module. Per-layer "
+                           "fallback to mixedk if the restack raises.")
     args = ap.parse_args()
+    # Set before the pack loads: the switch is read per call, but a bad value must fail the
+    # launch, not the first request.
+    MOE_KERNEL = args.moe_kernel
 
     device = torch.device("cuda:0")
     t0 = time.time()

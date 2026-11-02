@@ -13,7 +13,7 @@
  * Client (P7):
  *   qes_client_session* cs = qes_client_open(peer, 47311, build, buckets, n, QES_NL, wait, &nego);
  *   qes_handle* h = qes_client_handle(cs, dev_name, gid_idx, rows, device_ordinal);
- *       qes_issue(h, L, x, ids, w, stream)  /  qes_collect(h, L, out, stream)
+ *       qes_issue(h, L, x, ids, w, stream, n_cold, rows) / qes_collect(h, L, out, stream, rows)
  *   qes_client_close(cs);
  *
  * Server (GX1):
@@ -51,8 +51,9 @@
 #define QES_TOPK 6
 
 /* Control protocol version. Both sides must agree; a mismatch is reported on the client with
- * both versions and build ids as the message text. */
-#define QES_PROTO_VERSION 3
+ * both versions and build ids as the message text. v4: the request header carries the seq it was
+ * written for (SlotHdr.seq) and both proxies require it to match the flag they are handling. */
+#define QES_PROTO_VERSION 4
 #define QES_MAX_BUCKETS 12
 #define QES_MAX_SLOTS 8     /* payload slots per data handle (in-flight requests per bucket) */
 #define QES_BUILD_LEN 40
@@ -162,9 +163,18 @@ QES_API int qes_status(const char* host, int ctl_port, qes_nego* out);
 
 /* ---- data path ------------------------------------------------------------------------- */
 
+/* n_cold: the layer's cold-expert count on the caller's placement, or 0 when unknown. It rides in the
+ * request header and the client proxy refuses to send a pick outside [-1, n_cold), so a bad id takes
+ * this client down instead of the server (client_check_ids in the .cu). */
+/* rows: how many of the handle's bucket rows this request really carries, or 0 for the whole bucket.
+ * The bucket sizes the slab and the wire geometry; it does not have to size the compute. The server
+ * serves `rows` rows and answers `rows` rows, so a prefill chunk that lands in a bigger bucket no
+ * longer costs the GX the padding: a 2560-row chunk in a 4096-row bucket computes 2560 rows. The
+ * default of 0 is what the whole-bucket bench and every caller that predates this field mean. */
 QES_API int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int32_t* ids,
-                      const void* w_bf16, cudaStream_t stream);
-QES_API int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream);
+                      const void* w_bf16, cudaStream_t stream, int n_cold, int rows = 0);
+QES_API int qes_collect(qes_handle* h, int layer, float* out_f32, cudaStream_t stream,
+                        int rows = 0);
 
 QES_API void qes_destroy(qes_handle* h);
 

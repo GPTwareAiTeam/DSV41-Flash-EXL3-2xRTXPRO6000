@@ -153,6 +153,8 @@ int main(int argc, char** argv) {
   std::vector<uint16_t> x_host(nx);
   for (size_t i = 0; i < nx; i++) x_host[i] = (uint16_t)(0x3f80 + (i % 97));  /* bf16 near 1.0 */
   std::vector<int32_t> ids(rows * QES_TOPK);
+  /* Synthetic ids over the whole expert range, not a placement's cold set, so every qes_issue below
+   * passes n_cold = 0: the seam's wire-range check is off for this harness. */
   for (size_t i = 0; i < ids.size(); i++) ids[i] = (int32_t)(i % 384);
   std::vector<uint16_t> w(rows * QES_TOPK, 0x3f00);
 
@@ -167,7 +169,7 @@ int main(int argc, char** argv) {
 
   /* warm: first round trip also primes the RC path. */
   for (int L = 0; L < QES_NL; L++) {
-    qes_issue(h, L, dx, di, dw, st);
+    qes_issue(h, L, dx, di, dw, st, 0);
     qes_collect(h, L, dout, st);
   }
   CK(cudaStreamSynchronize(st));
@@ -177,7 +179,7 @@ int main(int argc, char** argv) {
   for (int it = 0; it < iters; it++)
     for (int L = 0; L < QES_NL; L++) {
       double t0 = now_us();
-      qes_issue(h, L, dx, di, dw, st);
+      qes_issue(h, L, dx, di, dw, st, 0);
       qes_collect(h, L, dout, st);
       CK(cudaStreamSynchronize(st));
       eager.push_back(now_us() - t0);
@@ -192,7 +194,7 @@ int main(int argc, char** argv) {
   cudaGraph_t g; cudaGraphExec_t ge;
   CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
   for (int L = 0; L < QES_NL; L++) {
-    qes_issue(h, L, dx, di, dw, st);
+    qes_issue(h, L, dx, di, dw, st, 0);
     qes_collect(h, L, dout, st);
   }
   CK(cudaStreamEndCapture(st, &g));
@@ -214,7 +216,7 @@ int main(int argc, char** argv) {
   std::vector<double> pipe;
   for (int it = 0; it < iters; it++) {
     double t0 = now_us();
-    for (int L = 0; L < QES_NL; L++) qes_issue(h, L, dx, di, dw, st);
+    for (int L = 0; L < QES_NL; L++) qes_issue(h, L, dx, di, dw, st, 0);
     for (int L = 0; L < QES_NL; L++) qes_collect(h, L, dout, st);
     CK(cudaStreamSynchronize(st));
     pipe.push_back((now_us() - t0) / QES_NL);
@@ -227,7 +229,7 @@ int main(int argc, char** argv) {
   for (int it = 0; it < iters; it++) {
     double t0 = now_us();
     for (int L = 0; L < QES_NL; L++) {
-      qes_issue(h, L, dx, di, dw, st);
+      qes_issue(h, L, dx, di, dw, st, 0);
       busy_kernel<<<1, 1, 0, st>>>(cyc);
       qes_collect(h, L, dout, st);
     }

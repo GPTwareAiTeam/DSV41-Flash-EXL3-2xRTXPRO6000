@@ -14,7 +14,8 @@ Phases: after load, after the warm-up decode (graphs captured -> statics exist),
 prefill, and after decode.
 
 Env:
-  CHECKPOINT, DRAFT_CHECKPOINT (defaults to CHECKPOINT), PLACEMENT,
+  CHECKPOINT, DRAFT_CHECKPOINT (defaults to CHECKPOINT),
+  PLACEMENT (default: the pack's PACK_MANIFEST.json, else qmesh/placement.final.json),
   KV_BITS (4|8|16, default 4), CACHE_TOKENS (default 1048576),
   DSPARK (1 loads the drafter), NUM_DRAFT (default 5), WARMUP_NEW (decode tokens of the warm-up
   prompt, default 24), LONG_PROMPT_FILE or CORPUS+LONG_TOKENS, LONG_NEW (decode tokens after the
@@ -38,10 +39,14 @@ import torch
 from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from exllamav3.util.memory import vram_accounting
 from qmesh.prefill_limit import PAGE_SIZE, PREFILL_ADAPTIVE, PrefillChunkLimiter
+from qmesh import placement as seam_placement
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
-PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
+# The pack's own table (qmesh/placement.py), not a repo default: this script walks the long prefill,
+# which touches far more experts than the identity phase, and a wrong cold count here is what made
+# the server refuse 2 of 384 ids on 2026-11-01 18:03.
+PLACEMENT = seam_placement.resolve(CHECKPOINT)
 KV_BITS = int(os.environ.get("KV_BITS", "4"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "1048576"))
 DSPARK = os.environ.get("DSPARK") == "1"
@@ -78,6 +83,12 @@ SEAM_ROWS = int(os.environ.get("SEAM_ROWS") or max(SEAM_BUCKETS))
 ARM_MAX_S = float(os.environ.get("ARM_MAX_S", "0"))
 ARM_TOTAL_S = float(os.environ.get("ARM_TOTAL_S", "0"))
 LOAD_ONLY = os.environ.get("LOAD_ONLY") == "1"
+# PREFILL_MEM_TRACE=<path prefix> records the CUDA allocator's history for the first arm's prefill and
+# dumps `<prefix>.snapshot.pickle` when that prefill completes. The live-tensor walk above sees what
+# survives a chunk, not the transients that peak in the middle of one, and the chunk's peak is exactly
+# what the limiter has to make room for. Parsing lives in
+# /home/treadall/recipe-artifacts/seamrobust/scripts/snapshot_top.py.
+PREFILL_MEM_TRACE = os.environ.get("PREFILL_MEM_TRACE", "")
 DEVICE = torch.device("cuda:0")
 G = 2 ** 30
 
@@ -374,6 +385,16 @@ def engine_report(model, cache, generator, title: str):
           f"torch_allocated={gib(torch.cuda.memory_allocated(DEVICE)):.3f} "
           f"non_torch={(total - free - torch.cuda.memory_reserved(DEVICE)) / G:.3f} "
           f"free={gib(free):.3f}", flush = True)
+    # The allocator's own view, once per report: `active` is memory torch believes is in use (a per-shape
+    # cache shows up here as growth that never comes back), `inactive_split` is freed-and-split memory
+    # that only exists without expandable segments. Read together with the chunk limiter's room_MiB these
+    # say whether a shrunken grant is caused by live growth or by the pool's shape history.
+    st = torch.cuda.memory_stats(DEVICE)
+    print(f"MEMB_ALLOC {title} expandable={os.environ.get('EXL3_EXPANDABLE_SEGMENTS_ACTIVE', 'env' if os.environ.get('PYTORCH_CUDA_ALLOC_CONF') else 'off')} "
+          f"active={gib(st.get('active_bytes.all.current', 0)):.3f} "
+          f"inactive_split={(st.get('inactive_split_bytes.all.current', 0)) / G:.3f} "
+          f"segments={int(st.get('segment.all.current', 0))} "
+          f"reserved={gib(torch.cuda.memory_reserved(DEVICE)):.3f}", flush = True)
 
 
 def peaks(title: str, base_alloc: int):
@@ -386,8 +407,10 @@ def peaks(title: str, base_alloc: int):
 
 
 def main():
-    placement = json.load(open(PLACEMENT))
-    hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
+    placement, placement_path, placement_sha = seam_placement.load(CHECKPOINT)
+    print(f"CLIENT_PLACEMENT path={placement_path} sha={placement_sha[:16]} ckpt={CHECKPOINT}",
+          flush = True)
+    hot = seam_placement.hot(placement)
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot
@@ -508,6 +531,16 @@ def main():
         if PREFILL_ADAPTIVE:
             generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(DEVICE)
         job = Job(input_ids = ids, max_new_tokens = max_new, sampler = GreedySampler())
+        # The trace has to start before the chunk allocates, so it goes on ahead of enqueue and comes off
+        # as soon as this arm's prefill has produced its first result: after that the only allocations are
+        # decode steps, which would bury the prefill peak in 24 rounds of noise.
+        trace_path = f"{PREFILL_MEM_TRACE}.{chunk_label}.snapshot.pickle"
+        trace_here = bool(PREFILL_MEM_TRACE) and chunk_label.startswith("arm_") \
+                     and not os.path.exists(trace_path)
+        if trace_here:
+            torch.cuda.memory._record_memory_history(enabled = "all", max_entries = 400000)
+            print(f"MEM_TRACE on path={trace_path} "
+                  f"base_alloc_mib={torch.cuda.memory_allocated(DEVICE) / 2 ** 20:.0f}", flush = True)
         generator.enqueue(job)
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats(DEVICE)
@@ -517,6 +550,7 @@ def main():
         prefill_t = None
         prefill_peak = None
         out = None
+        gen = None  # first result that carries the generated token ids: an arm is often stopped
         n = 0  # results yielded (one per token, plus the prefill and eos markers)
         aborted = False
         while generator.num_remaining_jobs():
@@ -540,13 +574,23 @@ def main():
                     prefill_t = time.time() - t
                     prefill_peak = torch.cuda.max_memory_allocated(DEVICE)
                     torch.cuda.reset_peak_memory_stats(DEVICE)
+                    if trace_here:
+                        torch.cuda.synchronize()
+                        torch.cuda.memory._dump_snapshot(trace_path)
+                        torch.cuda.memory._record_memory_history(enabled = None)
+                        trace_here = False
+                        print(f"MEM_TRACE dump path={trace_path} "
+                              f"prefill_peak_mib={(prefill_peak - base_alloc) / 2 ** 20:.0f}",
+                              flush = True)
+                if gen is None and r.get("token_ids") is not None:
+                    gen = r  # before eos, which a one-token or time-limited arm may never reach
                 if r.get("eos"):
                     out = r
                 n += 1
         torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated(DEVICE)
         prefill_peak = peak if prefill_peak is None else prefill_peak
-        out = out or {}
+        out = out or gen or {}
         return {"wall_s": time.time() - t, "ttft_s": first_t, "steps": n,
                 "chunks": limiter.chunks if limiter else None,
                 "shrunk": limiter.shrunk if limiter else None,
@@ -554,7 +598,12 @@ def main():
                 "aborted": aborted,
                 "peak_rise_mib": (prefill_peak - base_alloc) / 2 ** 20,
                 "decode_peak_rise_mib": (peak - base_alloc) / 2 ** 20,
-                "decide_us_median": limiter.summary()["decide_us_median"] if limiter else None}
+                "decide_us_median": limiter.summary()["decide_us_median"] if limiter else None,
+                # The tokens this arm produced, so two arms can be compared for identity and not
+                # only for rate. `out` is the eos chunk's result; an aborted or time-limited arm
+                # never reaches eos, so None here means "no identity" and must never be a match.
+                "gen_ids": None if not out.get("token_ids") else out["token_ids"].tolist()[0][:4],
+                "gen_text": out.get("text")}
 
     warm_ids = tokenizer.encode("Write a paragraph about the history of sailing ships.",
                                 add_bos = True, encode_special_tokens = True)
@@ -617,7 +666,8 @@ def main():
                   f"pieces={None if r['chunks'] is None else -(-chunk // SEAM_ROWS)} "
                   f"round_trips={None if r['chunks'] is None else -(-chunk // SEAM_ROWS) * COLD_LAYERS} "
                   f"round_trips_total={None if r['chunks'] is None else -(-chunk // SEAM_ROWS) * COLD_LAYERS * r['chunks']} "
-                  f"decide_us_median={r['decide_us_median']}", flush = True)
+                  f"decide_us_median={r['decide_us_median']} "
+                  f"gen_ids={r['gen_ids']} gen_text={r['gen_text']!r}", flush = True)
             free_now, _total_now = torch.cuda.mem_get_info(DEVICE)
             print(f"PREFILL_ARM_PEAK depth={depth} chunk={chunk} "
                   f"peak_rise_mib={r['peak_rise_mib']:.0f} "

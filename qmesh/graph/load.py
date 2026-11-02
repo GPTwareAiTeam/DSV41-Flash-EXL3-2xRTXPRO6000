@@ -6,15 +6,16 @@ sys.path.insert(0, "/src/exllamav3")
 import torch
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from qmesh.null_remote import install
+from qmesh import placement as seam_placement
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
-PLACEMENT = os.environ.get("PLACEMENT", "/src/exllamav3/qmesh/placement.final.json")
+PLACEMENT = seam_placement.resolve(CHECKPOINT)   # the pack's table, else $PLACEMENT, else the repo default
 
 
 def load(max_history=5):
     install()
-    placement = json.load(open(PLACEMENT))
-    hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
+    placement, _path, _sha = seam_placement.load(CHECKPOINT)
+    hot = seam_placement.hot(placement)
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot

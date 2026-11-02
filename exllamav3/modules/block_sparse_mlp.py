@@ -44,6 +44,14 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
+# The readback-free ("all fused") launch takes `num_active = -1`, so it is chosen whenever
+# num_tokens*top_k fits the fused capacity - which bounds the *total* number of assignments, never
+# how many of them land on one expert. EXL3_MOE_ALLFUSED_MAX_ROWS=N turns that into a maximum row
+# count instead: calls of N rows or fewer take the counted dispatch, which launches by the number
+# of experts that actually got rows. It exists to A/B the 2026-11-01 rows=6 death against the
+# dispatch choice alone, because that death is a small call and the small call is the only shape
+# that takes the readback-free launch in a real prefill; unset (-1) keeps the current behaviour.
+ALLFUSED_MAX_ROWS = int(os.environ.get("EXL3_MOE_ALLFUSED_MAX_ROWS", "-1"))
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # Diagnostic: one SEAM_TIER line per routed call with the row-count band of every expert and how many
 # assignments each tier took. EXL3_MOE_TIER_TRACE=1 turns it on and it is inert when unset; it is how
@@ -1184,6 +1192,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         cpu_pending = None
         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
+            # Timeline only (qmesh/remote_seam_host.mark, EXL3_SEAM_MARK=1): the seam records when the
+            # issue's copies went out, this says where the GPU experts it overlaps began and ended
+            _mark = getattr(self.cpu_host, "mark", None)
+            if _mark is not None:
+                _mark(self.cpu_layer_idx, "hot0")
 
         if self.cpu_offload:
             final_hidden_states, cpu_pending = self.cpu_offload_issue(
@@ -1255,7 +1268,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # (multi-user verify: 8 users x 6 rows x top-6 = 288 > 256 aborted the capture), so
                 # it takes the all-fused launch
                 if self.fused_mode_buffers is not None and (
-                        num_tokens * top_k <= self.fused_rows or
+                        (num_tokens * top_k <= self.fused_rows
+                         and (ALLFUSED_MAX_ROWS < 0 or num_tokens > ALLFUSED_MAX_ROWS)) or
                         (num_tokens <= self.fused_rows and torch.cuda.is_current_stream_capturing())):
                     expert_count_list = None
                 else:

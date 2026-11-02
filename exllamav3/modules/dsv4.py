@@ -2723,6 +2723,16 @@ class DSV4Attention(Module):
         # eq. 26 de-rotation and the group-major store for the grouped o_proj are fused into
         # the kernel epilogue: output is (G, seq, hpg * D), fp16
         hpg = self.num_q_heads // self.o_groups
+        # The chunk's attention-output workspace goes through get_scratch, not get: an exact-shape entry
+        # is pinned for the life of the process, and a 32k prefill with an adaptive chunk creates a new
+        # row count every few chunks. Measured 2026-11-01 on the prod pair: one 32k prefill left 0.627 GiB
+        # of dsv4_attn_out entries (2560+2304+2048+1536+1280+256 rows, 93% of all statics) and that was
+        # almost exactly the +700 MiB by which live allocation grew during the prefill - which is what
+        # shrank the grant from 2560 to 256 rows. get_scratch keeps decode-class sizes and sends larger
+        # ones through the caching allocator, power-of-two rounded, so the next chunk size reuses it.
+        out_ws = g_tensor_cache.get_scratch(device, self.o_groups * seq * hpg * self.head_dim,
+                                            torch.half, "dsv4_attn_out", seq) \
+            .view(self.o_groups, seq, hpg * self.head_dim)
         out = dsa_attn(
             q[0].half().contiguous(), pool_c, pool_r, bt, sinks = self.sinks,
             ring = ring, kv_chunk = kv[0], win_len = self.sliding_window,
@@ -2731,7 +2741,7 @@ class DSV4Attention(Module):
             compress_rate = dense_m, scale = self.sm_scale,
             derot_inv_freq = self._rope_type_neg(), groups = self.o_groups, group_major = True,
             page_size = epp, qc = qc,
-            out = g_tensor_cache.get(device, (self.o_groups, seq, hpg * self.head_dim), torch.half, "dsv4_attn_out"),
+            out = out_ws,
             # Image chunk (vision): bidirectional over the chunk, own window into history
             nc_chunk = bool(params.get("nc_chunk", False)),
         )

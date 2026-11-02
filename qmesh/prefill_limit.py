@@ -117,9 +117,17 @@ class PrefillChunkLimiter:
             self.shrunk += rows < chunk
             if PREFILL_ADAPTIVE_LOG:
                 total = torch.cuda.mem_get_info(dev)[1]
+                # `active` and `inactive_split` next to allocated/reserved: when a grant shrinks, the
+                # question is whether torch's in-use memory grew (a buffer per chunk shape kept for the
+                # process life shows up as active and never comes back) or whether freed blocks simply lost
+                # their shape (that is inactive_split, which expandable segments keep near zero).
+                st = torch.cuda.memory_stats(dev)
                 log(f"PREFILL_CHUNK_ADAPT start={start} planned={chunk} rows={rows} room_MiB={room / 2**20:.0f} "
                     f"free_MiB={free / 2**20:.0f} reserved_MiB={reserved / 2**20:.0f} alloc_MiB={alloc / 2**20:.0f} "
-                    f"non_torch_MiB={(total - free - reserved) / 2**20:.0f}")
+                    f"non_torch_MiB={(total - free - reserved) / 2**20:.0f} "
+                    f"active_MiB={st.get('active_bytes.all.current', 0) / 2**20:.0f} "
+                    f"split_MiB={st.get('inactive_split_bytes.all.current', 0) / 2**20:.0f} "
+                    f"segs={int(st.get('segment.all.current', 0))}")
         self.prev = (start, rows, alloc, time.perf_counter())
         return rows
 

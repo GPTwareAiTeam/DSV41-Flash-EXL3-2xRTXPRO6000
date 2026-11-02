@@ -8,7 +8,7 @@ line per prompt plus a summary. Timing comes from the engine's own job accountin
 
   CHECKPOINT   model dir (default /models/dsv41/exl3-2.8535-p7hot-hc1)
   DRAFT_CHECKPOINT  drafter (mtp) model dir (default: CHECKPOINT), e.g. the HC1 overlay
-  PLACEMENT    placement json (default qmesh/placement.final.json)
+  PLACEMENT    placement json (default: the pack's PACK_MANIFEST.json, else qmesh/placement.final.json)
   PROMPTS      path to prompt list (JSON array)  [default: built-in 3 prompts]
   PROMPTS_TXT  path to a text file; each non-empty line is one prompt (overrides PROMPTS)
   CORPUS       comma-separated corpus txt files; each file is truncated to CORPUS_TOKENS tokens
@@ -37,8 +37,10 @@ EXL3_WHOLE_GRAPH=0 and is not part of ARMS.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
+import sys
 
 os.environ.setdefault("EXL3_MOE_SPLIT_FUSED", "0")
 os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
@@ -47,10 +49,16 @@ import torch
 
 from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
+from qmesh import placement as seam_placement
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
 DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
-PLACEMENT = os.environ.get("PLACEMENT", os.path.join(os.path.dirname(__file__), "placement.final.json"))
+# qmesh/placement.py owns the choice (explicit PLACEMENT, else the pack's manifest, else the repo
+# default) so this script, mem_budget.py and the loaders cannot each pick a different table: the
+# 18:03 prefill died because it was the one client that still read the 2.8535 table under the 4620
+# server. The resolved sha is also what the seam handshake checks against the server's Hello.
+PLACEMENT = seam_placement.resolve(CHECKPOINT)
+
 MAX_NEW = int(os.environ.get("MAX_NEW", "256"))
 MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
 DSPARK = os.environ.get("DSPARK") == "1"
@@ -59,8 +67,14 @@ WARMUP = int(os.environ.get("WARMUP", "0"))
 WARMUP_NEW = int(os.environ.get("WARMUP_NEW") or MAX_NEW)
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "4096"))
 OUT = os.environ.get("OUT", "")
-DEBUG_RESULTS = os.environ.get("DEBUG_RESULTS") == "1"
 MEM_BREAKDOWN = os.environ.get("MEM_BREAKDOWN") == "1"
+# MARGIN_PROBE=1 prints, per prompt, the top-2 logits that produced the first generated token and
+# their gap. Two arms can differ in text while agreeing on 128 tokens out of 128 until one near-tied
+# step flips; the gap is what says whether a flip is a reordering artefact (gap far below the kernels'
+# measured 2e-3 relative difference) or a real disagreement. Read once per prompt, after the sampler
+# already consumed those logits, so it cannot change the token it measures.
+MARGIN_PROBE = os.environ.get("MARGIN_PROBE") == "1"
+DEBUG_RESULTS = os.environ.get("DEBUG_RESULTS") == "1"
 CORPUS_TOKENS = int(os.environ.get("CORPUS_TOKENS", "24000"))
 CORPUS_FILES = [p for p in os.environ.get("CORPUS", "").split(",") if p.strip()]
 LONG_TOKENS = int(os.environ.get("LONG_TOKENS", "0"))
@@ -131,18 +145,35 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
         text = ""
         chunks = 0
         eos_result = None
+        probed = False
         while generator.num_remaining_jobs():
             for result in generator.iterate():
                 if DEBUG_RESULTS:
                     print("DBG " + json.dumps(
                         {k: (list(v.shape) if isinstance(v, torch.Tensor) else v)
                          for k, v in result.items() if k != "text"}, default=str), flush=True)
+                if MARGIN_PROBE and not probed and result.get("logits") is not None:
+                    probed = True
+                    top = torch.topk(result["logits"][0, 0].float(), 2)
+                    chosen = result.get("token_ids")
+                    print(f"MARGIN spec={spec} prompt={label} "
+                          f"top_ids={[int(t) for t in top.indices]} "
+                          f"top_logits={[round(float(v), 5) for v in top.values]} "
+                          f"gap={float(top.values[0] - top.values[1]):.5f} "
+                          f"chosen={int(chosen[0, 0]) if chosen is not None else -1}", flush=True)
                 chunk = result.get("text", "")
                 if chunk:
                     text += chunk
                     chunks += 1
                 if result.get("eos"):
                     eos_result = result
+                if result.get("stage") == "error":
+                    # Generator.reap_failed_job contains a forward failure as an "error" result with
+                    # eos=True. Without this the arm reports 0 tokens with rc=0 and the exception
+                    # that killed the job never reaches the log (measured 2026-11-01: a seam arm
+                    # looked "empty" while the real failure was one layer-0 request).
+                    print(f"ARM_JOB_ERROR {spec} prompt={label} error={result.get('error')!r}",
+                          file = sys.stderr, flush = True)
         wall = time.time() - t0
         st = eos_result or {}
         new_tokens = st.get("new_tokens") or chunks
@@ -221,8 +252,12 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
 
 
 def main():
-    placement = json.load(open(PLACEMENT))
-    hot = {f"layers.{layer}.ffn": v["hot"] for layer, v in placement["layers"].items()}
+    placement, placement_path, placement_sha = seam_placement.load(CHECKPOINT)
+    # Printed before any model work: the seam handshake refuses a server whose Hello advertises
+    # another table, so this number either matches the server's or names the mismatch here.
+    print(f"CLIENT_PLACEMENT path={placement_path} sha={placement_sha[:16]} ckpt={CHECKPOINT}",
+          flush=True)
+    hot = seam_placement.hot(placement)
     config = Config.from_directory(CHECKPOINT)
     config.infer_params.moe_cpu_split = 1
     config.infer_params.moe_remote_hot = hot

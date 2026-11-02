@@ -14,6 +14,35 @@ _split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0"
 _split_prof = bool(os.environ.get("EXL3_SPLIT_PROF"))
 _sprof = {"issue": [], "wait": []}
 
+# EXL3_MOE_SPLIT_ID_CHECK=1: audit, on the client, the cold-local ids that go on the worker's
+# wire (see _ids_check). Off by default: the audit reads the ids back to the host, which costs a
+# sync per layer per call. It exists because on 2026-11-01 the server received an id (268) past
+# its layer's cold count (254) on a rows=6 call and the fused expert kernel then read past the
+# layer's table; nothing on the client checked what it shipped, so the only evidence was on GX.
+_id_check = os.environ.get("EXL3_MOE_SPLIT_ID_CHECK", "0") not in ("", "0")
+
+
+def _ids_check(key, first, num_experts, sel):
+    """Print, and bound-check, the worker ids of one translate.
+
+    Contract: the wire carries cold-local ids, i.e. 0 <= id < num_experts - first (first = this
+    layer's GPU-resident expert count), and -1 for a pick that is not on the worker at all. A
+    larger id makes the worker index past its expert tables inside a fused launch, and the
+    resulting illegal access only surfaces at some later synchronise, so the failure names the
+    wrong call and the wrong layer. Checking here names the client, the layer and the value.
+    """
+    cold = int(num_experts) - int(first)
+    n = sel.numel()
+    lo, hi = int(sel.min()), int(sel.max())
+    print(f"SEAM_CLIENT_IDS key={key} first={first} n_cold={cold} n={n} min={lo} max={hi}",
+          flush = True)
+    if n and hi >= cold:
+        rows = sel.reshape(sel.shape[0], -1) if sel.dim() > 1 else sel.reshape(1, -1)
+        raise RuntimeError(
+            f"cold-local ids out of range for the worker: {key} ships ids up to {hi} for "
+            f"{cold} cold experts (first GPU-resident expert {first} of {num_experts}); "
+            f"rows={rows.shape[0]} ids={rows[:4].tolist()}")
+
 def _sprof_wrap(kind, layer, fn):
     ev0 = torch.cuda.Event(enable_timing = True)
     ev1 = torch.cuda.Event(enable_timing = True)
@@ -436,7 +465,18 @@ class BlockSparseMLP_CPU:
         split_k = int(getattr(ip, "moe_cpu_split", 0))
         remote_hot = getattr(ip, "moe_remote_hot", None)
         if remote_hot is not None and self.key in remote_hot:
-            split_k = self.num_experts - len(remote_hot[self.key])
+            hot_ids = remote_hot[self.key]
+            # Registration-time guard, before any request can be sent: the cold count this layer
+            # derives is num_experts - len(hot), so a hot list from another pack (or another expert
+            # count) silently shifts every cold id. Failing here names the layer and the file's
+            # intent instead of surfacing as a server fail-stop on the first long prefill.
+            if hot_ids and (min(hot_ids) < 0 or max(hot_ids) >= self.num_experts):
+                raise RuntimeError(
+                    f"placement hot list for {self.key} has expert ids in "
+                    f"[{min(hot_ids)},{max(hot_ids)}] but the layer has {self.num_experts} experts: "
+                    f"the placement file does not belong to this checkpoint (qmesh/placement.py "
+                    f"picks the pack's own table; PLACEMENT overrides it)")
+            split_k = self.num_experts - len(hot_ids)
         if split_k:
             assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
@@ -587,10 +627,19 @@ class BlockSparseMLP_CPU:
                     return None, ("fused", pending)
             sel_cpu = self._split_translate(selected_experts)
             return None, self.cpu_host.submit_issue(
-                self.cpu_layer_idx, y, sel_cpu, routing_weights)
+                self.cpu_layer_idx, y, sel_cpu, routing_weights, n_cold = self._split_n_cold())
         sel_cpu = self._split_translate(selected_experts)
         return self.cpu_host.submit_prefill(
-            self.cpu_layer_idx, y, sel_cpu, routing_weights), None
+            self.cpu_layer_idx, y, sel_cpu, routing_weights,
+            n_cold = self._split_n_cold()), None
+
+    def _split_n_cold(self):
+        """The cold-expert count the tail ids above are indexed against, i.e. the bound the
+        transport checks each pick against before it goes on the wire (None when the split is
+        dynamic: the map kernel owns the range and its count changes per step)."""
+        if self._split_map is not None or self.cpu_split_first is None:
+            return None
+        return self.num_experts - self.cpu_split_first
 
     def _split_translate(self, selected_experts):
         """Copy-path selection translate: dynamic placement runs the map kernel (hit counts,
@@ -598,7 +647,16 @@ class BlockSparseMLP_CPU:
         graphs at baked addresses -- and the worker-side selection with -1 sentinels for
         GPU-resident picks); the static split is a tail offset."""
         if self._split_map is None:
-            return (selected_experts - self.cpu_split_first).clamp_min(-1)
+            # Cold-local id for a cold pick, -1 for anything else. Both ends need the guard: a
+            # selection id of `num_experts` (the sentinel the MoE path writes for "no expert") used
+            # to translate to `num_experts - first`, which is one past the worker's last cold expert
+            # and made the worker fail-stop the whole seam on a pick it could have skipped.
+            rel = selected_experts - self.cpu_split_first
+            n_cold = self.num_experts - self.cpu_split_first
+            sel_cpu = torch.where((rel >= 0) & (rel < n_cold), rel, torch.full_like(rel, -1))
+            if _id_check:
+                _ids_check(self.key, self.cpu_split_first, self.num_experts, sel_cpu)
+            return sel_cpu
         n = selected_experts.numel()
         buf = self._split_selcpu_t
         if buf is None or buf.numel() < n:
@@ -608,6 +666,8 @@ class BlockSparseMLP_CPU:
         ext.moe_split_map(
             selected_experts.view(-1), self._split_map, self._split_hist,
             buf[:n], self.cpu_split_first)
+        if _id_check:
+            _ids_check(self.key, self.cpu_split_first, self.num_experts, sel_cpu)
         return sel_cpu
 
     def cpu_offload_issue(self, shape, y, selected_experts, routing_weights, params):
@@ -638,7 +698,14 @@ class BlockSparseMLP_CPU:
         enqueues a flag wait ahead of the readback, so the add consumes the worker's output
         exactly when it is ready). Fused handles add in place straight from the pinned slot
         (or skip the readback entirely for a job with no CPU-resident picks)."""
+
         if cpu_pending is not None:
+            # Timeline only (EXL3_SEAM_MARK=1): the GPU experts and the shared expert that ran under
+            # the seam's request are done, so the collect the seam records next starts from here.
+            # Layers without a host have no seam and no cpu_pending, hence no mark.
+            _mark = getattr(getattr(self, "cpu_host", None), "mark", None)
+            if _mark is not None:
+                _mark(self.cpu_layer_idx, "hot1")
             if isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
                 f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
                 if _split_prof:
