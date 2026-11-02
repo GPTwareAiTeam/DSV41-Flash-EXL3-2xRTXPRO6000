@@ -121,6 +121,19 @@ start=$(date +%s); deadline=$((start + MAXMIN * 60)); hard=$((start + HARD_CAP_M
 export GPU_TICKET_HARDCAP=$hard
 printf 'hardcap=%s\n' "$hard" >>"$ticket" 2>/dev/null
 log "start $AGENT max=${MAXMIN}m hardcap=${HARD_CAP_MIN}m load=$(cut -d" " -f1 /proc/loadavg)"
+# A mis-typed ticket must not read as a failed build. `setsid "$@"` execs argv[0] as a filename, so a
+# command passed as ONE quoted string ("scripts/x.sh a b") becomes a filename with spaces and dies as
+# rc=127 in 0 s with setsid's "No such file or directory" -- which two of my own tickets ate on
+# 2026-11-02 (one relative, one absolute) before anyone saw the cause. Refuse it before the GPU is
+# touched, and say what to do instead.
+case "$1" in
+  *' '*|'') log "TICKET_BAD_CMD argv0=\"$1\" hint=pass the command as separate words, not one quoted string"
+            printf 'TICKET_BAD_CMD argv0=%s\n' "$1" >&2; exit 2 ;;
+esac
+if [ ! -x "$1" ]; then
+  log "TICKET_BAD_CMD argv0=\"$1\" hint=argv[0] must be an executable file (cwd is $PWD)"
+  printf 'TICKET_BAD_CMD argv0=%s not executable (cwd=%s)\n' "$1" "$PWD" >&2; exit 2
+fi
 setsid "$@" & cpid=$!
 grace_until=0
 while kill -0 "$cpid" 2>/dev/null; do

@@ -759,6 +759,15 @@ check("the release guard only holds tickets that name a pair container",
       'check_release "$@"' in src("gpu_run_pair.sh")
       and 'PAIR_CONTAINERS="seam-p7-dev seam-p7-prod seam-gx2-dev seam-gx1-prod"' in src("gpu_run_pair.sh")
       and "PAIR_CHECK_FORCE" in src("gpu_run_pair.sh"), "")
+# Executed, not grepped: a ticket whose command is one quoted string must exit 2 before the GPU, because
+# `setsid "$@"` would otherwise exec a filename with spaces and die as rc=127 in 0 s -- which read as a
+# failed build twice on 2026-11-02 and cost a box window each time.
+_r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "T", "1", "scripts/pair_prepare.sh dev x --side gx"],
+             env=dict(_e, QBASE=os.path.join(_gd, "q")),
+             capture_output=True, text=True, timeout=60)
+check("a ticket whose command is one quoted string is refused before the GPU",
+      _r.returncode == 2 and "TICKET_BAD_CMD argv0=" in (_r.stdout + _r.stderr),
+      "rc=%s %s" % (_r.returncode, (_r.stdout + _r.stderr).strip()[:200]))
 _sh.rmtree(_gd, ignore_errors=True)
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
