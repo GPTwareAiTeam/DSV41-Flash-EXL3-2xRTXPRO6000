@@ -254,8 +254,22 @@ def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
             problems.append(f"ext_build_id={ext.get('build_id')} want={build_id}")
         if ext.get("source_sha") != sha:
             problems.append(f"ext_source={str(ext.get('source_sha'))[:8]} want={sha[:8]}")
-        if ext.get("arch_list") != manifest[side]["cuda_arch"]:
-            problems.append(f"ext_arch={ext.get('arch_list')} want={manifest[side]['cuda_arch']}")
+        # the stamp records arch_list as the list torch takes, so compare against the one-entry list
+        if ext.get("arch_list") != [manifest[side]["cuda_arch"]]:
+            problems.append(f"ext_arch={ext.get('arch_list')} want={[manifest[side]['cuda_arch']]}")
+        # cuda-exl3 is gitignored and built per checkout, so the GX stamp has to name it: without it
+        # the release would verify clean and then serve every layer on the mixed-K module.
+        if side == "gx":
+            cx = ext.get("cx") or {}
+            if not cx:
+                problems.append("cx_stamp=missing")
+            else:
+                if cx.get("build_id") != build_id:
+                    problems.append(f"cx_build_id={cx.get('build_id')} want={build_id}")
+                if cx.get("source_sha") != sha:
+                    problems.append(f"cx_source={str(cx.get('source_sha'))[:8]} want={sha[:8]}")
+                if cx.get("arch_list") != [manifest[side]["cuda_arch"]]:
+                    problems.append(f"cx_arch={cx.get('arch_list')} want={[manifest[side]['cuda_arch']]}")
 
     # 6. the container must be wired to the pair root, not to some tree somebody copied into it
     if skip_ct:

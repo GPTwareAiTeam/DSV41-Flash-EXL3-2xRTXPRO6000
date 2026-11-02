@@ -116,8 +116,11 @@ def write(pair, sha, ref_file="", log="", by=""):
         "cut_at": rj.get("cut_at"),
         "lib": {arch_p7: {k: lib_p7.get(k) for k in ("sha256", "build_id", "source_sha", "sm")},
                 arch_gx: {k: lib_gx.get(k) for k in ("sha256", "build_id", "source_sha", "sm")}},
+        # "cx" on gx: cuda-exl3 is gitignored and built per checkout, so the manifest has to name the
+        # kernel the release was built with -- a promotion compares releases by this, and without it a
+        # release that never built its kernel would look like any other (pair_sync_check.py).
         "ext": {"p7": {k: ext_p7.get(k) for k in ("sha256", "build_id", "source_sha", "arch_list")},
-                "gx": {k: ext_gx.get(k) for k in ("sha256", "build_id", "source_sha", "arch_list")}},
+                "gx": {k: ext_gx.get(k) for k in ("sha256", "build_id", "source_sha", "arch_list", "cx")}},
         "ref_ids": ref_ids,
         "p7": {"label": "P7", "container": cfg["p7ct"], "arch": arch_p7, "root": root,
                "sm": cfg["p7_arch"], "cuda_arch": "12.0" if cfg["p7_arch"] == "sm_120" else "12.1",

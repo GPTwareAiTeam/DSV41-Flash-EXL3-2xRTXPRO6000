@@ -27,8 +27,19 @@ for arch in x86_64 aarch64; do
     > "$so.stamp"
 done
 printf 'ext\n' > "$REL_DIR/ext/exllamav3_ext.so"
-printf '{"build_id":"%s","source_sha":"%s","sha256":"%s"}' "$BID" "$SHA" \
-  "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" > "$REL_DIR/ext/BUILD_STAMP.json"
+# The GX stamp also has to name the cuda-exl3 kernel (its .so is gitignored and built per checkout),
+# so a prepared GX release is only "prepared" with both halves stamped.
+stamp_json() {  # <build_id> <so-sha> <cx-sha|""> -- one BUILD_STAMP.json as pair_build_ext.sh writes it
+  local bid=$1 so_sha=$2 cx_sha=$3
+  if [ -n "$cx_sha" ]; then
+    printf '{"build_id":"%s","source_sha":"%s","sha256":"%s","cx":{"build_id":"%s","source_sha":"%s","arch_list":["12.1"],"sha256":"%s","so":"_C.so","built_at":"2026-11-01T00:00:00Z"}}' \
+      "$bid" "$SHA" "$so_sha" "$bid" "$SHA" "$cx_sha"
+  else
+    printf '{"build_id":"%s","source_sha":"%s","sha256":"%s"}' "$bid" "$SHA" "$so_sha"
+  fi
+}
+stamp_json "$BID" "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" "cx-$BID" \
+  > "$REL_DIR/ext/BUILD_STAMP.json"
 cd "$REL"
 export PAIR_DRY=1 PAIR_DRY_SSH="$WORK/bin/stub_ssh" PAIR_ROOT_OVERRIDE="$WORK/pair" \
        PAIR_QUEUE="$WORK/noq" PAIR_DRY_GPU=free PAIR_STATE_OVERRIDE="$WORK/pairs"
@@ -62,9 +73,18 @@ out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
 want "foreign ext stamp refused" "EXT_STAMP_MISMATCH" "$out"
 want "foreign ext stamp fails before the flip" "PAIR_UPDATE_FAILED pair=$PAIR phase=prepared" "$out"
 
+# 3b. the torch extension is stamped for this build but the cuda-exl3 kernel is not: the release would
+# serve every layer on the mixed-K module, so the ticket must refuse it before the flip.
+stamp_json "$BID" "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" "" \
+  > "$REL_DIR/ext/BUILD_STAMP.json"
+out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
+want "kernel-less gx stamp refused" "CX_STAMP_MISSING gx" "$out"
+want "kernel-less gx stamp fails before the flip" "PAIR_UPDATE_FAILED pair=$PAIR phase=prepared" "$out"
+[ "$rc" != 0 ] && echo "OK   kernel-less exit=$rc" || { echo "FAIL kernel-less gx stamp exited 0"; fails=$((fails + 1)); }
+
 # 4. prepared: stamps of this build, nothing to build, flip and smoke happen
-printf '{"build_id":"%s","source_sha":"%s","sha256":"%s"}' "$BID" "$SHA" \
-  "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" > "$REL_DIR/ext/BUILD_STAMP.json"
+stamp_json "$BID" "$(sha256sum "$REL_DIR/ext/exllamav3_ext.so" | cut -d' ' -f1)" "cx-$BID" \
+  > "$REL_DIR/ext/BUILD_STAMP.json"
 out=$(PAIR_FLIP_ONLY=1 run "$SHA"); rc=$?
 want "prepared release flips" "PAIR_UPDATED_DRY pair=$PAIR sha=$SHA build=$BID" "$out"
 want "stamp verify reported" "LIB_OK p7 x86_64" "$out"

@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# pair_build_ext.sh -- build the exllamav3 torch extension for one release, per container.
+# pair_build_ext.sh -- build the native pieces of one release, per container: the exllamav3 torch
+# extension on both sides, and on GX the vendored cuda-exl3 cold-expert kernel.
 #
 #   pair_build_ext.sh <pair> <sha> [--side p7|gx|both]
 #   pair_build_ext.sh verify <pair> <sha> [--side p7|gx|both]   (stamp check only, builds nothing)
 #
-# The cache is per release (releases/<sha>/ext) and per container image (P7 torch 2.14, GX torch 2.11,
-# and 12.0 vs 12.1 arch), so each side builds its own: a cache shared between containers is how one
-# container's stale objects became another container's "fresh" build.
+# The torch cache is per release (releases/<sha>/ext) and per container image (P7 torch 2.14, GX torch
+# 2.11, and 12.0 vs 12.1 arch), so each side builds its own: a cache shared between containers is how
+# one container's stale objects became another container's "fresh" build.
+#
+# cuda-exl3 is different: it is gitignored, built in place into the release's own tree
+# (releases/<sha>/src/vendor/cuda-exl3/src/cuda_exl3/_C.<abi>.so) by the container that will import it,
+# so every cut needs this stage before it can serve. Its identity rides in the same BUILD_STAMP.json
+# as the torch extension's (`cx`), and verify mode refuses a GX stamp without it.
 #
 # Guards are the same as pair_build_lib.sh: no server in this pair's container, no compiler already
 # running on the box, and on GX enough free memory that no pack is loading. A build killed mid-JIT
@@ -70,7 +76,7 @@ side_docker() {  # <side> <args...>
 side_hostsh() { local side=$1; if [ "$side" = p7 ]; then bash -c "$2"; else pair_gxsh "$2"; fi; }
 
 build_side() {
-  local side=$1 ct sm archlist out rc
+  local side=$1 ct sm archlist out rc cxout cxso cxsha cxname
   if [ "$side" = p7 ]; then ct=$P7CT; sm=$P7_ARCH; else ct=$GXCT; sm=$GX_ARCH; fi
   archlist=$(pair_cuda_arch_for "$sm")
   local rel_c="$MOUNT/releases/$SHA"
@@ -158,6 +164,33 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
   side_docker "$side" exec "$ct" sh -c "chown -R $uid:$gid $rel_c/ext" \
     || { pair_step "EXT_FAIL $side chown_cache"; return 1; }
 
+  # cuda-exl3, the cold-expert kernel. Its .so is gitignored on purpose -- it is per checkout and per
+  # image -- so a release that was cut but never built has no kernel at all: the worker prints
+  # SEAM_MOE_NOEXT and serves every layer on the mixed-K module, which is correct output at a
+  # fraction of the rate. Building it here, in the container that will import it, and putting its
+  # identity into the same stamp as the torch extension's is what makes "the release passed" mean
+  # "the release's kernel passed". (~100 s at MAX_JOBS=8, inside this stage's own timeout.)
+  if [ "$side" = gx ]; then
+    pair_step "CX_BUILD gx $ct arch=12.1 jobs=$JOBS build=$BUILD_ID"
+    cxout=$(pair_gxsh "docker exec $(printf %q "$ct") bash -lc $(printf %q "cd $rel_c/src && env MAX_JOBS=$JOBS TORCH_CUDA_ARCH_LIST=12.1 timeout $EXT_TIMEOUT sh qmesh/build_cudaexl3.sh")" 2>&1)
+    rc=$?
+    [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$cxout" >> "$PAIR_LOG"
+    # The script's own last line is the import probe's schema assertion, so rc=0 means the .so was
+    # built *and* loaded with the shared-accumulator args the seam adapter asks for.
+    if [ "$rc" != 0 ] || ! printf '%s' "$cxout" | grep -q '^cuda_exl3 ok:'; then
+      pair_step "CX_FAIL gx rc=$rc $(printf '%s' "$cxout" | grep -E 'Error|error:|FAILED|Assertion' | tail -3 | tr '\n' ' ')"
+      return 1
+    fi
+    cxso=$(pair_gxsh "ls -1 $rel_c/src/vendor/cuda-exl3/src/cuda_exl3/_C*.so 2>/dev/null | head -1")
+    [ -n "$cxso" ] || { pair_step "CX_FAIL gx no_so_in_release_tree"; return 1; }
+    cxname=$(basename "$cxso")
+    cxsha=$(pair_gxsh "sha256sum '$cxso'" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$cxsha" ] || { pair_step "CX_FAIL gx so_unreadable so=$cxname"; return 1; }
+    # built as root inside the container; the host user stamps and later prunes the tree
+    pair_gxsh "chown -R $(id -u):$(id -g) $rel_c/src/vendor/cuda-exl3" >/dev/null 2>&1 || true
+    pair_step "CX_OK gx so=$cxname sha256=$cxsha arch=12.1"
+  fi
+
   local so sha_so
   so=$(printf '%s\n' "$out" | sed -n 's/^EXT_SO //p' | tail -1)
   [ -n "$so" ] || { pair_step "EXT_FAIL $side no_so_path"; return 1; }
@@ -170,15 +203,23 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u -"
   local torchv
   torchv=$(side_docker "$side" exec "$ct" python3 -c 'import torch;print(torch.__version__)' 2>/dev/null | tail -1)
   local stamp
-  stamp=$(python3 - "$BUILD_ID" "$SHA" "$archlist" "$torchv" "$sha_so" "$side" <<'PY'
+  # One stamp per release per side, and on GX it carries the kernel too: a release whose cuda-exl3 was
+  # not built looks identical otherwise (the .so is gitignored), and the smoke would be the first place
+  # that noticed -- as a slow server instead of a missing build.
+  stamp=$(python3 - "$BUILD_ID" "$SHA" "$archlist" "$torchv" "$sha_so" "$side" "${cxsha:-}" "${cxname:-}" <<'PY'
 import datetime, json, sys
-bid, sha, archs, torchv, so, side = sys.argv[1:7]
-print(json.dumps({
+bid, sha, archs, torchv, so, side, cxsha, cxname = sys.argv[1:9]
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+doc = {
     "build_id": bid, "source_sha": sha,
     "arch_list": archs.split(";") if ";" in archs else archs.split(","),
     "torch": torchv, "sha256": so, "host": side,
-    "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-}, indent=2, sort_keys=True))
+    "built_at": now,
+}
+if cxsha:
+    doc["cx"] = {"build_id": bid, "source_sha": sha, "arch_list": ["12.1"],
+                 "sha256": cxsha, "so": cxname, "built_at": now}
+print(json.dumps(doc, indent=2, sort_keys=True))
 PY
 )
   if [ "$side" = p7 ]; then
@@ -186,7 +227,7 @@ PY
   else
     printf '%s\n' "$stamp" | pair_gxsh "cat > '$REL/ext/BUILD_STAMP.json'"
   fi
-  pair_step "EXT_OK $side torch=$torchv arch=$archlist so=$(basename "$so") sha256=$sha_so"
+  pair_step "EXT_OK $side torch=$torchv arch=$archlist so=$(basename "$so") sha256=$sha_so${cxsha:+ cx=$cxname cx_sha256=$cxsha}"
   # `ninja -n` in the cache: a non-empty build plan means a later runtime import would rebuild the
   # extension *under a live server* (the SIGBUS that has taken pairs down), so say so now.
   local ndry

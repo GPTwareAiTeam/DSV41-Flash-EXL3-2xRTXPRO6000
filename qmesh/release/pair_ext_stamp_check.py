@@ -23,6 +23,22 @@ def main():
     if bad:
         print(f"EXT_STAMP_MISMATCH {side} " + " ".join(f"{k}={d.get(k)}" for k in bad))
         return 1
+    # A GX release whose cuda-exl3 was never built is indistinguishable from a good one by src+sha:
+    # the .so is gitignored and exists only in the built tree. Verify mode is the last check before a
+    # flip, so it demands the kernel's identity here instead of leaving the smoke to notice it as a
+    # slow server.
+    if side == "gx":
+        cx = d.get("cx") or {}
+        if not cx:
+            print(f"CX_STAMP_MISSING gx build={bid}")
+            return 1
+        badcx = [k for k, v in (("build_id", bid), ("source_sha", sha)) if cx.get(k) != v]
+        if cx.get("arch_list") != ["12.1"]:
+            badcx.append("arch_list")
+        if badcx:
+            print("CX_STAMP_MISMATCH gx " + " ".join(f"{k}={cx.get(k)}" for k in badcx))
+            return 1
+        print(f"CX_OK gx sha256={cx.get('sha256')} so={cx.get('so')} arch=12.1 (stamp)")
     print(f"EXT_OK {side} sha256={d.get('sha256')} build={d.get('build_id')} (stamp)")
     return 0
 
