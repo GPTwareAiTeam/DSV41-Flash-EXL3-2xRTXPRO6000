@@ -173,6 +173,15 @@ bool qes_trace() {
   return on;
 }
 
+/* SEAM_HOOK_TIME=1 prints SEAM_HOOK_US for every served request: the microseconds the proxy spent
+ * inside the compute hook. The hook is whichever pointer the server installed, so one switch
+ * measures the Python cold path and the C hook the same way, and the difference between the two is
+ * what the interpreter costs per call - no wire, no client queueing, no second instrument. */
+bool qes_hook_time() {
+  static const bool on = getenv("SEAM_HOOK_TIME") != nullptr;
+  return on;
+}
+
 /* QES_TRACE=1 traces setup and the WRs each side posts; QES_TRACE=2 also traces every completion
  * and the bytes a compute produced, which tells "the peer never wrote it" apart from "the peer
  * wrote zeros". */
@@ -1062,8 +1071,21 @@ void server_proxy(qes_handle* h) {
       const int rows = (int)hdr->rows;
       int refused = 0;
       if (h->server_fn) {
+        /* SEAM_HOOK_TIME=1 times the call into the compute hook. Both paths come through this
+         * line - the Python cold path and the C hook - so the difference between two runs is the
+         * interpreter's cost on the server, not wire time and not client-side queueing: the hook
+         * returns only after the answer is in the pinned slab, so this covers the whole forward
+         * plus the copy out, blocked, exactly as the client waits for it. */
+        const bool timed = qes_hook_time();
+        const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         refused = h->server_fn(h->server_ctx, L, rows, req, (const int32_t*)(req + h->ids_off),
                                req + h->w_off, (float*)(h->slab + off_resp(h, i)));
+        if (timed) {
+          const double us = std::chrono::duration<double, std::micro>(
+                                std::chrono::steady_clock::now() - t0).count();
+          fprintf(stderr, "SEAM_HOOK_US port=%d layer=%d rows=%d us=%.1f\n", h->tcp_port, L, rows, us);
+          fflush(stderr);
+        }
       } else {
         server_compute(h, i, L, rows);
       }
