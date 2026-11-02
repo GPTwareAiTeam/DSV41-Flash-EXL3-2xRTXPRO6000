@@ -163,24 +163,51 @@ def plan_side(cfg, side):
         why.append(f"entrypoint={got['entrypoint']}")
     if list(got["cmd"]) != list(want["cmd"]):
         why.append(f"cmd={got['cmd']}")
+    # A wanted mount is satisfied by an identical live mount, or by a live parent that carries it:
+    # seam-p7-dev and seam-p7-prod were built with /models <- /models before the spec narrowed to the
+    # pack's own directory, and /models/dsv41 is present through it. Calling that "absent" made every
+    # dev prepare die on a RECREATE the owner forbids ("never recreate an existing container"), while
+    # the container could do the job all along.
+    def covering(src, dst):
+        for gdst, gsrc in got["mounts"].items():
+            if gdst == dst:
+                continue
+            if (dst == gdst or dst.startswith(gdst.rstrip("/") + "/")) and \
+               (src == gsrc or src.startswith(gsrc.rstrip("/") + "/")):
+                return gdst, gsrc
+        return None
+
     for src, dst in want["mounts"]:
         seen = got["mounts"].get(dst)
-        if seen != src:
-            # `~` wrong source, `+` wanted but absent. Nothing here ever means "add a mount" for a
-            # mount the live container has and the spec does not -- that is the next loop, and it
-            # removes. (A removed mount used to print as `mount:+<dst>=<src>`, which read as an add.)
-            why.append(f"mount:~{dst}={seen} want={src}" if seen
-                       else f"mount:+{dst}=absent want={src}")
+        if seen == src:
+            continue
+        if seen:
+            # `~` wrong source. Nothing here ever means "add a mount" for a mount the live container
+            # has and the spec does not -- that is the next loop, and it removes. (A removed mount used
+            # to print as `mount:+<dst>=<src>`, which read as an add.)
+            why.append(f"mount:~{dst}={seen} want={src}")
+            continue
+        cover = covering(src, dst)
+        if cover:
+            why.append(f"advisory:mount:{dst}=covered_by {cover[0]}={cover[1]}")
+        else:
+            why.append(f"mount:+{dst}=absent want={src}")
     # A mount the spec no longer names is drift, not history. The P7 containers were once given the
     # 12 TB /mnt/data12 drive; the owner's pack rule (2026-11-02: packs live on the serving box's own
     # disk) drops it from the spec. Comparing only the wanted mounts made that removal invisible --
     # plan said "unchanged" and the next flip would have kept the drive in place. An extra live mount
     # is reported here as a removal (`mount:-`) and leaves when the container is recreated at a queued
     # update; the spec itself may not name /mnt at all (SPEC_REFUSED in spec()).
+    #
+    # It is an advisory, not a verdict: a removal can only be applied by recreating the container, and
+    # the owner forbids recreating one that exists ("never recreate or rename an existing container").
+    # So the line stays visible (an operator reading plan sees the difference) while the pair keeps
+    # running: nothing about it makes the release wrong, and the pack rule is enforced on the pack the
+    # server actually loads (pair_pack_disk.py) and again by the smoke.
     wanted_dst = {dst for _src, dst in want["mounts"]}
     for dst, src in sorted(got["mounts"].items()):
         if dst not in wanted_dst:
-            why.append(f"mount:-{dst}={src} (not in spec)")
+            why.append(f"advisory:mount:-{dst}={src} (not in spec)")
     for k, v in want["env"].items():
         if got["env"].get(k) != v:
             why.append(f"env:{k}={got['env'].get(k) or '-'} want={v}")
@@ -259,19 +286,36 @@ def check_ownership(cfg):
             die(f"{ct} is named by a live ticket ({who}); refusing to recreate it")
 
 
+def real_reasons(why):
+    """The reasons that mean "this container cannot do the job", i.e. not the advisories.
+
+    An advisory names a difference only a recreation could remove (an extra mount, a narrower spec
+    mount carried by a live parent) or one that is already satisfied. The owner's rule is that an
+    existing container is never recreated outside a queued update, so an advisory may not turn into a
+    refusal: it is printed for the operator and skipped by the verdict.
+    """
+    return [w for w in (why or []) if not w.startswith("advisory:")]
+
+
 def cmd_plan(cfg, quiet=False):
     rc = 0
     for side in ("p7", "gx"):
         ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]
         why = plan_side(cfg, side)
-        if why:
-            # "missing" is not "differs": a pair that has never run has no container to replace, and
-            # printing RECREATE for it made a first rollout look like a swap of something running.
-            exists = docker(cfg, side, ["inspect", "-f", "{{.Id}}", ct])[0] == 0
+        real = real_reasons(why)
+        adv = [w[len("advisory:"):] for w in why if w.startswith("advisory:")]
+        if not real and not adv:
+            if not quiet:
+                print(f"PLAN {cfg['pair']} {side} {ct} OK")
+            continue
+        # "missing" is not "differs": a pair that has never run has no container to replace, and
+        # printing RECREATE for it made a first rollout look like a swap of something running.
+        exists = docker(cfg, side, ["inspect", "-f", "{{.Id}}", ct])[0] == 0
+        if real:
             rc = 1
-            print(f"PLAN {cfg['pair']} {side} {ct} {'RECREATE' if exists else 'CREATE'} {' '.join(why)}")
-        elif not quiet:
-            print(f"PLAN {cfg['pair']} {side} {ct} OK")
+            print(f"PLAN {cfg['pair']} {side} {ct} {'RECREATE' if exists else 'CREATE'} {' '.join(real)}")
+        else:
+            print(f"PLAN {cfg['pair']} {side} {ct} OK advisory={' '.join(adv)}")
     return rc
 
 
@@ -310,7 +354,10 @@ def cmd_apply(cfg, sha, ts, force=False):
     if not os.path.isdir(os.path.join(cfg["root"], "releases", sha, "src")):
         die(f"release {sha[:8]} is not cut at {cfg['root']}")
     check_ownership(cfg)
-    todo = [(s, plan_side(cfg, s)) for s in ("p7", "gx")]
+    # Only a container that cannot do the job is recreated. An advisory difference (an extra mount, a
+    # spec mount carried by a live parent) survives on purpose: applying it means swapping a container
+    # that is serving, which is the owner's call, not a rollout's, so the flip must not fail over it.
+    todo = [(s, real_reasons(plan_side(cfg, s))) for s in ("p7", "gx")]
     todo = [(s, w) for s, w in todo if w]
     if not todo and not force:
         print(f"APPLY {cfg['pair']} no_recreate_needed")
@@ -364,7 +411,10 @@ def cmd_apply(cfg, sha, ts, force=False):
         print(f"LINK_UNPROMOTED {cfg['pair']} current=absent containers->releases/{sha[:12]} "
               f"(current moves only on a passed promote)")
     cmd_inner(cfg, sha, verify=False)
-    left = [(s, w) for s, w in ((s, plan_side(cfg, s)) for s in ("p7", "gx")) if w]
+    # The post-check asks the same question the verdict asked: advisories are printed (they are the
+    # operator's business) but they are not a failed apply.
+    left = [(s, real_reasons(w)) for s, w in ((s, plan_side(cfg, s)) for s in ("p7", "gx"))]
+    left = [(s, w) for s, w in left if w]
     if left:
         die("after recreate the containers still differ: " +
             " ".join(f"{s}:{';'.join(w)}" for s, w in left))

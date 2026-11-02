@@ -634,6 +634,24 @@ check("an extra live mount is planned as a removal, not an add",
       "mount:-/mnt/data12/models/exl3=/mnt/data12/models/exl3 (not in spec)" in _why
       and "mount:+/mnt/data12" not in _why, _why)
 del _got["mounts"]["/mnt/data12/models/exl3"]
+# The difference between "recreate this container" and "note this and keep running" is the
+# difference between a refused prepare and a release that ships; dev's prepare died on it on
+# 2026-11-02 because both live P7 containers mount /models where the spec names the pack directory.
+check("a removable extra mount is an advisory, not a verdict",
+      "advisory:mount:-/mnt/data12/models/exl3=/mnt/data12/models/exl3 (not in spec)" in _why
+      and not pc.real_reasons(["advisory:mount:-/x=/x (not in spec)"])
+      and pc.real_reasons(["mount:+/x=absent want=/x"]) == ["mount:+/x=absent want=/x"], _why)
+del pc.live
+_got2 = dict(_got)
+_got2["mounts"] = dict(_got["mounts"], **{"/models": "/models"})
+_got2["mounts"].pop("/models/dsv41", None)
+pc.live = lambda cfg, side: _got2
+_cov = " ".join(_REAL_PLAN(_cfg, "p7") or [])
+check("a parent mount that carries the wanted path is covered, not absent",
+      "mount:+/models/dsv41=absent" not in _cov and "covered_by /models=/models" in _cov
+      and not [w for w in pc.real_reasons(_REAL_PLAN(_cfg, "p7") or []) if w.startswith("mount")], _cov)
+del pc.live
+pc.live = lambda cfg, side: _got
 _d0 = sorted(_got["mounts"])[0]
 _s0 = _got["mounts"][_d0]
 _got["mounts"][_d0] = "/wrong/place"
