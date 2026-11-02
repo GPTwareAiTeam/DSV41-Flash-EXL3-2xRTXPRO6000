@@ -322,11 +322,19 @@ class SeamServer:
         if not self.ws_auto:
             return min(self.ws_rows, rows)
         avail = _avail_mib()
+        # Step down the instant the current rung stops fitting, but climb back only with
+        # WS_HYST_MIB to spare: on GX1 a resident pack leaves MemAvailable wandering around the
+        # 2048-row threshold (542 MiB available against 614 needed), and a picker that followed
+        # that noise would alternate 2048 and 1024 pieces call after call for no gain. Being slow
+        # on the way up is the safe direction - a rung too small only costs the weight pass the
+        # split already paid.
+        prev = self.__dict__.get("_ws_pick")
         pick = None
         for n in WS_LADDER:
             if n > self.ws_rows:
                 continue
-            if avail < 0 or ws_mib_for(rows, n) + WS_GUARD_MIB <= avail:
+            slack = 0 if (prev is None or n <= prev) else WS_HYST_MIB
+            if avail < 0 or ws_mib_for(rows, n) + WS_GUARD_MIB + slack <= avail:
                 pick = n
                 break
         if pick is None:
@@ -501,6 +509,9 @@ WS_LADDER = (2048, 1024, 512)
 # piece's transient is not the only thing racing for the last GiB (slab, CUDA context, the page
 # cache of a 113.65 GiB pack), and being one rung too big costs a 4x stall, not 10%.
 WS_GUARD_MIB = int(os.environ.get("SEAM_WS_GUARD_MIB", "320"))
+# Extra headroom demanded before a request moves *up* a rung, so a box sitting near a threshold
+# holds its choice instead of alternating piece sizes call after call.
+WS_HYST_MIB = int(os.environ.get("SEAM_WS_HYST_MIB", "128"))
 # SEAM_WS_ROWS_AUTO=0 pins every request to exactly ws_rows: for A/B runs that need the old
 # behaviour, and for --ws-check/--ws-probe/--rows-bench, which set ws_rows themselves.
 WS_AUTO = os.environ.get("SEAM_WS_ROWS_AUTO", "1") != "0"
