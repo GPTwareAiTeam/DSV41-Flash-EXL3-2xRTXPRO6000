@@ -95,10 +95,10 @@ def _mark_dump():
     except Exception:
         pass
     print("[SEAMMARK] layer route_to_payload route_to_hot0  hot_span  hot1_to_collect "
-          "route_to_collect   (ms of device time)", flush = True)
+          "collect_to_done route_to_done   (ms of device time)", flush = True)
     for layer in sorted(_marks):
         m = _marks[layer]
-        if not all(k in m for k in ("route", "hot0", "hot1", "collect")):
+        if not all(k in m for k in ("route", "hot0", "hot1", "collect", "done")):
             continue
         t0 = m["route"]
         # route is recorded on the caller's stream where the routing that produces this layer's
@@ -111,15 +111,17 @@ def _mark_dump():
               f"{t0.elapsed_time(m['hot0']):14.3f} "
               f"{m['hot0'].elapsed_time(m['hot1']):9.3f} "
               f"{m['hot1'].elapsed_time(m['collect']):16.3f} "
-              f"{t0.elapsed_time(m['collect']):16.3f}", flush = True)
-        ids = " ".join(f"{k}={m[k + '_s']:x}" for k in ("route", "hot0", "hot1", "collect", "payload")
+              f"{m['collect'].elapsed_time(m['done']):16.3f} "
+              f"{t0.elapsed_time(m['done']):16.3f}", flush = True)
+        ids = " ".join(f"{k}={m[k + '_s']:x}" for k in ("route", "hot0", "hot1", "collect", "done",
+                                                       "payload")
                        if k + "_s" in m)
         print(f"[SEAMMARK] {layer:5d} streams {ids}", flush = True)
         # Absolute device ms since the first event of the process, and the host time each point was
         # enqueued. A gap that exists on the device but not on the host is queued work between the
         # two points; a gap on the host that is not on the device is the host running ahead.
         h0 = m.get("route_h")
-        keys = ("route", "issue", "payload", "hot0", "hot1", "collect")
+        keys = ("route", "issue", "payload", "hot0", "hot1", "collect", "done")
         abs_ms = " ".join(f"{k}={_base_ev.elapsed_time(m[k]):.2f}"
                           for k in keys if k in m and _base_ev is not None)
         host_us = " ".join(f"{k}={((m[k + '_h'] - h0) / 1e3 if h0 is not None else 0):.0f}"
@@ -514,6 +516,11 @@ class RemoteSeamHost:
         seam.collect(layer_idx, dst.data_ptr(), stream.cuda_stream)
         if not direct:
             out[pos:pos + n] = dst[:n]
+        if _MARK and layer_idx in _marks and n >= _MARK_MIN_ROWS:
+            # The wait kernel is behind the collect above, so this event's device time is when the
+            # reply had landed and its rows were in `out`: the far end of the layer's seam wait.
+            self._mark_ev(layer_idx, "done", stream)
+
         if t0 is not None:
             t1 = time.perf_counter_ns()
             ev1 = torch.cuda.Event(enable_timing = True)
@@ -597,7 +604,9 @@ class RemoteSeamHost:
             # Already a finished tensor: SEAM_OVERLAP=0 submitted and waited in one call.
             return handle
         p = handle
-        if _MARK and p.layer in _marks:
+        # Same row floor as the issue side: a drafter forward reuses these layer indices with a
+        # handful of rows and would otherwise overwrite the chunk's collect with its own.
+        if _MARK and p.rows >= _MARK_MIN_ROWS and p.layer in _marks:
             self._mark_ev(p.layer, "collect", p.stream)
         while p.next < len(p.plan):
             while len(p.inflight) >= self.ns:
