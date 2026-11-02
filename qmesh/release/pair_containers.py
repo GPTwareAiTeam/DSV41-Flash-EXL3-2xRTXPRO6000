@@ -240,8 +240,11 @@ def cmd_plan(cfg, quiet=False):
         ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]
         why = plan_side(cfg, side)
         if why:
+            # "missing" is not "differs": a pair that has never run has no container to replace, and
+            # printing RECREATE for it made a first rollout look like a swap of something running.
+            exists = docker(cfg, side, ["inspect", "-f", "{{.Id}}", ct])[0] == 0
             rc = 1
-            print(f"PLAN {cfg['pair']} {side} {ct} RECREATE {' '.join(why)}")
+            print(f"PLAN {cfg['pair']} {side} {ct} {'RECREATE' if exists else 'CREATE'} {' '.join(why)}")
         elif not quiet:
             print(f"PLAN {cfg['pair']} {side} {ct} OK")
     return rc
