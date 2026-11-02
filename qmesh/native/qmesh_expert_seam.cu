@@ -1720,18 +1720,22 @@ void session_note_reason(ServerSession* ss, const char* why) {
 
 namespace {
 
+/* The state of the occupied server, and the one hint that is useful to whoever reads it: a client
+ * that is already queued gets this string inside its own "queued:" reply, so telling it to queue
+ * there reads as if the server had not heard it. The hint belongs to the two sites that answer a
+ * client which has not asked to wait -- status and refusal -- so it is appended there, not here. */
 std::string busy_text(qes_server* s) {
   char buf[QES_MSG_LEN];
   if (!s->active)
     snprintf(buf, sizeof(buf), "server busy");
   else
-    snprintf(buf, sizeof(buf),
-             "server busy (session from %s since %s, sid=%u, %llus); start the client with "
-             "SEAM_WAIT=1 to queue instead of failing",
+    snprintf(buf, sizeof(buf), "server busy (session from %s since %s, sid=%u, %llus)",
              s->active->ip, s->active->since.c_str(), s->active->id,
              (unsigned long long)((now_ns() - s->active->t0) / 1000000000));
   return buf;
 }
+
+std::string busy_hint() { return "; start the client with SEAM_WAIT=1 to queue instead of failing"; }
 
 bool send_reply(int fd, const CtlReply& r) {
   const char* why = "";
@@ -2207,7 +2211,8 @@ void handle_ctl_conn(qes_server* s, int fd, const char* ip) {
       rep.buckets[i] = (uint32_t)s->buckets[i];
       rep.ports[i] = (uint32_t)s->eps[i].port;
     }
-    snprintf(rep.message, QES_MSG_LEN, "%s", s->active ? busy_text(s).c_str() : "idle");
+    snprintf(rep.message, QES_MSG_LEN, "%s%s", s->active ? busy_text(s).c_str() : "idle",
+             s->active ? busy_hint().c_str() : "");
     send_reply(fd, rep);
     close(fd);
     return;
@@ -2233,7 +2238,7 @@ void handle_ctl_conn(qes_server* s, int fd, const char* ip) {
       return;
     }
     rep.status = QES_ST_BUSY;
-    snprintf(rep.message, QES_MSG_LEN, "%s", busy_text(s).c_str());
+    snprintf(rep.message, QES_MSG_LEN, "%s%s", busy_text(s).c_str(), busy_hint().c_str());
     say("SEAM_REJECT ip=%s reason=busy active_sid=%u active_ip=%s", ip, s->active->id,
         s->active->ip);
     send_reply(fd, rep);
