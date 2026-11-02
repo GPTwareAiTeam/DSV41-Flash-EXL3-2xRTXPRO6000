@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import ctypes
+import gc
 import json
 import os
 import sys
@@ -37,6 +39,13 @@ from qmesh.native import qes
 # exllamav3 is imported inside SeamServer.__init__: its module import JIT-builds exllamav3_ext
 # (minutes on a cold cache, and it blocks on the torch extension baton), which a --stub server
 # must never pay for - the wire/protocol baseline has to come up on a box whose GPU is busy.
+
+# libc handle for malloc_trim(0): the only way Python can hand glibc's freed arenas back to the
+# kernel (see _trim_host). Absent on a musl box, where the trim is simply skipped.
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except OSError:  # noqa: BLE001 - a missing libc handle costs the trim, not the server
+    _LIBC = None
 
 HIDDEN = qes.HIDDEN
 TOPK = qes.TOPK
@@ -98,12 +107,59 @@ def _check_ids(layer, rows, ids, num_experts):
                            f"{int(ids[ids >= num_experts][:8].max())}")
 
 
+# How much MemAvailable one forward needs before it is even launched. Per-request device scratch is
+# priced per row by the picker (_pick_step), but that is only the module's row buffers: the exl3
+# restack transient, the allocator's growth and the pinned slab are extra, and on a box that is
+# already swapping the allocation itself is what fails - a 6-row forward died on 2026-11-01 with
+# avail_min_mib=560 swap_max_mib=3762, and the launch failure it raised killed a process that held
+# a 113 GiB pack. 0 = off, which is the shipped default because the floor has to be measured per
+# box, not guessed: the dev box serves 2048-row pieces at avail_mib=507 (SEAM_WS_PICK ... need_mib=331),
+# so a floor set from the failing number alone would refuse every request. Set SEAM_FWD_FLOOR_MIB
+# from a run that logs avail_mib on both the served and the refused calls.
+FWD_FLOOR_MIB = int(os.environ.get("SEAM_FWD_FLOOR_MIB", "0"))
+
+# Refusal codes. They travel to the client in the slot's fail word (see qmesh_expert_seam.h) and are
+# what the client's proxy prints instead of "the seam transport is dead".
+REFUSE_MEM = 4
+REFUSE_COMPUTE = 5
+
+
+def _free_cached():
+    """Return cached-but-unused device blocks to the driver before deciding there is no room."""
+    try:
+        torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 - a context that cannot empty is a context that is gone
+        pass
+
+
+def _cuda_ok():
+    """True while this process's CUDA context can still run a kernel.
+
+    The difference between "this request does not fit" and "this process can never answer again",
+    and the only thing allowed to kill the server: a launch failure that leaves the context unusable
+    turns every later session into the same failure, so the box is better off reloaded than
+    accepting. A live context means the request was refused, not the server.
+    """
+    try:
+        torch.cuda.synchronize()
+        torch.zeros(1, device = "cuda")
+        torch.cuda.synchronize()
+        return True
+    except Exception:  # noqa: BLE001 - any raise here is the answer: unusable
+        return False
+
+
 def build_layer(base, cold_ids, device):
     """Subset the layer's routed-expert module to `cold_ids` (checkpoint expert ids, ordered).
 
     Mirrors worker_group_server.build_group, with all cold experts in one module so the
-    fused mixed-K path runs one launch per layer."""
-    ffn = copy.deepcopy(base)
+    fused mixed-K path runs one launch per layer.
+
+    The copy shares the one Config instead of duplicating it: a plain deepcopy clones
+    `config.stc`, the safetensors index of the whole pack, into every layer module - 65 MiB per
+    copy, 40 copies, all of it held by the modules and therefore unreclaimable by gc/malloc_trim
+    after the load (measured: 2.6 GiB of the 3.4 GiB swap bill on GX2)."""
+    ffn = copy.deepcopy(base, {id(base.config): base.config})
     ffn.gates = [ffn.gates[e] for e in cold_ids]
     ffn.ups = [ffn.ups[e] for e in cold_ids]
     ffn.downs = [ffn.downs[e] for e in cold_ids]
@@ -126,9 +182,12 @@ def build_layer(base, cold_ids, device):
 class SeamServer:
     def __init__(self, model_dir, placement_path, device, stub = False, ws_rows = 0,
                  fail_after = 0):
-        # fail_after: testing hook for the fail-stop below - raise on call N+1. 0 = never.
+        # fail_after: testing hook for the refusal path - raise on call N+1. 0 = never.
         self.fail_after = int(fail_after or 0)
         self.seen = 0
+        # Refused requests since start (SEAM_COMPUTE_REFUSED). A refusal is not a failure of the
+        # server: the session it belonged to ended, the listener did not.
+        self.refusals = 0
         # One compute at a time. The C proxy calls this hook from a thread per open handle, and a
         # client with several row buckets keeps several handles (1/6/64...) with one request in
         # flight each, so two threads can be inside _forward at once: the pinned-slab pointers are
@@ -139,14 +198,16 @@ class SeamServer:
         # access / launch failure inside the GX compute, i.e. exactly the "6-row" deaths of
         # 2026-11-01, and it cannot be seen by a single-handle benchmark (that is serialized).
         self.compute_lock = threading.Lock()
-        # ws_rows: serve each request in pieces of at most this many rows, so the peak device
-        # workspace follows ws_rows instead of the row bucket (see _forward). 0 = one piece.
+        # ws_rows: the largest piece a request may be served in (see _forward); the piece actually
+        # used is picked per call from WS_LADDER as far as the box's MemAvailable pays for it, so
+        # this is a ceiling, not a promise. 0 = no split at all (one piece, whatever it costs).
         placement = json.load(open(placement_path))
         self.device = device
         self.stub = stub
         self.stream = None
         self.layers = {}
         self.ws_rows = int(ws_rows or 0)
+        self.ws_auto = WS_AUTO
         if stub:
             # Wire/protocol baseline: no experts are needed and nothing here touches CUDA or
             # exllamav3, so a stub server is up in seconds even while the GPU holds another pack.
@@ -203,13 +264,18 @@ class SeamServer:
             self.layers[layer] = build_layer(base, cold, device)
             del base
             torch.cuda.empty_cache()
-            # The layer's file-backed pages were only ever a staging copy: drop them so the cache
-            # does not take memory the next layer (or a 4096-row workspace) needs.
+            # Host side of the same bill: the loader's CPU buffers for this layer are dead now, and
+            # on a unified-pool box anything the kernel is holding on their behalf is swap the next
+            # layer's cudaMalloc cannot use (see _trim_host). Reported per layer so a load that
+            # leaks is visible in the log rather than in somebody's swap census afterwards.
+            released = _trim_host()
+            host_rss, host_swap = _host_rss_swap_mib()
             dropped = _drop_page_cache(self.pack_paths[layer]) if self.fadvise else False
             print(f"layer {layer}: {len(cold)} cold experts, "
                   f"{torch.cuda.memory_allocated(device) / 2**30:.2f} GiB "
                   f"avail_mib={_avail_mib()} cached_mib={_cached_mib()} "
                   f"rss_peak_mib={_rss_peak_mib()} swap_mib={_swap_used_mib()} "
+                  f"host_rss_mib={host_rss} host_swap_mib={host_swap} host_trim_mib={released} "
                   f"cached_dropped={int(dropped)}", flush=True)
             # Convert now, not on the first request for this layer: this is the only moment the
             # group transient fits (see PRELOAD_CX). _cx_moe prints SEAM_MOE_CX or SEAM_MOE_NOFIT
@@ -217,6 +283,31 @@ class SeamServer:
             # because nothing of the module was released in that case.
             if self.preload:
                 self._cx_moe(layer, self.layers[layer][0])
+        # The CPU model and its config were only the factory: every layer module is built now and
+        # owns its device tensors, and nothing else reads them (build_layer shares `config` and
+        # never touches `stc` again). Closing the collection hands back the pack's open descriptors
+        # and the loader's pinned staging pool (stloader_close_file frees it), and the trim below
+        # hands back the loader's arenas, so the pack's 113.5 GiB is the only thing a loaded server
+        # reserves -- 3.44 GiB of VmSwap after a load was this staging plus the deepcopy'd index,
+        # and the owner cannot run swap off while the server keeps asking for it.
+        closed = ""
+        try:
+            config.stc.close()
+            closed = "ok"
+        except Exception as e:  # noqa: BLE001 - a live collection is not a reason to lose the load
+            closed = f"{type(e).__name__}: {e}"
+        del model, config
+        released = _trim_host()
+        host_rss, host_swap = _host_rss_swap_mib()
+        host_anon = _proc_status_mib(("RssAnon",))[0]
+        print(f"SEAM_HOST_MEM phase=load_done rss_mib={host_rss} swap_mib={host_swap} "
+              f"anon_mib={host_anon} trim_mib={released} stc_close={closed} avail_mib={_avail_mib()} "
+              f"box_swap_mib={_swap_used_mib()}", flush=True)
+        # Which mappings still hold the host bill, biggest first: an empty list means the trim
+        # returned everything and the pack is the only thing the box gave up.
+        for size_mib, swap_mib, rss_mib in _anon_maps():
+            print(f"SEAM_HOST_MAP size_mib={size_mib} swap_mib={swap_mib} "
+                  f"rss_mib={rss_mib}", flush=True)
         cx_n = sum(1 for v in self._cx_layers.values() if v is not None)
         if self._cx_layers:
             print(f"SEAM_PACK_KERNEL cudaexl3_layers={cx_n} mixedk_layers={NL - cx_n} "
@@ -226,22 +317,50 @@ class SeamServer:
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
 
-        Fail-stop, not fail-soft: the C proxy posts the response only after this hook returns, so
-        an exception allowed to escape here is swallowed by ctypes (it prints "Exception ignored")
-        and the *previous* call's bytes in the pinned response region get posted as this call's
-        answer. That is exactly what happened on GX2 on 2026-11-01 08:57: a CUDA launch failure
-        inside _forward_piece left the context permanently broken, 170k callbacks raised, the
-        server kept accepting sessions for 20 min and the client decoded garbage ("magnetic
-        magnetic ..."). So any failure here kills the process: the RC QP goes away, the client's
-        proxy sees the CQ error, marks the handle dead and raises - an error, never stale numbers.
+        Returns 0 when the response region holds this request's answer, or a refusal code (see
+        REFUSE_MEM / REFUSE_COMPUTE). The C proxy turns a nonzero return into "poison this slot,
+        tell the client which of the two it was, end this one session" and goes back to accepting
+        (qmesh_expert_seam.h). The pack stays resident: a request this box cannot serve costs the
+        client one failed call, not a 150-220 s reload for everyone.
+
+        Never raise. The C proxy posts the response only after this hook returns, so an exception
+        allowed to escape is swallowed by ctypes (it prints "Exception ignored") and the *previous*
+        call's bytes in the pinned response region get posted as this call's answer. That is exactly
+        what happened on GX2 on 2026-11-01 08:57: a CUDA launch failure inside _forward_piece left
+        the context permanently broken, 170k callbacks raised, the server kept accepting sessions for
+        20 min and the client decoded garbage ("magnetic magnetic ...").
+
+        So a failure is either "this request cannot be computed" - refused, process alive, client
+        gets NaN and a named error - or "this process can never answer again", which is the only
+        case that still exits: a dead context fails every later session the same way, and a server
+        that cannot compute must not pretend to. _cuda_ok decides.
         """
         # Per-call device time, reported every minute as SEAM_COMPUTE (median/mean/max us per row
         # bucket). Paired with the client's round-trip timing this splits the seam into GX1 compute
         # and wire: wire = round trip - compute.
         t0 = time.perf_counter_ns()
         self.seen += 1
+        avail = _avail_mib()
+        if 0 <= avail < FWD_FLOOR_MIB:
+            # Cheap, no device work: return the allocator's unused blocks, then look again. Only a
+            # box that is still short after that is refused before a launch it would pay for in
+            # swap storms and launch failures.
+            if not self.stub:
+                _free_cached()
+            avail = _avail_mib()
+        if 0 <= avail < FWD_FLOOR_MIB:
+            self.refusals += 1
+            print(f"SEAM_COMPUTE_REFUSED layer={layer} rows={rows} why=memory "
+                  f"need_mib={FWD_FLOOR_MIB} avail_mib={avail} swapped_mib={_swap_used_mib()} "
+                  f"dev_{_dev_mem_mib()} "
+                  f"calls={sum(len(v) for v in _times.values())} refusals={self.refusals} "
+                  f"- answering nothing, the session ends, the server keeps listening", flush=True)
+            return REFUSE_MEM
         try:
-            if self.fail_after and self.seen > self.fail_after:
+            # Exactly call N+1, not every call after it: the refusal must leave a process that
+            # still answers, and the only way to show that from one server is a later call that
+            # is served normally.
+            if self.fail_after and self.seen == self.fail_after + 1:
                 raise RuntimeError(f"injected compute failure on call {self.seen} (--fail-after "
                                    f"{self.fail_after})")
             # The lock covers the whole forward, not just one piece: a request served in ws_rows
@@ -249,24 +368,41 @@ class SeamServer:
             # not interleave inside the module.
             with self.compute_lock:
                 self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
-        except Exception as e:  # noqa: BLE001 - see the docstring: no safe local recovery
-            print(f"SEAM_COMPUTE_FAIL layer={layer} rows={rows} err={type(e).__name__}: {e} "
+        except Exception as e:  # noqa: BLE001 - see the docstring: return, never raise
+            # The message names the *calling* shape; only the traceback names the frame that raised.
+            # A CUDA illegal access surfaces at the next host sync (a `.tolist()`, a copy to host),
+            # so the frame is regularly several layers away from the kernel that faulted - without
+            # this, "rows=6" is the only evidence and it can be the wrong call entirely.
+            import traceback
+            trace = [ln for ln in traceback.format_exc().rstrip().splitlines()]
+            # A sticky launch failure is sticky: the probe itself raises and the context is gone.
+            if self.stub:
+                # A stub has no CUDA context that could be dead, and asking for one would create
+                # it - up to half a GiB of the same headroom the resident pack on this box needs.
+                usable = True
+            else:
+                _free_cached()
+                usable = _cuda_ok()
+            self.refusals += 1
+            print(f"SEAM_COMPUTE_{'REFUSED' if usable else 'FAIL'} layer={layer} rows={rows} "
+                  f"err={type(e).__name__}: {e} "
                   f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()} "
                   f"dev_{_dev_mem_mib()} "
-                  f"calls={sum(len(v) for v in _times.values())} "
-                  f"- exiting: a server that cannot compute must not answer", flush=True)
-            # The message above names the *calling* shape; only the traceback names the frame that
-            # raised. A CUDA illegal access surfaces at the next host sync (a `.tolist()`, a copy to
-            # host), so the frame is regularly several layers away from the kernel that faulted -
-            # without this, "rows=6" is the only evidence and it can be the wrong call entirely.
-            import traceback
-            for line in traceback.format_exc().rstrip().splitlines():
+                  f"calls={sum(len(v) for v in _times.values())} refusals={self.refusals} "
+                  f"cuda_ok={int(usable)} "
+                  + ("- answering nothing, the session ends, the server keeps listening"
+                     if usable else
+                     "- exiting: the CUDA context cannot run a kernel any more, so no later "
+                     "session could be served"), flush=True)
+            for line in trace:
                 print(f"SEAM_COMPUTE_TRACE {line}", flush=True)
-            sys.stderr.flush()
-            os._exit(70)
-        else:
-            with _lock:
-                _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
+            if not usable:
+                sys.stderr.flush()
+                os._exit(70)
+            return REFUSE_COMPUTE
+        with _lock:
+            _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
+        return 0
 
     def _forward(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Serve one request of `rows` rows, in internal pieces of at most ws_rows.
@@ -276,11 +412,17 @@ class SeamServer:
         ~150 KiB per row, so a bucket of N rows costs 150*N KiB of transient device memory however
         the slab is sized - 301 MiB at 2048 rows, 602 at 4096, 1202 at 8192, against 733 MiB of
         headroom on GX2 and 876 on GX1. The scratch scales with the rows handed to the module, not
-        with the number of requests, so serving a big bucket as several ws_rows pieces makes the
-        peak depend on ws_rows instead. Pieces run in order on the same CUDA stream and the single
-        synchronise at the end still covers them; the pinned slab and the wire cost are unchanged,
-        which is the point: a bigger bucket then buys fewer per-layer calls (remote_seam_host
-        chunks a prefill at the largest granted bucket) without a bigger workspace.
+        with the number of requests, so serving a big bucket as several pieces makes the peak
+        depend on the piece size instead. Pieces run in order on the same CUDA stream and the
+        single synchronise at the end still covers them; the pinned slab and the wire cost are
+        unchanged, which is the point: a bigger bucket then buys fewer per-layer calls
+        (remote_seam_host chunks a prefill at the largest granted bucket) without a bigger
+        workspace.
+
+        The piece size itself is a bandwidth/footprint trade (WS_LADDER): every piece re-reads the
+        layer's whole cold-expert weight set, so small pieces multiply the weight traffic, and
+        pieces large enough not to fit turn the box into a swap storm. ws_rows is the ceiling and
+        _pick_step takes the largest rung under it that MemAvailable pays for right now.
         """
         if self.stub:
             # Known-answer stub: the same out[r][j] = float(x[r][j]) + (layer + 1) the C proxy
@@ -293,15 +435,67 @@ class SeamServer:
             view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = xf + (layer + 1)
             return
         ffn, _ = self.layers[layer]
-        step = self.ws_rows if 0 < self.ws_rows < rows else rows
+        step = self._pick_step(rows)
         for r0 in range(0, rows, step):
             self._forward_piece(layer, ffn, min(step, rows - r0),
                                 x_ptr + r0 * HIDDEN * 2, ids_ptr + r0 * TOPK * 4,
                                 w_ptr + r0 * TOPK * 2, out_ptr + r0 * HIDDEN * 4)
 
+    def _pick_step(self, rows):
+        """Rows per piece for one request: the largest ladder rung under ws_rows the box can pay.
+
+        ws_rows <= 0 means "never split", whatever the workspace costs - the escape hatch the
+        ws-probe/ws-check modes and a deliberate one-piece A/B rely on. Above that the ceiling is
+        honoured and the rung is otherwise chosen from MemAvailable, because the failure this
+        guards against is asymmetric: picking one rung too big cost 4.3 s per call on GX2 (8192
+        rows, 0 MiB free, 1.3 GiB of swap written during ten calls), while picking one too small
+        costs a weight pass (~12 ms per 2048 rows).
+        """
+        if self.ws_rows <= 0:
+            return rows
+        if not self.ws_auto:
+            return min(self.ws_rows, rows)
+        avail = _avail_mib()
+        # A box that is already swapping cannot be talked into a bigger piece by free memory: GX2,
+        # 3.9 GiB swapped out, ran 4 x 2048-row pieces of layer 0 at p50 105 ms but mean 172 ms
+        # (9 of 10 calls did swap I/O) - worse than the 153 ms mean of 8 x 1024 on the same box -
+        # while the same code with MemAvailable back at 1225 ran those pieces at mean 115 ms. The
+        # swap in use, not MemAvailable, is the discriminator, so a paging box stays on the floor
+        # rung; MemAvailable still decides between the rungs above it.
+        swapped = _swap_used_mib()
+        paging = swapped > SWAP_WARN_MIB
+        # Step down the instant the current rung stops fitting, but climb back only with
+        # WS_HYST_MIB to spare: on GX1 a resident pack leaves MemAvailable wandering around the
+        # 2048-row threshold (542 MiB available against 566 needed), and a picker that followed
+        # that noise would alternate 2048 and 1024 pieces call after call for no gain. Being slow
+        # on the way up is the safe direction - a rung too small only costs the weight pass the
+        # split already paid.
+        prev = self.__dict__.get("_ws_pick")
+        pick = None
+        if not paging:
+            for n in WS_LADDER:
+                if n > self.ws_rows:
+                    continue
+                slack = 0 if (prev is None or n <= prev) else WS_HYST_MIB
+                if avail < 0 or ws_mib_for(rows, n) + WS_GUARD_MIB + slack <= avail:
+                    pick = n
+                    break
+        if pick is None:
+            # Nothing fits: take the smallest rung rather than hand the box a request it will
+            # swap through. A caller that reaches this on every call wants a smaller bucket.
+            pick = min(self.ws_rows, WS_LADDER[-1])
+        if pick != self.__dict__.get("_ws_pick"):
+            self._ws_pick = pick
+            print(f"SEAM_WS_PICK rows={rows} ws={pick} avail_mib={avail} swapped_mib={swapped} "
+                  f"need_mib={ws_mib_for(rows, pick) + WS_GUARD_MIB:.0f} "
+                  f"pieces={(rows + pick - 1) // pick}", flush = True)
+        return min(pick, rows)
+
     def _forward_piece(self, layer, ffn, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """One mixed-K forward of `rows` rows straight out of, and back into, the pinned slab."""
-        x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN).copy())
+        # Same argument on the way in: the C proxy owns these bytes until this hook returns, so the
+        # H2D can read them in place instead of staging a rows*HIDDEN*2 copy (117 MiB at 8192 rows).
+        x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN))
         x = x.view(torch.bfloat16).to(self.device).half()
         ids_np = view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)
         _check_ids(layer, rows, ids_np, ffn.num_experts)
@@ -324,8 +518,14 @@ class SeamServer:
                 part = ffn.forward(x.view(1, rows, HIDDEN),
                                    {"external_selected": sel, "external_weights": gw})
         self.stream.synchronize()
-        view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN)[:] = \
-            part.view(rows, HIDDEN).float().cpu().numpy()
+        # Device -> the client's pinned slab, in place. The obvious form of this line --
+        # `slab[:] = part.float().cpu().numpy()` -- allocates a fresh rows*HIDDEN*4 CPU tensor per
+        # call (235 MiB at 8192 rows) and glibc keeps those mmaps in its arenas long after the
+        # copy, so a prefill paid ~50 GiB of host churn on a box whose headroom is measured in
+        # hundreds of MiB. Wrapping the slab with from_numpy makes it the destination itself.
+        out_host = torch.from_numpy(
+            view(out_ptr, rows * HIDDEN * 4, np.float32).reshape(rows, HIDDEN))
+        out_host.copy_(part.view(rows, HIDDEN))
 
     def _cx_moe(self, layer, ffn):
         """The layer's cuda-exl3 adapter, built on first use (see _forward_piece).
@@ -413,8 +613,13 @@ def _reporter():
         for rows in sorted(snap):
             v = sorted(snap[rows])
             n = len(v)
+            # avail_mib is the box state those calls were served in, printed here because this is the
+            # only place a *served* call reports it: setting SEAM_FWD_FLOOR_MIB needs the avail of
+            # served calls next to the avail of a refusal, and taking it from the load line or from
+            # an idle box describes a state no forward ever ran in.
             print(f"SEAM_COMPUTE rows={rows} n={n} p50_us={v[n // 2]:.1f} "
-                  f"mean_us={sum(v) / n:.1f} max_us={v[-1]:.1f}", flush=True)
+                  f"mean_us={sum(v) / n:.1f} max_us={v[-1]:.1f} "
+                  f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()}", flush=True)
 
 
 def view(addr, nbytes, dtype):
@@ -441,16 +646,43 @@ def slab_mib(buckets, slots = 1) -> float:
     return total / 2**20
 
 
-# Measured, not predicted: --ws-probe on the dev pair with the 113.65 GiB pack resident gave
-# 301 MiB of transient device memory at 2048 rows, 602 at 4096 and 1202 at 8192, i.e. 147 KiB per
-# row, and the slab is on top of that (slab_mib). A request served in ws_rows pieces pays this for
-# ws_rows, not for the bucket, so a big bucket is a wire/call-count decision, not a workspace one.
-WS_KIB_PER_ROW = 147
+# Host memory one piece of `rows` needs on top of the pack, KiB per row. Two measurements, both on
+# a box with the 4460 pack resident: --ws-probe reported 301 MiB of transient device memory at 2048
+# rows (147 KiB/row), but the host's MemAvailable fell by ~467 MiB across a window of ten 2048-row
+# calls on GX2, i.e. ~233 KiB/row once the staging the device side shares with the host is counted.
+# MemAvailable is what the picker can read, so the host figure is the one that governs; 235 KiB/row
+# still clears the 2048-row rung on GX2 with a full pack (566 MiB against ~1220 available) and
+# leaves it unreachable on GX1 (461-653 available, the box is already 3 GiB into swap).
+WS_KIB_PER_ROW = 235
+
+# Piece-size ladder for _forward. A request served in N pieces makes N passes over the layer's
+# resident cold experts, so the per-row cost falls with piece size until the transient workspace
+# stops fitting. Measured on GX2 with the 4460 pack resident, one layer at a time, p50 per row:
+#   8192 rows  layer 0 : 1024 -> 18.5 us, 2048 -> 12.8 us, 4096 -> 27.4 us (+3.2 s p99)
+#   8192 rows  layer 20: 1024 -> 19.9 us, 2048 -> 13.8 us, 4096 -> 39.8 us (+4.8 s p99)
+#   4096 rows  layer 0 : 1024 -> 28.1 us, 2048 -> 12.6 us
+#   4096 rows  layer 20: 1024 -> 19.9 us, 2048 -> 13.5 us
+# and a single 8192-row piece needs 4.3 s a call and wrote 1.3 GiB of swap in ten calls. So 2048 is
+# both the default ceiling and the top rung, and 1024 is the floor: GX1 measured 220 ms per 8192-row
+# call in 512-row pieces against 154-169 in 1024s, so a 512 rung only ever bought a slower box.
+WS_LADDER = (2048, 1024)
+# Headroom the picker insists on beyond the piece's own workspace: the piece's transient is not the
+# only thing racing for the last GiB (slab, CUDA context, the page cache of a 113.65 GiB pack), and
+# being one rung too big costs a 4x stall, not 10%.
+WS_GUARD_MIB = int(os.environ.get("SEAM_WS_GUARD_MIB", "96"))
+# Extra headroom demanded before a request moves *up* a rung, so a box sitting near a threshold
+# holds its choice instead of alternating piece sizes call after call.
+WS_HYST_MIB = int(os.environ.get("SEAM_WS_HYST_MIB", "128"))
+# SEAM_WS_ROWS_AUTO=0 pins every request to exactly ws_rows: for A/B runs that need the old
+# behaviour, and for --ws-check/--ws-probe/--rows-bench, which set ws_rows themselves.
+WS_AUTO = os.environ.get("SEAM_WS_ROWS_AUTO", "1") != "0"
 
 # Swap in use above this and the resident pack is paging; see _swap_used_mib and
 # SEAM_SERVER_SWAP_WARN in main(). A few hundred MiB is normal noise on these boxes, a few GiB is
-# a box that is already over its head before the first request.
-SWAP_WARN_MIB = 512
+# a box that is already over its head before the first request. The piece-size picker refuses to
+# leave the floor rung while this is exceeded, so a box whose swap is stale rather than active
+# raises it (SEAM_SWAP_WARN_MIB=N) instead of pinning the ladder for the rest of the run.
+SWAP_WARN_MIB = int(os.environ.get("SEAM_SWAP_WARN_MIB", "512"))
 
 # Floor the cuda-exl3 restack has to leave on the box besides its own peak (see _cx_moe). 1.5 GiB is
 # the headroom a loaded GX actually has left (slab + workspace + CUDA context); a conversion that
@@ -526,6 +758,83 @@ def _swap_used_mib() -> int:
     # SWAP_WARN_MIB` raised TypeError. On a stub that kills the server before SEAM_LISTEN; on a real
     # load it kills it *after* the 153 s pack load. Caught by the 2026-11-01 failstop slot.
     return (total - free) // 1024
+
+
+def _proc_status_mib(fields) -> tuple:
+    """`(VmRSS, VmSwap, ...)` of this process, MiB, -1 per unreadable field."""
+    seen = {}
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                key = line.split(":", 1)[0]
+                if key in fields:
+                    seen[key] = int(line.split()[1]) // 1024
+    except OSError:
+        return tuple(-1 for _ in fields)
+    return tuple(seen.get(key, -1) for key in fields)
+
+
+def _host_rss_swap_mib() -> tuple:
+    """(resident, swapped) host memory of this process, MiB.
+
+    On a GX the pack is device memory of a unified pool, so these two numbers are the whole host
+    bill the server has any business holding: the pinned client slabs plus a live interpreter. A
+    load that ends with GiBs here has left Python/glibc staging behind (see _trim_host)."""
+    return _proc_status_mib(("VmRSS", "VmSwap"))
+
+
+def _trim_host() -> int:
+    """Hand freed CPU staging back to the OS. Returns MiB released (0 = nothing was stale).
+
+    The loader reads every tensor of a ~2.9 GiB safetensors file through a CPU buffer and copies it
+    into the unified pool; Python and glibc free those buffers into their arenas, but glibc only
+    returns an arena to the kernel when it is trimmed, so the process keeps GiBs of dead staging -
+    which the kernel evicts to swap as soon as the pack fills the pool (GX1 2026-11-02:
+    3.44 GiB VmSwap, 2.88 GiB of it one anonymous mapping, 0.76 GiB resident). gc.collect() drops
+    the Python objects, malloc_trim(0) releases the arenas; together they are the difference
+    between "the box has headroom" and "every expert call takes page faults"."""
+    before = _host_rss_swap_mib()
+    gc.collect()
+    try:
+        _LIBC.malloc_trim(0)
+    except Exception:  # noqa: BLE001 - a libc without malloc_trim must not fail a load
+        pass
+    after = _host_rss_swap_mib()
+    # A mapping's swap entries go with the mapping, so this delta is memory the box really has back.
+    return max(0, (before[0] + before[1]) - (after[0] + after[1]))
+
+
+def _anon_maps(min_mib: int = 64, top: int = 4) -> list:
+    """Largest anonymous mappings of this process, [(size_mib, swap_mib, rss_mib), ...].
+
+    This is the answer to "why is a loaded server in swap": the pack is device memory, so any big
+    anonymous mapping here is host staging that survived the load. Printed right after _trim_host
+    so a load that still keeps GiBs names the mapping instead of costing another reload to find."""
+    maps = []
+    size = rss = swap = None
+    try:
+        with open("/proc/self/smaps") as fh:
+            for line in fh:
+                if "-" in line.split(" ", 1)[0] and len(line.split()) >= 5:
+                    if size is not None and size > min_mib * 1024 and (swap or rss):
+                        maps.append((size // 1024, swap // 1024, (rss or 0) // 1024))
+                    # Anonymous = no pathname (6th field) and not a device mapping (/dev/..., [heap]).
+                    fields = line.split()
+                    anon = len(fields) == 5
+                    size = 0 if anon else None
+                    rss = swap = 0
+                elif size is not None:
+                    key = line.split(":", 1)[0]
+                    if key == "Size":
+                        size = int(line.split()[1])
+                    elif key == "Rss":
+                        rss = int(line.split()[1])
+                    elif key == "Swap":
+                        swap = int(line.split()[1])
+    except OSError:
+        return []
+    maps.sort(reverse=True)
+    return maps[:top]
 
 
 def _drop_page_cache(path: str) -> bool:
@@ -625,6 +934,116 @@ def _probe_run(server, rows, ptrs, tag):
     return (time.perf_counter_ns() - t0) / 1e3
 
 
+# --rows-bench times a request as one piece up to this many rows by default: past it the transient
+# workspace (147 KiB/row, 1202 MiB at 8192 rows) is bigger than the headroom a loaded GX has, and
+# the call swaps instead of computing.
+WHOLE_MAX = int(os.environ.get("SEAM_ROWS_BENCH_WHOLE_MAX", "4096"))
+
+def _vmstat_swap():
+    """(pswpin, pswpout) in pages, straight out of /proc/vmstat.
+
+    A pack that has been pushed to swap still "works": the calls fault the pages back in and the
+    only symptom is that every forward is slower than the same forward on an idle box. Measuring
+    si/so around the timed calls is what separates "the kernel is slow here" from "the box is
+    paging", and the headroom question hangs on that difference."""
+    pin = pout = 0
+    try:
+        for line in open("/proc/vmstat"):
+            if line.startswith("pswpin "):
+                pin = int(line.split()[1])
+            elif line.startswith("pswpout "):
+                pout = int(line.split()[1])
+    except OSError:
+        return -1, -1
+    return pin, pout
+
+
+def rows_bench(server, spec, iters, layers = "0", warmup = 2, ws_list = ""):
+    """Time the real cold-expert forward at several row counts on the resident pack, no client.
+
+    The seam's SEAM_COMPUTE p50 is what this measures plus the wire; this mode removes the wire
+    (and the P7, and the slab copies' variability) and runs the exact `_forward` the server runs,
+    so a per-row number taken with the full pack resident can be compared directly with a
+    one-layer bench. Each row count is timed as one piece and, when --ws-rows or --rows-bench-ws
+    is set, in pieces of those sizes too - the split is a separate bill. Swap traffic and
+    MemAvailable are reported around each timed window.
+    """
+    if server.stub:
+        print("SEAM_ROWS_BENCH stub=1: nothing to measure without the cold experts", flush = True)
+        return
+    # The bench sets the piece size itself, rung by rung; the per-call picker would override it.
+    server.ws_auto = False
+    layer_list = [int(x) for x in str(layers).split(",") if x.strip()]
+    for layer in layer_list:
+        _rows_bench_layer(server, spec, iters, layer, warmup, ws_list)
+
+def _rows_bench_layer(server, spec, iters, layer, warmup, ws_list = ""):
+    dev = server.device
+    ncold = server.layers[layer][1]
+    ffn = server.layers[layer][0]
+    tier = getattr(ffn, "fused_rows", None)
+    print(f"SEAM_ROWS_BENCH_HEAD layer={layer} n_cold={ncold} tier={tier} kernel={MOE_KERNEL} "
+          f"iters={iters} ws_rows={server.ws_rows} avail_mib={_avail_mib()} "
+          f"swapped_mib={_swap_used_mib()}", flush = True)
+    ws_caps = [int(x) for x in str(ws_list).split(",") if x.strip()]
+    for rows in [int(x) for x in spec.split(",") if x.strip()]:
+        stage, x_ptr, ids_ptr, w_ptr, out_ptr = _probe_stage(rows, ncold)
+        # One timed shape per piece size: 0 = the whole request in one piece. Naming a
+        # --rows-bench-ws list means exactly those sizes; without one the default is the whole
+        # request plus the server's own ws_rows split, which is the old behaviour, except that a
+        # whole request above WHOLE_MAX is skipped - one 8192-row piece thrashed GX2 for 4.3 s a
+        # call and wrote 1.3 GiB of swap in ten calls, and that is not a measurement anyone wants
+        # by accident. 0 in the list still forces it.
+        if ws_caps:
+            want = [w for w in ws_caps if w == 0 or w < rows]
+        else:
+            want = [0] if rows <= WHOLE_MAX else []
+            if 0 < server.ws_rows < rows:
+                want.append(server.ws_rows)
+            if not want:
+                want = [server.ws_rows or rows]
+        for ws in want:
+            pieces = 1 if ws <= 0 else (rows + ws - 1) // ws
+            piece_rows = rows if ws <= 0 else min(ws, rows)
+            keep = server.ws_rows
+            server.ws_rows = ws
+            try:
+                for _ in range(warmup):
+                    server._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+                torch.cuda.synchronize(dev)
+                torch.cuda.empty_cache()
+                avail0, swap0 = _avail_mib(), _swap_used_mib()
+                pin0, pout0 = _vmstat_swap()
+                times, io_hits = [], 0
+                for _ in range(iters):
+                    pin_a, pout_a = _vmstat_swap()
+                    t0 = time.perf_counter_ns()
+                    server._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
+                    torch.cuda.synchronize(dev)
+                    times.append((time.perf_counter_ns() - t0) / 1e3)
+                    pin_b, pout_b = _vmstat_swap()
+                    if pin_b != pin_a or pout_b != pout_a:
+                        io_hits += 1
+                pin1, pout1 = _vmstat_swap()
+                times.sort()
+                p50 = times[len(times) // 2]
+                print(f"SEAM_ROWS_BENCH rows={rows} piece_rows={piece_rows} pieces={pieces} "
+                      f"iters={iters} p50_us={p50:.1f} p99_us={times[min(len(times) - 1, int(len(times) * 0.99))]:.1f} "
+                      f"min_us={times[0]:.1f} max_us={times[-1]:.1f} us_per_row={p50 / rows:.2f} "
+                      f"avail_mib={avail0}->{_avail_mib()} swapped_mib={swap0}->{_swap_used_mib()} "
+                      f"calls_with_swap_io={io_hits} swapin_pages={max(pin1 - pin0, 0)} "
+                      f"swapout_pages={max(pout1 - pout0, 0)}", flush = True)
+                # Same figures under the tag the wire-side reports grep for, so one log carries both
+                # the wire-inclusive SEAM_COMPUTE p50 and the compute-alone p50.
+                print(f"SEAM_COMPUTE rows={rows} n={iters} p50_us={p50:.1f} "
+                      f"mean_us={sum(times) / len(times):.1f} max_us={times[-1]:.1f} "
+                      f"bench=rows_bench layer={layer} pieces={pieces}", flush = True)
+            finally:
+                server.ws_rows = keep
+        del stage
+        torch.cuda.empty_cache()
+
+
 def _report_recon(server, rows, tag):
     """Print the batched reconstruct tier's group plan as built by this load, and whether forcing
     the dispatch threshold can work at all. Experts above fused_rows go to that tier; if the
@@ -659,6 +1078,7 @@ def ws_probe(server, spec, min_avail_mib, tiers = ()):
         print("SEAM_WS stub=1: nothing to measure without the cold experts", flush = True)
         return
     dev = server.device
+    server.ws_auto = False             # the probe measures the rung it was pointed at
     ncold = server.layers[0][1]
     # Always measure the load-time threshold first (it is the deployed behaviour); a tiers list
     # adds the forced rungs after it, so one run is a complete A/B against the baseline.
@@ -851,13 +1271,15 @@ def main():
                            "(a full pack plus a nearly full box would swap, not fail, and the "
                            "number would be meaningless)")
     ap.add_argument("--ws-rows", type = int, default = int(os.environ.get("SEAM_WS_ROWS", "0")),
-                    help = "serve each request in pieces of at most this many rows, so the peak "
-                           "device workspace follows this instead of the row bucket (measured "
-                           "~150 KiB per row of scratch in the cold-expert forward: 301 MiB at "
-                           "2048 rows, 602 at 4096, 1202 at 8192). 0 = one piece per request, "
-                           "which is what a bucket sized to the box's headroom needs. Set this "
-                           "when the bucket is bigger than the box's workspace, e.g. 2048 rows "
-                           "on a 733 MiB box keeps the peak near 150 MiB.")
+                    help = "ceiling on the rows served per piece, so the peak device workspace "
+                           "follows the piece instead of the row bucket (measured ~147 KiB per "
+                           "row of scratch in the cold-expert forward: 301 MiB at 2048 rows, 602 "
+                           "at 4096, 1202 at 8192). The piece actually used is the largest rung "
+                           "of WS_LADDER under this ceiling that MemAvailable pays for, because "
+                           "each piece re-reads the layer's cold-expert weights (2048 rows "
+                           "measured 12.5-13.8 us/row on the 4460 pack against 18.8 for 1024). "
+                           "0 = one piece per request, whatever it costs; SEAM_WS_ROWS_AUTO=0 "
+                           "pins the split to exactly this number.")
     ap.add_argument("--ws-tiers", default = os.environ.get("SEAM_WS_TIERS", ""),
                     help = "comma separated fused_rows thresholds to sweep for --ws-probe / "
                            "--ws-tier-check: the threshold is the dispatch split, so experts above "
@@ -882,7 +1304,42 @@ def main():
                            "vendor/cuda-exl3's MoE gemm after a one-off restack into per-bitrate "
                            "trellis stacks; mixedk keeps exllamav3's mixed-K module. Per-layer "
                            "fallback to mixedk if the restack raises.")
+    ap.add_argument("--rows-bench", default = "",
+                    help = "comma separated row counts: load the pack, then time the real "
+                           "cold-expert forward at each of them without waiting for a client and "
+                           "exit (one piece, plus the --ws-rows split when set). Reports "
+                           "SEAM_ROWS_BENCH with p50/p99, us/row, MemAvailable and the swap "
+                           "in/out pages seen during the timed calls.")
+    ap.add_argument("--rows-bench-iters", type = int, default = 10,
+                    help = "timed calls per row count for --rows-bench (default 10).")
+    ap.add_argument("--rows-bench-layer", default = "0",
+                    help = "layer(s) whose resident cold experts --rows-bench times, comma "
+                           "separated so one load gives the spread across the stack (default 0).")
+    ap.add_argument("--rows-bench-ws", default = "",
+                    help = "comma separated piece sizes to time for --rows-bench, so one load "
+                           "compares e.g. 1024,2048,4096 on the same rows (default: the server's "
+                           "own --ws-rows split).")
     args = ap.parse_args()
+
+    # A GX box holds one cold pack and one server, and two kinds of job want it: the pair release,
+    # and a bench that measures against a loaded pack. They are serialised by the box gate,
+    # <queue>/gx<N>.gate, whose lifecycle pair_gx_gate_take/pair_gx_gate_down own; the one launcher
+    # that checks it and starts a pack load is seam_server_ensure.sh, and it passes the gate's
+    # answer as SEAM_GATE_OK=1 through the docker exec. A direct `python3 qmesh/worker_seam_server.py`
+    # ignores the claim and loads 113.65 GiB the release thinks is free (the 01:43 orphan on GX2
+    # blocked the dev update for its whole run), so a launch that will map the pack is refused here
+    # -- before SeamServer runs, so before a byte is mapped or a CUDA context exists and a refused
+    # launch costs the box nothing. --stub is exempt: it returns before the pack and CUDA (see
+    # SeamServer.__init__), so it takes no memory the gate protects, and a stub launch is how the
+    # wire tests run against a full box.
+    if os.environ.get("SEAM_GATE_OK") != "1" and not args.stub:
+        # stderr, and the first line verbatim: the ensure/smoke refusal check and
+        # qmesh/tests/server_gate.sh match that exact prefix.
+        print("SEAM_SERVER_REFUSED SEAM_GATE_OK missing: start through seam_server_ensure.sh",
+              file = sys.stderr, flush = True)
+        print("  (that helper takes the gx gate and passes SEAM_GATE_OK=1; a direct launch would "
+              "map the pack outside the claim)", file = sys.stderr, flush = True)
+        return 3
     # Set before the pack loads: the switch is read per call, but a bad value must fail the
     # launch, not the first request.
     MOE_KERNEL = args.moe_kernel
@@ -914,6 +1371,10 @@ def main():
             ws_check(server, args.ws_check)
         if args.ws_tier_check:
             ws_tier_check(server, args.ws_tier_check, tiers)
+        return
+    if args.rows_bench:
+        rows_bench(server, args.rows_bench, args.rows_bench_iters, args.rows_bench_layer,
+                    ws_list = args.rows_bench_ws)
         return
     threading.Thread(target = _reporter, daemon = True).start()
 
@@ -958,4 +1419,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # sys.exit, not a bare call: main returns 3 from the gate refusal, and a launcher that only sees
+    # "the process ended" would read a refusal as a clean shutdown.
+    sys.exit(main())
