@@ -338,6 +338,12 @@ check("the preflight reclaims this pair's own orphan before refusing",
       and _upd.index('pair_server_stop 2>&1') < _upd.index('others=$(pair_others_busy)'), "")
 check("a verified flip releases the recorded server pid",
       'rm -f "$(pair_server_pidfile)"' in src("pair_update_run.sh"), "")
+# A pair's first release has no containers to reuse, and the lib build runs inside them: prepare that
+# answers "unchanged" to a CREATE plan leaves the release cut and the pair unable to start a server.
+check("prepare creates a missing pair container instead of reporting it unchanged",
+      '*CREATE*' in src("pair_prepare.sh") and 'pair_containers.py" apply' in src("pair_prepare.sh"), "")
+check("prepare leaves a matching pair alone",
+      'unchanged' in src("pair_prepare.sh"), "")
 
 
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

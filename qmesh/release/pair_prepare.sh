@@ -69,13 +69,18 @@ pair_step "PREPARE_RELEASE pair=$PAIR sha=${SHA:0:12} build=$BUILD_ID"
 plan_out=$(python3 "$HERE/pair_containers.py" plan "$PAIR" 2>&1)
 printf '%s\n' "$plan_out" | sed 's/^/  /'
 case "$plan_out" in
-*RECREATE*)
+*CREATE*|*RECREATE*)
+  # A pair that has never run (prod on 2026-11-02) has no containers at all: the plan says CREATE and
+  # apply makes them. Saying "unchanged" there left the release cut and the lib unbuilt, because the
+  # build runs inside those containers. RECREATE still needs the ticket's PAIR_ALLOW_RECREATE, and the
+  # apply refuses that here on its own.
+  why=$(printf '%s\n' "$plan_out" | grep -o 'CREATE\|RECREATE' | head -1)
   ts=$(date -u +%Y%m%dT%H%M%SZ)
   python3 "$HERE/pair_containers.py" apply "$PAIR" "$SHA" --ts "$ts" 2>&1 | sed 's/^/  /'
   rc=${PIPESTATUS[0]}
-  [ "$rc" = 0 ] || pair_die "PREPARE_FAILED $PAIR phase=containers rc=$rc (recreate needs a ticket: " \
-      "PAIR_ALLOW_RECREATE=1 inside a queued PairUpdate)"
-  pair_step "PREPARE_CONTAINERS pair=$PAIR wired ts=$ts"
+  [ "$rc" = 0 ] || pair_die "PREPARE_FAILED $PAIR phase=containers rc=$rc ($why: creating needs the " \
+      "containers to be absent, recreating needs PAIR_ALLOW_RECREATE=1 inside a queued PairUpdate)"
+  pair_step "PREPARE_CONTAINERS pair=$PAIR $why wired ts=$ts"
   ;;
 *)
   pair_step "PREPARE_CONTAINERS pair=$PAIR unchanged"
