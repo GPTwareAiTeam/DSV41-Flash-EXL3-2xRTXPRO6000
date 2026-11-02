@@ -153,8 +153,13 @@ def build_layer(base, cold_ids, device):
     """Subset the layer's routed-expert module to `cold_ids` (checkpoint expert ids, ordered).
 
     Mirrors worker_group_server.build_group, with all cold experts in one module so the
-    fused mixed-K path runs one launch per layer."""
-    ffn = copy.deepcopy(base)
+    fused mixed-K path runs one launch per layer.
+
+    The copy shares the one Config instead of duplicating it: a plain deepcopy clones
+    `config.stc`, the safetensors index of the whole pack, into every layer module - 65 MiB per
+    copy, 40 copies, all of it held by the modules and therefore unreclaimable by gc/malloc_trim
+    after the load (measured: 2.6 GiB of the 3.4 GiB swap bill on GX2)."""
+    ffn = copy.deepcopy(base, {id(base.config): base.config})
     ffn.gates = [ffn.gates[e] for e in cold_ids]
     ffn.ups = [ffn.ups[e] for e in cold_ids]
     ffn.downs = [ffn.downs[e] for e in cold_ids]
@@ -279,16 +284,24 @@ class SeamServer:
             if self.preload:
                 self._cx_moe(layer, self.layers[layer][0])
         # The CPU model and its config were only the factory: every layer module is built now and
-        # owns its device tensors, and nothing else reads them (build_layer deepcopies `base`). The
-        # trim below is what hands the loader's arenas back, so the pack's 113.5 GiB is the only
-        # thing a loaded server reserves -- 3.44 GiB of VmSwap after a load was this staging, and
-        # the owner cannot run swap off while the server keeps asking for it.
+        # owns its device tensors, and nothing else reads them (build_layer shares `config` and
+        # never touches `stc` again). Closing the collection hands back the pack's open descriptors
+        # and the loader's pinned staging pool (stloader_close_file frees it), and the trim below
+        # hands back the loader's arenas, so the pack's 113.5 GiB is the only thing a loaded server
+        # reserves -- 3.44 GiB of VmSwap after a load was this staging plus the deepcopy'd index,
+        # and the owner cannot run swap off while the server keeps asking for it.
+        closed = ""
+        try:
+            config.stc.close()
+            closed = "ok"
+        except Exception as e:  # noqa: BLE001 - a live collection is not a reason to lose the load
+            closed = f"{type(e).__name__}: {e}"
         del model, config
         released = _trim_host()
         host_rss, host_swap = _host_rss_swap_mib()
         host_anon = _proc_status_mib(("RssAnon",))[0]
         print(f"SEAM_HOST_MEM phase=load_done rss_mib={host_rss} swap_mib={host_swap} "
-              f"anon_mib={host_anon} trim_mib={released} avail_mib={_avail_mib()} "
+              f"anon_mib={host_anon} trim_mib={released} stc_close={closed} avail_mib={_avail_mib()} "
               f"box_swap_mib={_swap_used_mib()}", flush=True)
         # Which mappings still hold the host bill, biggest first: an empty list means the trim
         # returned everything and the pack is the only thing the box gave up.
