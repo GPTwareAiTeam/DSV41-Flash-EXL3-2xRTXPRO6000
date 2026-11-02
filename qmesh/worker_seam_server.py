@@ -561,8 +561,13 @@ def _reporter():
         for rows in sorted(snap):
             v = sorted(snap[rows])
             n = len(v)
+            # avail_mib is the box state those calls were served in, printed here because this is the
+            # only place a *served* call reports it: setting SEAM_FWD_FLOOR_MIB needs the avail of
+            # served calls next to the avail of a refusal, and taking it from the load line or from
+            # an idle box describes a state no forward ever ran in.
             print(f"SEAM_COMPUTE rows={rows} n={n} p50_us={v[n // 2]:.1f} "
-                  f"mean_us={sum(v) / n:.1f} max_us={v[-1]:.1f}", flush=True)
+                  f"mean_us={sum(v) / n:.1f} max_us={v[-1]:.1f} "
+                  f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()}", flush=True)
 
 
 def view(addr, nbytes, dtype):
