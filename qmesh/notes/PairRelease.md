@@ -417,6 +417,31 @@ for the one-shot form), then the flip-only ticket, then `pair_check.sh dev` must
 `pair_promote.sh <sha>` (it refuses unless dev's manifest carries that sha and the seam fingerprint
 matches; `--force` is for a deliberate protocol change).
 
+Two things about `pair_prepare.sh` that cost an afternoon on 2026-11-02 and are now enforced:
+
+- **It is a build, and a GX build claims the box.** `pair_build_lib.sh` and `pair_build_ext.sh` both
+  take the claim through the helper, so a prepare that touches the GX half has to run inside a queue
+  ticket (a build-only one is fine) or it is refused: a compile beside a loaded pack is the collision
+  the claim exists for. The P7 half is a host compile and needs no ticket, which is why the usual
+  shape is `pair_prepare.sh dev <sha> --side p7` out of band and then a `PairBuild` ticket for gx.
+- **A container difference is not always a recreate.** `pair_containers.py plan` separates "this
+  container cannot do the job" (image, env, security, shm, gpus, a mount that is genuinely absent)
+  from `advisory:` differences that only a recreation could remove (an extra live mount, a spec mount
+  a live parent already carries -- both P7 containers mount `/models` while the spec names the pack
+  directory). Only the first is a `RECREATE`; the second is printed and skipped, so a prepare does not
+  die on a swap the owner forbids outside a queued update. The pack rule keeps its teeth where it can
+  be enforced: `pair_pack_disk.py` on the pack the server loads, and the smoke.
+
+**Serving is a verb of its own.** `pair_serve.sh <pair>` is the one way to leave a pair serving: it
+works from the release `current` names, refuses unless `pair_check.sh` says both halves `IN_SYNC`,
+refuses a foreign pack load on the box or a server already up, takes the box claim, re-checks what the
+smoke checks (NVML on both ends -- a container alive after a device-cgroup reload cannot see the GPU,
+and the fix is `docker restart`, which it does under the claim -- and a torch JIT lock nobody alive
+owns), waits for `MemAvailable` to cover the pack plus the margin, starts with `--fresh`, records the
+worker in `state/server-<pair>.pid` and drops the claim. It runs inside a queue ticket like every other
+GX job. The smoke and the flip both stop the server when they end, so "the pair is down" is a state
+somebody chose, never a leftover.
+
 ## Dry runs
 
 `PAIR_DRY=1` plus `PAIR_DRY_SSH=<stub>` runs any of the above against a fake transport: builders
