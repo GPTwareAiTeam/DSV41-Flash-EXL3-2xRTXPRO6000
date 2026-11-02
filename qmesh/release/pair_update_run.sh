@@ -68,9 +68,9 @@ evidence() {
   [ "${PAIR_DRY:-0}" = 1 ] && return 0
   python3 - "$PAIR_STATE_DIR/evidence/${SHA:-none}.json" "$PAIR" "${SHA:-}" "${BUILD_ID:-}" \
            "$ok" "$why" "$PHASE" "${PAIR_LOG:-}" "${SMOKE_ROW:-}" "${SMOKE_IDS:-}" \
-           "$P7CT" "$GXCT" "${REL:-}" <<'PY' 2>&1 | sed 's/^/  /' | tee -a "${PAIR_LOG:-/dev/null}"
+           "$P7CT" "$GXCT" "${REL:-}" "${SMOKE_MIX:-}" <<'PY' 2>&1 | sed 's/^/  /' | tee -a "${PAIR_LOG:-/dev/null}"
 import datetime, json, os, sys
-path, pair, sha, build_id, ok, why, phase, log, row, ids, p7ct, gxct, rel = sys.argv[1:14]
+path, pair, sha, build_id, ok, why, phase, log, row, ids, p7ct, gxct, rel, mix = sys.argv[1:15]
 if not sha:
     print("EVIDENCE_SKIP no release sha yet")
     sys.exit(0)
@@ -86,6 +86,15 @@ for tok in ids.split():
         ids_doc["n"] = int(v)
     elif k == "sha256":
         ids_doc["sha256"] = v
+# Which layers the cuda-exl3 restack refused on the smoke's load: the digest is only meaningful
+# together with it (one release drew 38/2 on one load and 39/1 on the next, 2026-11-02).
+mix_doc = {}
+for tok in mix.split():
+    k, _, v = tok.partition("=")
+    if k in ("cx_layers", "mixedk_layers") and v.isdigit():
+        mix_doc[k] = int(v)
+    elif k == "nofit_layers":
+        mix_doc[k] = v
 doc = {
     "format": 1,
     "pair": pair,
@@ -95,7 +104,7 @@ doc = {
     "ok": ok == "ok",
     "failed_at_phase": "" if ok == "ok" else phase,
     "why": why,
-    "smoke": {"row": row, "ids": ids_doc},
+    "smoke": {"row": row, "ids": ids_doc, "kernel": mix_doc},
     "containers": {"p7": p7ct, "gx": gxct},
     "log": log,
     "written_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -439,7 +448,10 @@ SMOKE_ROW=$row
 # a smoke that predates the total.
 SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS_TOTAL n=\([0-9]*\) sha256=\([0-9a-f]*\).*/n=\1 sha256=\2/p' | head -1)
 [ -n "$SMOKE_IDS" ] || SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS .* n=\([0-9]*\) sha256=\([0-9a-f]*\).*/n=\1 sha256=\2/p' | head -1)
-pair_step "UPDATE_SMOKE pair=$PAIR $row ${SMOKE_IDS:-ids=none}"
+# The layer set the smoke was served by, carried into the evidence next to the ids: a digest alone
+# cannot say whether a mismatch came from the release or from a different restack.
+SMOKE_MIX=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_KERNEL_MIX //p' | head -1)
+pair_step "UPDATE_SMOKE pair=$PAIR $row ${SMOKE_IDS:-ids=none} mix=${SMOKE_MIX:-unknown}"
 
 # prod's decode ids must equal the ids dev's smoke of this same sha produced: same packs, same code,
 # so the engine has to emit the same tokens on both boxes. The gate already refuses a sha dev never
@@ -459,9 +471,28 @@ if isinstance(n, int) and digest:
     print(f"n={n} sha256={digest}")
 PY
 )
+  dev_mix=$(python3 - "$PAIR_STATE/dev/evidence/$SHA.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+k = ((doc.get("smoke") or {}).get("kernel") or {})
+if k:
+    print(" ".join(f"{n}={v}" for n, v in sorted(k.items())))
+PY
+)
   case "$dev_ids" in
     "") pair_step "UPDATE_IDS_CROSSCHECK pair=prod skipped (dev evidence for $SHA records no ids)" ;;
-    "$SMOKE_IDS") pair_step "UPDATE_IDS_CROSSCHECK pair=prod ok $SMOKE_IDS" ;;
+    "$SMOKE_IDS")
+      # The mix is printed, not compared: the control release held one digest across 37/3, 38/2
+      # and 39/1, so a differing mix is context for a mismatch, not a mismatch by itself.
+      if [ -n "$dev_mix" ] && [ "$dev_mix" != "${SMOKE_MIX:-}" ]; then
+        pair_step "UPDATE_IDS_CROSSCHECK pair=prod ok $SMOKE_IDS (dev mix '$dev_mix', prod mix '${SMOKE_MIX:-unknown}')"
+      else
+        pair_step "UPDATE_IDS_CROSSCHECK pair=prod ok $SMOKE_IDS"
+      fi
+      ;;
     *) fail "ids_mismatch prod=$SMOKE_IDS dev=$dev_ids" ;;
   esac
 fi
