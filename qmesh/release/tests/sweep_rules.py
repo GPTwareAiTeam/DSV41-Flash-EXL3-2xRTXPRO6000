@@ -697,6 +697,10 @@ check("a resolvable GXCT still reads its own box's claim",
 check("the wrapper hands its hard cap to the ticket's children",
       "export GPU_TICKET_HARDCAP=$hard" in src("gpu_run_pair.sh")
       and "hardcap=%s" in src("gpu_run_pair.sh"), "")
+check("the release guard only holds tickets that name a pair container",
+      'check_release "$@"' in src("gpu_run_pair.sh")
+      and 'PAIR_CONTAINERS="seam-p7-dev seam-p7-prod seam-gx2-dev seam-gx1-prod"' in src("gpu_run_pair.sh")
+      and "PAIR_CHECK_FORCE" in src("gpu_run_pair.sh"), "")
 _sh.rmtree(_gd, ignore_errors=True)
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")

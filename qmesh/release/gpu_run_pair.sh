@@ -17,7 +17,15 @@
 # different release on its P7 and GX halves -- that is exactly how a pair hangs with `peer layout
 # mismatch` or dies with `remote invalid request`. So before a job starts, the pair is checked
 # against its manifest, and a job is refused (exit 4 drift, 5 check error) instead of poisoning the
-# queue. PairUpdate (the update job itself) and PAIR_CHECK_SKIP=1 bypass the guard.
+# queue.
+#
+# Who this applies to: a ticket that names one of the pair's own containers (`seam-p7-dev`,
+# `seam-p7-prod`, `seam-gx2-dev`, `seam-gx1-prod`) on its command line, and the update jobs
+# themselves. A ticket that names no pair container -- an experiment in its own container, a
+# different GPU, no `/pair` mount -- cannot be affected by that drift and is not held up by it: on
+# 2026-11-02 the whole queue stalled behind a repair because every ticket was checked. `PAIR_CHECK_SKIP=1`
+# still turns the check off for a command that reaches a pair indirectly, and `PAIR_CHECK_FORCE=1`
+# turns it on for one that does not name the container it will use.
 set -u
 AGENT=${1:?agent}; MAXMIN=${2:?minutes}; shift 2
 BASE=${QBASE:?QBASE}
@@ -31,8 +39,27 @@ for _c in "$BASE/../../scripts" "$BASE/../scripts"; do
 done
 # check_release: 0 run, 4 drift (refuse), 5 check error (refuse). Transient ssh failures are retried
 # three times 10 s apart: a 10 s network blip must not silently run a job on a stale pair.
+# The pair's containers, as pairs.conf names them: a ticket that names none of these is not
+# touching the pair's release.
+PAIR_CONTAINERS="seam-p7-dev seam-p7-prod seam-gx2-dev seam-gx1-prod"
+# Named on the command line, not reached through some script we cannot read: that is the line
+# between "this ticket can hurt the pair" and "this ticket cannot".
+names_pair() {
+  local a c
+  for a in "$@"; do
+    for c in $PAIR_CONTAINERS; do
+      case "$a" in *"$c"*) return 0 ;; esac
+    done
+  done
+  return 1
+}
 check_release() {
   [ -n "${PAIR_CHECK_SKIP:-}" ] && return 0
+  if [ -z "${PAIR_CHECK_FORCE:-}" ] && ! names_pair "$@" \
+     && [ "$AGENT" != PairUpdate ] && [ "$AGENT" != PairUpdateRun ]; then
+    log "PAIR_CHECK_SKIP release guard not applicable: $AGENT names no pair container"
+    return 0
+  fi
   [ "$AGENT" = PairUpdate ] && return 0
   [ "$AGENT" = PairUpdateRun ] && return 0
   local name; name=$(basename "$BASE")
@@ -75,7 +102,7 @@ while :; do
     exec 9>"$LOCK"
     flock 9
     gpu_busy || {
-      check_release; grc=$?
+      check_release "$@"; grc=$?
       [ "$grc" = 0 ] && break
       flock -u 9
       log "refused $AGENT release_check_rc=$grc (not started)"
