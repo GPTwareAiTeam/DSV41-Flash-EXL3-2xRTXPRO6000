@@ -19,7 +19,11 @@ cp "$HERE/stub_ssh.sh" "$WORK/bin/stub_ssh"; chmod +x "$WORK/bin/stub_ssh"
 printf '{"build_id":"sm-demo","seam":{"fingerprint":"fp:dry","proto":"3"}}' > "$WORK/pair/releases/$SHA/RELEASE.json"
 cd "$REL"
 export PAIR_ROOT_OVERRIDE="$WORK/pair" PAIR_STATE_OVERRIDE="$WORK/pairs" PAIR_SSH="$WORK/bin/stub_ssh" \
-       PAIR_QUEUE="$WORK/noq"
+       PAIR_QUEUE="$WORK/noq" PAIR_GATE_DIR="$WORK/noq"
+# The GX gate lives next to the live queue, not in PAIR_QUEUE: without PAIR_GATE_DIR this stub smoke
+# waited out the real dev smoke's claim (SMOKE_GATE_WAIT_MIN, 20 min) before it could fail -- the
+# battery looked hung on 2026-11-02 while dev was actually running.
+mkdir -p "$WORK/noq"
 unset PAIR_DRY PAIR_DRY_SSH
 fails=0
 want() {  # <case> <expected-substring> <text>
@@ -58,10 +62,11 @@ out=$(SEAM_ENSURE="$WORK/bin/ensure" ./pair_smoke.sh dev "$SHA" 2>&1); rc=$?
 want "a silent death stays a timeout" "SMOKE_FAIL server_timeout_or_died" "$out"
 want_not "with no memory verdict invented" "SMOKE_FAIL memory" "$out"
 
-# 4. The grant is the smoke's, not the pair's: 2048 rows reserve 294 MiB the smoke never touches.
+# 4. The smoke grants the pair's own list (pairs.conf), never a narrower one: the release was measured
+# on 1,6,64,8192, and a grant of 1,6,64 is a 64-row prefill cap rather than the same instrument.
 ensure_stub 0 "SEAM_ENSURE state=started port=1"
 out=$(SEAM_ENSURE="$WORK/bin/ensure" ./pair_smoke.sh dev "$SHA" 2>&1)
-want "the server is asked for the smoke's buckets" "buckets=1,6,64" "$out"
+want "the server is asked for the pair's buckets" "buckets=1,6,64,8192" "$out"
 
 echo "RESULT $([ "$fails" = 0 ] && echo PASS || echo FAIL) fails=$fails"
 rm -rf "$WORK"

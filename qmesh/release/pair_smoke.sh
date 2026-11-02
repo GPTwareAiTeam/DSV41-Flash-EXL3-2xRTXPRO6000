@@ -231,6 +231,22 @@ case "$arm_out" in
     fail "wire_mismatch $(printf '%s' "$arm_out" | grep -m1 -E 'peer layout mismatch|remote invalid request' | cut -c1-300)" ;;
 esac
 
+# The grant, not the request, is the shape the pair runs: the server advertises its --buckets and the
+# client adopts the intersection, so a client asking for less than the server grants silently caps
+# every prefill chunk at its own largest bucket. That is what happened on 23:32 (server 1,6,64,8192,
+# client default topped out at 4096 and contained neither 8192 nor 256, grant 1,6,64, chunk_rows=64,
+# 1.6 s/token): the smoke measured a pair that was not the shipped one. A smoke that cannot see the
+# shipping width has nothing to say about the release.
+grant=$(printf '%s\n' "$arm_out" | sed -n 's/.*accepted=\([0-9][0-9,]*\).*/\1/p' | head -1)
+grant_line=$(python3 "$HERE/pair_bucket_grant.py" "$grant" "$SMOKE_BUCKETS"); grant_rc=$?
+case "$grant_rc" in
+  0) echo "SMOKE_BUCKETS_GRANT $grant_line" ;;
+  2) # No negotiated line: a client that never reached the server. The arm's own rc/rows checks below
+     # already fail the smoke; inventing a grant verdict here would report the wrong cause.
+     echo "SMOKE_BUCKETS_GRANT unknown want=$SMOKE_BUCKETS" ;;
+  *) fail "bucket_grant $grant_line (a prefill chunk splits at the largest granted bucket; the arm must ask for the pair's list)" ;;
+esac
+
 # The rows are read from the arm's log, by path: `python3 - <<'PY'` owns stdin with its own source, so a
 # piped arm_out read as empty and this check reported "arm_no_tokens NONE" for an arm whose log held a
 # full 8-token row (23:29:19 on dev). The parser is pair_arm_rows.py so that it can be tested.

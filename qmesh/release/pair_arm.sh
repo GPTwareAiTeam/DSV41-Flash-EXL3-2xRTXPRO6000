@@ -63,8 +63,13 @@ envs=(
   -e "CUDA_VISIBLE_DEVICES=$GPU"
   -e "REMOTE_TRANSPORT=seam"
   -e "SEAM_DEV=$SEAM_DEV" -e "SEAM_GID=$SEAM_GID" -e "SEAM_PEER=$SEAM_PEER"
-  # no SEAM_BUCKETS: the client's own default is the superset and the server narrows it to what it
-  # granted. Pinning the server's list here would silently cap every prefill chunk at its max row.
+  # SEAM_BUCKETS is a *request*: the server grants the intersection of this list and its own
+  # (--buckets, from pairs.conf). Leaving it unset used the client's fallback default
+  # (1,6,64,256,512,1024,2048,4096), which does not contain the shipping prefill width 8192: the
+  # intersection was 1,6,64, so the 23:32 dev arm negotiated chunk_rows=64 and split every 8192-row
+  # prefill chunk into 128 calls of 64 rows (accepted=1,6,64, 1.6 s/token decode). Ask for the pair's
+  # own list and the grant is exact.
+  -e "SEAM_BUCKETS=$BUCKETS"
   -e "MAX_PROMPTS=$ROWS" -e "MAX_NEW=$MAX_NEW" -e "WARMUP=$WARMUP" -e "WARMUP_NEW=$MAX_NEW"
   -e "CACHE_TOKENS=$CACHE" -e "PROMPTS=$PROMPTS" -e "CHECKPOINT=$CHECKPOINT"
 )

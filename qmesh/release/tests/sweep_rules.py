@@ -143,11 +143,13 @@ check("failed update writes failed evidence", 'evidence failed "$*"' in ur, "")
 def code_lines(text):
     return [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
 
-# The client must ask for its own superset and let the server narrow it. Handing the client the
-# server's list is what capped every prefill chunk at 64 rows.
-check("the client does not pin buckets",
-      not any("SEAM_BUCKETS" in l for l in code_lines(src("pair_arm.sh")) + code_lines(src("pair_env.sh"))),
-      "")
+# The client adopts the intersection of what it asks for and what the server grants, and its
+# fallback default lists 1,6,64,256,512,1024,2048,4096 -- no 8192. So a client that asks for
+# nothing gets 1,6,64 from an 8192-granting server and caps every prefill chunk at 64 rows (dev,
+# 2026-11-02). The arm asks for the pair's list, which is the server's list; ask for a superset
+# and the pair would still run, but on a width the release was never measured at.
+check("the client asks for the pair's buckets",
+      'SEAM_BUCKETS=$BUCKETS' in "".join(l.replace('"', '') for l in code_lines(src("pair_arm.sh"))), "")
 check("the server is asked for the wide grant",
       all(int(pc.load_conf(q)["buckets"].split(",")[-1]) >= 2048 for q in ("prod", "dev")),
       str([pc.load_conf(q)["buckets"] for q in ("prod", "dev")]))
@@ -294,7 +296,29 @@ check("the smoke waits for the GX box before the load preflight",
       'SMOKE_MEM_READY' in src("pair_smoke.sh")
       and any("SMOKE_MEM_WAIT_S" in l for l in code_lines(src("pair_smoke.sh")))
       and "LOAD_MARGIN" in src("pair_smoke.sh"), "")
+# The arm must ask for the pair's list. The client adopts the intersection of its request and the
+# server's grant, so a request that misses the shipping width (8192) is a silent 64-row cap: on
+# 2026-11-02 the dev arm negotiated accepted=1,6,64 against a server granting 1,6,64,8192 and every
+# prefill chunk went 128 calls deep. Pairs.conf is where the list lives; the arm quotes it.
+conf = src("pairs.conf")
+conf_buckets = [l.split()[11] for l in conf.splitlines()
+                if l.split()[:1] and l.split()[0] in ("prod", "dev") and len(l.split()) > 11]
+check("every pair ships the prefill width its release is measured on",
+      len(conf_buckets) == 2 and all(b == "1,6,64,8192" for b in conf_buckets),
+      "pairs.conf buckets: %s" % conf_buckets)
+check("the arm requests the pair's buckets, not a client fallback",
+      'SEAM_BUCKETS=$BUCKETS' in "".join(l.replace('"', '') for l in code_lines(src("pair_arm.sh"))), "")
+check("the smoke fails when the grant is not the pair's list",
+      'bucket_grant' in src("pair_smoke.sh") and 'SMOKE_BUCKETS_GRANT' in src("pair_smoke.sh"), "")
 
+check("the grant comparator is a tested file, not an inline comparison",
+      'pair_bucket_grant.py' in src("pair_smoke.sh")
+      and os.path.exists(os.path.join(HERE, "pair_bucket_grant.py"))
+      and os.path.exists(os.path.join(HERE, "tests", "bucket_grant.sh")), "")
+# The stub smoke must not take the live gate: it is a test of one failure path, and waiting out the
+# real dev smoke turned the battery into a 20-minute hang.
+check("the stub smoke keeps its own gate directory",
+      any("PAIR_GATE_DIR" in l for l in code_lines(src("tests/smoke_memory.sh"))), "")
 
 
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

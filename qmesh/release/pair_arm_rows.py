@@ -45,8 +45,12 @@ def main(argv):
     rows.sort(key=lambda d: d.get("i", 0))
     blob = "\n".join(f"{d.get('i', 0)}|{d['text']}" for d in rows)
     new = sum(int(d.get("new_tokens") or 0) for d in rows)
+    # accept_rate/tokens_per_round are diagnostics, not gates: a single 8-token decode has too few
+    # rounds to judge a drafter, but a run whose acceptance is 0 while the drafter is on is visible in
+    # the ticket instead of only in the arm's log (the 23:32 dev arm: 0 of 15, 1.14 tokens/round).
     print(f"i={rows[0].get('i', 0)} rows={len(rows)} new_tokens={new} "
           f"ttft_ms={rows[0].get('ttft_ms', '?')} decode_ms_per_tok={rows[0].get('decode_ms_per_tok', '?')} "
+          f"accept_rate={rows[0].get('accept_rate', '?')} tokens_per_round={rows[0].get('tokens_per_round', '?')} "
           f"text_sha256={hashlib.sha256(blob.encode()).hexdigest()}")
     print(f"NEW {new}")
     return 0
