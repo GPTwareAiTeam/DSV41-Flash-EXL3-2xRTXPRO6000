@@ -144,3 +144,16 @@ container runs this commit before anything is measured; without it a ticket meas
 synced last, including a transport library the container built days ago
 (`qmesh/native/bin/BUILD_INFO.aarch64` records the commit and `.cu` hash that produced the shard's
 library).
+
+Staging has to run **inside the gate and after the pair's server is stopped**: the GX tree is a live
+bind mount, so an rsync under a serving process can hand a process that starts halfway through a tree
+that is half one commit and half another. The order the ranked ticket uses is `gate take -> stop the
+pair's server -> stage (exit 13 if a sha disagrees) -> box-clear check -> refusal -> oracle -> two
+fresh loads`; staging first and gating later costs the reload it was meant to avoid.
+
+`stage_gx.sh` also prints `STAGE lib_src seam_cu=... built_from=... state=match|stale`. The container's
+library is compiled from the `.cu` on disk, so a stage can leave the source one revision ahead of the
+library - the two commits after `dabfa4c9` add a `SEAM_HOOK_US` stderr line and change one busy
+message, nothing on the wire or in the layout. `state=stale` next to passing numbers is that, and
+rebuilding is a `build_gx_transport.sh` away once the box is free, at the cost of a new build id for
+every container sharing the tree.
