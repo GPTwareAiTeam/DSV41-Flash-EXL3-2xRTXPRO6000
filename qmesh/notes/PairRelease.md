@@ -158,6 +158,12 @@ the command to use, before it reads anything or touches the queue; `pair_promote
 thing that sets that flag. The flag alone is not enough: for that exact sha there must be a
 `pairs/dev/evidence/<sha>.json` written by the dev ticket itself, and it must say
 `ok=true`, carry a smoke row, and carry **generated token ids** (`smoke.ids.n > 0`).
+The promote queues `pair_update.sh prod <sha> --flip-only`, the same two-step shape dev uses: what
+prod runs was cut, wired and built by `pair_prepare.sh` outside the queue, and the ticket only
+verifies the stamps, flips and smokes. Until 2026-11-02 it dropped the flag, so every promote left
+the prod queue compiling (that day's prod ticket rebuilt both transport libs and both torch
+extensions between 00:42:03 and 00:42:34). `pair_promote.sh --build` is the escape hatch for a pair
+that was never prepared, and `tests/sweep_rules.py` pins the default.
 
 Text is not proof. A wrong build can still emit fluent-looking output; the ids it actually generated
 are what a mismatched tree, a stale JIT cache or a half-flipped release cannot reproduce. The smoke
