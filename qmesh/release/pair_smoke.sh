@@ -160,6 +160,33 @@ if [ "$PACK_MIB" -gt 0 ]; then
   done
   echo "SMOKE_MEM_READY avail_mib=${avail:-0} want_mib=$want pack_mib=$PACK_MIB margin_mib=$LOAD_MARGIN waited=${waited}s"
 fi
+# A stamp proves the artifact was the one built; it does not prove a client's next import is a hit.
+# torch's version hash covers the include-path spelling and the flags, so a cache written under a
+# different spelling has a full build plan waiting for whoever imports first -- and inside a smoke
+# that is the arm, under load. On 2026-11-02 a 196-unit rebuild there evicted the 113.65 GiB cold pack
+# from page cache and the prefill fell from 790 to 351 rows/s on its first chunk (565.2 tok/s). Probe
+# both halves with the client's own import, short: a hit costs a second, a miss fails the ticket before
+# it loads a pack. The build that follows the failure is out of band (scripts/pair_build_ext.sh).
+ext_probe() {  # <side> <container>
+  local side=$1 ct=$2 cmd
+  cmd='cd /src/exllamav3 && TORCH_EXTENSIONS_DIR=/pair/extcache TORCH_CUDA_ARCH_LIST=12.0 \
+timeout -k 5 ${SMOKE_EXT_PROBE_S:-60} python3 -c "import exllamav3.ext as e; print(\"SMOKE_EXT_HIT\", e.exllamav3_ext.__file__)"'
+  if [ "$side" = p7 ]; then
+    docker exec "$ct" sh -c "$cmd" 2>&1
+  else
+    pair_gxsh "docker exec $ct sh -c '$cmd'" 2>&1
+  fi
+}
+for _s in p7 gx; do
+  if [ "$_s" = p7 ]; then _ct=$P7CT; else _ct=$GXCT; fi
+  _out=$(ext_probe "$_s" "$_ct"); _rc=$?
+  case "$_out" in
+    *SMOKE_EXT_HIT*)
+      echo "SMOKE_EXT_HIT $_s ct=$_ct $(printf '%s' "$_out" | grep -m1 SMOKE_EXT_HIT | sed 's/^SMOKE_EXT_HIT //')" ;;
+    *)
+      fail "ext_client_miss $_s ct=$_ct rc=$_rc cache=/pair/extcache (a client import does not reuse the stamped artifact; run scripts/pair_build_ext.sh $PAIR --side $_s out of band)" ;;
+  esac
+done
 pair_step "SMOKE_SERVER_START pair=$PAIR ct=$GXCT build=$BUILD_ID buckets=$SMOKE_BUCKETS timeout=${SMOKE_SERVER_TIMEOUT}s"
 srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT \
           SEAM_GATE_DIR="$(dirname "$(pair_gx_gate_file)")" \

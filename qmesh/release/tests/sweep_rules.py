@@ -158,6 +158,13 @@ check("box memory refusals are classified, not blamed on the release",
 check("a memory failure keeps the code (no restore)",
       "rollback=none" in ur and "restore\n}" not in ur.split("memory_fail()")[1].split("\n}")[0], "")
 check("smoke runs the arm with ids", "--ids" in sm, "")
+# The stamp names the artifact, but only an import can say whether the next client reuses it. A cache
+# written under another include-path spelling has a full plan waiting; inside a smoke that plan runs
+# under load and evicts the pack (2026-11-02: 565.2 tok/s). The probe must come before the load.
+check("a smoke proves the client cache before it loads a pack",
+      "SMOKE_EXT_HIT" in sm and "ext_client_miss" in sm
+      and sm.index("ext_client_miss") < sm.index('pair_step "SMOKE_SERVER_START'), "")
+
 check("missing ids fail the smoke", "arm_no_ids" in sm, "")
 check("smoke totals the ids across arms", "SMOKE_ARM_IDS_TOTAL" in sm, "")
 check("update records the ids total, not one arm",
