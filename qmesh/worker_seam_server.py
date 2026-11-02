@@ -322,28 +322,37 @@ class SeamServer:
         if not self.ws_auto:
             return min(self.ws_rows, rows)
         avail = _avail_mib()
+        # A box that is already swapping cannot be talked into a bigger piece by free memory: GX2,
+        # 3.9 GiB swapped out, ran 4 x 2048-row pieces of layer 0 at p50 105 ms but mean 172 ms
+        # (9 of 10 calls did swap I/O) - worse than the 153 ms mean of 8 x 1024 on the same box -
+        # while the same code with MemAvailable back at 1225 ran those pieces at mean 115 ms. The
+        # swap in use, not MemAvailable, is the discriminator, so a paging box stays on the floor
+        # rung; MemAvailable still decides between the rungs above it.
+        swapped = _swap_used_mib()
+        paging = swapped > SWAP_WARN_MIB
         # Step down the instant the current rung stops fitting, but climb back only with
         # WS_HYST_MIB to spare: on GX1 a resident pack leaves MemAvailable wandering around the
-        # 2048-row threshold (542 MiB available against 614 needed), and a picker that followed
+        # 2048-row threshold (542 MiB available against 566 needed), and a picker that followed
         # that noise would alternate 2048 and 1024 pieces call after call for no gain. Being slow
         # on the way up is the safe direction - a rung too small only costs the weight pass the
         # split already paid.
         prev = self.__dict__.get("_ws_pick")
         pick = None
-        for n in WS_LADDER:
-            if n > self.ws_rows:
-                continue
-            slack = 0 if (prev is None or n <= prev) else WS_HYST_MIB
-            if avail < 0 or ws_mib_for(rows, n) + WS_GUARD_MIB + slack <= avail:
-                pick = n
-                break
+        if not paging:
+            for n in WS_LADDER:
+                if n > self.ws_rows:
+                    continue
+                slack = 0 if (prev is None or n <= prev) else WS_HYST_MIB
+                if avail < 0 or ws_mib_for(rows, n) + WS_GUARD_MIB + slack <= avail:
+                    pick = n
+                    break
         if pick is None:
             # Nothing fits: take the smallest rung rather than hand the box a request it will
             # swap through. A caller that reaches this on every call wants a smaller bucket.
             pick = min(self.ws_rows, WS_LADDER[-1])
         if pick != self.__dict__.get("_ws_pick"):
             self._ws_pick = pick
-            print(f"SEAM_WS_PICK rows={rows} ws={pick} avail_mib={avail} "
+            print(f"SEAM_WS_PICK rows={rows} ws={pick} avail_mib={avail} swapped_mib={swapped} "
                   f"need_mib={ws_mib_for(rows, pick) + WS_GUARD_MIB:.0f} "
                   f"pieces={(rows + pick - 1) // pick}", flush = True)
         return min(pick, rows)
@@ -523,8 +532,10 @@ WS_AUTO = os.environ.get("SEAM_WS_ROWS_AUTO", "1") != "0"
 
 # Swap in use above this and the resident pack is paging; see _swap_used_mib and
 # SEAM_SERVER_SWAP_WARN in main(). A few hundred MiB is normal noise on these boxes, a few GiB is
-# a box that is already over its head before the first request.
-SWAP_WARN_MIB = 512
+# a box that is already over its head before the first request. The piece-size picker refuses to
+# leave the floor rung while this is exceeded, so a box whose swap is stale rather than active
+# raises it (SEAM_SWAP_WARN_MIB=N) instead of pinning the ladder for the rest of the run.
+SWAP_WARN_MIB = int(os.environ.get("SEAM_SWAP_WARN_MIB", "512"))
 
 # Floor the cuda-exl3 restack has to leave on the box besides its own peak (see _cx_moe). 1.5 GiB is
 # the headroom a loaded GX actually has left (slab + workspace + CUDA context); a conversion that
