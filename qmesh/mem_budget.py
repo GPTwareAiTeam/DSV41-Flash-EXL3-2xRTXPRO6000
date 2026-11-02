@@ -83,6 +83,12 @@ SEAM_ROWS = int(os.environ.get("SEAM_ROWS") or max(SEAM_BUCKETS))
 ARM_MAX_S = float(os.environ.get("ARM_MAX_S", "0"))
 ARM_TOTAL_S = float(os.environ.get("ARM_TOTAL_S", "0"))
 LOAD_ONLY = os.environ.get("LOAD_ONLY") == "1"
+# PREFILL_MEM_TRACE=<path prefix> records the CUDA allocator's history for the first arm's prefill and
+# dumps `<prefix>.snapshot.pickle` when that prefill completes. The live-tensor walk above sees what
+# survives a chunk, not the transients that peak in the middle of one, and the chunk's peak is exactly
+# what the limiter has to make room for. Parsing lives in
+# /home/treadall/recipe-artifacts/seamrobust/scripts/snapshot_top.py.
+PREFILL_MEM_TRACE = os.environ.get("PREFILL_MEM_TRACE", "")
 DEVICE = torch.device("cuda:0")
 G = 2 ** 30
 
@@ -515,6 +521,16 @@ def main():
         if PREFILL_ADAPTIVE:
             generator.prefill_chunk_limit = limiter = PrefillChunkLimiter(DEVICE)
         job = Job(input_ids = ids, max_new_tokens = max_new, sampler = GreedySampler())
+        # The trace has to start before the chunk allocates, so it goes on ahead of enqueue and comes off
+        # as soon as this arm's prefill has produced its first result: after that the only allocations are
+        # decode steps, which would bury the prefill peak in 24 rounds of noise.
+        trace_path = f"{PREFILL_MEM_TRACE}.{chunk_label}.snapshot.pickle"
+        trace_here = bool(PREFILL_MEM_TRACE) and chunk_label.startswith("arm_") \
+                     and not os.path.exists(trace_path)
+        if trace_here:
+            torch.cuda.memory._record_memory_history(enabled = "all", max_entries = 400000)
+            print(f"MEM_TRACE on path={trace_path} "
+                  f"base_alloc_mib={torch.cuda.memory_allocated(DEVICE) / 2 ** 20:.0f}", flush = True)
         generator.enqueue(job)
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats(DEVICE)
@@ -548,6 +564,14 @@ def main():
                     prefill_t = time.time() - t
                     prefill_peak = torch.cuda.max_memory_allocated(DEVICE)
                     torch.cuda.reset_peak_memory_stats(DEVICE)
+                    if trace_here:
+                        torch.cuda.synchronize()
+                        torch.cuda.memory._dump_snapshot(trace_path)
+                        torch.cuda.memory._record_memory_history(enabled = None)
+                        trace_here = False
+                        print(f"MEM_TRACE dump path={trace_path} "
+                              f"prefill_peak_mib={(prefill_peak - base_alloc) / 2 ** 20:.0f}",
+                              flush = True)
                 if gen is None and r.get("token_ids") is not None:
                     gen = r  # before eos, which a one-token or time-limited arm may never reach
                 if r.get("eos"):
