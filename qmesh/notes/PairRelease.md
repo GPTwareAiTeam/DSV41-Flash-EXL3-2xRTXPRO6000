@@ -403,6 +403,7 @@ pair_prepare.sh <pair> [sha] [--side both|p7|gx]            # cut+wire+build, ou
 pair_env.sh <pair>                    # the env a job should run with (CUDA_VISIBLE_DEVICES etc.)
 pair_arm.sh <pair> [--rows N]         # one client arm through the release
 pair_smoke.sh <pair>                  # server + 1-row arm, SMOKE_OK / SMOKE_FAIL
+pair_serve.sh <pair> [sha]            # load `current` and leave the server serving (ticket only)
 pair_ref.sh <pair> [--compare]        # record / compare the decode reference
 pair_check.sh <pair> [--quiet]        # guard: 0 IN_SYNC, 4 PAIR_DRIFT, 5 error
 pair_status.sh <pair>                 # human summary of both sides

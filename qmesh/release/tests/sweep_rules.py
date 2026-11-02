@@ -345,14 +345,25 @@ check("the piece size is the pair's number, pinned",
       and 'WS_ENV="SEAM_WS_ROWS=$WS_ROWS SEAM_WS_ROWS_AUTO=0"' in src("pair_lib.sh"), "")
 # One pack per GX box. A build and a smoke both load or hammer that box, so both must claim it through
 # the take helper (which reads a foreign claim and waits); writing the file directly would let two jobs
-# believe they own the box, which is what collided on 2026-11-02.
+# believe they own the box, which is what collided on 2026-11-02. Serving is the third job that loads a
+# pack, so it takes the claim the same way.
 check("every GX job claims the box through the helper",
-      any("pair_gx_gate_take " in l for l in code_lines(src("pair_build_ext.sh")))
-      and any("pair_gx_gate_take " in l for l in code_lines(src("pair_smoke.sh")))
+      all(any("pair_gx_gate_take " in l for l in code_lines(src(f)))
+          for f in ("pair_build_ext.sh", "pair_smoke.sh", "pair_serve.sh"))
       and not any("pair_gx_gate_up " in l
-                  for f in ("pair_build_ext.sh", "pair_smoke.sh") for l in code_lines(src(f)))
+                  for f in ("pair_build_ext.sh", "pair_smoke.sh", "pair_serve.sh") for l in code_lines(src(f)))
       and "pair_gx_gate_state() {" in src("pair_lib.sh")
       and "pair_gx_gate_down() {" in src("pair_lib.sh"), "")
+# "The pair is down" must be a state somebody chose, reached from the release `current` names and only
+# after the sync check says the artifact on disk is the stamped one; and the worker it leaves behind has
+# to be named in the pidfile, or the next ticket can only stop it by pattern.
+check("serving starts from `current`, refuses drift, and records the worker",
+      "pair_current_sha" in src("pair_serve.sh")
+      and "pair_check.sh" in src("pair_serve.sh")
+      and "PAIR_SERVE_DRIFT" in src("pair_serve.sh")
+      and "pair_server_record" in src("pair_serve.sh")
+      and "--fresh" in src("pair_serve.sh")
+      and "pair_gx_foreign_server" in src("pair_serve.sh"), "")
 check("the gate test is in the battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate.sh")), "")
 # A GX command runs on the host unless it says docker exec, and the host has no /pair: a container path
