@@ -77,6 +77,10 @@ GX_PREFLIGHT_AVAIL_GIB=${GX_PREFLIGHT_AVAIL_GIB:-115}
 # the take can no longer start a server while a smoke holds the box, and a smoke can not be handed a
 # box another job claimed. SEAM_GATE_REQUIRED=0 is for stub harnesses only.
 SEAM_GATE_DIR=${SEAM_GATE_DIR:-/home/treadall/recipe-artifacts/gpu0-gx1/queue}
+# The gate belongs to the *pair's* container, not to whichever container this job runs in: CT may be a
+# private container that shares the box (a worktree of the same pack), and the gate that protects that
+# box is still gx<N>.gate. Default unchanged, so every existing caller keeps CT's gate.
+SEAM_GATE_CT=${SEAM_GATE_CT:-$CT}
 SEAM_GATE_REQUIRED=${SEAM_GATE_REQUIRED:-1}
 
 seam_gxsh() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$GX" "$1"; }
@@ -112,7 +116,7 @@ seam_pids()  { seam_gxct "pgrep -fc \"^python3 -u qmesh/worker_seam_server.py\""
 # is a deliberate act with a new until. This script never writes the file -- pair_gx_gate_take and
 # pair_gx_gate_down own its lifecycle -- it only answers "may I touch this box".
 seam_gate_file() {  # seam-gx2-dev -> <queue dir>/gx2.gate, the same mapping pair_lib.sh uses
-  local n=${CT#seam-gx}
+  local n=${SEAM_GATE_CT#seam-gx}
   printf '%s/gx%s.gate\n' "$SEAM_GATE_DIR" "${n%%-*}"
 }
 seam_gate_is_ancestor() {  # <pid> -> 0 when it is this process or one of its ancestors
@@ -130,7 +134,7 @@ seam_gate_check() {  # -> 0 allowed; prints PREFLIGHT_FAIL gate_* and returns 3 
   local f o p u h now
   f=$(seam_gate_file)
   if [ ! -f "$f" ]; then
-    echo "PREFLIGHT_FAIL gate_free owner=none file=$f host=$GX (take the gate before loading: gx${CT#seam-gx} is shared)"
+    echo "PREFLIGHT_FAIL gate_free owner=none file=$f host=$GX (take the gate before loading: gx${SEAM_GATE_CT#seam-gx} is shared)"
     return 3
   fi
   o=$(sed -n 's/^owner=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
