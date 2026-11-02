@@ -319,6 +319,25 @@ check("the grant comparator is a tested file, not an inline comparison",
 # real dev smoke turned the battery into a 20-minute hang.
 check("the stub smoke keeps its own gate directory",
       any("PAIR_GATE_DIR" in l for l in code_lines(src("tests/smoke_memory.sh"))), "")
+# An interrupted ticket used to leave the pack resident (23:32 on 2026-11-02) and the next smoke
+# refused `pair_busy gx_procs=2`. The fix is ownership, not a pattern kill: record the worker's pid,
+# stop only that pid, and reclaim it at the next ticket's preflight.
+check("the smoke records the worker it started",
+      'pair_server_record' in src("pair_smoke.sh"), "")
+check("an interrupted smoke stops its own server, a verified one keeps it",
+      'SMOKE_VERDICT' in src("pair_smoke.sh") and 'pair_server_stop' in src("pair_smoke.sh")
+      and 'smoke_exit' in src("pair_smoke.sh"), "")
+check("the interrupt path stops by recorded pid, not by pattern",
+      'pair_server_stop' in src("pair_update_run.sh")
+      and 'pair_client_stop' in src("pair_update_run.sh")
+      and not any('pkill -f worker_seam_server' in l for l in src("pair_update_run.sh").split("on_term")[1].split("restore()")[0].splitlines()), "")
+_upd = src("pair_update_run.sh")
+check("the preflight reclaims this pair's own orphan before refusing",
+      _upd.count("others=$(pair_others_busy)") == 1
+      and 'UPDATE_ORPHAN' in _upd
+      and _upd.index('pair_server_stop 2>&1') < _upd.index('others=$(pair_others_busy)'), "")
+check("a verified flip releases the recorded server pid",
+      'rm -f "$(pair_server_pidfile)"' in src("pair_update_run.sh"), "")
 
 
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

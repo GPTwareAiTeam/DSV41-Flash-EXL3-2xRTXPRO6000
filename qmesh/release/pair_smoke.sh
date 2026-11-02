@@ -97,7 +97,15 @@ if ! pair_gx_gate_take "smoke-$PAIR" $(( (SMOKE_SERVER_TIMEOUT + SMOKE_ARM_TIMEO
   echo "SMOKE_GATE_BUSY $(pair_gx_gate_state)"
   fail "gx_busy $(pair_gx_gate_state)"
 fi
-trap pair_gx_gate_down EXIT
+# The claim and the server this smoke loaded are both its own. pair_gx_gate_down used to be the whole
+# trap, so a smoke that was terminated left the pack resident and every later ticket queued behind it.
+# A smoke that reached its verdict keeps the server: that server is the update's result, not a leak.
+SMOKE_VERDICT=0
+smoke_exit() {
+  pair_gx_gate_down
+  [ "$SMOKE_VERDICT" = 1 ] || pair_server_stop
+}
+trap smoke_exit EXIT
 echo "SMOKE_GATE owner=smoke-$PAIR until=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$(pair_gx_gate_file)")"
 
 echo "SMOKE_MEM_BEFORE $(gx_mem)"
@@ -161,6 +169,14 @@ case "$srv_out" in
   *state=started*) ;;
   *) fail "server_not_ready $(printf '%s' "$srv_out" | grep -m1 SEAM_ENSURE)" ;;
 esac
+# This smoke started that worker, so it owns it: the pid goes to state so an interrupted ticket can
+# stop exactly this process instead of whatever a later ticket loaded (see pair_server_stop). Without
+# it a ticket killed at 23:32 left the pack loaded and the 23:54 smoke refused `pair_busy gx_procs=2`.
+if pair_server_record "$BUILD_ID"; then
+  echo "SMOKE_SERVER_PID $(sed -n 's/.* pid=\([0-9]*\).*/\1/p' "$(pair_server_pidfile)")"
+else
+  echo "SMOKE_SERVER_PID unrecorded"
+fi
 
 loaded=$(pair_gxsh "docker exec $GXCT sh -c \"grep -m1 '^SEAM_SERVER_LOADED' /tmp/seam_server.log\"" 2>/dev/null | tail -1)
 echo "SMOKE_SERVER_LOADED $loaded"
@@ -313,4 +329,6 @@ esac
 awk -v got="$pf_tps" -v want="$SMOKE_PREFILL_MIN_TPS" 'BEGIN { exit !(got + 0 >= want + 0) }' \
   || fail "prefill_slow depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS"
 echo "SMOKE_PREFILL_OK depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS aborts=0"
+SMOKE_VERDICT=1
+[ "${PAIR_SMOKE_KEEP_SERVER:-0}" = 1 ] || rm -f "$(pair_server_pidfile)"
 echo "SMOKE_OK $PAIR $SHA $BUILD_ID"

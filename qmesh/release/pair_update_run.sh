@@ -143,6 +143,14 @@ on_term() {
   fi
   [ -n "$TS" ] && echo "recreated at ts=$TS; undo with: $HERE/pair_containers.py rollback $PAIR $TS" \
       > "$PAIR_STATE_DIR/restore-$PAIR-$TS.txt"
+  # The ticket's own client and the server it loaded go with it. This is not the old pattern-kill that
+  # took down the next arm's server: pair_server_stop addresses the pid this ticket recorded, after
+  # checking that pid still runs worker_seam_server.py, and does nothing when none was recorded (a
+  # ticket interrupted before the smoke, or after a verified flip, keeps the serving server).
+  cli_stop=$(pair_client_stop 2>/dev/null || true)
+  [ -n "$cli_stop" ] && pair_step "RESTORE_$cli_stop"
+  srv_stop=$(pair_server_stop 2>&1 || true)
+  [ -n "$srv_stop" ] && pair_step "RESTORE_$srv_stop"
   exit 143
 }
 trap on_term TERM INT
@@ -218,6 +226,15 @@ for t in "$PAIR_QUEUE"/gpu_queue/[0-9]*-*; do
   case "$base" in *-PairUpdate|*-PairUpdateRun) continue ;; esac
   pair_step "UPDATE_QUEUE_NOTE pair=$PAIR other_ticket=$base (queued behind us; the queue serialises)"
 done
+# An orphan this pair's own ticket left behind is not somebody else's work: a ticket killed before its
+# trap ran (SIGKILL, a container restart) leaves the pack resident, and refusing there is how the 23:54
+# smoke spent the GX2 window on `pair_busy gx_procs=2` while a colleague waited. The pid file names it,
+# pair_server_stop checks the pid still is that worker, so a foreign server is still refused below.
+orphan=$(pair_server_stop 2>&1 || true)
+case "$orphan" in
+  SERVER_STOP\ *) pair_step "UPDATE_ORPHAN_${orphan#SERVER_STOP } (this pair's interrupted ticket left it; stopped)" ;;
+  *)              [ -n "$orphan" ] && pair_step "UPDATE_ORPHAN_NOTE $orphan" ;;
+esac
 others=$(pair_others_busy)
 if [ -n "$others" ] && [ "${PAIR_UPDATE_FORCE:-0}" != 1 ]; then
   pair_step "PAIR_UPDATE_REFUSED pair=$PAIR pair_busy $others (a client or ticket owns this pair; wait for it)"
@@ -333,7 +350,9 @@ rc=${PIPESTATUS[0]}
 # ---- 6. smoke -----------------------------------------------------------------------------------
 phase smoke
 status_write 20 "server start + one decode row"
-smoke_out=$("$HERE/pair_smoke.sh" "$PAIR" "$SHA" 2>&1)
+# The smoke may keep the worker it loaded (it is this update's result); everything else about the pid
+# file is the smoke's to decide, so stand-alone smokes clean up after themselves.
+smoke_out=$(PAIR_SMOKE_KEEP_SERVER=1 "$HERE/pair_smoke.sh" "$PAIR" "$SHA" 2>&1)
 smoke_rc=$?
 printf '%s\n' "$smoke_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
 if [ "$smoke_rc" != 0 ]; then
@@ -413,6 +432,10 @@ check_rc=$?
 printf '%s\n' "$check_out" | sed 's/^/  /' | tee -a "$PAIR_LOG"
 [ "$check_rc" = 0 ] || fail "post-update check rc=$check_rc"
 VERIFIED=1
+# The server this ticket loaded is now the pair's serving server, verified on this release: it stops
+# being a ticket's to interrupt, so the recorded pid goes. A stale claim here would let a later
+# ticket's interruption kill a server its own smoke never started.
+rm -f "$(pair_server_pidfile)"
 status_write 1 "done"
 
 # Evidence last, so the file only exists once the pair is really on the release and verified.

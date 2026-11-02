@@ -186,6 +186,50 @@ pair_current_sha() {  # <root> [remote 1] -> sha the `current` symlink points at
   # readlink -f echoes a missing path unchanged: only a real releases/<sha> counts as current
   case "$t" in "$root"/releases/*) basename "$t" ;; *) return 0 ;; esac
 }
+
+# ---- what a ticket loaded, and how it puts it back ------------------------------------------------
+# A ticket owns the pack it loaded and the client it started, and nothing else. Neither may be
+# stopped by pattern: on 2026-11-02 a killed 23:32 ticket left `worker_seam_server.py` holding 116 GiB,
+# and the 23:54 smoke refused with `pair_busy gx_procs=2` while a colleague waited on the box. The
+# server is addressed by the pid the ticket recorded plus a cmdline check, so a reused pid can not be
+# mistaken for it; the pair's own P7 container is the only place the client can be.
+pair_server_pidfile() { echo "$PAIR_STATE_DIR/server-$PAIR.pid"; }
+pair_server_record() {  # <build id> -- records the worker this ticket's ensure started
+  local pid
+  pid=$(pair_gxsh "docker exec $GXCT pgrep -f 'python3 -u qmesh/worker_seam_server.py' | head -1" 2>/dev/null)
+  case "${pid:-}" in ''|*[!0-9]*) return 1 ;; esac
+  printf 'pair=%s build=%s pid=%s at=%s\n' "$PAIR" "$1" "$pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$(pair_server_pidfile)"
+  return 0
+}
+pair_server_stop() {  # stops the recorded worker if it is still the one that was recorded
+  local f pid build live out
+  f=$(pair_server_pidfile)
+  [ "$PAIR_DRY" = 1 ] && { echo "SERVER_STOP_DRY $(cat "$f" 2>/dev/null)"; return 0; }
+  pid=$(sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  build=$(sed -n 's/.* build=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  [ -n "$pid" ] || return 0
+  live=$(pair_gxsh "docker exec $GXCT sh -c 'tr \"\\0\" \" \" < /proc/$pid/cmdline 2>/dev/null'" 2>/dev/null)
+  case "$live" in
+    *worker_seam_server.py*) ;;
+    *) printf 'SERVER_STOP_SKIP pid=%s (gone or not the worker)\n' "$pid"; rm -f "$f"; return 0 ;;
+  esac
+  out=$(pair_gxsh "docker exec $GXCT kill -TERM $pid && echo sent" 2>/dev/null)
+  if [ "${out:-}" = sent ]; then
+    printf 'SERVER_STOP pid=%s build=%s\n' "$pid" "${build:-?}"
+  else
+    printf 'SERVER_STOP_FAILED pid=%s build=%s\n' "$pid" "${build:-?}"
+  fi
+  rm -f "$f"
+  return 0
+}
+pair_client_stop() {  # the arm's client lives in the pair's own P7 container; nobody else's does
+  [ "$PAIR_DRY" = 1 ] && return 0
+  docker exec "$P7CT" pkill -f 'qmesh/mem_budget.py' >/dev/null 2>&1 &&
+    echo "CLIENT_STOP ct=$P7CT"
+  return 0
+}
+
 # Seam identity: the three files that define the wire. A release that changes any byte of them is a
 # different protocol, whatever a constant says, so the fingerprint is the sha256 over their names and
 # contents (same on P7 and GX for the same release).
