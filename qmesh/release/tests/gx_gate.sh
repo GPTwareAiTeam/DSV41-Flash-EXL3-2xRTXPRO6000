@@ -17,6 +17,9 @@ export PAIR_GATE_DIR=$W
 # shellcheck source=../pair_lib.sh
 . "$REL/pair_lib.sh"
 PAIR_HOME=$W; PAIR_DRY=0; GXCT=seam-gx2-dev; PAIR=dev
+# A claim may only be taken inside a queue ticket (pair_ticket_hardcap); these cases are the claim's
+# own battery, so they stand in for the wrapper and declare the cap it would export.
+export GPU_TICKET_HARDCAP=$(( $(date +%s) + 3600 ))
 f=$W/gx2.gate
 fails=0
 want() {  # <case> <expected-substring> <actual>
@@ -26,6 +29,20 @@ eq() { if [ "$2" = "$3" ]; then echo "OK   $1"; else echo "FAIL $1 (wanted '$2',
 
 eq "the gate names the box from the container" "$W/gx2.gate" "$(pair_gx_gate_file)"
 eq "no file means free" free "$(pair_gx_gate_state)"
+# An unresolvable GXCT must not answer "free": queue/gx.gate never exists, so a claimed box read free
+# and a hand-run check took GX2 while a smoke held it (2026-11-02 03:1x). Unresolvable is an error.
+_gxct=$GXCT; unset GXCT
+out=$(pair_gx_gate_file 2>/dev/null); rc=$?
+eq "an unset GXCT resolves no gate" 2 "$rc"
+eq "an unset GXCT has no path" "" "$out"
+eq "an unset GXCT reads unresolved, not free" gate_unresolved "$(pair_gx_gate_state)"
+if pair_gx_gate_take nope 5 0; then echo "FAIL unresolvable_refused (took a box it cannot name)"; fails=$((fails + 1));
+else echo "OK   unresolvable_refused"; fi
+[ -f "$f" ] && { echo "FAIL unresolvable_writes_nothing (wrote $f)"; fails=$((fails + 1)); } || echo "OK   unresolvable_writes_nothing"
+GXCT=bogus
+eq "an unparsable GXCT reads unresolved" gate_unresolved "$(pair_gx_gate_state)"
+GXCT=$_gxct
+eq "a resolvable GXCT names its own box again" "$W/gx2.gate" "$(pair_gx_gate_file)"
 
 # A live foreign claim: a real process holds it (a dead pid is free, which the next case pins).
 sleep 300 & foreign=$!

@@ -131,7 +131,15 @@ pair_gxstdin() {
 # "<owner> pid=… until=<epoch>". A missing file, or a past `until`, means free, so a crashed job cannot
 # wedge a box, and a reader never has to trust that the writer cleaned up.
 pair_gx_gate_file() {  # -> <queue dir>/gx{N}.gate, N from the GX container name (seam-gx2-dev -> 2)
-  local n=${GXCT#seam-gx}
+  local n=${GXCT:-}; n=${n#seam-gx}
+  # An unset GXCT used to resolve to "gx.gate", which never exists, so the reader answered "free" for a
+  # box that was claimed: on 2026-11-02 03:1x a hand-run check reported GX2 free while a smoke held it.
+  # A gate reader must never guess, so an unusable GXCT is an error, not "free".
+  if [ -z "$n" ] || [ "$n" = "${GXCT:-}" ]; then
+    echo "pair_gx_gate_file: GXCT='${GXCT:-<unset>}' is not seam-gx<N>[<suffix>]: refusing to guess which" \
+         "gate to read (an unresolvable path reads as 'free' for a claimed box)" >&2
+    return 2
+  fi
   printf '%s\n' "${PAIR_GATE_DIR:-$PAIR_HOME/recipe-artifacts/gpu0-gx1/queue}/gx${n%%-*}.gate"
 }
 pair_p7_gpu_users() {  # [gpu index...] -> "gpu<N> pid=<pid> <name>" per compute process; empty = idle
@@ -199,7 +207,8 @@ pair_gpu_foreign_users() {  # <gpu index...> <own container> -> users on those G
 }
 
 pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until or a dead local holder is free
-  local f o p u h; f=$(pair_gx_gate_file)
+  local f o p u h
+  f=$(pair_gx_gate_file) || { echo gate_unresolved; return 0; }
   [ -f "$f" ] || { echo free; return 0; }
   o=$(sed -n 's/^owner=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   p=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
@@ -247,7 +256,8 @@ pair_ticket_hardcap() {  # -> epoch the calling queue ticket must be off this bo
   return 1
 }
 pair_gx_gate_up() {  # <label> <minutes> -> atomic; never replaces a claim that is still held
-  local f cap until now; f=$(pair_gx_gate_file)
+  local f cap until now
+  f=$(pair_gx_gate_file) || { echo "PAIR_GATE_REFUSED gate_unresolved label=${1:-?}" >&2; return 5; }
   [ "$PAIR_DRY" = 1 ] && return 0
   now=$(date +%s)
   if ! cap=$(pair_ticket_hardcap); then
@@ -289,7 +299,8 @@ pair_gx_gate_take() {  # <label> <minutes> <wait_minutes> -> 0 claimed, 1 still 
   done
 }
 pair_gx_gate_down() {  # drop the claim only if the line is still this process's, on this host
-  local f h; f=$(pair_gx_gate_file)
+  local f h
+  f=$(pair_gx_gate_file) || return 0
   [ "$PAIR_DRY" = 1 ] && return 0
   h=$(sed -n 's/.*host=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   [ "${h:-$(hostname -s)}" = "$(hostname -s)" ] || return 0

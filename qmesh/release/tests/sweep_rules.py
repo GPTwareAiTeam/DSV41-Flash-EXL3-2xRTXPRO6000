@@ -571,7 +571,8 @@ check("a claim never runs past the ticket's hard cap",
 # ticket in its ancestry, and inside one it is clamped to the cap the wrapper exported.
 import subprocess as _sp, tempfile as _tf, shutil as _sh
 _gd = _tf.mkdtemp(prefix="gategate")
-_env = dict(os.environ, PAIR_GATE_DIR=_gd, PAIR_QUEUE_ROOT="/tmp/sweepq", PAIR_QUEUE="/tmp/sweepq")
+_env = dict(os.environ, PAIR_GATE_DIR=_gd, PAIR_QUEUE_ROOT="/tmp/sweepq", PAIR_QUEUE="/tmp/sweepq",
+            GXCT="seam-gx2-dev")
 for _k in ("GPU_RUN_STATUS", "GPU_TICKET_HARDCAP"):
     _env.pop(_k, None)
 _probe = ('. /home/treadall/recipe-pair-release/qmesh/release/pair_lib.sh 2>/dev/null || '
@@ -594,6 +595,34 @@ _r = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; pair_gx_gate_up clamps 120; ech
 _until = re.search(r"until=(\d+)", _r.stdout or "")
 check("a claim longer than the ticket is clamped to its cap",
       "rc=0" in _r.stdout and _until and int(_until.group(1)) <= int(_env["GPU_TICKET_HARDCAP"]),
+      (_r.stdout + _r.stderr).strip()[:200])
+
+# A reader must never guess which box it is reading. With GXCT unset the path used to be
+# queue/gx.gate -- a file that never exists -- so a claimed box answered "free", and on 2026-11-02
+# 03:1x a hand-run check reported GX2 free while a smoke held it. An unresolvable gate is an error
+# that reaches the caller as a refusal (rc 5), never as "free" and never as a wait.
+for _label, _gx in (("unset", None), ("unparsable", "bogus")):
+    _e = dict(_env)
+    _e["GPU_TICKET_HARDCAP"] = str(int(__import__("time").time()) + 600)
+    _e.pop("GXCT", None)
+    if _gx:
+        _e["GXCT"] = _gx
+    _r = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; pair_gx_gate_file 2>/dev/null >/dev/null; '
+                  'echo "file_rc=$?"; echo "state=$(pair_gx_gate_state)"; '
+                  'pair_gx_gate_up nobody 5 >/dev/null 2>&1; echo "up_rc=$?"' % HERE],
+                 env=_e, capture_output=True, text=True)
+    check("an unresolvable GXCT (%s) reads unresolved, never free, and refuses a claim" % _label,
+          "file_rc=2" in _r.stdout and "state=gate_unresolved" in _r.stdout
+          and "up_rc=5" in _r.stdout, (_r.stdout + _r.stderr).strip()[:200])
+# ...and a resolvable one still names its own box, so the guard is not a blanket refusal. The claim
+# is taken by the probing shell itself, so its pid is alive for the read that follows.
+_e = dict(_env); _e["GPU_TICKET_HARDCAP"] = str(int(__import__("time").time()) + 600)
+_e["GXCT"] = "seam-gx2-dev"
+_r = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; pair_gx_gate_up keeper 5 >/dev/null 2>&1; '
+              'echo "file=$(pair_gx_gate_file)"; echo "state=$(pair_gx_gate_state)"' % HERE],
+             env=_e, capture_output=True, text=True)
+check("a resolvable GXCT still reads its own box's claim",
+      "file=%s/gx2.gate" % _gd in _r.stdout and "state=keeper until=" in _r.stdout,
       (_r.stdout + _r.stderr).strip()[:200])
 check("the wrapper hands its hard cap to the ticket's children",
       "export GPU_TICKET_HARDCAP=$hard" in src("gpu_run_pair.sh")

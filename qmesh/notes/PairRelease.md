@@ -614,3 +614,24 @@ index by UUID) and refuses `gpu_busy p7_gpus=0,1 users=<pid name;...>` before it
 anything, i.e. before the flip; processes inside the pair's own container are exempt
 (`pair_pid_in_container`), `PAIR_GPU_WAIT_MIN` (default 0) covers an arm that is already ending, and
 GPU2's users are reported as `UPDATE_GPU2_IN_USE` without ever being waited on or touched.
+
+### A gate reader never guesses which box it is reading (2026-11-02)
+
+`pair_gx_gate_file` built its path from `${GXCT#seam-gx}`. With `GXCT` unset that is empty, so the path
+became `queue/gx.gate` -- a file that never exists -- and `pair_gx_gate_state` answered **free** for a
+box that was claimed. That is not hypothetical: at 03:1x a hand-run check read GX2 free while the dev
+smoke held `gx2.gate` (`owner=smoke-dev pid=… until=…`), and a job that trusted it would have loaded a
+second cold pack onto the claimed box. An unset or unparsable `GXCT` is now an error: the function
+returns 2 with the reason on stderr (safe under `set -u`), `pair_gx_gate_state` prints
+`gate_unresolved` instead of `free`, and `pair_gx_gate_up` refuses with rc 5 `PAIR_GATE_REFUSED
+gate_unresolved` rather than waiting or taking a box it cannot name. `tests/gx_gate.sh` and
+`tests/sweep_rules.py` both run the unset and the unparsable case for real, and pin that a resolvable
+`GXCT` still reads its own box's claim.
+
+The queue wrapper is part of the release too. The copy the queue was running
+(`queue/gpu_run_pair.sh`) predated the release guard: no `pair_check.sh`, no `PAIR_DRIFT` /
+`PAIR_CHECK_ERROR` refusal, so every ticket that night could start on a pair whose halves served
+different releases. It also wrote its own `hardcap=` line after the wait loop; the release copy
+computes `start`/`hard` before `setsid`, exports `GPU_TICKET_HARDCAP` and appends the line, so the
+claim's cap is the run's, not the ticket's creation time. A wrapper is read incrementally by bash, so
+it is replaced only between tickets, atomically (`cp -p` to `.new`, `bash -n`, `mv`, `cmp`).
