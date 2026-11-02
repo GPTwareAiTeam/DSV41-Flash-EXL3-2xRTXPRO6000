@@ -254,6 +254,15 @@ fi
 # A pair that was idle (the normal case: the busy check above refuses a serving one) must be left
 # idle on failure -- restarting a server for a release that never served costs a full 113 GiB pack
 # load on GX2, i.e. minutes of the very box the smoke just proved is memory-tight.
+foreign=$(pair_gx_foreign_server)
+if [ -n "$foreign" ] && [ "${PAIR_UPDATE_FORCE:-0}" != 1 ]; then
+  # Before anything is cut, flipped or re-created: a pack load in another container owns the box.
+  # On 2026-11-02 02:41 a ticket re-created P7 and flipped before its smoke found this, then had to
+  # roll both back -- a busy box must cost a refusal, not a rollback.
+  pair_step "PAIR_UPDATE_REFUSED pair=$PAIR gx_busy ${foreign} (one pack load per box; wait for it)"
+  exit 3
+fi
+[ -n "$foreign" ] && pair_step "UPDATE_FORCED pair=$PAIR gx_busy ${foreign} (PAIR_UPDATE_FORCE=1)"
 SERVER_BEFORE=$(pair_gxsh "docker exec $GXCT pgrep -fc worker_seam_server.py 2>/dev/null" | tail -1)
 SERVER_BEFORE=${SERVER_BEFORE:-0}
 pair_step "UPDATE_SERVER_BEFORE pair=$PAIR serving=$SERVER_BEFORE"

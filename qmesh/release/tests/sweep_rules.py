@@ -222,6 +222,16 @@ def _tracked_release_trees():
 
 check("no extracted release tree is tracked inside the tooling tree",
       not _tracked_release_trees(), ",".join(_tracked_release_trees()[:3]))
+check("a JIT lock left by a dead build is cleared, and only when nothing alive owns it",
+      'SEAM_ENSURE stale torch build lock(s):' in src("seam_server_ensure.sh")
+      and src("seam_server_ensure.sh").index("seam_gxct \"rm -f $SEAM_LOG\"")
+          < src("seam_server_ensure.sh").index("stale torch build lock")
+      and 'pair_torch_locks' in src("pair_smoke.sh")
+      and 'pair_torch_build_live' in src("pair_smoke.sh"), "")
+check("a busy box is refused before anything is cut or re-created",
+      'pair_gx_foreign_server' in src("pair_update_run.sh")
+      and src("pair_update_run.sh").index("pair_gx_foreign_server")
+          < src("pair_update_run.sh").index("phase containers"), "")
 check("the smoke repairs a container that lost NVML, but only after it owns the box",
       'pair_ensure_nvml p7 "$P7CT"' in src("pair_smoke.sh")
       and 'pair_ensure_nvml gx "$GXCT"' in src("pair_smoke.sh")

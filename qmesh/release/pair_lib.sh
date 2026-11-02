@@ -284,6 +284,19 @@ pair_server_record() {  # <build id> -- records the worker this ticket's ensure 
     > "$(pair_server_pidfile)"
   return 0
 }
+pair_torch_locks() {  # <ct> -- JIT build locks a dead process left in the container
+  pair_gxsh "docker exec $1 sh -c 'for f in /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock; do [ -e \"\$f\" ] && echo \"\$f\"; done'" 2>/dev/null
+}
+pair_torch_build_live() {  # <ct> -- how many compilers or servers are alive there right now
+  pair_gxsh "docker exec $1 sh -c 'pgrep -fc \"(^|/)(nvcc|cicc|ninja)( |\$)|worker_seam_server\" || true'" 2>/dev/null | tr -dc 0-9
+}
+pair_gx_foreign_server() {  # "server_in=<ct>:<pid>" for a pack load in a container that is not this pair's
+  # One pack load per box is the rule, and the load is what costs 116 GiB and 3 minutes. Our own
+  # container is excluded by name; a worker in anybody else's is somebody's work, and a ticket that
+  # flipped a release before noticing it is a ticket that mutates a busy pair (2026-11-02 02:41).
+  [ "$PAIR_DRY" = 1 ] && return 0
+  pair_gxsh "for c in \$(docker ps --format '{{.Names}}'); do [ \"\$c\" = '$GXCT' ] && continue; p=\$(docker exec \"\$c\" pgrep -f 'python3 -u qmesh/worker_seam_server.py' 2>/dev/null | head -1); [ -n \"\$p\" ] && echo \"server_in=\$c:\$p\"; done" 2>/dev/null
+}
 pair_server_stop() {  # stops the recorded worker if it is still the one that was recorded
   local f pid build live out
   f=$(pair_server_pidfile)

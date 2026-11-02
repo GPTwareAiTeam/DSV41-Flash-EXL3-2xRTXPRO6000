@@ -124,6 +124,18 @@ echo "SMOKE_GATE owner=smoke-$PAIR until=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\
 # while discovering it inside the worker's init costs the whole ticket.
 pair_ensure_nvml p7 "$P7CT" || fail "nvml p7=$P7CT"
 pair_ensure_nvml gx "$GXCT" || fail "nvml gx=$GXCT"
+# A JIT build killed mid-link leaves torch's ext lock behind and every import then blocks in
+# file_baton.wait at 512 MB with an empty log (2026-11-02). The ensure clears it too, but the smoke
+# says so in its own log, and it only touches a lock when nothing alive could own it.
+locks=$(pair_torch_locks "$GXCT")
+if [ -n "$locks" ]; then
+  if [ "$(pair_torch_build_live "$GXCT")" = 0 ]; then
+    pair_gxsh "docker exec $GXCT sh -c 'rm -f /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock'" >/dev/null 2>&1
+    echo "SMOKE_TORCH_LOCK cleared=$(printf '%s' "$locks" | tr '\n' ',')"
+  else
+    echo "SMOKE_TORCH_LOCK kept (a build or server is alive beside it): $(printf '%s' "$locks" | tr '\n' ' ')"
+  fi
+fi
 
 echo "SMOKE_MEM_BEFORE $(gx_mem)"
 

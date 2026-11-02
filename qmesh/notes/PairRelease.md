@@ -10,6 +10,28 @@ This note describes the release system in `qmesh/release/` (branch `tools/pair-r
 into `/home/treadall/recipe-artifacts/gpu0-gx1/scripts/`). It answers one question per pair:
 **are both halves on the same release, and is that release the one we think it is?**
 
+## A JIT lock outlives the build that died (2026-11-02)
+
+torch holds `<torch_extensions>/<pyver>/<name>/lock` while it builds; the lock goes with a normal exit.
+A worker killed mid-build -- our own pkill, or a launch that died because the container had lost NVML --
+leaves it, and every later import blocks in `file_baton.wait` at ~512 MB RSS with an empty log and no
+progress. That is indistinguishable from a hung pack load, and it cost the 07:27 window three loads:
+the build started with no CUDA, died, and the 07:30 and 07:37 loads sat frozen for 4 minutes each.
+
+`seam_server_ensure.sh` clears the lock on its start path, after its pkill, after `seam_pids` proves no
+server of this pair is alive, and after the preflight has refused a live `nvcc`/`cicc`/`ninja`, printing
+`SEAM_ENSURE stale torch build lock(s): <paths>`. The smoke checks the same two globs before it starts
+the server and says `SMOKE_TORCH_LOCK cleared=…`, or `kept` when something alive could own the lock.
+
+## A busy box is refused before the ticket mutates anything (2026-11-02)
+
+At 02:41 a dev ticket re-created P7 and flipped a release, then its smoke refused with
+`gx_busy server_in=seam-gx2-4460:5304` because a colleague's pack load was already on the box; the
+ticket then rolled the containers back. `pair_gx_foreign_server` now asks the GX host what is loaded
+in every container but this pair's, and the update refuses with
+`PAIR_UPDATE_REFUSED … gx_busy …` before the release, container or link phase. `PAIR_UPDATE_FORCE=1`
+keeps the old behaviour for a deliberate co-tenant run.
+
 ## A smoke stops the server it started (2026-11-02)
 
 `pair_smoke.sh` used to keep its worker on a passing verdict and delete the pidfile that named it, on

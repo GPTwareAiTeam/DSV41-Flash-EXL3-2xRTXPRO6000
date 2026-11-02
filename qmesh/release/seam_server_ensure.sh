@@ -410,6 +410,23 @@ seam_server_ensure() {
     [ -n "$req" ] || { echo "SEAM_ENSURE state=error auto-buckets-empty" >&2; return 2; }
   fi
   seam_gxct "rm -f $SEAM_LOG"
+  # torch's JIT build holds <torch_extensions>/<pyver>/<name>/lock and removes it on a normal exit.
+  # A worker killed mid-build -- our own pkill above, or a launch that died because the container had
+  # lost NVML -- leaves the lock behind, and every later import then blocks forever in
+  # file_baton.wait at ~512 MB RSS with a completely empty log: indistinguishable from a hung pack
+  # load. It cost a whole window on 2026-11-02 (the 07:27 build started with no CUDA, died, and its
+  # lock then held the 07:30 and 07:37 loads at 512 MB, rchar frozen, for 4 min each). seam_pids is 0
+  # on every path that reaches this line and the preflight above has already refused a live build, so
+  # a lock that still exists belongs to a process that is gone: drop it, say so, let the import
+  # rebuild what it must.
+  local stale
+  stale=$(seam_gxct "for f in /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock; do
+                       [ -e \"\$f\" ] && echo \"\$f\"; done" 2>/dev/null)
+  if [ -n "$stale" ]; then
+    echo "SEAM_ENSURE stale torch build lock(s): $(echo $stale)"
+    seam_gxct "for f in /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock; do
+                 [ -e \"\$f\" ] && rm -f \"\$f\"; done" >/dev/null 2>&1
+  fi
   local slots=""
   seam_slots_supported && slots="--slab-slots $SEAM_SLAB_SLOTS"
   [ -n "$slots" ] || echo "SEAM_SLOTS_UNSUPPORTED (v2 build: one payload slot per handle, flag omitted)" >&2
