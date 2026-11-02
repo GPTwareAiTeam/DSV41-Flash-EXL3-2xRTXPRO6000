@@ -243,6 +243,12 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u /tmp/pair_ext_pr
   # One stamp per release per side, and on GX it carries the kernel too: a release whose cuda-exl3 was
   # not built looks identical otherwise (the .so is gitignored), and the smoke would be the first place
   # that noticed -- as a slow server instead of a missing build.
+  # The stamp names the torch that built it: the two halves run different builds (2.14 / 2.11) and an
+  # artifact silently moved between them is a mismatch nothing else would catch. A bare torch import,
+  # no exllamav3, so it cannot touch the cache it is describing.
+  local torchv
+  torchv=$(side_docker "$side" exec "$ct" python3 -c 'import torch; print(torch.__version__)' 2>/dev/null | tail -1)
+  [ "$torchv" != unknown ] || { pair_step "EXT_FAIL $side torch_version_unreadable ct=$ct"; return 1; }
   stamp=$(python3 - "$BUILD_ID" "$SHA" "$archlist" "$torchv" "$sha_so" "$side" "${cxsha:-}" "${cxname:-}" <<'PY'
 import datetime, json, sys
 bid, sha, archs, torchv, so, side, cxsha, cxname = sys.argv[1:9]
