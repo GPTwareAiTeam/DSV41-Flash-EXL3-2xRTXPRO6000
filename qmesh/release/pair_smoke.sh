@@ -231,36 +231,10 @@ case "$arm_out" in
     fail "wire_mismatch $(printf '%s' "$arm_out" | grep -m1 -E 'peer layout mismatch|remote invalid request' | cut -c1-300)" ;;
 esac
 
-# The rows are read from the arm's log, not from a pipe: the script itself arrives on stdin (`python3 -`
-# plus a heredoc), so a `... | python3 - <<'PY'` hands the parser an empty stdin after the heredoc has
-# been consumed as source -- and this check then reported "arm_no_tokens NONE" for an arm whose log
-# held a full 8-token row with ids (23:29:19 on dev). The log is the bytes that get kept anyway.
-row=$(python3 - "$ARM_LOG" <<'PY'
-import hashlib, json, sys
-rows = []
-for line in open(sys.argv[1], errors="replace"):
-    line = line.strip()
-    if not (line.startswith("{") and line.endswith("}")):
-        continue
-    try:
-        d = json.loads(line)
-    except ValueError:
-        continue
-    if "text" not in d:
-        continue
-    rows.append(d)
-if not rows:
-    print("NONE")
-    sys.exit(0)
-rows.sort(key=lambda d: d.get("i", 0))
-blob = "\n".join(f"{d.get('i', 0)}|{d['text']}" for d in rows)
-new = sum(int(d.get("new_tokens") or 0) for d in rows)
-print(f"i={rows[0].get('i', 0)} rows={len(rows)} new_tokens={new} "
-      f"ttft_ms={rows[0].get('ttft_ms', '?')} decode_ms_per_tok={rows[0].get('decode_ms_per_tok', '?')} "
-      f"text_sha256={hashlib.sha256(blob.encode()).hexdigest()}")
-print(f"NEW {new}")
-PY
-)
+# The rows are read from the arm's log, by path: `python3 - <<'PY'` owns stdin with its own source, so a
+# piped arm_out read as empty and this check reported "arm_no_tokens NONE" for an arm whose log held a
+# full 8-token row (23:29:19 on dev). The parser is pair_arm_rows.py so that it can be tested.
+row=$(python3 "$HERE/pair_arm_rows.py" "$ARM_LOG")
 printf '%s\n' "$row" | sed -n 's/^i=/SMOKE_ROW /p'
 new_tokens=$(printf '%s\n' "$row" | sed -n 's/^NEW //p')
 [ "${new_tokens:-0}" -gt 0 ] || fail "arm_no_tokens $(printf '%s\n' "$row" | head -1)"

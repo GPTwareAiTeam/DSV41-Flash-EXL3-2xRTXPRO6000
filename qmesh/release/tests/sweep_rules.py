@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import importlib.util, os, sys, io, contextlib
+import importlib.util, os, re, sys, io, contextlib
 os.environ["PAIR_QUEUE_ROOT"] = "/tmp/sweepq"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 spec = importlib.util.spec_from_file_location("pc", os.path.join(HERE, "pair_containers.py"))
@@ -275,6 +275,25 @@ check("a glob in a docker exec goes through a shell",
       not any("docker exec" in l and "_C*" in l and "sh -c" not in l
               for f in ("pair_build_ext.sh", "pair_smoke.sh", "pair_update_run.sh", "pair_lib.sh")
               for l in code_lines(src(f))), "")
+
+# `python3 -` reads its *program* from stdin, so a heredoc plus a pipe (`... | python3 - <<'PY'`) leaves
+# the parser an empty stream. That silently turned a complete 8-token arm row into "arm_no_tokens NONE"
+# on dev (2026-11-02) and would have written empty references. The arm's rows are parsed by a helper the
+# battery can test; no shell script may pipe data into a heredoc'd python again.
+check("arm rows are parsed by a file, not through a heredoc's stdin",
+      'pair_arm_rows.py' in src("pair_smoke.sh")
+      and os.path.exists(os.path.join(HERE, "pair_arm_rows.py"))
+      and not any(re.search(r"\|\s*python3\s+-\s+[^|]*<<", l)
+                  for f in ("pair_smoke.sh", "pair_ref.sh", "pair_update_run.sh")
+                  for l in code_lines(src(f))), "")
+check("the arm-row parser is in the battery",
+      os.path.exists(os.path.join(HERE, "tests", "arm_rows.sh")), "")
+# The smoke asks a box that has just unloaded 113 GiB to prove it came back, before the worker's own
+# refusal decides the ticket: a load started into a box still releasing memory reads as a bad release.
+check("the smoke waits for the GX box before the load preflight",
+      'SMOKE_MEM_READY' in src("pair_smoke.sh")
+      and any("SMOKE_MEM_WAIT_S" in l for l in code_lines(src("pair_smoke.sh")))
+      and "LOAD_MARGIN" in src("pair_smoke.sh"), "")
 
 
 
