@@ -47,9 +47,18 @@ if [ "$(pair_gx_foreign_server)" != "" ]; then
   pair_die "PAIR_SERVE_FOREIGN $(pair_gx_foreign_server) (one pack load per box)"
 fi
 if [ "$(pair_gxsh "docker exec $GXCT pgrep -fc '^python3 -u qmesh/worker_seam_server.py'" 2>/dev/null)" != 0 ]; then
-  # Something already serves here. Say what, and let the caller decide to stop it first; silently
-  # reusing it would mean the pair serves whatever the last ticket left loaded.
-  pair_die "PAIR_SERVE_ALREADY $(pair_server_pidfile) $(cat "$(pair_server_pidfile)" 2>/dev/null)"
+  serving=$(pair_gx_serving_build)
+  # Something already serves here. If it is this exact build, the pair is already resting where this
+  # ticket wanted to put it: a restore queued as a safety net behind an evicting ticket must be a no-op
+  # there, not a second 116 GiB load that evicts the next ticket's measurement. Anything else is
+  # somebody's work and the caller has to decide to stop it first; silently reusing it would mean the
+  # pair serves whatever the last ticket left loaded.
+  if [ -n "$BUILD_ID" ] && [ "$serving" = "$BUILD_ID" ]; then
+    pair_server_record "$BUILD_ID" || true
+    pair_step "PAIR_SERVE_ALREADY_UP pair=$PAIR build=$BUILD_ID sha=${SHA:0:12} ct=$GXCT $(cat "$(pair_server_pidfile)" 2>/dev/null)"
+    exit 0
+  fi
+  pair_die "PAIR_SERVE_ALREADY $(pair_server_pidfile) $(cat "$(pair_server_pidfile)" 2>/dev/null) serving=${serving:-unknown}"
 fi
 
 pair_gx_gate_take "serve-$PAIR" $(( ${SERVE_TIMEOUT_MIN:-25} )) 0 \

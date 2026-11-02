@@ -812,6 +812,21 @@ def _nocap(e):
 # Executed, not grepped: a ticket whose command is one quoted string must exit 2 before the GPU, because
 # `setsid "$@"` would otherwise exec a filename with spaces and die as rc=127 in 0 s -- which read as a
 # failed build twice on 2026-11-02 and cost a box window each time.
+# A restore ticket is queued as a safety net behind an evicting one, so it usually finds the pair already
+# serving the release it was going to serve. Reloading there costs 116 GiB and evicts the next ticket's
+# measurement, so "already up on this build" has to be a success, not PAIR_SERVE_ALREADY. The build id is
+# read from the running worker's environment -- neither the pidfile nor `current` says what is loaded.
+_rb = _sp.run(["bash", "-c", '. "%s/pair_lib.sh"; GXCT=seam-gx2-dev; PAIR_DRY=0; '
+               'pair_gxsh() { echo "dev-deadbeef"; }; echo "b=$(pair_gx_serving_build)"' % HERE],
+              env=_nocap(_env), capture_output=True, text=True)
+check("the serving-build reader returns the worker's own SEAM_BUILD_ID",
+      "b=dev-deadbeef" in _rb.stdout and "SEAM_BUILD_ID=" not in _rb.stdout,
+      (_rb.stdout + _rb.stderr).strip()[:200])
+_ps = src("pair_serve.sh")
+check("a restore that finds its own build already serving is a no-op, not a reload",
+      "PAIR_SERVE_ALREADY_UP" in _ps and '[ "$serving" = "$BUILD_ID" ]' in _ps
+      and _ps.index("PAIR_SERVE_ALREADY_UP") < _ps.index("pair_gx_gate_take"),
+      "")
 _r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "T", "1", "scripts/pair_prepare.sh dev x --side gx"],
              env=_nocap(dict(_e, QBASE=os.path.join(_gd, "q"))),
              capture_output=True, text=True, timeout=60)

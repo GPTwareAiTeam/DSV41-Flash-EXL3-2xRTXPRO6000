@@ -373,6 +373,14 @@ pair_server_record() {  # <build id> -- records the worker this ticket's ensure 
     > "$(pair_server_pidfile)"
   return 0
 }
+pair_gx_serving_build() {  # build id the worker in our GX container carries, empty when it does not serve
+  # The release a pair serves is a property of the *running worker*, not of the pidfile and not of the
+  # `current` link: a restore ticket that queues behind an evicting one must be able to tell "already
+  # up on the build I was asked for" from "up on something else", or it either dies noisily or reloads
+  # 116 GiB over a healthy pair.
+  [ "$PAIR_DRY" = 1 ] && return 0
+  pair_gxsh "docker exec $GXCT sh -c 'p=\$(pgrep -f \"^python3 -u qmesh/worker_seam_server[.]py\" | head -1); [ -n \"\$p\" ] && tr \"\\0\" \"\\n\" < /proc/\$p/environ 2>/dev/null | sed -n \"s/^SEAM_BUILD_ID=//p\" | head -1'" 2>/dev/null | tail -1
+}
 pair_torch_locks() {  # <ct> -- JIT build locks a dead process left in the container
   pair_gxsh "docker exec $1 sh -c 'for f in /root/.cache/torch_extensions/*/*/lock /tmp/torch_extensions/*/*/lock; do [ -e \"\$f\" ] && echo \"\$f\"; done'" 2>/dev/null
 }
