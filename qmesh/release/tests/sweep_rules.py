@@ -363,6 +363,17 @@ check("prepare creates a missing pair container instead of reporting it unchange
       '*CREATE*' in src("pair_prepare.sh") and 'pair_containers.py" apply' in src("pair_prepare.sh"), "")
 check("prepare leaves a matching pair alone",
       'unchanged' in src("pair_prepare.sh"), "")
+# A release's stamp must not travel on the gx ssh stdin: a redirect written outside
+# `$(pair_gxsh …)` is not reliably applied inside the substitution, the remote `cat` reads the
+# host's own stdin, and the release ships a 0-byte RELEASE.json that only verify notices -- after
+# a green smoke has already moved `current` (gx2, 9fc3ca8a, 2026-11-02).
+_cut = src("pair_cut.sh")
+check("the gx stamp travels in the command, not on stdin",
+      "base64 -w0" in _cut and "cat > '$tmp/RELEASE.json'" not in _cut, "")
+check("a cut refuses a stamp it cannot read back",
+      "STAMP_EMPTY" in _cut and "STAMP_WRITE_FAILED" in _cut, "")
+check("a cut refuses stamps that differ between the sides", "STAMP_MISMATCH" in _cut, "")
+check("an existing release with an empty stamp is repaired", "STAMP_REPAIR" in _cut, "")
 
 
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

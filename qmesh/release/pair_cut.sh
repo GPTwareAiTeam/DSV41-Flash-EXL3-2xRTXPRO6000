@@ -140,6 +140,26 @@ cut_side() {  # <p7|gx> <root>
     [ -n "$(pair_gxsh "[ -d '$rel' ] && echo yes")" ] && have=1
   fi
   if [ "$have" = 1 ] && [ ! "$FORCE" = 1 ]; then
+    # EXISTING does not mean stamped. A 0-byte RELEASE.json is what a cut that died between
+    # creating the file and writing its content leaves behind -- and this branch used to keep it
+    # forever, so on 2026-11-02 gx2 carried an empty stamp for 9fc3ca8a and dev verify failed with
+    # `DRIFT release_json=missing` *after* a green smoke. Rewrite the stamp only (same sha, same
+    # digest, same build id on both sides, the pair-level truth); the tree is not touched.
+    local got
+    if [ "$side" = p7 ]; then got=$(wc -c < "$rel/RELEASE.json" 2>/dev/null || echo 0)
+    else got=$(pair_gxsh "wc -c < '$rel/RELEASE.json' 2>/dev/null || echo 0"); fi
+    if [ "${got:-0}" -le 0 ]; then
+      echo "STAMP_REPAIR $PAIR $side $rel (RELEASE.json was ${got:-0} bytes, tree kept)"
+      if [ "$side" = p7 ]; then
+        printf '%s\n' "$RELEASE_JSON" > "$rel/RELEASE.json" || return 1
+      else
+        pair_gxsh "cat > '$rel/RELEASE.json'" <<<"$RELEASE_JSON" || return 1
+        got=$(pair_gxsh "wc -c < '$rel/RELEASE.json' 2>/dev/null || echo 0")
+        [ "${got:-0}" -gt 0 ] || { echo "STAMP_REPAIR_FAILED $PAIR gx $rel"; return 1; }
+      fi
+      echo "CUT $PAIR $side $rel (stamp repaired)"
+      return 0
+    fi
     echo "EXISTS $PAIR $side $rel"
     return 0
   fi
@@ -151,7 +171,9 @@ cut_side() {  # <p7|gx> <root>
     # anybody noticing (2026-11-01: `SEAM_SESSION_START ... build=unknown proto=3`, accepted).
     # qes.build_id() reads <tree>/qmesh/BUILD_ID as its last fallback; write it, never hand-copy.
     printf '%s\n' "$BUILD_ID" > "$tmp/src/qmesh/BUILD_ID" || return 1
-    printf '%s\n' "$RELEASE_JSON" > "$tmp/RELEASE.json"
+    printf '%s\n' "$RELEASE_JSON" > "$tmp/RELEASE.json" || return 1
+    # a cut never ships a stamp it cannot read back (2026-11-02: gx2 was left with 0 bytes)
+    [ -s "$tmp/RELEASE.json" ] || { echo "STAMP_WRITE_FAILED $PAIR p7"; return 1; }
     rm -rf "$rel"
     mv -T "$tmp" "$rel" || return 1
   else
@@ -161,10 +183,17 @@ cut_side() {  # <p7|gx> <root>
                tar -x -C '$tmp/src'; echo EXTRACTED" \
           < <(git -C "$PAIR_REPO" archive --format=tar "$SHA")) || return 1
     case "$out" in *EXTRACTED*) ;; *) echo "EXTRACT_FAILED $PAIR gx: $out"; return 1 ;; esac
+    # The stamp travels inside the command, never on stdin. `out=$(pair_gxsh "…" ) < <(printf …)`
+    # binds the redirect to this shell, so the remote `cat` read the *host's* stdin and wrote a
+    # 0-byte RELEASE.json -- 2026-11-02: gx2 carried one for 9fc3ca8a, dev smoked green and then
+    # failed verify with `DRIFT release_json=missing`. base64 keeps the JSON out of the quoting;
+    # a ~470-byte stamp is a safe argument.
+    local out b64
+    b64=$(printf '%s\n' "$RELEASE_JSON" | base64 -w0) || return 1
     out=$(pair_gxsh "set -e; printf '%s\n' '$BUILD_ID' > '$tmp/src/qmesh/BUILD_ID'; \
-               cat > '$tmp/RELEASE.json'; \
-               rm -rf '$rel'; mv -T '$tmp' '$rel'; echo CUT_OK") \
-          < <(printf '%s\n' "$RELEASE_JSON") || return 1
+               printf %s '$b64' | base64 -d > '$tmp/RELEASE.json'; \
+               [ -s '$tmp/RELEASE.json' ] || { echo STAMP_EMPTY; exit 1; }; \
+               rm -rf '$rel'; mv -T '$tmp' '$rel'; echo CUT_OK") || return 1
     case "$out" in *CUT_OK*) ;; *) echo "CUT_FAILED $PAIR gx: $out"; return 1 ;; esac
   fi
   local n
@@ -174,6 +203,15 @@ cut_side() {  # <p7|gx> <root>
     n=$(pair_gxsh "find '$rel/src' -type f | wc -l")
   fi
   [ "${n:-0}" -ge "$FILES" ] || { echo "CUT_SHORT $PAIR $side files=$n want>=$FILES"; return 1; }
+  # One release, one stamp: the two copies must be byte-identical, or the client and the server
+  # name different builds for the same code and the pair is mixed without anybody noticing.
+  if [ "$side" = gx ] && [ -f "$PAIR_ROOT/releases/$SHA/RELEASE.json" ]; then
+    local sum_p7 sum_gx
+    sum_p7=$(sha256sum "$PAIR_ROOT/releases/$SHA/RELEASE.json" | cut -d' ' -f1)
+    sum_gx=$(pair_gxsh "sha256sum '$rel/RELEASE.json' 2>/dev/null | cut -d' ' -f1")
+    [ "${sum_p7:-x}" = "${sum_gx:-y}" ] || {
+      echo "STAMP_MISMATCH $PAIR p7=${sum_p7:-none} gx=${sum_gx:-none}"; return 1; }
+  fi
   echo "CUT $PAIR $side $rel files=$n"
 }
 

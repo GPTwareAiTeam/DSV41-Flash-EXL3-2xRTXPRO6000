@@ -69,6 +69,23 @@ build4=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_i
 check "$([ "$rc4" = 0 ] && [ "$build4" != "$build1" ] && echo 1)" \
       "--force stamps a new release instead of adopting" "rc=$rc4 build=$build4"
 
+# An existing release with an empty stamp is a half-written stamp, not a release: the next cut
+# rewrites the stamp from the pair's truth and keeps the tree. 2026-11-02: gx2 carried a 0-byte
+# RELEASE.json for the release dev had already smoked green, and dev verify then failed with
+# `DRIFT release_json=missing` -- the release was fine, its stamp was not.
+treesum() { (cd "$1" && find . -type f -print0 | sort -z | xargs -0 md5sum | md5sum | cut -d' ' -f1); }
+before_p7=$(treesum "$P7/releases/$SHA/src"); before_gx=$(treesum "$GX/releases/$SHA/src")
+: > "$GX/releases/$SHA/RELEASE.json"
+out5=$(run); rc5=$?
+build5=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' \
+          "$GX/releases/$SHA/RELEASE.json" 2>/dev/null)
+check "$([ "$rc5" = 0 ] && printf '%s' "$out5" | grep -q STAMP_REPAIR && echo 1)" \
+      "an empty gx stamp is repaired instead of kept" "rc=$rc5 $out5"
+check "$([ "$build5" = "$build4" ] && cmp -s "$P7/releases/$SHA/RELEASE.json" "$GX/releases/$SHA/RELEASE.json" && echo 1)" \
+      "the repaired stamp is the pair's stamp on both sides" "want=$build4 got=$build5"
+check "$([ "$(treesum "$P7/releases/$SHA/src")" = "$before_p7" ] && [ "$(treesum "$GX/releases/$SHA/src")" = "$before_gx" ] && echo 1)" \
+      "repairing the stamp does not touch either tree"
+
 rm -rf "$W"
 echo "RESULT $([ "$fails" = 0 ] && echo PASS || echo FAIL) fails=$fails"
 exit $([ "$fails" = 0 ] && echo 0 || echo 1)
