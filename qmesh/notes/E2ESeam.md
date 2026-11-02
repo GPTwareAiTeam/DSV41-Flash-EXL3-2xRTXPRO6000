@@ -87,3 +87,81 @@ ACCEPTANCE RATE (0.74–0.82), not mean accepted length. That rate is good; DSpa
 28.0 → 17.6 ms/tok (−37%). Hybrid is bound by GX1 cold compute (~358 µs/layer rows=1, ~525 µs/layer round
 trip ≈ 21 ms/token), not by DSpark. Mean tokens per verify round must be computed as
 1 + accepted/verify_rounds (verify round count not logged here).
+
+## Direct pack load (2026-11-02)
+
+The cold shard can be filled straight from the EXL3 pack (`SEAM_MOE_DIRECT=1`,
+`qmesh/worker_seam_server.py`), skipping the host-side module-build restack that used to cost
+100-150 s and a CUDA allocation per layer. Two `--fresh` loads of the 4460 pack on the dev pair
+(P7 GPU1 + GX2), each followed by an ids arm and a 32k/8192 prefill
+(`seamrobust/scripts/seam_direct_plain.sh`, evidence `seamrobust/evidence/directpack/direct_1102-092228.log`):
+
+    SEAM_PACK_KERNEL cudaexl3_layers=40 mixedk_layers=0 of=40
+    SEAM_MOE_DIRECT layer=0..39 n=... read_ms=2100..2600   40/40, fail 0, nofit 0
+    32k prefill at 8192-row chunks                         957.3 tok/s (canary ae4fe322 957.7,
+                                                           control 9fc3ca8a 881.8)
+    ARM_IDS arm=dspark1 n=8                               67158aeb... == the release's SMOKE_ARM_IDS
+    cx_direct_check.py layers 5 and 39                     from_pack == module build, 2/2
+
+`SEAM_SLACK avail_mib=1200 swapped_mib=1303` is this box's steady state, not a fault of the direct
+path: the shipping server on the same box reports 1440/3816, and the prefill rate is unchanged.
+`f96fc065` is a different digest - `SMOKE_ARM_IDS_TOTAL`, the same 8 tokens summed over all rounds -
+so a ticket that compares the `ARM_IDS` line against it will call every good run a WARN.
+
+**Two tables, one contract.** The seam's cold-local ids are positions in a placement file, so the two
+halves must read the same bytes or every id means a different expert. The contract is the file:
+
+- `/cold/placement.exl3.json`, sha `844251e79b9d` - the pack's own table. Its `warm` is ascending on
+  all 40 layers, so the warm-order numbering below is a byte-identical no-op for it.
+- `/cold/placement.exl3.ranked.json`, sha `5982a8ba7363` - same hot/cold sets and bit widths, ordered
+  by global rank: hot by rank, then all 2800 4-bit cold experts, then all 8100 2-bit ones, each by
+  rank (`qmesh/tests/make_ranked_placement.py`, reproducible byte for byte). Checked against
+  `ranking/expert_ranking_2.25.csv`: 0 violations over 40 layers, bands disjoint, 10864 of 10900 cold
+  positions differ from the plain file, `warm_bpw` permuted with `warm`.
+
+The server loads `layers.N.warm` as the cold order and prints
+`SEAM_PLACEMENT path=... ranked=0|1 warm_4bpw=... source_sha=...`; both halves of the client
+(`block_sparse_mlp_cpu.load_cpu_split` and the module registration) assert that their permutation is
+the file's. Two asserts make the boundary a property of the file instead of of the numbers:
+
+- client side, at registration and at split time: `moe_remote_warm == placement.warm(...)`, and the
+  client derives its cold count from `len(warm)`;
+- server side, per direct layer: `SEAM_PLACEMENT_GROUPS layer=N n=... warm_4bpw_n=... groups4=...
+  groups2=... ok=1`, i.e. the shard's own 4-bit group size equals the file's `warm_4bpw_n`, the 4-bit
+  experts come first, and the totals agree (`sum(warm_4bpw_n) == sum(groups4) == 2800`). A MISMATCH
+  is a `SystemExit` before any client is served; it can only fire when the file and the pack disagree.
+
+**A client on the other table is refused, not fatal.** The Hello carries `placement_sha =
+sha256(file)[:12]`; `RemoteSeamHost._check_placement` compares it with the file the client loaded and
+raises `RuntimeError: placement mismatch on host:port` before the first request. The transport refuses
+one connection at a time (close, one line, `SEAM_REJECT`) and keeps the pack: an unexpected client
+costs a line, not a 150 s reload. `qmesh/tests/refusal_stub.sh` proves it end to end with a `--stub`
+server and `qmesh/tests/placement_sha_refusal.py` (which must call `placement.load()` first -
+`current_sha()` is only set by `load()`).
+
+**The GX tree is a copy.** `qmesh/tests/stage_gx.sh` rsyncs the worktree and proves by sha that the
+container runs this commit before anything is measured; without it a ticket measures whatever was
+synced last, including a transport library the container built days ago
+(`qmesh/native/bin/BUILD_INFO.aarch64` records the commit and `.cu` hash that produced the shard's
+library).
+
+Staging has to run **inside the gate and after the pair's server is stopped**: the GX tree is a live
+bind mount, so an rsync under a serving process can hand a process that starts halfway through a tree
+that is half one commit and half another. The order the ranked ticket uses is `gate take -> stop the
+pair's server -> stage (exit 13 if a sha disagrees) -> box-clear check -> refusal -> oracle -> two
+fresh loads`; staging first and gating later costs the reload it was meant to avoid.
+
+`stage_gx.sh` also prints `STAGE lib_src seam_cu=... built_from=... state=match|stale`. The container's
+library is compiled from the `.cu` on disk, so a stage can leave the source one revision ahead of the
+library - the two commits after `dabfa4c9` add a `SEAM_HOOK_US` stderr line and change one busy
+message, nothing on the wire or in the layout. `state=stale` next to passing numbers is that, and
+rebuilding is a `build_gx_transport.sh` away once the box is free, at the cost of a new build id for
+every container sharing the tree.
+
+**What the ranked table is.** `placement.hot4460-cold2800x4-8100x2.ranked.json` (sha `5982a8baa736`)
+against the shipped `placement.hot4460-cold2800x4-8100x2.json` (sha `844251e79b9d`): per layer
+`hot + warm` is a permutation of `0..383`, the hot and warm *sets* are identical to the plain file's,
+`warm_bpw` is non-increasing (all 4-bit, then all 2-bit), `warm_4bpw_n` equals the count of 4-bit
+entries, and the totals are 4460 hot / 10900 cold / 2800 at 4 bits: 40 layers, 0 exceptions. So the
+client's `sorted(hot + warm) == range(num_experts)` assert cannot fire on it, and the only thing the
+ranked run changes is cold numbering.

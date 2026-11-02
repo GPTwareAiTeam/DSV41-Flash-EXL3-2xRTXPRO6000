@@ -476,6 +476,15 @@ class BlockSparseMLP_CPU:
                     f"[{min(hot_ids)},{max(hot_ids)}] but the layer has {self.num_experts} experts: "
                     f"the placement file does not belong to this checkpoint (qmesh/placement.py "
                     f"picks the pack's own table; PLACEMENT overrides it)")
+            warm_ids = (getattr(ip, "moe_remote_warm", None) or {}).get(self.key)
+            if warm_ids is not None and sorted(list(hot_ids) + list(warm_ids)) != list(
+                    range(self.num_experts)):
+                # Same failure as load_cpu_split's permutation assert, but before the layer's
+                # weights are touched and before the module can send a single request.
+                raise RuntimeError(
+                    f"placement hot+warm for {self.key} is not a permutation of "
+                    f"0..{self.num_experts - 1} (hot {len(hot_ids)}, warm {len(warm_ids)}): "
+                    f"the warm list in the placement file disagrees with its hot list")
             split_k = self.num_experts - len(hot_ids)
         if split_k:
             assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
@@ -863,7 +872,21 @@ class BlockSparseMLP_CPU:
         perm = None
         if remote:
             hot = list(remote_hot[self.key])
-            cold = [e for e in range(self.num_experts) if e not in set(hot)]
+            # The cold order is the placement file's, not ascending: the server numbers its
+            # cold experts by their position in `layers.N.warm`, and every id the client sends
+            # is such a position, so the two lists must be the same list. Ascending agrees with
+            # the unranked file only; a ranked file puts all 4-bit cold experts first and would
+            # shift every id by one interleave. Assert instead of trusting either side.
+            warm = (getattr(ip, "moe_remote_warm", None) or {}).get(self.key)
+            cold = (list(warm) if warm is not None
+                    else [e for e in range(self.num_experts) if e not in set(hot)])
+            if sorted(hot + cold) != list(range(self.num_experts)):
+                raise RuntimeError(
+                    f"placement hot+warm for {self.key} is not a permutation of "
+                    f"0..{self.num_experts - 1} (hot {len(hot)}, cold {len(cold)}, "
+                    f"{'file warm list' if warm is not None else 'ascending fallback'}): the "
+                    f"placement file does not belong to this checkpoint, or its warm list "
+                    f"disagrees with its hot list")
             perm = hot + cold
             self._split_perm = perm
             self._split_seeded = True
@@ -874,8 +897,28 @@ class BlockSparseMLP_CPU:
         else:
             first = self.num_experts - split_k
 
-        # Same eligibility probes as the whole-layer path, on the tail experts
-        probe = ([self.gates[first]] if self.gated else []) + [self.ups[first], self.downs[first]]
+        # Same eligibility probes as the whole-layer path, on a cold expert the checkpoint actually
+        # carries. The tail is the placement file's cold order, not ascending: with a ranked table
+        # the first cold expert is whichever the ranking put there (layer 0: 49), while the P7 hot
+        # pack holds the hot experts plus one cold one (expert 1, the first cold in ascending
+        # order), so probing self.ups[first] read a key that is not in the file -
+        # KeyError 'layers.0.ffn.experts.49.w1.trellis' killed the first ranked arm before it
+        # routed a single token. Type, bitrate and bias presence are properties of the cold
+        # shard, not of a position in the file, so the first cold expert present in the checkpoint
+        # answers for all of them; if none is, refuse the split and leave the layer whole.
+        def in_ckpt(l):
+            return stc.has_tensor(l.key + ".trellis")
+        pi = next((i for i in range(first, len(self.ups)) if in_ckpt(self.ups[i])), None)
+        if pi is None:
+            print(f" !! {self.key}: none of the {len(self.ups) - first} cold experts is in the "
+                  f"checkpoint, CPU split skipped (nothing to probe for type and bitrate)")
+            return False
+        probe = ([self.gates[pi]] if self.gated else []) + [self.ups[pi], self.downs[pi]]
+        for l in probe:
+            if not in_ckpt(l):
+                print(f" !! {self.key}: cold expert {l.key} has no .trellis in the checkpoint, "
+                      f"CPU split skipped")
+                return False
         for l in probe:
             if stc.get_tensor(l.key + ".mul1", cpu, optional = True) is None:
                 print(f" !! {self.key}: experts are not mul1, CPU split skipped")
@@ -887,7 +930,11 @@ class BlockSparseMLP_CPU:
                 print(f" !! {self.key}: unsupported bitrate, CPU split skipped")
                 return False
         def bias_keys(ls):
-            has = [(l.key + ".bias") in stc.tensor_file_map for l in ls[first:]]
+            # Only the experts this checkpoint carries: with the ranked table the tail is a
+            # permutation, and the file holds one cold expert, so `ls[first:]` mixes "present with
+            # a bias" and "absent" and reads as mixed biases even when no bias exists anywhere.
+            cold_present = [l for l in ls[first:] if in_ckpt(l)]
+            has = [(l.key + ".bias") in stc.tensor_file_map for l in cold_present]
             if any(has) and not all(has):
                 print(f" !! {self.key}: mixed expert biases, CPU split skipped")
                 return None
@@ -970,9 +1017,13 @@ class BlockSparseMLP_CPU:
         def dims_of(l):
             s = stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]
             return (s[0] * 16, s[1] * 16, trellis_rate(s[2]))
-        gd = dims_of(self.gates[first]) if self.gated else None
-        ud = dims_of(self.ups[first])
-        dd = dims_of(self.downs[first])
+        # Same rule as the probe above: the dims come from a header, so they have to come from a key
+        # this checkpoint carries. Recomputed here because the frequency-guided permutation above
+        # may have reordered the tail, and with the ranked table position `first` is not expert 1.
+        dp = next((i for i in range(first, len(self.ups)) if in_ckpt(self.ups[i])), first)
+        gd = dims_of(self.gates[dp]) if self.gated else None
+        ud = dims_of(self.ups[dp])
+        dd = dims_of(self.downs[dp])
         hi, ho = ud[0], dd[1]
 
         def fetch_aux(ls, suffix, optional = False):

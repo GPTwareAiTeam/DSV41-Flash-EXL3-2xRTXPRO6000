@@ -27,7 +27,20 @@ ssh 10.0.100.2 'cd /home/treadall/qmesh-exl3-runtime/qmesh/native && setsid nohu
 # P7 client (GPU0, tiny footprint)
 CUDA_VISIBLE_DEVICES=0 ./bin/qes_bench.x86_64 client rocep142s0f0 5 10.0.100.2 47311 <ROWS> 200 0
 ```
-Server must be restarted per `<ROWS>` (rows fixed per handle).
+`<ROWS>`, the bucket list and the slab are fixed per server, so a different shape needs a restart;
+a different client does not -- the server now takes one session after another (refusing or queuing a
+peer that arrives while one is live) and keeps its handle for the next one.
+
+Two switches the C-hook work added:
+```
+# what the server's compute hook costs per request, whichever hook is installed: one call site, so
+# the Python cold path and the C hook are measured identically (stderr, one line per served request)
+SEAM_HOOK_TIME=1 <server>           # -> SEAM_HOOK_US port=47311 layer=38 rows=1024 us=1450.0
+# -arch=native asks the driver for the GPU in this container; the aarch64 build for a GX box has no
+# device to ask (and a busy box must not be asked), so the arch is nameable from outside
+NVCC_ARCH=sm_121 ./build.sh         # seam bench + libqmesh_expert_seam
+CUDA_ARCH=sm_121 ./build_moe.sh     # cuda-exl3 kernels for qmc_compute
+```
 
 ## Results (median, us; n = iterations; all four modes report correctness OK)
 

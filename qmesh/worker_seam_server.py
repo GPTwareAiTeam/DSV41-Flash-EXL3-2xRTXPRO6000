@@ -202,6 +202,12 @@ class SeamServer:
         # used is picked per call from WS_LADDER as far as the box's MemAvailable pays for it, so
         # this is a ceiling, not a promise. 0 = no split at all (one piece, whatever it costs).
         placement = json.load(open(placement_path))
+        # One line, before anything is loaded, naming the table this server's cold-local ids are
+        # positions in. The Hello advertises its sha (main), so a client on another table is
+        # refused; this line is what an operator reads to know *which* table that was.
+        print(f"SEAM_PLACEMENT path={(placement_path)} ranked={int(bool(placement.get('ranked')))} "
+              f"warm_4bpw={placement.get('warm_4bpw_experts', '-')} "
+              f"source_sha={(placement.get('source_sha256') or '-')[:12]}", flush=True)
         self.device = device
         self.stub = stub
         self.stream = None
@@ -248,22 +254,66 @@ class SeamServer:
         # (qmesh/build_cudaexl3.sh) and a server started on a checkout without it would otherwise
         # die on the first request, deep inside compute()'s fail-stop.
         self.preload = PRELOAD_CX and MOE_KERNEL == "cudaexl3" and not stub
+        self._cx_cls = None
         if self.preload:
             try:
-                from qmesh import exl3_moe_cuda  # noqa: F401  (loads the vendor extension)
+                from qmesh.exl3_moe_cuda import CudaExl3Moe  # noqa: F401  (loads the extension)
+                self._cx_cls = CudaExl3Moe
             except Exception as e:
                 self.preload = False
                 print(f"SEAM_MOE_NOEXT preload=off err={type(e).__name__}: {e} "
                       f"- every layer will stay on the mixed-K module", flush=True)
         self._cx_layers: dict = {}
+        self.layer_n: dict = {}
+        # Per layer, the file's own claim about its cold order: `warm_bpw` (the bitrate of each
+        # cold position) and `warm_4bpw_n` (the 4-bit group boundary). None for an unranked file.
+        self.layer_bpw_file: dict = {}
+        self.layer_4n_file: dict = {}
         config = Config.from_directory(model_dir)
         model = Model.from_config(config)
         for layer in range(NL):
-            cold = placement["layers"][str(layer)]["warm"]
-            base = next(m for m in model.modules if m.key == f"layers.{layer}").mlp
-            self.layers[layer] = build_layer(base, cold, device)
-            del base
-            torch.cuda.empty_cache()
+            layer_pl = placement["layers"][str(layer)]
+            cold = layer_pl["warm"]
+            self.layer_n[layer] = len(cold)
+            # The ranked file puts every 4-bit cold expert before every 2-bit one and records that
+            # boundary; the shard says, per expert, which bitrate it was cut at. Both must name the
+            # same set and the same boundary, or the client's cold-local ids mean something else
+            # here than they mean there -- a silent id shift, not an error anywhere else.
+            self.layer_bpw_file[layer] = layer_pl.get("warm_bpw")
+            self.layer_4n_file[layer] = layer_pl.get("warm_4bpw_n")
+            hit = None
+            if self.preload and cold and DIRECT_PACK:
+                # Slabs first, then the shard's bytes into their slices: the layer's only copy of
+                # its experts is the one the kernels read, so this costs the layer's cold bytes and
+                # cannot be refused for want of a second copy's worth of free memory.
+                t0 = time.perf_counter()
+                avail0, swap0 = _avail_mib(), _swap_used_mib()
+                try:
+                    hit = self._cx_cls.from_pack(self.pack_paths[layer], layer, cold, device,
+                                                 fadvise = self.fadvise)
+                except Exception as e:  # noqa: BLE001 - a bad shard must not lose the other 39
+                    hit = None
+                    print(f"SEAM_MOE_DIRECT_FAIL layer={layer} n={len(cold)} "
+                          f"err={type(e).__name__}: {e} - falling back to the per-expert module "
+                          f"path for this layer", flush=True)
+                if hit is not None:
+                    self._cx_layers[layer] = hit
+                    self.layers[layer] = (None, len(cold))
+                    avail1 = _avail_mib()
+                    prev = self.__dict__.get("_cx_avail_min", avail1)
+                    self._cx_avail_min = min(prev, avail1)
+                    print(f"SEAM_MOE_DIRECT layer={layer} n={len(cold)} groups={hit.describe()} "
+                          f"slab_mib={hit.nbytes() / 2**20:.0f} "
+                          f"read_ms={1e3 * (time.perf_counter() - t0):.0f} "
+                          f"avail_mib={avail0}->{avail1} swap_mib={swap0}->{_swap_used_mib()} "
+                          f"rss_peak_mib={_rss_peak_mib()} cached_mib={_cached_mib()}",
+                          flush=True)
+                    self._check_placement_groups(layer, cold, hit)
+            if hit is None:
+                base = next(m for m in model.modules if m.key == f"layers.{layer}").mlp
+                self.layers[layer] = build_layer(base, cold, device)
+                del base
+                torch.cuda.empty_cache()
             # Host side of the same bill: the loader's CPU buffers for this layer are dead now, and
             # on a unified-pool box anything the kernel is holding on their behalf is swap the next
             # layer's cudaMalloc cannot use (see _trim_host). Reported per layer so a load that
@@ -276,12 +326,12 @@ class SeamServer:
                   f"avail_mib={_avail_mib()} cached_mib={_cached_mib()} "
                   f"rss_peak_mib={_rss_peak_mib()} swap_mib={_swap_used_mib()} "
                   f"host_rss_mib={host_rss} host_swap_mib={host_swap} host_trim_mib={released} "
-                  f"cached_dropped={int(dropped)}", flush=True)
+                  f"cached_dropped={int(dropped)} direct={int(hit is not None)}", flush=True)
             # Convert now, not on the first request for this layer: this is the only moment the
             # group transient fits (see PRELOAD_CX). _cx_moe prints SEAM_MOE_CX or SEAM_MOE_NOFIT
             # per layer, and a refusal leaves the layer on the mixed-K module, which is correct
             # because nothing of the module was released in that case.
-            if self.preload:
+            if self.preload and hit is None:
                 self._cx_moe(layer, self.layers[layer][0])
         # The CPU model and its config were only the factory: every layer module is built now and
         # owns its device tensors, and nothing else reads them (build_layer shares `config` and
@@ -313,6 +363,38 @@ class SeamServer:
             print(f"SEAM_PACK_KERNEL cudaexl3_layers={cx_n} mixedk_layers={NL - cx_n} "
                   f"of={NL} avail_mib={_avail_mib()} avail_min_mib={getattr(self, '_cx_avail_min', '?')} "
                   f"swap_mib={_swap_used_mib()} rss_peak_mib={_rss_peak_mib()}", flush=True)
+
+    def _check_placement_groups(self, layer, cold, hit):
+        """Assert the ranked file's cold order against the bitrate the shard was cut at.
+
+        `hit.groups` carries each expert's bitrate and its position in `cold`. The file promises
+        `cold[:warm_4bpw_n]` are exactly the 4-bit experts; a file reordered against a pack cut
+        from another table would still be self-consistent -- the client numbers its cold ids from
+        the same file, so nothing downstream can tell -- which is why the check lives here, where
+        the shard's own geometry is in hand.
+        """
+        bpw_file = self.layer_bpw_file.get(layer)
+        n_file = self.layer_4n_file.get(layer)
+        if not bpw_file or n_file is None:
+            return
+        got = [None] * len(cold)
+        for grp in hit.groups:
+            for pos in grp.source:
+                got[int(pos)] = int(grp.bits)
+        wrong = [i for i, b in enumerate(got) if b != bpw_file[i]]
+        n4 = sum(1 for b in got if b == 4)
+        if wrong or n4 != n_file:
+            print(f"SEAM_PLACEMENT_GROUPS layer={layer} MISMATCH n={len(cold)} "
+                  f"warm_4bpw_n={n_file} shard_4bpw={n4} "
+                  f"file={bpw_file[:n_file] + bpw_file[n_file:]} "
+                  f"shard={got} positions={wrong[:8]}", flush=True)
+            raise SystemExit(
+                f"placement/shard mismatch on layer {layer}: the file's warm order does not "
+                f"describe this pack (warm_4bpw_n={n_file}, {n4} 4-bit experts in the shard, "
+                f"{len(wrong)} cold positions at the wrong bitrate); refusing to load a pack "
+                f"under a table that numbers its experts differently")
+        print(f"SEAM_PLACEMENT_GROUPS layer={layer} n={len(cold)} warm_4bpw_n={n_file} "
+              f"groups4={n4} groups2={len(cold) - n4} ok=1", flush=True)
 
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
@@ -498,7 +580,7 @@ class SeamServer:
         x = torch.from_numpy(view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN))
         x = x.view(torch.bfloat16).to(self.device).half()
         ids_np = view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)
-        _check_ids(layer, rows, ids_np, ffn.num_experts)
+        _check_ids(layer, rows, ids_np, self.layer_n[layer])
         ids = torch.from_numpy(ids_np.astype(np.int64))
         w = torch.from_numpy(view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK).copy())
         w = w.view(torch.bfloat16).float()
@@ -507,10 +589,16 @@ class SeamServer:
         sel = ids.clamp_min(0).to(self.device)
         gw = torch.where(miss, torch.zeros_like(w), w).to(self.device).half()
         # Cold-expert kernel switch (MOE_KERNEL). cuda-exl3 wants a layer's experts of one bitrate
-        # stacked into one trellis instead of one module per expert; the restack happens on the
-        # first call for the layer and drops the per-expert copies, so the resident cost is one
-        # copy of the cold pack and not two. A layer that cannot restack stays on the module.
+        # stacked into one trellis instead of one module per expert; a direct-loaded layer is
+        # already in that layout (`SEAM_MOE_DIRECT`), and any other layer is restacked on its first
+        # call, which drops the per-expert copies so the resident cost is one copy of the cold pack
+        # and not two. A layer that cannot restack stays on the module.
         cx = self._cx_moe(layer, ffn) if MOE_KERNEL == "cudaexl3" else None
+        if cx is None and ffn is None:
+            # Unreachable by construction: a layer has either its module or its direct stack.
+            # Serving the previous call's bytes instead would look like a correct answer (see
+            # compute()), so name it and die.
+            raise RuntimeError(f"layer {layer}: no cold-expert kernel and no module to serve it")
         with torch.cuda.stream(self.stream):
             if cx is not None:
                 part = cx.forward(x, sel, gw)
@@ -537,6 +625,13 @@ class SeamServer:
         cx = self.__dict__.setdefault("_cx_layers", {})
         if layer in cx:
             return cx[layer]
+        if ffn is None:
+            # A direct-loaded layer is already converted and was cached before the load moved on,
+            # so a miss here means its module is gone and nothing replaced it. There is nothing to
+            # restack; name it rather than raising on `_cx_transient_mib(None)`.
+            cx[layer] = None
+            print(f"SEAM_MOE_NOLAYER layer={layer} - no module and no stacked copy", flush=True)
+            return None
         try:
             from qmesh.exl3_moe_cuda import (CudaExl3Moe, RestackBroken, transient_mib as
                                              _cx_transient_mib, _live_mib as _cx_cold_mib,
@@ -684,11 +779,17 @@ WS_AUTO = os.environ.get("SEAM_WS_ROWS_AUTO", "1") != "0"
 # raises it (SEAM_SWAP_WARN_MIB=N) instead of pinning the ladder for the rest of the run.
 SWAP_WARN_MIB = int(os.environ.get("SEAM_SWAP_WARN_MIB", "512"))
 
-# Floor the cuda-exl3 restack has to leave on the box besides its own peak (see _cx_moe). 1.5 GiB is
-# the headroom a loaded GX actually has left (slab + workspace + CUDA context); a conversion that
-# eats into it swaps the 113.65 GiB pack out page by page, and on GB10 that stalls the whole host,
-# not just this process (GX1, 2026-11-01 16:44). Set SEAM_CX_MARGIN_MIB=0 only to measure a restack
-# on a box you are willing to lose.
+# Floor a *restack* has to leave on the box besides its own peak (see _cx_moe). 1.5 GiB is the
+# headroom a loaded GX actually has left (slab + workspace + CUDA context); a conversion that eats
+# into it swaps the 113.65 GiB pack out page by page, and on GB10 that stalls the whole host, not
+# just this process (GX1, 2026-11-01 16:44). It is a per-layer refusal test, not a global policy:
+# layer N is restacked when avail - need >= margin, so N refuses every layer whose need + N exceeds
+# avail, and the count of refused layers moves with N (measured on GX2, 2026-11-02, 4460 pack:
+# N=1536 leaves 2, N=2600 leaves 3; the layers are 37-39, the last ~2.7-3.1 GiB of a 113.65 GiB load).
+# Since SEAM_MOE_DIRECT (see exl3_moe_cuda.from_pack) the normal load path does not restack at all --
+# it reads each layer straight out of the pack, needs no transient, and never consults this floor --
+# so the margin now only gates the per-layer fallback taken when from_pack fails. Set
+# SEAM_CX_MARGIN_MIB=0 only to measure a restack on a box you are willing to lose.
 CX_MARGIN_MIB = int(os.environ.get("SEAM_CX_MARGIN_MIB", "1536"))
 
 # Convert each cold layer to the cuda-exl3 kernel as it loads, on by default when that kernel is
@@ -699,6 +800,13 @@ CX_MARGIN_MIB = int(os.environ.get("SEAM_CX_MARGIN_MIB", "1536"))
 # 1000 over 40 layers, 116223 right after layer 0). Deferring the restack to the first request is
 # what wedged GX1. SEAM_MOE_PRELOAD=0 restores that behaviour for a box measured to have slack.
 PRELOAD_CX = os.environ.get("SEAM_MOE_PRELOAD", "1") != "0"
+
+# Read each cold layer straight from its pack shard into the stacked layout instead of loading one
+# module per expert and restacking those (see CudaExl3Moe.from_pack). On, because the module path's
+# conversion needs a transient the last layers of a 113.65 GiB pack on a 121.6 GiB box do not have:
+# GX2 2026-11-02 refused layers 37-39 (`SEAM_MOE_NOFIT`) and landed on 37/3. SEAM_MOE_DIRECT=0 keeps
+# the module path for an A/B on one box.
+DIRECT_PACK = os.environ.get("SEAM_MOE_DIRECT", "1") != "0"
 
 
 def ws_mib_for(rows: int, ws_rows: int = 0) -> float:
@@ -1227,11 +1335,55 @@ def ws_tier_check(server, rows, tiers):
 
 
 
+def _install_cpp_hook(srv, server):
+    """SEAM_MOE_CPP=1: serve the cold-expert MoE from the C hook instead of _forward_piece.
+
+    Opt-in and fail-open. Registration goes through server._cx_moe, which is the cache the load
+    already filled when SEAM_MOE_PRELOAD=1, so no layer is restacked twice and no stacked bytes are
+    copied: CppMoe hands C the data_ptr() of the tensors this server holds and allocates one int32
+    remap table per layer. A layer whose restack is absent - the mixed-K module, i.e. 38/39, or any
+    layer the load reported as SEAM_MOE_NOFIT - is not registered; C forwards that one request to
+    the Python trampoline CppMoe leaves behind, which is server.compute, so it answers exactly as
+    it does today instead of refusing. A missing .so or a failed registration prints why and
+    returns None, and the caller installs the Python hook.
+
+    install(handle=srv._h) makes qmc_compute the hook itself, through qes_server_set_fn and the C
+    symbol's address: on the proxy threads a request for a registered layer goes from the slab
+    straight into the kernels, with no Python frame and no GIL. Only the layers that were not
+    registered take the trampoline. install() refuses a half out mode and closes the context before
+    installing anything, so the state is either the C hook or the shipped Python one.
+
+    The returned object must outlive the server: it owns the remap tables, the group arrays and the
+    fallback trampoline whose addresses C holds.
+    """
+    if os.environ.get("SEAM_MOE_CPP", "0") == "0":
+        return None
+    if server.stub:
+        # No pack and no restacks, so there is nothing to point C at; say it rather than let the
+        # registration fail with the KeyError of an empty cache.
+        print("SEAM_MOE_CPP_OFF stub=1 - the stub answers from the protocol, not from experts",
+              flush = True)
+        return None
+    try:
+        from qmesh.moe_cpp import CppMoe
+        cpp = CppMoe(server).install(handle=srv._h)
+    except Exception as e:   # noqa: BLE001 - any failure keeps the Python path
+        print(f"SEAM_MOE_CPP_OFF err={type(e).__name__}: {str(e).splitlines()[0][:200]} "
+              f"- serving the Python cold path", flush = True)
+        return None
+    print(f"SEAM_MOE_CPP_ON layers={len(cpp.layers)} fallback={cpp.fallback} "
+          f"ws_rows={server.ws_rows} out_mode={cpp.out_mode()}", flush = True)
+    return cpp
+
+
 def main():
     global MOE_KERNEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default="/cold")
-    ap.add_argument("--placement", default="/cold/placement.exl3.json")
+    # The client resolves the same variable (qmesh/placement.py), so one export names the table on
+    # both halves of a pair; an explicit --placement still wins.
+    ap.add_argument("--placement", default=os.environ.get("SEAM_PLACEMENT",
+                                                           "/cold/placement.exl3.json"))
     ap.add_argument("--dev", default="rocep1s0f0")
     ap.add_argument("--gid", type=int, default=3)
     ap.add_argument("--port", type=int, default=47311)
@@ -1408,7 +1560,12 @@ def main():
     placement_sha = hashlib.sha256(open(args.placement, "rb").read()).hexdigest()[:12]
     srv = qes.Server(args.dev, args.gid, args.port, 0, buckets, build = qes.build_id(),
                      placement_sha = placement_sha, wait = args.wait, slots = args.slab_slots)
-    srv.set_fn(lambda L, R, x, ids, w, o: server.compute(L, R, x, ids, w, o))
+    # SEAM_MOE_CPP=1 installs the C hook instead (see _install_cpp_hook); its object is held
+    # here, not dropped, because it owns the arrays the C context reads. With the variable
+    # unset this is exactly the trampoline it has always been.
+    _cpp_hook = _install_cpp_hook(srv, server)   # noqa: F841 - alive for srv.run()
+    if _cpp_hook is None:
+        srv.set_fn(lambda L, R, x, ids, w, o: server.compute(L, R, x, ids, w, o))
     try:
         srv.run()   # serves client sessions until SIGINT/SIGTERM
     except KeyboardInterrupt:

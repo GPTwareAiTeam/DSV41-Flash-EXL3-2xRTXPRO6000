@@ -30,8 +30,10 @@ elementwise sum: the slab gets the layer's answer with a single rounding, at the
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import struct
 import sys
 
 import torch
@@ -327,6 +329,95 @@ class CudaExl3Moe:
         return " ".join(f"bits{g.bits}{'+frac' if g.frac else ''}:{g.n_experts}"
                         for g in self.groups)
 
+    @classmethod
+    def from_pack(cls, path: str, layer: int, cold_ids, device = None, fadvise: bool = True):
+        """Stack a layer's cold experts straight out of its pack shard, without per-expert modules.
+
+        The restack path (`__init__`) needs the layer's experts resident as one module per expert
+        before it can copy them into the stacked layout, so a conversion on a nearly full box has
+        to find `transient_mib` (1.5-1.8 GiB) of free memory that exists only for the duration of
+        the copy, and whatever the allocator cannot hand back afterwards stays gone. By layers
+        37-39 of a 113.65 GiB pack on a 121.6 GiB box that transient does not exist and the layer
+        is refused (`SEAM_MOE_NOFIT`). Here the stacked tensors are the *only* copy: they are
+        allocated first and each expert's trellis/suh/svh is read from the shard into its slice,
+        so the layer costs its cold bytes plus one staging buffer (<= 12 MiB) and the decision
+        cannot depend on how much of the box is already loaded.
+
+        Geometry and the codebook come from the shard's header (the shape of `w1.trellis`, the
+        presence of `mul1`/`mcg`), which is the same information the module path reads off the
+        loaded linears; `qmesh/tests/cx_direct_check.py` compares the two byte for byte.
+
+        Expert `e` of the checkpoint stores its gate as `w1`, its up projection as `w3` and its
+        down projection as `w2` (exllamav3's own key mapping), in the layout the kernels here
+        consume: trellis (in/16, out/16, words) int16, suh half (in), svh half (out).
+        A member's `source` is its position in `cold_ids`, exactly as `__init__` labels the module's
+        experts: the ids this layer receives are local to the cold set (`_check_ids` bounds them by
+        len(cold)), and `remap` is indexed by them. The shard's keys, by contrast, are the
+        checkpoint's global expert ids, which is why the two are carried separately.
+        """
+        dev = torch.device(device or "cuda")
+        shard = _Shard(path, fadvise = fadvise)
+        self = cls.__new__(cls)
+        self.device = dev
+        self.num_experts = len(cold_ids)
+        try:
+            by_key: dict[tuple[int, int, int], list[tuple[int, int, int, int, int, int]]] = {}
+            for local_i, e in enumerate(cold_ids):
+                g, u, d = _pack_names(layer, e)
+                kt, nt, w13 = shard.shape(g + ".trellis")
+                _, nt_u, w13u = shard.shape(u + ".trellis")
+                k2t, n2t, w2 = shard.shape(d + ".trellis")
+                if w13u != w13:
+                    raise ValueError(f"expert {e}: gate/up tile widths differ ({w13} vs {w13u})")
+                cb = shard.codebook(g)
+                if shard.codebook(u) != cb or shard.codebook(d) != cb:
+                    raise ValueError(f"expert {e}: gate/up/down codebooks differ")
+                by_key.setdefault((int(w13), int(w2), cb), []).append(
+                    (int(local_i), int(e), int(kt), int(nt), int(k2t), int(n2t)))
+            # Geometry of the whole layer, from any expert (they share hidden/inter).
+            first = by_key[sorted(by_key)[0]][0]
+            self.hidden = 16 * first[2]
+            self.inter = 16 * first[3]
+            self.groups: list[Group] = []
+            stage = _Stage(dev)
+            for key, members in sorted(by_key.items()):
+                _, _, gkt, gnt, gk2t, gn2t = members[0]
+                e_n = len(members)
+                grp = Group(*_bits_frac(key[0]), key[2])
+                grp.n_experts = e_n
+                grp.trellis13 = torch.empty((e_n, gkt, 2 * gnt, key[0]),
+                                            dtype = torch.int16, device = dev)
+                grp.suh13 = torch.empty((e_n, 2, 16 * gkt), dtype = torch.half, device = dev)
+                grp.svh13 = torch.empty((e_n, 32 * gnt), dtype = torch.half, device = dev)
+                grp.trellis2 = torch.empty((e_n, gk2t, gn2t, key[1]),
+                                           dtype = torch.int16, device = dev)
+                grp.suh2 = torch.empty((e_n, 1, 16 * gk2t), dtype = torch.half, device = dev)
+                grp.svh2 = torch.empty((e_n, 16 * gn2t), dtype = torch.half, device = dev)
+                for i, (src, expert, skt, snt, sk2t, sn2t) in enumerate(members):
+                    if (skt, snt, sk2t, sn2t) != (gkt, gnt, gk2t, gn2t):
+                        raise ValueError(f"expert {src} (checkpoint {expert}): tile geometry "
+                                         f"differs inside one bitrate group")
+                    g, u, d = _pack_names(layer, expert)
+                    shard.read_into(g + ".trellis", grp.trellis13[i, :, :gnt], stage)
+                    shard.read_into(u + ".trellis", grp.trellis13[i, :, gnt:], stage)
+                    shard.read_into(g + ".suh", grp.suh13[i, 0], stage)
+                    shard.read_into(u + ".suh", grp.suh13[i, 1], stage)
+                    shard.read_into(g + ".svh", grp.svh13[i, :16 * gnt], stage)
+                    shard.read_into(u + ".svh", grp.svh13[i, 16 * gnt:], stage)
+                    shard.read_into(d + ".trellis", grp.trellis2[i], stage)
+                    shard.read_into(d + ".suh", grp.suh2[i, 0], stage)
+                    shard.read_into(d + ".svh", grp.svh2[i], stage)
+                grp.source = [m[0] for m in members]
+                self.groups.append(grp)
+            for grp in self.groups:
+                remap = torch.full((self.num_experts,), -1, dtype=torch.int64, device = dev)
+                remap[torch.tensor(grp.source, dtype = torch.int64, device = dev)] = torch.arange(
+                    len(grp.source), dtype = torch.int64, device = dev)
+                grp.remap = remap
+        finally:
+            shard.close()
+        return self
+
     # -- forward --------------------------------------------------------------------------------
     def forward(self, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """x half (M, H), ids int64 (M, T) this layer's cold experts, w half (M, T) -> fp32 (M, H).
@@ -420,3 +511,98 @@ class CudaExl3Moe:
         if total is None:
             return torch.zeros((M, self.hidden), dtype=torch.float32, device=x.device)
         return total
+
+
+# -- reading the cold pack shard -------------------------------------------------------------
+_ST_DTYPE = {
+    "F16": torch.half, "BF16": torch.bfloat16, "F32": torch.float32, "F64": torch.float64,
+    "I16": torch.int16, "I32": torch.int32, "I64": torch.int64,
+    "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
+}
+
+
+def _pack_names(layer: int, expert: int) -> tuple[str, str, str]:
+    """(gate, up, down) tensor-name prefixes of one cold expert in a `cold-LNN.safetensors` shard.
+
+    exllamav3's own mapping (`integration/transformers.py: EXPERT_PROJ_NAMES`): w1 gate, w3 up,
+    w2 down. The stacked layout wants gate first and up second along N, exactly as the pack
+    stores them.
+    """
+    base = f"layers.{int(layer)}.ffn.experts.{int(expert)}"
+    return base + ".w1", base + ".w3", base + ".w2"
+
+
+class _Stage:
+    """One reusable pinned host buffer for the shard reads (pageable if the target is the CPU)."""
+
+    def __init__(self, device):
+        self.device = device
+        self.buf = None
+
+    def get(self, nbytes: int) -> torch.Tensor:
+        if self.buf is None or self.buf.numel() < nbytes:
+            self.buf = torch.empty(nbytes, dtype = torch.uint8,
+                                   pin_memory = self.device.type == "cuda")
+        return self.buf[:nbytes]
+
+
+class _Shard:
+    """Header-only view of one pack shard plus a pread-into-`dst` reader.
+
+    Not a safetensors mmap: mmapping 113.65 GiB of shards would put the page cache back on the
+    unified pool this design is trying to keep clear. Each tensor is one `preadv` into the
+    staging buffer and one copy into its slice, and the pages it touched are handed back with
+    `POSIX_FADV_DONTNEED` immediately, so a layer's read costs its bytes and not its bytes plus
+    a cached copy of the shard.
+    """
+
+    def __init__(self, path: str, fadvise: bool = True):
+        self.path = path
+        self.fadvise = fadvise
+        self.fd = os.open(path, os.O_RDONLY)
+        try:
+            head = os.pread(self.fd, 8, 0)
+            if len(head) != 8:
+                raise ValueError(f"{path}: not a safetensors shard (short header length)")
+            n = struct.unpack("<Q", head)[0]
+            hdr = json.loads(os.pread(self.fd, n, 8).decode("utf-8"))
+            self.data = 8 + n
+            self.info = {k: (v["dtype"], tuple(v["shape"]),
+                             int(v["data_offsets"][0]), int(v["data_offsets"][1]))
+                         for k, v in hdr.items() if k != "__metadata__"}
+        except BaseException:  # noqa: BLE001 - a malformed shard must not leak a fd per layer
+            os.close(self.fd)
+            self.fd = -1
+            raise
+
+    def shape(self, key: str) -> tuple:
+        try:
+            return self.info[key][1]
+        except KeyError:
+            raise KeyError(f"{self.path}: no tensor {key!r}") from None
+
+    def codebook(self, prefix: str) -> int:
+        """Which codebook this linear uses, from the flags the loader would set on it."""
+        if prefix + ".mul1" in self.info:
+            return CB_MUL1
+        if prefix + ".mcg" in self.info:
+            return CB_MCG
+        return CB_3INST
+
+    def read_into(self, key: str, dst: torch.Tensor, stage: _Stage) -> int:
+        tag, shape, begin, end = self.info[key]
+        n = end - begin
+        buf = stage.get(n)
+        got = os.preadv(self.fd, [buf.numpy()], self.data + begin)
+        if got != n:
+            raise IOError(f"{self.path}: short read for {key!r}: {got} of {n} bytes")
+        # Blocking: the pinned buffer is reused for the next tensor as soon as this returns.
+        dst.copy_(buf.view(_ST_DTYPE[tag]).view(shape))
+        if self.fadvise:
+            os.posix_fadvise(self.fd, self.data + begin, n, os.POSIX_FADV_DONTNEED)
+        return n
+
+    def close(self) -> None:
+        if getattr(self, "fd", -1) >= 0:
+            os.close(self.fd)
+            self.fd = -1
