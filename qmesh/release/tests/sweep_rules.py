@@ -134,6 +134,8 @@ check("prod update names the only way in", "pair_promote.sh" in src("pair_update
 check("promote passes the flag and nothing else does",
       'PAIR_PROMOTE=1 "${cmd[@]}"' in src("pair_promote.sh")
       and 'PAIR_PROMOTE=1' not in src("pair_update_run.sh"), "")
+check("promote queues a flip-only ticket (prepares out of band)",
+      "cmd+=(--flip-only)" in src("pair_promote.sh"), "")
 check("promote requires per-sha dev evidence", "dev/evidence/$SHA.json" in src("pair_promote.sh"), "")
 check("promote wants decode ids, not just a row", "pair_canary_gate" in src("pair_promote.sh"), "")
 check("one definition of the canary gate",

@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # pair_promote.sh -- move the OTHER pair onto the release dev is already serving.
 #
-#   pair_promote.sh <sha> [--force] [--max-min N]
+#   pair_promote.sh <sha> [--force] [--max-min N] [--build]
+#
+# The queued ticket only flips and smokes: the release must already be cut, wired and built on prod
+# by pair_prepare.sh, so a promote never compiles inside the queue (2026-11-02: a full promote left
+# the queue rebuilt both libs and the torch extension at flip time, which is exactly what prepare is
+# for). `--build` is the escape hatch for a pair that was never prepared; expect it to queue the
+# compilers.
 #
 # Rollout order is not a preference: dev is the pair whose failures are cheap, so a release reaches
 # prod only after dev runs it and its check says IN_SYNC. This script refuses otherwise. It also
@@ -14,13 +20,15 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=pair_lib.sh
 . "$HERE/pair_lib.sh"
 
-SHA_ARG=${1:?usage: pair_promote.sh <sha> [--force] [--max-min N]}
+SHA_ARG=${1:?usage: pair_promote.sh <sha> [--force] [--max-min N] [--build]}
 shift
-FORCE=0; MINS=""
+FORCE=0; MINS=""; FLIP_ONLY=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1 ;;
     --max-min) MINS=$2; shift ;;
+    --build) FLIP_ONLY=0 ;;
+    --flip-only) FLIP_ONLY=1 ;;
     *) pair_die "unknown flag $1" ;;
   esac
   shift
@@ -64,7 +72,11 @@ fi
 pair_step "PROMOTE_OK sha=${SHA:0:12} seam=$new_seam dev=IN_SYNC evidence=$ev"
 
 pair_load prod
-cmd=("$HERE/pair_update.sh" prod "$SHA" ${MINS:+--max-min "$MINS"})
+cmd=("$HERE/pair_update.sh" prod "$SHA")
+[ -n "$MINS" ] && cmd+=(--max-min "$MINS")
+# The ticket flips and smokes; it does not compile. --build is the deliberate exception.
+[ "$FLIP_ONLY" = 1 ] && cmd+=(--flip-only)
+pair_step "PROMOTE_TICKET ${cmd[*]}"
 # pair_update.sh prod refuses without this: the evidence check has already happened here, and the
 # flag is what says so. Nothing else sets it.
 PAIR_PROMOTE=1 "${cmd[@]}"
