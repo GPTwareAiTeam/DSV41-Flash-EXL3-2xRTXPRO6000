@@ -805,11 +805,15 @@ check("the release guard only holds tickets that name a pair container",
       'check_release "$@"' in src("gpu_run_pair.sh")
       and 'PAIR_CONTAINERS="seam-p7-dev seam-p7-prod seam-gx2-dev seam-gx1-prod"' in src("gpu_run_pair.sh")
       and "PAIR_CHECK_FORCE" in src("gpu_run_pair.sh"), "")
+# The gate probes above set GPU_TICKET_HARDCAP to stand in for a wrapper; a wrapper actually run here is
+# a fresh top-level ticket and must not look like one queued from inside a ticket.
+def _nocap(e):
+    e = dict(e); e.pop("GPU_TICKET_HARDCAP", None); return e
 # Executed, not grepped: a ticket whose command is one quoted string must exit 2 before the GPU, because
 # `setsid "$@"` would otherwise exec a filename with spaces and die as rc=127 in 0 s -- which read as a
 # failed build twice on 2026-11-02 and cost a box window each time.
 _r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "T", "1", "scripts/pair_prepare.sh dev x --side gx"],
-             env=dict(_e, QBASE=os.path.join(_gd, "q")),
+             env=_nocap(dict(_e, QBASE=os.path.join(_gd, "q"))),
              capture_output=True, text=True, timeout=60)
 check("a ticket whose command is one quoted string is refused before the GPU",
       _r.returncode == 2 and "TICKET_BAD_CMD argv0=" in (_r.stdout + _r.stderr),
@@ -820,7 +824,7 @@ _tmp = os.path.join(_gd, "t.sh")
 with open(_tmp, "w") as _fh:
     _fh.write("#!/bin/sh\nexit 0\n")
 _r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "T", "1", "bash", _tmp],
-             env=dict(_e, QBASE=os.path.join(_gd, "q")), capture_output=True, text=True, timeout=60)
+             env=_nocap(dict(_e, QBASE=os.path.join(_gd, "q"))), capture_output=True, text=True, timeout=60)
 check("a ticket that starts with a PATH command (bash <script>) is accepted",
       _r.returncode != 2 and "TICKET_BAD_CMD" not in (_r.stdout + _r.stderr),
       "rc=%s %s" % (_r.returncode, (_r.stdout + _r.stderr).strip()[:200]))
@@ -841,7 +845,7 @@ with open(_lk, "w") as _fh:
     _fh.write("#!/bin/sh\nflock -n %s -c 'echo lock_free' || echo lock_held\n" % os.path.join(_qb, "gpu.lock"))
 os.chmod(_lk, 0o755)
 _r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "LockProbe", "1", "sh", _lk],
-             env=dict(_e, QBASE=_qb, QGPUS="0", PATH=_bin + ":" + os.environ["PATH"]),
+             env=_nocap(dict(_e, QBASE=_qb, QGPUS="0", PATH=_bin + ":" + os.environ["PATH"])),
              capture_output=True, text=True, timeout=120)
 check("a ticket command can take the queue lock its wrapper released",
       "lock_free" in (_r.stdout + _r.stderr), (_r.stdout + _r.stderr).strip()[:200])
@@ -851,6 +855,25 @@ check("the wrapper closes the lock descriptor before it starts a ticket",
       "exec 9>&-" in _wrap
       and _wrap.index('check_release "$@"') < _wrap.index('exec 9>"$LOCK"')
       and "check_release" not in _locked, _locked.strip()[:200])
+# A ticket body that queues a ticket deadlocks the FIFO: the outer entry stays head while its own
+# command waits for the inner one, and nothing behind either can run. On 2026-11-02 10:23-10:32 four
+# waiters sat behind exactly that (an IDTrace ticket whose body called run_dev.sh) and the cure applied
+# on the spot -- deleting a finished ticket file -- left the cause in place. GPU_TICKET_HARDCAP is
+# exported into the ticket's children and nowhere else, so the wrapper can tell it is inside one.
+_wrap = src("gpu_run_pair.sh")
+check("a ticket cannot queue another ticket: the guard runs before any entry is written",
+      "TICKET_NESTED" in _wrap
+      and _wrap.index("TICKET_NESTED") < _wrap.index('ticket="$Q/'), "")
+_qn = os.path.join(_gd, "q3")
+_r = _sp.run(["bash", "%s/gpu_run_pair.sh" % HERE, "Nested", "1", "sh", _tmp],
+             env=dict(_e, QBASE=_qn, QGPUS="0",
+                      GPU_TICKET_HARDCAP=str(int(__import__("time").time()) + 600)),
+             capture_output=True, text=True, timeout=60)
+_qn_dir = os.path.join(_qn, "gpu_queue")
+_qn_left = [f for f in os.listdir(_qn_dir) if not f.startswith("status-")] if os.path.isdir(_qn_dir) else []
+check("a ticket queued from inside a ticket is refused and leaves no entry behind",
+      _r.returncode == 2 and "TICKET_NESTED" in (_r.stdout + _r.stderr) and not _qn_left,
+      "rc=%s left=%s %s" % (_r.returncode, _qn_left, (_r.stdout + _r.stderr).strip()[:160]))
 
 _sh.rmtree(_gd, ignore_errors=True)
 check("the ensure gate has its own battery",

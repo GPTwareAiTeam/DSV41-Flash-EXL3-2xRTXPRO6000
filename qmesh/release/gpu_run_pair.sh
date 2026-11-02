@@ -33,6 +33,16 @@ Q=$BASE/gpu_queue; LOCK=$BASE/gpu.lock; PRIO=$BASE/gpu_priority.txt; LOG=$BASE/g
 EXTEND_MAX_MIN=${EXTEND_MAX_MIN:-10}; HARD_CAP_MIN=${HARD_CAP_MIN:-$((MAXMIN + 30))}; GRACE_SEC=${GRACE_SEC:-90}
 mkdir -p "$Q"
 log() { echo "$(date +%T) $*" >> "$LOG"; }
+# A ticket that queues another ticket deadlocks the queue: the outer ticket is still head while its
+# own command waits for the inner one, and neither can run. On 2026-11-02 10:23-10:32 four waiters sat
+# behind exactly that (an IDTrace ticket whose body called run_dev.sh). GPU_TICKET_HARDCAP is exported
+# by the wrapper into its command and nowhere else, so its presence here means we are inside a ticket.
+if [ -n "${GPU_TICKET_HARDCAP:-}" ]; then
+  echo "TICKET_NESTED: a ticket cannot queue another ticket -- the outer entry is the head and would" >&2
+  echo "wait on the inner one forever. Queue the work as one ticket, or run the inner command directly." >&2
+  log "TICKET_NESTED refused $AGENT: queued from inside an existing ticket"
+  exit 2
+fi
 SCRIPTS=""
 for _c in "$BASE/../../scripts" "$BASE/../scripts"; do
   [ -x "$_c/pair_check.sh" ] && { SCRIPTS=$(cd "$_c" && pwd); break; }
