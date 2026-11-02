@@ -1320,6 +1320,26 @@ def main():
                            "compares e.g. 1024,2048,4096 on the same rows (default: the server's "
                            "own --ws-rows split).")
     args = ap.parse_args()
+
+    # A GX box holds one cold pack and one server, and two kinds of job want it: the pair release,
+    # and a bench that measures against a loaded pack. They are serialised by the box gate,
+    # <queue>/gx<N>.gate, whose lifecycle pair_gx_gate_take/pair_gx_gate_down own; the one launcher
+    # that checks it and starts a pack load is seam_server_ensure.sh, and it passes the gate's
+    # answer as SEAM_GATE_OK=1 through the docker exec. A direct `python3 qmesh/worker_seam_server.py`
+    # ignores the claim and loads 113.65 GiB the release thinks is free (the 01:43 orphan on GX2
+    # blocked the dev update for its whole run), so a launch that will map the pack is refused here
+    # -- before SeamServer runs, so before a byte is mapped or a CUDA context exists and a refused
+    # launch costs the box nothing. --stub is exempt: it returns before the pack and CUDA (see
+    # SeamServer.__init__), so it takes no memory the gate protects, and a stub launch is how the
+    # wire tests run against a full box.
+    if os.environ.get("SEAM_GATE_OK") != "1" and not args.stub:
+        # stderr, and the first line verbatim: the ensure/smoke refusal check and
+        # qmesh/tests/server_gate.sh match that exact prefix.
+        print("SEAM_SERVER_REFUSED SEAM_GATE_OK missing: start through seam_server_ensure.sh",
+              file = sys.stderr, flush = True)
+        print("  (that helper takes the gx gate and passes SEAM_GATE_OK=1; a direct launch would "
+              "map the pack outside the claim)", file = sys.stderr, flush = True)
+        return 3
     # Set before the pack loads: the switch is read per call, but a bad value must fail the
     # launch, not the first request.
     MOE_KERNEL = args.moe_kernel
@@ -1399,4 +1419,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # sys.exit, not a bare call: main returns 3 from the gate refusal, and a launcher that only sees
+    # "the process ended" would read a refusal as a clean shutdown.
+    sys.exit(main())
