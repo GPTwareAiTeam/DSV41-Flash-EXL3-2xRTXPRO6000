@@ -1234,34 +1234,28 @@ def _install_cpp_hook(srv, server):
     already filled when SEAM_MOE_PRELOAD=1, so no layer is restacked twice and no stacked bytes are
     copied: CppMoe hands C the data_ptr() of the tensors this server holds and allocates one int32
     remap table per layer. A layer whose restack is absent - the mixed-K module, i.e. 38/39, or any
-    layer the load reported as SEAM_MOE_NOFIT - is not registered; dispatch() sends it to
-    server.compute, so it answers exactly as it does today instead of refusing. A missing .so or a
-    failed registration prints why and returns None, and the caller installs the Python hook.
+    layer the load reported as SEAM_MOE_NOFIT - is not registered; C forwards that one request to
+    the Python trampoline CppMoe leaves behind, which is server.compute, so it answers exactly as
+    it does today instead of refusing. A missing .so or a failed registration prints why and
+    returns None, and the caller installs the Python hook.
 
-    The C hook is installed through srv.set_fn, so it sits behind qes.py's own trampoline: an
-    exception in either path is still turned into the protocol's refusal code, and the per-expert
-    work of a registered layer never enters Python - the trampoline costs one call per request.
+    install(handle=srv._h) makes qmc_compute the hook itself, through qes_server_set_fn and the C
+    symbol's address: on the proxy threads a request for a registered layer goes from the slab
+    straight into the kernels, with no Python frame and no GIL. Only the layers that were not
+    registered take the trampoline. install() refuses a half out mode and closes the context before
+    installing anything, so the state is either the C hook or the shipped Python one.
 
-    The returned object must outlive the server: it owns the remap tables and the group arrays
-    whose device pointers C reads.
+    The returned object must outlive the server: it owns the remap tables, the group arrays and the
+    fallback trampoline whose addresses C holds.
     """
     if os.environ.get("SEAM_MOE_CPP", "0") == "0":
         return None
     try:
         from qmesh.moe_cpp import CppMoe
-        cpp = CppMoe(server).install()
-        srv.set_fn(cpp.dispatch)
+        cpp = CppMoe(server).install(handle=srv._h)
     except Exception as e:   # noqa: BLE001 - any failure keeps the Python path
         print(f"SEAM_MOE_CPP_OFF err={type(e).__name__}: {str(e).splitlines()[0][:200]} "
               f"- serving the Python cold path", flush = True)
-        return None
-    if cpp.out_mode():
-        # A half response is rows*HIDDEN*2 per row, and qes.py's off_resp still prices
-        # rows*HIDDEN*4, so every slot after the first would be read at the wrong offset. The wire
-        # has to change with the format; until it does, refuse to serve one.
-        print(f"SEAM_MOE_CPP_OFF out_mode={cpp.out_mode()} - the seam slot is fp32; unset "
-              f"SEAM_MOE_CPP_OUT or change qes.py's off_resp with it", flush = True)
-        cpp.close()
         return None
     print(f"SEAM_MOE_CPP_ON layers={len(cpp.layers)} fallback={cpp.fallback} "
           f"ws_rows={server.ws_rows} out_mode={cpp.out_mode()}", flush = True)

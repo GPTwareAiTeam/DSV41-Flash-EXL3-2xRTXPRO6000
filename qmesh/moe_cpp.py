@@ -2,13 +2,16 @@
 
 Everything here runs at load time, once:
 
-    cpp = CppMoe(server).install()    # hands the resident restacks' device pointers to C
-    srv.set_fn(cpp.dispatch)          # C for the layers it registered, the server's own path
-                                      # for the layers it could not (the mixed-K ones)
+    cpp = CppMoe(server).install(handle=srv._h)   # device pointers to C, then qmc_compute into
+                                                   # the proxy's hook; srv.set_fn is NOT called
 
-dispatch() is one dict lookup per request; the per-expert work never leaves C. The hook signature
-is the shipped seam one, so the refusal codes and the protocol are untouched: this is a new
-callback behind the existing setter, not a new wire.
+The hook is the C symbol: qes_server_set_fn gets qmc_entry() and this context, so a served request
+for any of the 40 layers runs from the proxy thread into the kernels without a Python frame. The
+layers this context holds no stacks for (38/39, the mixed-K pack) are handed from C to the server's
+own compute through a ctypes trampoline that install() keeps alive - the same call the shipped
+Server.set_fn made for every layer, now made only for those two. The signature is the shipped seam
+one, so the refusal codes and the protocol are untouched: this is a new callback behind the existing
+setter, not a new wire.
 
 The C side needs one qmc_group per bitrate group per layer, pointing at the stacked tensors
 qmesh/exl3_moe_cuda.CudaExl3Moe already holds (the layer's resident copy of the cold pack). Nothing
@@ -32,6 +35,11 @@ TOPK = qes.TOPK
 NL = qes.NL
 
 MAX_GROUPS = 8
+
+# qes_server_fn: void* ctx, then the proxy's six (layer, rows, x, ids, w, out). The same type qes.py
+# uses for its trampoline; here it types only the fallback, because the hook itself is the C symbol.
+_SERVER_FN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
 
 
 class QmcGroup(ctypes.Structure):
@@ -95,6 +103,10 @@ def lib():
                                  ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
     h.qmc_last_error.restype = ctypes.c_char_p
     h.qmc_last_error.argtypes = []
+    h.qmc_entry.restype = ctypes.c_void_p
+    h.qmc_entry.argtypes = []
+    h.qmc_set_fallback.restype = ctypes.c_int
+    h.qmc_set_fallback.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     h.qmc_close.restype = None
     h.qmc_close.argtypes = [ctypes.c_void_p]
     _lib = h
@@ -120,7 +132,7 @@ class CppMoe:
         self._registered = set()
         self.fallback = []     # layers left to the server's path (mixed-K: no cuda-exl3 stacks)
 
-    def install(self, layers=None):
+    def install(self, layers=None, handle=None):
         """Register the given layers' stacks into the C context; returns self.
 
         Pointers only. Each group hands C the data_ptr() of the tensors CudaExl3Moe already holds in
@@ -136,6 +148,13 @@ class CppMoe:
         reported as SEAM_MOE_NOFIT / SEAM_MOE_NOEXT) - is recorded in self.fallback and skipped:
         there are no cuda-exl3 stacks to point at, and refusing it would fail requests the
         server's own path still answers. dispatch() is what routes those.
+
+        `handle` is the seam proxy (qes.Server._h). Given it, the proxy's hook becomes this
+        library's own qmc_compute, installed through the shipped qes_server_set_fn, so a served
+        request never re-enters the interpreter; the layers C cannot serve reach the server
+        through a trampoline this object keeps alive (see _install_on_proxy). Without it nothing is
+        installed and the caller routes with dispatch(), which is how the bench compares both
+        paths in one process.
         """
         srv = self.server
         dev = torch.device(srv.device) if not isinstance(srv.device, torch.device) else srv.device
@@ -191,10 +210,57 @@ class CppMoe:
               f"ws_rows={srv.ws_rows} dev={ordinal}", flush=True)
         if not self.layers:
             raise RuntimeError(f"CppMoe: no layer has cuda-exl3 stacks to serve")
+        if handle is not None:
+            # The proxy reads the response at off_resp's stride, rows*HIDDEN*4. A half response
+            # needs the slot and the client's Seam.collect changed with it; installing one anyway
+            # would hand a served request a buffer it cannot interpret.
+            mode = self.out_mode()
+            if mode != 0:
+                self.close()
+                raise RuntimeError(f"CppMoe: out mode {mode} needs the seam slot and the client's "
+                                   f"collect to change with it; refusing to install")
+            self._install_on_proxy(handle)
         return self
 
+    def _install_on_proxy(self, handle) -> None:
+        """Make qmc_compute the proxy's hook, with the two unserved layers falling back to Python.
+
+        qes_server_set_fn takes a plain function pointer, and qmc_compute's arguments are already a
+        qes_server_fn, so the install is one cast on the C symbol - the request path from the proxy
+        thread to the kernels stays in C for every layer this context registered. The fallback is
+        a ctypes trampoline over the server's own compute, i.e. exactly what Server.set_fn used to
+        install, kept here so 38/39 still answer; it must not raise, or ctypes swallows the
+        exception and invents a return, so it refuses with the protocol's code 5 instead.
+
+        The symbol is resolved on the seam library's own handle: qes.lib() binds qes_server_set_fn
+        with the ctypes callback type as its second argument, and the C address is a plain void*.
+        """
+        qlib = ctypes.CDLL(qes.lib()._name)
+        qlib.qes_server_set_fn.restype = None
+        qlib.qes_server_set_fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+
+        def tramp(ctx, layer, rows, x, ids, w, out):
+            try:
+                return int(self.server.compute(layer, rows, x, ids, w, out) or 0)
+            except BaseException as e:   # noqa: BLE001 - the proxy must hear "no answer"
+                print(f"SEAM_COMPUTE_REFUSED cpp fallback raised {type(e).__name__}: {e}",
+                      flush=True)
+                return 5
+
+        self._fallback_cb = _SERVER_FN(tramp)   # keep alive: C calls it from proxy threads
+        h = handle if isinstance(handle, ctypes.c_void_p) else ctypes.c_void_p(int(handle))
+        if self.lib.qmc_set_fallback(self.ctx, ctypes.cast(self._fallback_cb, ctypes.c_void_p),
+                                     h) != 0:
+            raise RuntimeError("CppMoe: qmc_set_fallback rejected")
+        qlib.qes_server_set_fn(h, self.lib.qmc_entry(), self.ctx)
+        print(f"SEAM_MOE_CPP_PROXY entry=qmc_compute fallback_layers={self.fallback}", flush=True)
+
     def dispatch(self, layer, rows, x, ids, w, out) -> int:
-        """The seam hook for a server holding this object: C where it can, server path where not.
+        """Route a request in Python: C where it can, server path where not.
+
+        Only for callers that pass srv.set_fn(cpp.dispatch) instead of install(handle=...), and for
+        the bench, which drives both paths from one process. On the proxy the hook is qmc_compute
+        itself; this function's fallback half is what install() hands C as the trampoline.
 
         One set lookup per request; the per-expert work stays inside qmc_compute. A layer in
         self.fallback runs server.compute unchanged, which is what keeps the mixed-K layers (38/39)

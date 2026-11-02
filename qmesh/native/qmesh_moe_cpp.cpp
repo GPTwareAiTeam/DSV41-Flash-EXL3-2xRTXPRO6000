@@ -299,6 +299,11 @@ struct Ctx {
   int64_t last_wall = 0;
   int64_t last_dev = 0;
   bool reported = false;
+  /* Where an unregistered layer goes when this context is the proxy's hook (qmc_set_fallback):
+   * fn is a qes_server_fn, fnctx what the proxy hands back as its first argument. Both NULL when
+   * the caller keeps routing in Python, in which case an unregistered layer is a refusal. */
+  void* fb_fn = nullptr;
+  void* fb_ctx = nullptr;
   cudaEvent_t ev0 = nullptr, ev1 = nullptr;
 };
 
@@ -609,7 +614,8 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
    * first and only half the bytes cross the wire: the response is 5120 floats per row, two thirds
    * of a served request's payload, so this is the one place a wire format can be halved without
    * touching the kernels. The slot must then be half-sized - that is the seam's layout decision
-   * (qes.py off_resp stride and the client's collect), not this file's. */
+   * (off_resp's stride in qmesh_expert_seam.cu and Seam.collect in remote_seam_host.py), not
+   * this file's. */
   const size_t obytes = (size_t)rows * H * (c.out_mode ? 2 : 4);
   const void* src = b.acc;
   if (c.out_mode) {
@@ -641,8 +647,9 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
   c->block_m = env_int("SEAM_MOE_CPP_BLOCK_M", 0);
   c->dump = env_int("SEAM_MOE_CPP_DUMP", 0) != 0;
   c->trace = env_int("SEAM_MOE_CPP_TRACE", 0) != 0;
-  /* Response format. Default fp32: the shipped seam slot is fp32 and qes.py's off_resp stride is
-   * rows*HIDDEN*4, so anything else must be a deliberate, matching change on the client side. */
+  /* Response format. Default fp32: the shipped seam slot is fp32 and off_resp's stride is
+   * rows*HIDDEN*4 (qmesh_expert_seam.cu, and Seam.collect in remote_seam_host.py), so anything else
+   * must be a deliberate, matching change on the client side. */
   {
     const char* om = getenv("SEAM_MOE_CPP_OUT");
     if (om && (!strcmp(om, "bf16") || !strcmp(om, "bfloat16")))
@@ -714,6 +721,15 @@ extern "C" int qmc_compute(void* ctx, int layer, int rows, const void* x_bf16, c
     return kRefuseCompute;
   }
   if (layer < 0 || layer >= QMC_NL || !c->layers[layer].have) {
+    /* Not a layer with cuda-exl3 stacks - the mixed-K pack (38/39) has none. When this context is
+     * the proxy's hook, the server's own path answers it through the trampoline install() handed
+     * to qmc_set_fallback; that is the shipped behaviour, and refusing here instead would fail a
+     * request the server can still serve. A caller that kept the Python dispatch (no fallback
+     * installed) never reaches this branch for such a layer. */
+    if (c->fb_fn) {
+      typedef int (*qes_fb_fn)(void*, int, int, const void*, const int32_t*, const void*, float*);
+      return ((qes_fb_fn)c->fb_fn)(c->fb_ctx, layer, rows, x_bf16, ids, w_bf16, out_f32);
+    }
     set_err("layer %d has no registered cuda-exl3 groups", layer);
     return kRefuseCompute;
   }
@@ -831,6 +847,23 @@ extern "C" int qmc_set_block_m(void* ctx, int block_m) {
   const int old = c->block_m;
   c->block_m = block_m;
   return old;
+}
+
+/* The address qes_server_set_fn installs. qmc_compute's arguments already are qes_server_fn's
+ * (void* ctx, then exactly the proxy's six), so the install is a cast and not an adapter - and a
+ * served request for a registered layer never re-enters the interpreter. */
+extern "C" void* qmc_entry(void) { return (void*)(uintptr_t)&qmc_compute; }
+
+/* Where qmc_compute sends a layer it holds no stacks for: fn is a qes_server_fn (the caller's
+ * trampoline over Server.compute) and fnctx what the proxy passes back to it. Called under the
+ * context's lock because it is set once at load, after the layer table is built. */
+extern "C" int qmc_set_fallback(void* ctx, void* fn, void* fnctx) {
+  auto* c = (Ctx*)ctx;
+  if (!c) return -1;
+  std::lock_guard<std::mutex> lk(c->mu);
+  c->fb_fn = fn;
+  c->fb_ctx = fnctx;
+  return 0;
 }
 
 /* Debug: copy the alignment of the last piece served for `layer` back to the caller, so the bench

@@ -15,7 +15,8 @@
  *   cuda-exl3 had_in / gemm13 / glu / gemm2(accumulate into one fp32 accumulator)
  *   cudaMemcpyAsync accumulator -> pinned response slot
  *
- * The response is fp32 because the shipped seam slot is (qes.py off_resp stride rows*HIDDEN*4).
+ * The response is fp32 because the shipped seam slot is (off_resp's stride, rows*HIDDEN*4, in
+ * qmesh_expert_seam.cu and the client's Seam.collect in remote_seam_host.py).
  * SEAM_MOE_CPP_OUT=bf16|fp16 rounds the answer on device and copies half the bytes instead; the
  * slot and the client's collect have to change together for that to be a wire format, so it stays
  * a measurement switch until that lands.
@@ -79,11 +80,21 @@ int qmc_compute(void *ctx, int layer, int rows, const void *x_bf16, const int32_
 int qmc_last_call_ns(void *ctx, int64_t *wall_ns, int64_t *dev_ns);
 int qmc_stats(void *ctx, int64_t *calls, int64_t *refused);
 /* Response format of the D2H: 0 = fp32 (the shipped slot), 1 = bf16, 2 = fp16. The slot's stride
- * follows it, so whoever reads the response has to agree with this value - qes.py's off_resp and
- * the client's collect are the other half of that agreement. set_out_mode returns the old mode, or
- * -1 for an unknown mode. */
+ * follows it, so whoever reads the response has to agree with this value - off_resp in
+ * qmesh_expert_seam.cu and Seam.collect in remote_seam_host.py are the other half of that
+ * agreement. set_out_mode returns the old mode, or -1 for an unknown mode. */
 int qmc_out_mode(void *ctx);
 int qmc_set_out_mode(void *ctx, int mode);
+
+/* Installing on the seam proxy, without a Python frame in the path. qmc_entry() returns the address
+ * of qmc_compute for qes_server_set_fn(s, fn, ctx) - the same call qes.py's Server.set_fn makes,
+ * with the C symbol instead of a ctypes callback. Layers this context does not hold (38/39: the
+ * mixed-K pack has no cuda-exl3 stacks) are then handed to `fn`, a qes_server_fn whose `fnctx` is
+ * whatever the caller passes: install() gives it the server's own trampoline, so those two layers
+ * reach Server.compute exactly as they did before this module existed, and the other 38 never
+ * leave C. Passing fn = NULL restores the refusal for an unregistered layer. */
+void *qmc_entry(void);
+int qmc_set_fallback(void *ctx, void *fn, void *fnctx);
 /* Alignment knobs. block_m = 0 keeps the automatic tier (pick_block_m on the previous call's live
  * count); a positive value freezes the tier, which a captured graph needs. set_block_m returns the
  * old value or -1. dump_align copies the last piece's alignment of `layer`/`group` back to the
