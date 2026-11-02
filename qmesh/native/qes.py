@@ -86,8 +86,11 @@ class Nego(ctypes.Structure):
         return self._text(self.message)
 
 
-_SERVER_FN = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
-                              ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+# int: 0 = answered, nonzero = refused (the C proxy poisons the slot, tells the client the code and
+# ends that session only). A void callback would leave ctypes to invent a return value, and the
+# proxy would post whatever it invented - the stale-bytes failure the refactor exists to remove.
+_SERVER_FN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
 
 
 def _lib():
@@ -326,10 +329,16 @@ class Server:
         self._cb = None
 
     def set_fn(self, fn):
-        """fn(layer, rows, x_bf16, ids_i32, w_bf16, out_f32): raw pinned-slab pointers as ints;
-        see worker_seam_server.py for the typed numpy wrapper."""
+        """fn(layer, rows, x_bf16, ids_i32, w_bf16, out_f32) -> int: raw pinned-slab pointers as
+        ints; see worker_seam_server.py for the typed numpy wrapper. 0 = answered, nonzero = refused."""
         def tramp(ctx, layer, rows, x, ids, w, out):
-            fn(layer, rows, x, ids, w, out)
+            # A raise here would be swallowed by ctypes and its return value invented, which is the
+            # one way a stale response could still be posted: refuse instead.
+            try:
+                return int(fn(layer, rows, x, ids, w, out) or 0)
+            except BaseException as e:   # noqa: BLE001 - the proxy must hear "no answer"
+                print(f"SEAM_COMPUTE_REFUSED hook raised {type(e).__name__}: {e}", flush = True)
+                return 5
         self._cb = _SERVER_FN(tramp)   # keep alive: the C side calls it from proxy threads
         lib().qes_server_set_fn(self._h, self._cb, None)
 

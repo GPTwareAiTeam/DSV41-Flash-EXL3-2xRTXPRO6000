@@ -98,6 +98,48 @@ def _check_ids(layer, rows, ids, num_experts):
                            f"{int(ids[ids >= num_experts][:8].max())}")
 
 
+# How much MemAvailable one forward needs before it is even launched. Per-request device scratch is
+# priced per row by the picker (_pick_step), but that is only the module's row buffers: the exl3
+# restack transient, the allocator's growth and the pinned slab are extra, and on a box that is
+# already swapping the allocation itself is what fails - a 6-row forward died on 2026-11-01 with
+# avail_min_mib=560 swap_max_mib=3762, and the launch failure it raised killed a process that held
+# a 113 GiB pack. 0 = off, which is the shipped default because the floor has to be measured per
+# box, not guessed: the dev box serves 2048-row pieces at avail_mib=507 (SEAM_WS_PICK ... need_mib=331),
+# so a floor set from the failing number alone would refuse every request. Set SEAM_FWD_FLOOR_MIB
+# from a run that logs avail_mib on both the served and the refused calls.
+FWD_FLOOR_MIB = int(os.environ.get("SEAM_FWD_FLOOR_MIB", "0"))
+
+# Refusal codes. They travel to the client in the slot's fail word (see qmesh_expert_seam.h) and are
+# what the client's proxy prints instead of "the seam transport is dead".
+REFUSE_MEM = 4
+REFUSE_COMPUTE = 5
+
+
+def _free_cached():
+    """Return cached-but-unused device blocks to the driver before deciding there is no room."""
+    try:
+        torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 - a context that cannot empty is a context that is gone
+        pass
+
+
+def _cuda_ok():
+    """True while this process's CUDA context can still run a kernel.
+
+    The difference between "this request does not fit" and "this process can never answer again",
+    and the only thing allowed to kill the server: a launch failure that leaves the context unusable
+    turns every later session into the same failure, so the box is better off reloaded than
+    accepting. A live context means the request was refused, not the server.
+    """
+    try:
+        torch.cuda.synchronize()
+        torch.zeros(1, device = "cuda")
+        torch.cuda.synchronize()
+        return True
+    except Exception:  # noqa: BLE001 - any raise here is the answer: unusable
+        return False
+
+
 def build_layer(base, cold_ids, device):
     """Subset the layer's routed-expert module to `cold_ids` (checkpoint expert ids, ordered).
 
@@ -126,9 +168,12 @@ def build_layer(base, cold_ids, device):
 class SeamServer:
     def __init__(self, model_dir, placement_path, device, stub = False, ws_rows = 0,
                  fail_after = 0):
-        # fail_after: testing hook for the fail-stop below - raise on call N+1. 0 = never.
+        # fail_after: testing hook for the refusal path - raise on call N+1. 0 = never.
         self.fail_after = int(fail_after or 0)
         self.seen = 0
+        # Refused requests since start (SEAM_COMPUTE_REFUSED). A refusal is not a failure of the
+        # server: the session it belonged to ended, the listener did not.
+        self.refusals = 0
         # One compute at a time. The C proxy calls this hook from a thread per open handle, and a
         # client with several row buckets keeps several handles (1/6/64...) with one request in
         # flight each, so two threads can be inside _forward at once: the pinned-slab pointers are
@@ -228,22 +273,50 @@ class SeamServer:
     def compute(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Pinned-slab pointers in; fp32 output written into the pinned response region.
 
-        Fail-stop, not fail-soft: the C proxy posts the response only after this hook returns, so
-        an exception allowed to escape here is swallowed by ctypes (it prints "Exception ignored")
-        and the *previous* call's bytes in the pinned response region get posted as this call's
-        answer. That is exactly what happened on GX2 on 2026-11-01 08:57: a CUDA launch failure
-        inside _forward_piece left the context permanently broken, 170k callbacks raised, the
-        server kept accepting sessions for 20 min and the client decoded garbage ("magnetic
-        magnetic ..."). So any failure here kills the process: the RC QP goes away, the client's
-        proxy sees the CQ error, marks the handle dead and raises - an error, never stale numbers.
+        Returns 0 when the response region holds this request's answer, or a refusal code (see
+        REFUSE_MEM / REFUSE_COMPUTE). The C proxy turns a nonzero return into "poison this slot,
+        tell the client which of the two it was, end this one session" and goes back to accepting
+        (qmesh_expert_seam.h). The pack stays resident: a request this box cannot serve costs the
+        client one failed call, not a 150-220 s reload for everyone.
+
+        Never raise. The C proxy posts the response only after this hook returns, so an exception
+        allowed to escape is swallowed by ctypes (it prints "Exception ignored") and the *previous*
+        call's bytes in the pinned response region get posted as this call's answer. That is exactly
+        what happened on GX2 on 2026-11-01 08:57: a CUDA launch failure inside _forward_piece left
+        the context permanently broken, 170k callbacks raised, the server kept accepting sessions for
+        20 min and the client decoded garbage ("magnetic magnetic ...").
+
+        So a failure is either "this request cannot be computed" - refused, process alive, client
+        gets NaN and a named error - or "this process can never answer again", which is the only
+        case that still exits: a dead context fails every later session the same way, and a server
+        that cannot compute must not pretend to. _cuda_ok decides.
         """
         # Per-call device time, reported every minute as SEAM_COMPUTE (median/mean/max us per row
         # bucket). Paired with the client's round-trip timing this splits the seam into GX1 compute
         # and wire: wire = round trip - compute.
         t0 = time.perf_counter_ns()
         self.seen += 1
+        avail = _avail_mib()
+        if 0 <= avail < FWD_FLOOR_MIB:
+            # Cheap, no device work: return the allocator's unused blocks, then look again. Only a
+            # box that is still short after that is refused before a launch it would pay for in
+            # swap storms and launch failures.
+            if not self.stub:
+                _free_cached()
+            avail = _avail_mib()
+        if 0 <= avail < FWD_FLOOR_MIB:
+            self.refusals += 1
+            print(f"SEAM_COMPUTE_REFUSED layer={layer} rows={rows} why=memory "
+                  f"need_mib={FWD_FLOOR_MIB} avail_mib={avail} swapped_mib={_swap_used_mib()} "
+                  f"dev_{_dev_mem_mib()} "
+                  f"calls={sum(len(v) for v in _times.values())} refusals={self.refusals} "
+                  f"- answering nothing, the session ends, the server keeps listening", flush=True)
+            return REFUSE_MEM
         try:
-            if self.fail_after and self.seen > self.fail_after:
+            # Exactly call N+1, not every call after it: the refusal must leave a process that
+            # still answers, and the only way to show that from one server is a later call that
+            # is served normally.
+            if self.fail_after and self.seen == self.fail_after + 1:
                 raise RuntimeError(f"injected compute failure on call {self.seen} (--fail-after "
                                    f"{self.fail_after})")
             # The lock covers the whole forward, not just one piece: a request served in ws_rows
@@ -251,24 +324,41 @@ class SeamServer:
             # not interleave inside the module.
             with self.compute_lock:
                 self._forward(layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr)
-        except Exception as e:  # noqa: BLE001 - see the docstring: no safe local recovery
-            print(f"SEAM_COMPUTE_FAIL layer={layer} rows={rows} err={type(e).__name__}: {e} "
+        except Exception as e:  # noqa: BLE001 - see the docstring: return, never raise
+            # The message names the *calling* shape; only the traceback names the frame that raised.
+            # A CUDA illegal access surfaces at the next host sync (a `.tolist()`, a copy to host),
+            # so the frame is regularly several layers away from the kernel that faulted - without
+            # this, "rows=6" is the only evidence and it can be the wrong call entirely.
+            import traceback
+            trace = [ln for ln in traceback.format_exc().rstrip().splitlines()]
+            # A sticky launch failure is sticky: the probe itself raises and the context is gone.
+            if self.stub:
+                # A stub has no CUDA context that could be dead, and asking for one would create
+                # it - up to half a GiB of the same headroom the resident pack on this box needs.
+                usable = True
+            else:
+                _free_cached()
+                usable = _cuda_ok()
+            self.refusals += 1
+            print(f"SEAM_COMPUTE_{'REFUSED' if usable else 'FAIL'} layer={layer} rows={rows} "
+                  f"err={type(e).__name__}: {e} "
                   f"avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()} "
                   f"dev_{_dev_mem_mib()} "
-                  f"calls={sum(len(v) for v in _times.values())} "
-                  f"- exiting: a server that cannot compute must not answer", flush=True)
-            # The message above names the *calling* shape; only the traceback names the frame that
-            # raised. A CUDA illegal access surfaces at the next host sync (a `.tolist()`, a copy to
-            # host), so the frame is regularly several layers away from the kernel that faulted -
-            # without this, "rows=6" is the only evidence and it can be the wrong call entirely.
-            import traceback
-            for line in traceback.format_exc().rstrip().splitlines():
+                  f"calls={sum(len(v) for v in _times.values())} refusals={self.refusals} "
+                  f"cuda_ok={int(usable)} "
+                  + ("- answering nothing, the session ends, the server keeps listening"
+                     if usable else
+                     "- exiting: the CUDA context cannot run a kernel any more, so no later "
+                     "session could be served"), flush=True)
+            for line in trace:
                 print(f"SEAM_COMPUTE_TRACE {line}", flush=True)
-            sys.stderr.flush()
-            os._exit(70)
-        else:
-            with _lock:
-                _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
+            if not usable:
+                sys.stderr.flush()
+                os._exit(70)
+            return REFUSE_COMPUTE
+        with _lock:
+            _times.setdefault(int(rows), []).append((time.perf_counter_ns() - t0) / 1e3)
+        return 0
 
     def _forward(self, layer, rows, x_ptr, ids_ptr, w_ptr, out_ptr):
         """Serve one request of `rows` rows, in internal pieces of at most ws_rows.

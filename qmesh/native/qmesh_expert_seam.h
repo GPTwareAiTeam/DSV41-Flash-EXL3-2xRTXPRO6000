@@ -138,9 +138,17 @@ QES_API qes_server* qes_server_open(const char* dev_name, int gid_idx, int ctl_p
 /* Optional server-side compute hook, used by every session handle the server creates. Pointers
  * are into the pinned slab for layer L: x bf16 [rows,QES_HIDDEN], ids int32 [rows,QES_TOPK]
  * (cold-local, -1 = not on this host), w bf16 [rows,QES_TOPK], out f32 [rows,QES_HIDDEN] (must be
- * fully written on return). Set before qes_server_run. */
-typedef void (*qes_server_fn)(void* ctx, int layer, int rows, const void* x_bf16,
-                              const int32_t* ids, const void* w_bf16, float* out_f32);
+ * fully written on return). Set before qes_server_run.
+ *
+ * The return value says whether the response region holds an answer, not just that the call ran:
+ * 0 = answered, post it; nonzero = this request cannot be answered right now (the box is out of
+ * memory, the compute raised) and the response must not be sent. The proxy then writes that code
+ * into the client's slot fail word, releases the waiter's flag, ends this one session and keeps
+ * listening. A request the GX cannot compute is not a reason to kill a server that holds a 113 GiB
+ * pack and takes 150-220 s to reload. Codes, as the client's fail word receives them: 4 = out of
+ * memory, 5 = compute failed while the CUDA context is still usable. */
+typedef int (*qes_server_fn)(void* ctx, int layer, int rows, const void* x_bf16,
+                             const int32_t* ids, const void* w_bf16, float* out_f32);
 QES_API void qes_server_set_fn(qes_server* s, qes_server_fn fn, void* ctx);
 
 /* Serves sessions until qes_server_shutdown. Returns 0 on clean shutdown, -1 on a fatal local

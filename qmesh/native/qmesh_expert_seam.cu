@@ -428,19 +428,37 @@ __global__ void publish_kernel(uint64_t* seq, uint64_t* hdr_seq) {
  * that gave up still copied the response slot, which holds the *previous* answer, and returned 0:
  * measured 2026-11-01 (failstop run 1101-094834) as `CALL_OK 3 finite=True` printed right after
  * "no response ... within 30 s". A dead seam must hand the caller NaN (isfinite() false), never
- * plausible rows. */
+ * plausible rows.
+ *
+ * The same poisoning covers a *refused* request. A server that cannot answer writes a code into this
+ * fail word and then releases the flag (server_proxy), so a waiter that wakes on the flag must read
+ * the word once more: without that read the collect would copy the slot's previous answer and hand
+ * the caller 8192 plausible rows computed for another layer, which is the one failure mode that
+ * looks like success. The word is written before the flag on the same QP, so seeing the flag means
+ * the word is there. */
 __global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, uint32_t* fail,
                             float* resp, int n_floats, uint64_t timeout_ns) {
   uint64_t want = *req_seq;
-  uint64_t t0, now;
+  uint64_t t0;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
   while (true) {
     uint64_t got;
     asm volatile("ld.acquire.sys.u64 %0, [%1];" : "=l"(got) : "l"(resp_seq) : "memory");
-    if (got >= want) return;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-    if (now - t0 > timeout_ns) {
-      asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(fail), "r"(1u) : "memory");
+    bool poison = false;
+    if (got >= want) {
+      uint32_t why;
+      asm volatile("ld.acquire.sys.u32 %0, [%1];" : "=r"(why) : "l"(fail) : "memory");
+      if (!why) return;
+      poison = true;
+    } else {
+      uint64_t now;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+      if (now - t0 > timeout_ns) {
+        asm volatile("st.release.sys.u32 [%0], %1;" :: "l"(fail), "r"(1u) : "memory");
+        poison = true;
+      }
+    }
+    if (poison) {
       const float nan = __int_as_float(0x7fc00000);
       for (int i = threadIdx.x; i < n_floats; i += blockDim.x) resp[i] = nan;
       return;
@@ -449,6 +467,10 @@ __global__ void wait_kernel(const uint64_t* req_seq, const uint64_t* resp_seq, u
 }
 
 }  // namespace
+
+struct ServerSession;
+/* Defined with ServerSession itself, below: the proxy threads run long before that. */
+void session_note_reason(ServerSession* ss, const char* why);
 
 struct qes_handle {
   int role = 0, rows = 0, dev = 0, port_idx = 1, gid_idx = 0, tcp_port = 0;
@@ -496,6 +518,9 @@ struct qes_handle {
   qes_server_fn server_fn = nullptr; /* optional compute hook (server role) */
   void* server_ctx = nullptr;
   struct qes_client_session* owner = nullptr; /* client handles are unlinked on destroy */
+  /* Server handles: the session this handle serves, so a refusal can name itself in the session's
+   * end line (SEAM_SESSION_END reason=compute-refused-code-N) instead of a generic qp-error. */
+  ServerSession* sess = nullptr;
 };
 
 /* =========================================================================================
@@ -681,6 +706,32 @@ bool post_flag(qes_handle* h, size_t remote_off, uint64_t seq) {
     fflush(stderr);
     set_err("ibv_post_send flag failed (port=%d rows=%d off=%zu seq=%llu): %s", h->tcp_port,
             h->rows, remote_off, (unsigned long long)seq, strerror(rc));
+    return false;
+  }
+  return true;
+}
+
+/* Inline RDMA WRITE of one 4-byte word into the peer's slab (the server writes a refusal code into
+ * the client's slot fail word with it). Same QP as post_flag, so a code posted here is on the wire
+ * before a flag posted after it. */
+bool post_u32(qes_handle* h, size_t remote_off, uint32_t v) {
+  ibv_sge sge{};
+  sge.addr = (uint64_t)(uintptr_t)&v;
+  sge.length = 4;
+  ibv_send_wr wr{};
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.wr_id = (uint64_t)remote_off | TRACE_FLAG;
+  wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+  wr.wr.rdma.remote_addr = h->remote_base + remote_off;
+  wr.wr.rdma.rkey = h->remote_rkey;
+  ibv_send_wr* bad = nullptr;
+  const int rc = ibv_post_send(h->qp, &wr, &bad);
+  if (rc) {
+    fprintf(stderr, "qes: ibv_post_send word off=%zu v=%u failed: %s (%d)\n", remote_off, v,
+            strerror(rc), rc);
+    fflush(stderr);
     return false;
   }
   return true;
@@ -881,23 +932,40 @@ bool client_check_ids(qes_handle* h, int slot, uint64_t seq) {
 
 /* A response that never came leaves the GPU waiter with no escape hatch, so wait_kernel raises the
  * slot's fail word instead of trapping. Pick it up here, print it once, and take the handle down
- * the same way a CQ error does: the session fails with a Python exception, not a sticky CUDA error. */
+ * the same way a CQ error does: the session fails with a Python exception, not a sticky CUDA error.
+ *
+ * Two ways a request ends this way, and they are not the same news. Word 1 is a timeout: nobody
+ * answered and the transport is gone. Words 4 and 5 are the peer saying it could not compute this
+ * request - out of memory, or its compute raised - while the listener stayed up, so the right move
+ * is to reopen the bucket (the client does that lazily) or wait for room, not to restart the GX.
+ * Say which one it was; the server's own SEAM_COMPUTE_REFUSED line carries the numbers. */
 void client_proxy(qes_handle* h) {
   while (h->running.load(std::memory_order_relaxed)) {
     if (!drain_cq(h)) break;
     for (int i = 0; i < h->slots; i++) {
-      if (load_acq32(h->slab, off_fail(h, i))) {
+      const uint32_t why = load_acq32(h->slab, off_fail(h, i));
+      if (!why) continue;
+      if (why >= 4) {
+        const SlotHdr* hdr = (const SlotHdr*)(h->slab + off_hdr(h, i));
+        fprintf(stderr,
+                "qes: the server refused layer=%u rows=%u on port=%d slot=%d (code=%u: %s). The "
+                "answer is NaN and this handle is finished; the server itself stayed up and is "
+                "accepting, so the next session needs no reload. See its SEAM_COMPUTE_REFUSED "
+                "line for avail_mib/swapped_mib.\n",
+                hdr->layer, hdr->rows, h->tcp_port, i, why,
+                why == 4 ? "not enough memory on the peer" : "the peer's compute failed");
+      } else {
         fprintf(stderr,
                 "qes: no response for layer slot %d on rows=%u port=%d within %llu s "
                 "(seq=%llu answered=%llu): the seam transport is dead\n",
                 i, h->rows, h->tcp_port, (unsigned long long)(WAIT_TIMEOUT_NS / 1000000000ull),
                 (unsigned long long)load_acq(h->slab, off_freq(h, i)),
                 (unsigned long long)h->handled[i]);
-        fflush(stderr);
-        h->dead.store(true);
-        h->running.store(false);
-        return;
       }
+      fflush(stderr);
+      h->dead.store(true);
+      h->running.store(false);
+      return;
     }
     for (int i = 0; i < h->slots; i++) {
       uint64_t r = load_acq(h->slab, off_freq(h, i));
@@ -992,11 +1060,39 @@ void server_proxy(qes_handle* h) {
       const int L = (int)hdr->layer;
       const uint8_t* req = h->slab + off_req(h, i);
       const int rows = (int)hdr->rows;
+      int refused = 0;
       if (h->server_fn) {
-        h->server_fn(h->server_ctx, L, rows, req, (const int32_t*)(req + h->ids_off),
-                     req + h->w_off, (float*)(h->slab + off_resp(h, i)));
+        refused = h->server_fn(h->server_ctx, L, rows, req, (const int32_t*)(req + h->ids_off),
+                               req + h->w_off, (float*)(h->slab + off_resp(h, i)));
       } else {
         server_compute(h, i, L, rows);
+      }
+      if (refused) {
+        /* The hook could not answer: the box is out of memory, or its compute raised with the CUDA
+         * context still usable. Post no response and kill nothing. The fail word tells the client's
+         * GPU waiter to poison the slot (the caller sees NaN, never the slot's previous answer) and
+         * its proxy to print why; ending this session only means the 113 GiB pack stays resident and
+         * the next client's hello is accepted, instead of a 150-220 s reload for one request that
+         * would not fit. The fail word is posted first: RC completes in order, so the client cannot
+         * see the flag before the code that explains it. */
+        fprintf(stderr,
+                "qes: server refused layer=%d rows=%d slot=%d port=%d code=%d: ending this session, "
+                "the server keeps accepting (see the hook's SEAM_COMPUTE_REFUSED line)\n",
+                L, rows, i, h->tcp_port, refused);
+        fflush(stderr);
+        post_u32(h, off_fail(h, i), (uint32_t)refused);
+        post_flag(h, off_fresp(h, i), r);
+        /* Name it in the session's end line: the log then reads "refused code=4/5" and
+         * "SEAM_SESSION_END reason=compute-refused-code-4/5" for the same event, which is what an
+         * operator needs to tell a refusal apart from a wire fault. First reason wins. */
+        if (h->sess) {
+          char why[64];
+          snprintf(why, sizeof(why), "compute-refused-code-%d", refused);
+          session_note_reason(h->sess, why);
+        }
+        h->dead.store(true);
+        h->running.store(false);
+        return;
       }
       if (qes_trace())
         fprintf(stderr,
@@ -1592,6 +1688,14 @@ struct ServerSession {
   std::vector<qes_handle*> handles; /* owned by the session thread once it starts */
 };
 
+/* First end reason wins: a refusal names itself, a later teardown must not overwrite it. */
+void session_note_reason(ServerSession* ss, const char* why) {
+  if (!ss) return;
+  std::lock_guard<std::mutex> lk(ss->mu);
+  if (ss->reason.empty()) ss->reason = why;
+}
+
+
 namespace {
 
 std::string busy_text(qes_server* s) {
@@ -1686,6 +1790,7 @@ qes_handle* session_handle_up(qes_server* s, ServerSession* ss, int k, int fd, b
   h->owns_ctx = h->owns_pd = h->owns_slab = h->owns_mr = false;
   h->server_fn = s->fn;
   h->server_ctx = s->fn_ctx;
+  h->sess = ss;
 
   /* Fresh sequence flags for this session: the slab is reused by the next client. */
   memset(h->slab, 0, h->slab_bytes);
