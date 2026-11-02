@@ -20,7 +20,7 @@
 #   * an existing container whose spec differs: creating containers is allowed, recreating is not,
 #   * GX MemAvailable below GX_BUILD_AVAIL_GIB (checked by the builders themselves).
 #
-# Prints, in order: CUT / PLAN / CREATE|EXISTS / LINK_BOOTSTRAP? / LIB_* / EXT_* and finally
+# Prints, in order: CUT / PLAN / CREATE|EXISTS / LINK_UNPROMOTED? / LIB_* / EXT_* and finally
 #   PREPARED <pair> sha=<sha> build=<build_id> sides=<sides>
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)

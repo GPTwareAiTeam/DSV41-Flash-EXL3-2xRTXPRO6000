@@ -319,12 +319,16 @@ def cmd_apply(cfg, sha, ts, force=False):
             docker(cfg, side, ["rename", f"{ct}.bak-{ts}", ct])
             die(f"rename {new} -> {ct} failed: {err.strip()[:400]}")
         docker(cfg, side, ["start", ct])
-    cur = os.path.join(cfg["root"], "current")
-    if not os.path.lexists(cur):
-        # A container may never be wired to a release root without a current: /src/exllamav3 would
-        # dangle and every client in it would fail to import (seen 2026-11-01).
-        print(f"LINK_BOOTSTRAP {cfg['pair']} current -> releases/{sha[:12]} (first release of this pair)")
-        cmd_link(cfg, sha)
+    # A pair's first containers have no current to be wired through, and creating one here would put
+    # an unvalidated release in the place every client resolves: on 2026-11-02 `pair_prepare.sh prod`
+    # left prod/current on the new sha at 00:00, before dev had passed, which is exactly the canary
+    # rule the owner set. So the containers are wired straight at the release tree instead, and
+    # `current` stays absent until a ticket promotes this sha (flip + smoke + verify). Such a
+    # container is armed, not serving: its /src/exllamav3 names releases/<sha>/src, and nothing that
+    # resolves through /pair/current can import.
+    if not os.path.lexists(os.path.join(cfg["root"], "current")):
+        print(f"LINK_UNPROMOTED {cfg['pair']} current=absent containers->releases/{sha[:12]} "
+              f"(current moves only on a passed promote)")
     cmd_inner(cfg, sha, verify=False)
     left = [(s, w) for s, w in ((s, plan_side(cfg, s)) for s in ("p7", "gx")) if w]
     if left:
@@ -386,13 +390,21 @@ def cmd_link(cfg, sha):
 
 
 def cmd_inner(cfg, sha=None, verify=True):
-    """Inside each container: /src/exllamav3 must resolve into this release, via /pair/current.
+    """Inside each container: /src/exllamav3 must resolve into this release.
 
     readlink -f resolves the whole chain, so the answer is /pair/releases/<sha>/src, not the
     intermediate /pair/current/src -- accept either, but it has to be THIS sha.
+
+    With no current, a container being armed for its first release is wired straight at
+    releases/<sha>/src: that is a container nobody may serve from yet (no current, so nothing that
+    resolves through /pair/current can import), and it is what lets pair_prepare build inside it
+    without promoting the release first. A *verified* wiring still needs a current, because there is
+    nothing to verify a promotion against until one exists.
     """
-    if not os.path.lexists(os.path.join(cfg["root"], "current")):
+    promoted = os.path.lexists(os.path.join(cfg["root"], "current"))
+    if not promoted and (verify or not sha):
         die(f"{cfg['root']}/current is missing: refusing to wire a container to an unreleased tree")
+    target = "/pair/current/src" if promoted else f"/pair/releases/{sha}/src"
     for side in ("p7", "gx"):
         ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]
         rc, out, err = docker(cfg, side, ["inspect", "-f", "{{.State.Running}}", ct])
@@ -401,7 +413,7 @@ def cmd_inner(cfg, sha=None, verify=True):
             continue
         cmd = ("set -e; mkdir -p /src /pair; "
                "if [ ! -L /src/exllamav3 ]; then rm -rf /src/exllamav3; fi; "
-               "ln -sfn /pair/current/src /src/exllamav3")
+               f"ln -sfn {target} /src/exllamav3")
         # right after a recreate, /pair/current may not have moved yet: wire the symlink, verify later
         if verify:
             cmd += "; readlink -f /src/exllamav3"
@@ -410,7 +422,7 @@ def cmd_inner(cfg, sha=None, verify=True):
             die(f"inner symlink in {ct} failed: {err.strip()[:300]}")
         got = out.strip()
         if not verify:
-            print(f"INNER {cfg['pair']} {side} {ct} linked")
+            print(f"INNER {cfg['pair']} {side} {ct} linked{'' if promoted else ' target=' + target}")
             continue
         want_sha = sha
         if not want_sha:

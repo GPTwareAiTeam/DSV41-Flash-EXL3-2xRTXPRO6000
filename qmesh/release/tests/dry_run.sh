@@ -1,7 +1,7 @@
 #!/bin/bash
 # Dry sweep of the whole pair-update flow: stub ssh + stub docker, no container, queue or GPU touched.
 #   ./tests/dry_run.sh [pair]
-# Prints CREATE/LINK_BOOTSTRAP/INNER/APPLY/LIB/EXT/FLIP/SMOKE lines and ends with PAIR_UPDATED_DRY.
+# Prints CREATE/LINK_UNPROMOTED/INNER/APPLY/LIB/EXT/FLIP/SMOKE lines and ends with PAIR_UPDATED_DRY.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); REL=$(dirname "$HERE")
 PAIR=${1:-dev}

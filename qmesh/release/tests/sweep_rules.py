@@ -74,7 +74,12 @@ out = msg.getvalue()
 runs = [a for _, a in calls if a.startswith("run ")]
 check("creates seam-p7-dev and seam-gx2-dev", any("seam-p7-dev" in a for a in runs) and any("seam-gx2-dev" in a for a in runs), str(runs)[:200])
 check("never renames an existing container", not any(a.startswith("rename") for _, a in calls))
-check("bootstrap current before wiring", "LINK_BOOTSTRAP" in out and links == ["link"] and inners == [False], out.strip()[:300])
+# The owner's rule: a release reaches a pair's `current` only through a passed promote. prepare may
+# arm the containers (they are idle, no current, nothing that resolves through /pair/current can
+# import), but creating prod/current at 00:00 on 2026-11-02 before dev had passed was a promote.
+check("prepare never creates current", "LINK_UNPROMOTED" in out and "LINK_BOOTSTRAP" not in out,
+      out.strip()[:300])
+check("prepare promotes nothing", links == [] and inners == [False], f"links={links} inners={inners}")
 check("no PAIR_ALLOW_RECREATE needed for a fresh pair", True)
 
 # inner without current
@@ -84,6 +89,20 @@ spec2 = importlib.util.spec_from_file_location("pc2", os.path.join(HERE, "pair_c
 pc2 = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(pc2)
 m = die_msg(pc2.cmd_inner, cfg2, "abc123")
 check("inner refuses a release root without current", "current is missing" in m, m)
+execed = []
+def fake_docker2(cfg, side, args, stdin=None, **kw):
+    if args[0] == "inspect":
+        return (0, "true\n", "")
+    if args[0] == "exec":
+        execed.append(args[-1])
+    return (0, "", "")
+pc2.docker = fake_docker2
+msg = io.StringIO()
+with contextlib.redirect_stdout(msg):
+    pc2.cmd_inner(cfg2, "abc123", verify=False)
+check("an unpromoted container is wired straight at the release",
+      any("ln -sfn /pair/releases/abc123/src /src/exllamav3" in c for c in execed)
+      and "target=/pair/releases/abc123/src" in msg.getvalue(), msg.getvalue().strip()[:200])
 
 # The ext cache is only reusable by a client if the builder spells the include path the way the
 # client does; these greps keep the two halves of that invariant from drifting apart again.
