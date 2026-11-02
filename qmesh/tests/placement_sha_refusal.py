@@ -36,9 +36,10 @@ def open_control(host, port):
 def main():
     host = os.environ.get("SEAM_HOST", "127.0.0.1")
     port = int(os.environ.get("SEAM_PORT", "47399"))
-    mine = (seam_placement.current_sha() or "").strip()
-    path = seam_placement.current_path()
-    print(f"PLACEMENT_REFUSAL client_path={path} client_sha={mine[:16] or 'unset'}", flush=True)
+    # Load the client's table the way a real client does (PLACEMENT first, then the pack manifest):
+    # current_sha() is only set by load(), and the shipping check compares against it.
+    _placement, path, mine = seam_placement.load()
+    mine = (mine or "").strip()
 
     ctl = open_control(host, port)
     srv = (getattr(ctl, "placement_sha", "") or "").strip()
