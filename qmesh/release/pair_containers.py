@@ -92,6 +92,16 @@ def spec(cfg, side):
     if spec["name"] != ct:
         die(f"{path} says name={spec['name']} but pairs.conf says {ct}")
     spec = json.loads(json.dumps(spec).replace("__PAIR_ROOT__", cfg["root"]))
+    # The owner's pack rule (2026-11-02): an expert pack lives on the local drive of the box that
+    # serves it. /mnt is the network drive on P7 and NFS from P7 on the GX boxes, so a mount there
+    # would have the pair read its experts across the wire (or, worse, a 12 TB drive that is not this
+    # box's). The spec is the only place a mount can enter a container, so refuse it here: plan, apply
+    # and the smoke all go through this function, and a stale spec can no longer reintroduce it.
+    for src, dst in spec.get("mounts") or []:
+        for p in (src, dst):
+            if p == "/mnt" or p.startswith("/mnt/"):
+                die(f"SPEC_REFUSED {path}: mount {dst}={src} is under /mnt; a pack lives on the "
+                    f"serving box's own disk, so a container may not mount the network drive")
     return spec
 
 
@@ -154,17 +164,23 @@ def plan_side(cfg, side):
     if list(got["cmd"]) != list(want["cmd"]):
         why.append(f"cmd={got['cmd']}")
     for src, dst in want["mounts"]:
-        if got["mounts"].get(dst) != src:
-            why.append(f"mount:{dst}={got['mounts'].get(dst) or '-'} want={src}")
+        seen = got["mounts"].get(dst)
+        if seen != src:
+            # `~` wrong source, `+` wanted but absent. Nothing here ever means "add a mount" for a
+            # mount the live container has and the spec does not -- that is the next loop, and it
+            # removes. (A removed mount used to print as `mount:+<dst>=<src>`, which read as an add.)
+            why.append(f"mount:~{dst}={seen} want={src}" if seen
+                       else f"mount:+{dst}=absent want={src}")
     # A mount the spec no longer names is drift, not history. The P7 containers were once given the
     # 12 TB /mnt/data12 drive; the owner's pack rule (2026-11-02: packs live on the serving box's own
     # disk) drops it from the spec. Comparing only the wanted mounts made that removal invisible --
     # plan said "unchanged" and the next flip would have kept the drive in place. An extra live mount
-    # is reported here and leaves only when the container is recreated at a queued update.
+    # is reported here as a removal (`mount:-`) and leaves when the container is recreated at a queued
+    # update; the spec itself may not name /mnt at all (SPEC_REFUSED in spec()).
     wanted_dst = {dst for _src, dst in want["mounts"]}
     for dst, src in sorted(got["mounts"].items()):
         if dst not in wanted_dst:
-            why.append(f"mount:+{dst}={src}")
+            why.append(f"mount:-{dst}={src} (not in spec)")
     for k, v in want["env"].items():
         if got["env"].get(k) != v:
             why.append(f"env:{k}={got['env'].get(k) or '-'} want={v}")

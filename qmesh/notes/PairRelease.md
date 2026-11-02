@@ -477,3 +477,27 @@ cost -7%/-22% (32k/65k tok/s) against `1d5d49f7`; a single 4096-row piece runs 2
 but wants ~1 GiB of GX headroom and neither box has it while paging. A picker may adapt to that on
 its own, which is exactly why `AUTO=0` is the other half of the pin: the pair has to run the shape
 its numbers were taken on, not the one the server judges affordable this minute.
+
+### The pack lives where the box serves it, proven by device, and the gate is binding
+
+The P7 containers were given `/models` (a directory on the 1.9 TB root disk) when the 4 TB pool is
+`/models/dsv41`; the pack was reachable only because the 12 TB drive happened to be mounted under
+that tree. Both P7 specs now mount the pool itself (`/models/dsv41:/models/dsv41`), and
+`pair_pack_disk.py` no longer trusts a path prefix: it probes the pool and compares `st_dev` with the
+pack, the placement file and every link target, refusing a pack that is merely *under* the pool path
+on another device (`p7:pack:… is on device 66305, but /models/dsv41 is device 66306`). On the GX side
+`/cold` must share the home directory's device, so a `/cold` that resolves into `/mnt` (P7's disk over
+NFS) is refused even when the string looks local. `/mnt` in any spec is refused by the loader
+(`SPEC_REFUSED`, exit 2) and reported, not thrown, by the checker (`PACK_DISK_FAIL`, rc 3); the plan
+renders a removal as `mount:-<dst>=<src> (not in spec)`, a wrong source as `~`, an absent wanted
+mount as `+…absent`, so dropping the 12 TB mount can never read like adding it.
+
+The GX gate is binding for every launch, not only the smoke that takes it: `seam_server_ensure.sh`
+calls `seam_gate_check` before it touches the box and refuses with rc 3, naming the state
+(`gate_free`, `gate_bad`, `gate_expired`, `gate_stale`, `gate_foreign`) and the owner/pid/until. It
+only ever *checks* a self or ancestor claim — a permanent claim by a restarted server would deadlock
+the next ticket — and `pair_gx_gate_state` now treats a claim whose pid is gone as free. The dispatch
+passes the real status through (`exit $?`), so a box-busy refusal no longer arrives as
+`server_timeout_or_died` after 900 s. The preflight names the holder as `server_in=<ct>:<pid>` and
+`mem_in=<ct> <MiB>` (`held_by=… top_mem=…`), and checks `gx-busy` before `gx-mem`: on 2026-11-02 the
+memory line fired first and blamed a full box when the pack and port belonged to `seam-gx2-4460`.

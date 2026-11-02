@@ -6,7 +6,7 @@
   "cmd": ["infinity"],
   "mounts": [
     ["__PAIR_ROOT__", "/pair"],
-    ["/models", "/models"],
+    ["/models/dsv41", "/models/dsv41"],
     ["/usr/local/cuda", "/opt/cuda"],
     ["/home/treadall/recipe-artifacts", "/artifacts"]
   ],

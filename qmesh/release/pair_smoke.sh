@@ -143,6 +143,7 @@ if [ "$PACK_MIB" -gt 0 ]; then
 fi
 pair_step "SMOKE_SERVER_START pair=$PAIR ct=$GXCT build=$BUILD_ID buckets=$SMOKE_BUCKETS timeout=${SMOKE_SERVER_TIMEOUT}s"
 srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT \
+          SEAM_GATE_DIR="$(dirname "$(pair_gx_gate_file)")" \
           SERVER_BUCKETS=$SMOKE_BUCKETS SEAM_SERVER_TIMEOUT=$SMOKE_SERVER_TIMEOUT \
           SEAM_SLACK_GATE=$SMOKE_SLACK_GATE SEAM_SLAB_SLOTS=$SMOKE_SLAB_SLOTS \
           SEAM_ENV="$(pair_server_env "$BUILD_ID")" \
@@ -150,9 +151,10 @@ srv_out=$(GX=$GX CT=$GXCT GX_DEV=${GX_DEV:-rocep1s0f0} GX_GID=$GX_GID PORT=$PORT
 srv_rc=$?
 [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$srv_out" >> "$PAIR_LOG"
 printf '%s\n' "$srv_out" | grep -E '^(SEAM_ENSURE|SEAM_SLACK|SEAM_NO_MEMORY|SEAM_NO_PACK)' | sed 's/^/SMOKE_SERVER /'
-# The worker refuses to load a pack that does not fit in MemAvailable and exits 3 -- but the ensure
-# wrapper reports "died" (rc 2) for that too, so the verdict has to be read from the line, not from
-# rc alone. Otherwise a box that is merely full is reported as a bad release and rolled back.
+# The worker refuses to load a pack that does not fit in MemAvailable; that refusal happens inside the
+# container and reaches us as the worker's own line, so the verdict is read from the text as well as
+# from the status. The ensure passes its real status through (it used to map every failure to 2), so a
+# refusal before the load arrives as rc 3 and the line names the container and pid that said no.
 case "$srv_out" in
   *SEAM_NO_MEMORY*)
     fail "memory server_no_memory $(printf '%s' "$srv_out" | grep -m1 SEAM_NO_MEMORY)" ;;
@@ -164,8 +166,12 @@ case "$srv_rc" in
   3) line=$(printf '%s' "$srv_out" | grep -m1 PREFLIGHT_FAIL)
      case "$line" in
        # the box, not the release, said no: the ticket keeps the code and says so (memory_fail)
-       *gx-mem*) fail "memory server_preflight $line" ;;
-       *)        fail "server_preflight_refused $line" ;;
+       *gx-mem*)  fail "memory server_preflight $line" ;;
+       # another container's server holds the pack and the port: roll back, free the pair, and name it
+       # (2026-11-02: "server_timeout_or_died" hid seam-gx2-4460 for the whole 900 s timeout).
+       *gx-busy*) fail "gx_busy server_preflight $line" ;;
+       *gate_*)   fail "gx_gate server_preflight $line" ;;
+       *)         fail "server_preflight_refused $line" ;;
      esac
      ;;
   4) fail "memory server_slack $(printf '%s' "$srv_out" | grep -m1 SEAM_SLACK)"

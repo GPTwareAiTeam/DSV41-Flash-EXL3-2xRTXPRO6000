@@ -33,9 +33,14 @@ def check(name, cond, detail=""):
         fails += 1
 
 
-def probe_d(real="/models/dsv41/pack", fstype="ext4", links=(), missing=None, failed=None):
-    return {"real": real, "fstype": fstype, "links": list(links), "missing": missing,
+def probe_d(real="/models/dsv41/pack", fstype="ext4", links=(), missing=None, failed=None,
+            dev="66306"):
+    return {"real": real, "fstype": fstype, "dev": dev, "links": list(links), "missing": missing,
             "real_failed": failed, "rc": 0, "err": ""}
+
+
+POOL_DEV = "66306"        # /dev/nvme1n1p1, the 4 TB pool, mounted at /models/dsv41
+ROOT_DEV = "66305"        # /dev/nvme0n1p2, the 1.9 TB root disk that holds the /models directory
 
 
 def p7_spec(mounts):
@@ -45,17 +50,26 @@ def p7_spec(mounts):
 def gx_spec(mounts):
     return {"mounts": mounts}
 
-GOOD_P7 = p7_spec([["__PAIR_ROOT__", "/pair"], ["/models", "/models"], ["/usr/local/cuda", "/opt/cuda"]])
-GOOD_GX = gx_spec([["__PAIR_ROOT__", "/pair"], ["__GX_HOME__/exl3-cold-pack-4460", "/cold"]])
+
+GOOD_P7 = p7_spec([["__PAIR_ROOT__", "/pair"], ["/models/dsv41", "/models/dsv41"],
+                   ["/usr/local/cuda", "/opt/cuda"]])
+GOOD_GX = gx_spec([["__PAIR_ROOT__", "/pair"], ["/home/treadall/exl3-cold-pack-4460", "/cold"]])
 
 
-def run(p7spec, p7probe, gxspec=None, gxprobe=None, placement=None):
+def run(p7spec, p7probe, gxspec=None, gxprobe=None, placement=None, poolprobe=None, homeprobe=None):
     """-> (fails, printed) with spec and probe stubbed."""
-    pd.pc.spec = lambda cfg, side: p7spec if side == "p7" else (gxspec if gxspec else GOOD_GX)
+    pd.spec_mounts = lambda cfg, side: [tuple(m) for m in
+                                        (p7spec if side == "p7" else (gxspec or GOOD_GX))["mounts"]]
     pd.manifest_refs = lambda pack: (placement, None)
 
     def fake_probe(host, path):
-        return p7probe if host is None else (gxprobe or probe_d("/home/x/exl3-cold-pack-4460"))
+        if host is None:
+            if path == pd.P7_ALLOW:
+                return poolprobe or probe_d(real=pd.P7_ALLOW, dev=POOL_DEV)
+            return p7probe
+        if path == "/home/treadall":
+            return homeprobe or probe_d(real="/home/treadall", dev=ROOT_DEV)
+        return gxprobe or probe_d("/home/treadall/exl3-cold-pack-4460", dev=ROOT_DEV)
     pd.probe = fake_probe
     out = []
     with contextlib.redirect_stdout(io.StringIO()) as buf:
@@ -74,12 +88,29 @@ fs, _ = run(p7_spec(GOOD_P7["mounts"] + [["/mnt/data12/models/exl3", "/mnt/data1
 check("a P7 mount naming the 12 TB drive is refused",
       any(w == "mount" and p == "/mnt/data12/models/exl3" and "12 TB" in r for s, w, p, r in fs), reasons(fs))
 
-# 2. /models must be the drive itself, not a bind of a subdirectory of someone else's tree
-fs, _ = run(p7_spec([["__PAIR_ROOT__", "/pair"], ["/mnt/data12/models", "/models"]]), probe_d())
-check("a /models mount from another disk is refused",
-      any(w == "mount" and p == "/models" for s, w, p, r in fs), reasons(fs))
+# 2. the spec must mount the pool itself. /models is a directory on the 1.9 TB root disk with the
+#    4 TB NVMe mounted inside it, so a /models:/models bind exposes the pool only by accident and a
+#    string test cannot say which device a pack landed on.
+fs, _ = run(p7_spec([["__PAIR_ROOT__", "/pair"], ["/models", "/models"]]), probe_d())
+check("a spec that mounts the /models directory instead of the pool is refused",
+      any(w == "mount" and p == "/models/dsv41" for s, w, p, r in fs), reasons(fs))
+fs, _ = run(p7_spec([["__PAIR_ROOT__", "/pair"], ["/mnt/data12/models", "/models/dsv41"]]), probe_d())
+check("a pool mounted from another disk is refused",
+      any(w == "mount" and p == "/models/dsv41" and "not from the pool itself" in r for s, w, p, r in fs),
+      reasons(fs))
+fs, _ = run(GOOD_P7, probe_d(), placement="/models/dsv41/placement.json")
+check("the pool mounted from itself, a pack on its device, passes", not fs, reasons(fs))
 
-# 3. the pack itself, and everything a link inside it resolves to, stays under the P7 root
+# 3. st_dev, not a path prefix: a pack that is under /models/dsv41 but on the root disk is not on the pool
+fs, _ = run(GOOD_P7, probe_d(real="/models/dsv41/pack", dev=ROOT_DEV))
+check("a pack under the pool path but on another device is refused",
+      any(w == "pack" and "is on device" in r for s, w, p, r in fs), reasons(fs))
+fs, _ = run(GOOD_P7, probe_d(dev=ROOT_DEV), placement="/models/dsv41/placement.json",
+            poolprobe=probe_d(real=pd.P7_ALLOW, dev=ROOT_DEV))
+check("a pool and a pack on the same device pass even when it is not the 4 TB one",
+      not fs, reasons(fs))
+
+# 4. the pack itself, and everything a link inside it resolves to, stays under the P7 root
 fs, _ = run(GOOD_P7, probe_d(real="/mnt/data12/models/pack"))
 check("a pack that resolves outside the P7 drive is refused",
       any(w == "pack" and "/mnt/data12/models/pack" in r for s, w, p, r in fs), reasons(fs))
@@ -91,21 +122,23 @@ check("a pack's link into the 12 TB drive is refused",
 fs, _ = run(GOOD_P7, probe_d(links=[("/models/dsv41/pack/x.safetensors", "/models/dsv41/serve/x.safetensors")]))
 check("a link that stays on the P7 drive passes", not fs, reasons(fs))
 
-# 4. a pack on a network filesystem is refused even when its path looks local
+# 5. a pack on a network filesystem is refused even when its path looks local
 fs, _ = run(GOOD_P7, probe_d(fstype="nfs4"))
 check("a pack on an NFS mount is refused", any("sits on nfs4" in r for s, w, p, r in fs), reasons(fs))
+fs, _ = run(GOOD_P7, probe_d(), poolprobe=probe_d(real=pd.P7_ALLOW, fstype="nfs4", dev=POOL_DEV))
+check("a pool on NFS is refused", any(w == "pool" and "own NVMe" in r for s, w, p, r in fs), reasons(fs))
 
-# 5. the manifest's placement profile is read at serving time and is a pack path too
+# 6. the manifest's placement profile is read at serving time and is a pack path too
 fs, _ = run(GOOD_P7, probe_d(real="/mnt/x"), placement="/mnt/data12/packs/placement.json")
 check("a placement profile outside the P7 drive is refused",
       any(w == "placement" for s, w, p, r in fs), reasons(fs))
 
-# 6. the GX half: /cold on the box's own disk, never /mnt (P7 over NFS) and never NFS at all
+# 7. the GX half: /cold on the box's own disk, never /mnt (P7 over NFS) and never NFS at all
 fs, _ = run(GOOD_P7, probe_d(),
             gx_spec(GOOD_GX["mounts"] + [["/mnt/data12/models/exl3", "/mnt/data12/models/exl3"]]))
 check("a GX mount naming /mnt is refused", any(s == "gx" and w == "mount" for s, w, p, r in fs), reasons(fs))
 fs, _ = run(GOOD_P7, probe_d(),
-            gxprobe=probe_d(real="/mnt/data12/models/exl3-cold-pack-4460"))
+            gxprobe=probe_d(real="/mnt/data12/models/exl3-cold-pack-4460", dev=ROOT_DEV))
 check("a GX pack under /mnt is refused",
       any(s == "gx" and w == "pack" and "under /mnt" in r for s, w, p, r in fs), reasons(fs))
 fs, _ = run(GOOD_P7, probe_d(), gxprobe=probe_d(fstype="nfs"))
@@ -116,6 +149,13 @@ fs, _ = run(GOOD_P7, probe_d())
 check("a local GX pack with no links passes", not fs, reasons(fs))
 fs, _ = run(GOOD_P7, probe_d(), gxprobe=probe_d(links=[("/home/x/pack/a", "/net/host/pack/a")]))
 check("a GX link into /net is refused", any(s == "gx" and w == "link" for s, w, p, r in fs), reasons(fs))
+fs, _ = run(GOOD_P7, probe_d(),
+            gxprobe=probe_d("/home/treadall/exl3-cold-pack-4460", dev=POOL_DEV))
+check("a GX pack on another device than the box's own disk is refused",
+      any(s == "gx" and w == "pack" and "root NVMe" in r for s, w, p, r in fs), reasons(fs))
+fs, _ = run(GOOD_P7, probe_d(), homeprobe=probe_d(missing="/home/treadall"))
+check("a GX whose own disk cannot be probed is refused",
+      any(s == "gx" and w == "home" for s, w, p, r in fs), reasons(fs))
 
 # 7. end to end over a real tree: the shipped hot pack carries links, and a link into the 12 TB drive
 #    (which is what the 4460 pack did through its overlay before 2026-11-02) must be caught by the
@@ -139,6 +179,10 @@ try:
     open(os.path.join(root, "packs", "placement.json"), "w").write("{}")
     pd.P7_ALLOW, pd.P7_PACK = root, pack
     pd.pc.spec = lambda cfg, side: GOOD_P7 if side == "p7" else GOOD_GX
+    pd.spec_mounts = lambda cfg, side: ([["__PAIR_ROOT__", "/pair"], [root, root]]
+                                        if side == "p7" else
+                                        [["__PAIR_ROOT__", "/pair"],
+                                         ["/home/treadall/exl3-cold-pack-4460", "/cold"]])
     pd.probe = lambda host, path: probe_d("/home/x/exl3-cold-pack-4460")
     real_probe = pd.probe
     # p7 paths are read locally by the checker itself, so restore the real probe for host None only.

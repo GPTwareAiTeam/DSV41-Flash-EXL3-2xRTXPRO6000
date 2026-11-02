@@ -4,6 +4,7 @@ os.environ["PAIR_QUEUE_ROOT"] = "/tmp/sweepq"
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 spec = importlib.util.spec_from_file_location("pc", os.path.join(HERE, "pair_containers.py"))
 pc = importlib.util.module_from_spec(spec); spec.loader.exec_module(pc)
+_REAL_PLAN = pc.plan_side   # the apply test below stubs the module attribute; the arrow tests need the real one
 
 fails = []
 def check(name, cond, detail=""):
@@ -389,10 +390,10 @@ import json as _json
 for _pair, _ct in (("prod", "seam-p7-prod"), ("dev", "seam-p7-dev")):
     _sp = _json.load(open(os.path.join(HERE, "containers", f"{_pair}-p7.json")))
     _mt = _sp.get("mounts") or []
-    check(f"{_pair}'s P7 spec mounts nothing from /mnt",
-          not any(s.startswith("/mnt") or d.startswith("/mnt") for s, d in _mt), str(_mt))
-    check(f"{_pair}'s P7 spec mounts the drive itself at /models",
-          any(d == "/models" and s == "/models" for s, d in _mt), str(_mt))
+    check(f"{_pair}'s P7 spec mounts the pool itself at /models/dsv41",
+          any(d == "/models/dsv41" and s == "/models/dsv41" for s, d in _mt), str(_mt))
+    check(f"{_pair}'s P7 spec does not mount the /models directory (root disk)",
+          not any(d == "/models" for s, d in _mt), str(_mt))
 check("prepare gates on the pack's disk before it cuts",
       "pair_pack_disk.py" in src("pair_prepare.sh")
       and src("pair_prepare.sh").index("pair_pack_disk.py") < src("pair_prepare.sh").index("pair_cut.sh"),
@@ -425,5 +426,104 @@ check("the flip-only ticket re-creates through the containers tool",
 check("promote can carry the same permission",
       "--recreate) RECREATE=1" in src("pair_promote.sh") and 'cmd+=(--recreate)' in src("pair_promote.sh"), "")
 
+
+# The gate is binding for every launch, not only for the smoke that takes it. seam_server_ensure.sh is
+# the one program that starts a GX server, so the check lives there: on a missing, expired, stale or
+# foreign claim it refuses with rc 3 and names the state, and it runs before anything on the box is
+# touched. The dispatch must pass that status through -- the old `|| exit 2` turned every refusal into
+# "server_timeout_or_died", which is how a foreign pack load hid for a whole 900 s timeout.
+_ens = src("seam_server_ensure.sh")
+_ensure_body = _ens[_ens.index("seam_server_ensure() {"):]
+check("the ensure checks the gate before it touches the box",
+      "seam_gate_check" in _ensure_body
+      and _ensure_body.index("seam_gate_check") < _ensure_body.index("seam_pids"),
+      "")
+check("a missing or foreign claim is refused by name, with the reason",
+      all(x in _ens for x in ("gate_free owner=none", "gate_expired owner=", "gate_stale owner=",
+                              "gate_foreign owner=", "PREFLIGHT_FAIL gate_bad")), "")
+_disp = _ens[_ens.rindex('if [ "${BASH_SOURCE[0]}" = "$0" ]'):]
+check("the ensure exits with its real status",
+      'seam_server_ensure "$@"' in _disp and "exit $?" in _disp and "|| exit 2" not in _disp,
+      " | ".join(_disp.splitlines()))
+check("the ensure only checks the claim, it never takes or drops it",
+      not re.search(r"^\s*pair_gx_gate_(take|down)\b", _ens, re.M), "")
+check("the dead-holder rule lives in pair_lib too",
+      "kill -0 \"$p\"" in src("pair_lib.sh"), "")
+check("the smoke hands the ensure the gate directory it actually claims in",
+      'SEAM_GATE_DIR="$(dirname "$(pair_gx_gate_file)")"' in src("pair_smoke.sh"), "")
+check("a busy box is classified apart from a memory-tight one",
+      '*gx-busy*) fail "gx_busy server_preflight $line"' in src("pair_smoke.sh")
+      and "*gx-mem*)  fail \"memory server_preflight" in src("pair_smoke.sh"), "")
+
+# Preflight order: the other container's server explains the missing memory, so it is reported first,
+# and both refusals name the holder. On 2026-11-02 the memory line fired first and read
+# "avail=0GiB need=115GiB" about a box whose pack (and port) belonged to seam-gx2-4460, pid 1083950.
+_pf = _ens[_ens.index("seam_preflight() {"):_ens.index("seam_server_ensure() {")]
+check("a foreign server is named with its container and pid",
+      'echo "server_in=\\$c:\\$p"' in _pf, "")
+check("the busy-box refusal comes before the memory refusal",
+      _pf.index("gx-busy") < _pf.index("gx-mem avail="), "")
+check("the memory refusal names the holder and the heaviest container",
+      "held_by=${other:-none} top_mem=$top" in _pf and "memory.current" in _pf, "")
+
+# Plan arrows: `mount:-` is a removal, `~` a wrong source, `+` a wanted mount that is absent. The
+# removal used to print as `mount:+<dst>=<src>`, i.e. exactly like an add, on the very line that
+# documents dropping the 12 TB mount from the P7 spec.
+_cfg = pc.load_conf("dev")
+_want = pc.spec(_cfg, "p7")
+_got = {"running": True, "image": _want["image"], "workdir": _want["workdir"],
+        "entrypoint": [_want["entrypoint"]], "cmd": list(_want["cmd"]),
+        "mounts": {d: s for s, d in _want["mounts"]}, "env": dict(_want["env"]),
+        "network": "host", "ipc": "host", "shm": 64 * 1024 ** 3, "security": ["label=disable"],
+        "ulimits": {"memlock": -1}, "devices": ["/dev/infiniband"], "gpus": True, "restart": "no"}
+pc.live = lambda cfg, side: _got
+_base = _REAL_PLAN(_cfg, "p7") or []
+check("an unchanged container plans nothing (baseline for the mount arrows)",
+      not [w for w in _base if w.startswith("mount")], str(_base))
+_got["mounts"]["/mnt/data12/models/exl3"] = "/mnt/data12/models/exl3"
+_why = " ".join(_REAL_PLAN(_cfg, "p7") or [])
+check("an extra live mount is planned as a removal, not an add",
+      "mount:-/mnt/data12/models/exl3=/mnt/data12/models/exl3 (not in spec)" in _why
+      and "mount:+/mnt/data12" not in _why, _why)
+del _got["mounts"]["/mnt/data12/models/exl3"]
+_d0 = sorted(_got["mounts"])[0]
+_s0 = _got["mounts"][_d0]
+_got["mounts"][_d0] = "/wrong/place"
+_why = " ".join(_REAL_PLAN(_cfg, "p7") or [])
+check("a mount from the wrong source is planned as ~", f"mount:~{_d0}=" in _why, _why)
+_got["mounts"].pop(_d0)
+_why = " ".join(_REAL_PLAN(_cfg, "p7") or [])
+check("a wanted mount that is absent is planned as + … absent",
+      f"mount:+{_d0}=absent want={_s0}" in _why, _why)
+del pc.live
+
+# A spec that names /mnt is refused by the loader (plan, apply, smoke) and reported, not aborted, by the
+# pack check: an operator who pastes the 12 TB mount back must get a refusal that says which mount and
+# why, not a traceback.
+import tempfile as _tf
+_W = _tf.mkdtemp(prefix="specmnt.")
+_old_spec = pc.SPEC_DIR
+try:
+    pc.SPEC_DIR = _W
+    _bad = {"name": "seam-p7-dev", "image": "img", "workdir": "/src", "entrypoint": "/bin/bash",
+            "mounts": [["/mnt/data12/models/exl3", "/mnt/data12/models/exl3"]], "env": {}, "args": [],
+            "cmd": []}
+    _json.dump(_bad, open(os.path.join(_W, "dev-p7.json"), "w"))
+    _m = die_msg(pc.spec, pc.load_conf("dev"), "p7")
+    check("a P7 spec that mounts /mnt is refused by the loader",
+          "SPEC_REFUSED" in _m and "own disk" in _m, _m)
+    _bad["name"] = "seam-gx2-dev"
+    _json.dump(_bad, open(os.path.join(_W, "dev-gx.json"), "w"))
+    _m = die_msg(pc.spec, pc.load_conf("dev"), "gx")
+    check("a GX spec that mounts /mnt is refused by the loader", "SPEC_REFUSED" in _m, _m)
+finally:
+    pc.SPEC_DIR = _old_spec
+    import shutil as _sh
+    _sh.rmtree(_W, ignore_errors=True)
+check("the pack check reads the spec's mounts raw so a bad mount is a report, not an abort",
+      "spec_mounts(" in src("pair_pack_disk.py") and "pc.spec(cfg, \"p7\")" not in src("pair_pack_disk.py")
+      and "pc.spec(cfg, \"gx\")" not in src("pair_pack_disk.py"), "")
+check("the ensure gate has its own battery",
+      os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
 sys.exit(1 if fails else 0)

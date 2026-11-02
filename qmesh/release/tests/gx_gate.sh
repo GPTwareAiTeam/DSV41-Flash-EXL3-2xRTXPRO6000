@@ -27,13 +27,15 @@ eq() { if [ "$2" = "$3" ]; then echo "OK   $1"; else echo "FAIL $1 (wanted '$2',
 eq "the gate names the box from the container" "$W/gx2.gate" "$(pair_gx_gate_file)"
 eq "no file means free" free "$(pair_gx_gate_state)"
 
-printf 'owner=Experiment pid=999999 until=%s\n' "$(( $(date +%s) + 600 ))" > "$f"
+# A live foreign claim: a real process holds it (a dead pid is free, which the next case pins).
+sleep 300 & foreign=$!
+printf 'owner=Experiment pid=%s until=%s\n' "$foreign" "$(( $(date +%s) + 600 ))" > "$f"
 want "a live foreign claim reads as taken" '^Experiment until=[0-9]*$' "$(pair_gx_gate_state)"
 if pair_gx_gate_take mine 5 0; then echo "FAIL take_foreign (took a live foreign claim)"; fails=$((fails + 1));
 else echo "OK   take_foreign (refused)"; fi
 want "take_foreign left the foreign line alone" '^owner=Experiment ' "$(cat "$f" | tr '\n' ' ')"
 
-printf 'owner=Experiment pid=999999 until=%s\n' "$(( $(date +%s) - 1 ))" > "$f"
+printf 'owner=Experiment pid=%s until=%s\n' "$foreign" "$(( $(date +%s) - 1 ))" > "$f"
 eq "an expired claim is free" free "$(pair_gx_gate_state)"
 if pair_gx_gate_take mine 5 0; then echo "OK   take_expired"; else echo "FAIL take_expired"; fails=$((fails + 1)); fi
 want "take_expired wrote our line" '^owner=mine pid='"$$"' until=' "$(cat "$f" | tr '\n' ' ')"
@@ -56,6 +58,7 @@ pair_gx_gate_down
 rm -f "$f"; PAIR_DRY=1; pair_gx_gate_take dry 5 0; PAIR_DRY=0
 [ -f "$f" ] && { echo "FAIL dry_writes_nothing (a dry run claimed the box)"; fails=$((fails + 1)); } || echo "OK   dry_writes_nothing"
 
+kill "$foreign" 2>/dev/null
 rm -rf "$W"
 echo "RESULT $( [ "$fails" = 0 ] && echo PASS || echo FAIL ) fails=$fails"
 [ "$fails" = 0 ]

@@ -134,13 +134,19 @@ pair_gx_gate_file() {  # -> <queue dir>/gx{N}.gate, N from the GX container name
   local n=${GXCT#seam-gx}
   printf '%s\n' "${PAIR_GATE_DIR:-$PAIR_HOME/recipe-artifacts/gpu0-gx1/queue}/gx${n%%-*}.gate"
 }
-pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until is free
-  local f o u; f=$(pair_gx_gate_file)
+pair_gx_gate_state() {  # -> "free" or "<owner> until=<epoch>"; a past until or a dead holder is free
+  local f o p u; f=$(pair_gx_gate_file)
   [ -f "$f" ] || { echo free; return 0; }
   o=$(sed -n 's/^owner=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  p=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   u=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   case "${u:-}" in ''|*[!0-9]*) echo "foreign_bad_gate ${o:-?}"; return 0 ;; esac
-  if [ "$u" -lt "$(date +%s)" ]; then echo free; else echo "${o:-?} until=$u"; fi
+  if [ "$u" -lt "$(date +%s)" ]; then echo free; return 0; fi
+  # A killed job leaves its claim behind. Every claim is written by a process on this host, so a pid
+  # that is gone means nobody is holding the box; without this a killed job locked the GX for its
+  # whole until and the next smoke waited its 20 minutes out.
+  if [ -n "${p:-}" ] && ! kill -0 "$p" 2>/dev/null; then echo free; return 0; fi
+  echo "${o:-?} until=$u"
 }
 pair_gx_gate_up() {  # <label> <minutes>
   local f; f=$(pair_gx_gate_file)
