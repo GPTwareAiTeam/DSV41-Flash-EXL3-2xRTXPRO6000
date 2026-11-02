@@ -185,7 +185,33 @@ start=$(date +%s); deadline=$((start + MAXMIN * 60)); hard=$((start + HARD_CAP_M
 # 2026-11-02 after GxPort2 held gx2.gate 26 minutes from outside the queue.
 export GPU_TICKET_HARDCAP=$hard
 printf 'hardcap=%s\n' "$hard" >>"$ticket" 2>/dev/null
-log "start $AGENT max=${MAXMIN}m hardcap=${HARD_CAP_MIN}m load=$(cut -d" " -f1 /proc/loadavg)"
+# Every ticket leaves a log, whether or not the agent wraps its command in tee. On 2026-11-02 a
+# canary ended rc=2 after 175 s and *nothing* recorded why: the ticket carried no PAIR_LOG, its
+# stdout was the launching terminal's, and the process that owned the terminal exited in the same
+# second. The wrapper knows the start time and the agent name; it does not know what the command
+# will print, so it captures all of it, keeps the terminal copy, and names the file in the `start`
+# line. `GPU_TICKET_LOG` is exported for scripts that write their own lines into the same file.
+#
+#   setsid bash -c 'exec "$@" > >(tee -a --output-error=warn "$0") 2>&1' <log> <command...>
+#
+# The `exec` keeps the pid, so `kill -- -$cpid` still hits the command's own process group (tee sits
+# in that group too), and the exit status is the command's, not tee's. `--output-error=warn` is what
+# makes the terminal copy safe to keep: without it tee exits on the first broken pipe, the command
+# then dies of SIGPIPE on its next write, and a ticket would die with the terminal of whoever queued
+# it -- the same loss, one step earlier. A tee that does not know the option (not GNU coreutils 8.24+,
+# not uutils) is not used at all; the command writes straight into the file then, and the log is the
+# only copy. Either way the log is written by the file side, never by the terminal.
+LOGDIR=$BASE/logs; mkdir -p "$LOGDIR"
+TICKET_LOG=$LOGDIR/$(printf '%s' "$AGENT" | tr -c 'A-Za-z0-9._-' '_')-$(date -u +%Y%m%dT%H%M%SZ)-$$.log
+: >"$TICKET_LOG"
+export GPU_TICKET_LOG=$TICKET_LOG
+printf 'log=%s\n' "$TICKET_LOG" >>"$ticket" 2>/dev/null
+log "start $AGENT max=${MAXMIN}m hardcap=${HARD_CAP_MIN}m log=$TICKET_LOG load=$(cut -d" " -f1 /proc/loadavg)"
+if tee --output-error=warn </dev/null >/dev/null 2>&1; then
+  _ticket_run() { setsid bash -c 'exec "$@" > >(tee -a --output-error=warn "$0") 2>&1' "$TICKET_LOG" "$@"; }
+else
+  _ticket_run() { setsid bash -c 'exec "$@" >>"$0" 2>&1' "$TICKET_LOG" "$@"; }
+fi
 # A mis-typed ticket must not read as a failed build. `setsid "$@"` execs argv[0] as a filename, so a
 # command passed as ONE quoted string ("scripts/x.sh a b") becomes a filename with spaces and dies as
 # rc=127 in 0 s with setsid's "No such file or directory" -- which two of my own tickets ate on
@@ -201,7 +227,7 @@ command -v -- "$1" >/dev/null 2>&1 || {
   log "TICKET_BAD_CMD argv0=\"$1\" hint=argv[0] must be an executable file or a command on PATH (cwd is $PWD)"
   printf 'TICKET_BAD_CMD argv0=%s not found (cwd=%s)\n' "$1" "$PWD" >&2; exit 2
 }
-setsid "$@" & cpid=$!
+_ticket_run "$@" & cpid=$!
 grace_until=0
 while kill -0 "$cpid" 2>/dev/null; do
   now=$(date +%s)
