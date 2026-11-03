@@ -350,6 +350,23 @@ _loop = 'for kv in ${PAIR_ARM_EXTRA_ENVS:-}; do envs+=(-e "$kv"); done'
 # place (2026-11-03: /artifacts/dspark-tpr/src wrote 5780205b into a cache stamped 04a61140 and
 # pair_serve refused the pair as DRIFT for an hour). One supported way in, and it is isolated.
 _pa = src("pair_arm.sh")
+# A container whose pid 1 is `sleep infinity` never reaps: every build a killed probe leaves behind
+# becomes a Z-state child of init with a fresh etimes, and the compiler guard then waits the full
+# budget on processes that cannot finish anything (2026-11-03: 14 zombies held pair_build_ext for
+# 20 min). Zombies are not builds.
+_pe = src("pair_build_ext.sh"); _pl = src("pair_build_lib.sh")
+# The baton clear has to happen in the shell that imports: the first clear runs before the symlink
+# flip, and /pair/extcache is its own directory, so clearing one spelling left the other -- and a
+# surviving lock does not fail the build, it sleeps in file_baton.wait with no compiler running.
+check("the ext build clears the baton where it imports",
+      _pe.count('for lck in $rel_c/ext/exllamav3_ext/lock $MOUNT/extcache/exllamav3_ext/lock; do') == 1
+      and _pe.index('EXT_LOCK cleared=$lck') < _pe.index('EXPECT_SRC=$rel_c/src/exllamav3 timeout'), "")
+
+check("the compiler guard counts only live compilers",
+      _pe.count("ps -eo stat=,etimes=,comm=") == 1 and _pl.count("ps -eo stat=,etimes=,comm=") == 1
+      and "\$1 !~ /^Z/" in _pe and "\$1 !~ /^Z/" in _pl
+      and "ps -eo etimes=,comm=" not in _pe, "")
+
 check("a client run from another src gets its own extension cache",
       "--src) SRC=$2" in _pa
       and "/src/exllamav3|/src/exllamav3/|/pair/current/src) EXT_DIR=/pair/extcache" in _pa

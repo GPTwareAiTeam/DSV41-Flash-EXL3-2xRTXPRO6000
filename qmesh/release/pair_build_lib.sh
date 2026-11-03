@@ -149,7 +149,7 @@ build_side() {
   # cc1plus alive for days, and waiting on those dead ones would block every build forever.
   local builds ignored stale=${PAIR_BUILD_STALE_SECS:-1800}
   compilers() {
-    side_hostsh "$1" "ps -eo etimes=,comm= | awk -v s=$stale '\$2 ~ /^(ninja|cc1plus|nvcc|cicc)\$/ {if (\$1 < s) f++; else o++} END {print f+0\" \"o+0}'"
+    side_hostsh "$1" "ps -eo stat=,etimes=,comm= | awk -v s=$stale '\$1 !~ /^Z/ && \$3 ~ /^(ninja|cc1plus|nvcc|cicc)\$/ {if (\$2 < s) f++; else o++} END {print f+0\" \"o+0}'"
   }
   read -r builds ignored <<<"$(compilers "$side")"
   local waited=0 cap=${PAIR_BUILD_WAIT_SECS:-1800}

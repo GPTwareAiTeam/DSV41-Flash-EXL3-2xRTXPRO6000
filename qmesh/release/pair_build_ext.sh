@@ -89,7 +89,7 @@ build_side() {
   # cc1plus alive for days, and waiting on those dead ones would block every build forever.
   local builds ignored stale=${PAIR_BUILD_STALE_SECS:-1800}
   compilers() {
-    side_hostsh "$1" "ps -eo etimes=,comm= | awk -v s=$stale '\$2 ~ /^(ninja|cc1plus|nvcc|cicc)\$/ {if (\$1 < s) f++; else o++} END {print f+0\" \"o+0}'"
+    side_hostsh "$1" "ps -eo stat=,etimes=,comm= | awk -v s=$stale '\$1 !~ /^Z/ && \$3 ~ /^(ninja|cc1plus|nvcc|cicc)\$/ {if (\$2 < s) f++; else o++} END {print f+0\" \"o+0}'"
   }
   read -r builds ignored <<<"$(compilers "$side")"
   local waited=0 cap=${PAIR_BUILD_WAIT_SECS:-1800}
@@ -129,6 +129,14 @@ build_side() {
     inner="ln -sfn $rel_c/src $link
 trap 'ln -sfn $back $link' EXIT
 cat > /tmp/pair_ext_probe.py
+# Clear the baton again in the shell that is about to import: the clear above runs before the
+# symlink flip, and the two spellings are not always one inode (/pair/extcache is its own directory
+# today, so `rm` on one left the other). A surviving lock never fails the build -- it sleeps in
+# file_baton.wait (3 x 600 s) with no compiler running, which looks exactly like a hung host
+# (2026-11-03 02:07Z: 20 min, pid 3475093, lock left by a probe killed at 02:02Z).
+for lck in $rel_c/ext/exllamav3_ext/lock $MOUNT/extcache/exllamav3_ext/lock; do
+  [ -e "$lck" ] && rm -f "$lck" && echo "EXT_LOCK cleared=$lck"
+done
 cd $link && nice -n 15 env MAX_JOBS=$JOBS NINJAFLAGS=-j$JOBS MAKEFLAGS=-j$JOBS \
 PYTHONPATH=$link TORCH_CUDA_ARCH_LIST=$archlist TORCH_EXTENSIONS_DIR=$rel_c/ext \
 EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u /tmp/pair_ext_probe.py
