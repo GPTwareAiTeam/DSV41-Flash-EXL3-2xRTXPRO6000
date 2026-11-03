@@ -13,6 +13,7 @@ them needs a pair, a worker, or a GPU.
 """
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -133,7 +134,9 @@ def tool_messages():
 
 # ---- Engine: enqueue contract and the 503 condition ----------------------------------------------------
 class StubTokenizer:
-    """encode() as validate_request uses it: one batched tensor, numel for the emptiness test."""
+    """encode() as validate_request uses it, plus the eos id the scheduler appends to stop conditions."""
+    eos_token_id = 2
+
     def __init__(self, n):
         self.ids = torch.tensor([list(range(1, n + 1))]) if n else torch.zeros((1, 0), dtype = torch.long)
 
@@ -184,6 +187,86 @@ def engine_validation():
             lambda: tight.validate_request({"prompt": "x", "max_tokens": 4}), "exceed cache capacity")
 
 
+class BatchGenerator:
+    """A generator that records what the scheduler asked for, and answers one result per active job.
+
+    `Generator.enqueue` is what assigns `serial_number` (generator.py:654-676) and `iterate` yields one dict
+    per active job with that serial, so the stub must do both or `Engine.run` cannot route a result back to
+    its waiter. `rows` per enqueue is the whole question: a batched decode is one `iterate` covering several
+    jobs of one row each, not one job of several rows (e2e_prompts.py:320 pins `max_batch_size=1`).
+    """
+    max_draft_tokens = 2
+
+    def __init__(self, text = None):
+        self.max_total_tokens = 4096
+        self.serials = []       # serials enqueued and not yet answered
+        self.next_serial = 0
+        self.enqueued = []      # (serial, rows, prompt len) in enqueue order
+        self.iterations = []    # how many jobs each iterate() call covered
+        self.tokens_per_job = 2
+        self.text = text or (lambda serial: f"job{serial}")
+
+    def enqueue(self, job):
+        # Job keeps the prompt in sequences[0].input_ids (job.py:40-48, pagetable.py:213-216); the row count
+        # is len(sequences), which serve_pair pins to one per request.
+        ids = job.sequences[0].input_ids          # a SeqTensor, not a tensor: it answers len(), not shape
+        job.serial_number = self.next_serial
+        self.next_serial += 1
+        self.serials.append(job.serial_number)
+        self.enqueued.append((job.serial_number, len(job.sequences), len(ids)))
+        return job.serial_number
+
+    def iterate(self):
+        active = [s for s in self.serials]
+        self.iterations.append(len(active))
+        for serial in active:
+            self.serials.remove(serial)
+            yield {"serial": serial, "text": self.text(serial), "eos": True, "eos_reason": "eos",
+                   "new_tokens": self.tokens_per_job, "prompt_tokens": 8, "cached_tokens": 0,
+                   "token_ids": torch.tensor([[1] * self.tokens_per_job])}
+
+
+def _serve_two(batch):
+    """Submit two requests, run the scheduler to completion, return (generator, per-request items)."""
+    saved = srv.BATCH
+    srv.BATCH = batch
+    try:
+        gen = BatchGenerator()
+        eng = srv.Engine(gen, StubTokenizer(8))
+        waiters = []
+        for max_tokens in (4, 5):
+            request = {"prompt": "x", "max_tokens": max_tokens, "temperature": 0.0, "top_p": 1.0,
+                       "presence": 0.0, "frequency": 0.0, "seed": None, "stop": [], "tools": False}
+            eng.validate_request(request)
+            waiters.append(eng.submit(request)[0])
+        thread = threading.Thread(target = eng.run, daemon = True)
+        thread.start()
+        items = [w.get(timeout = 5) for w in waiters]
+        eng.stop()
+        thread.join(timeout = 5)
+        return gen, items
+    finally:
+        srv.BATCH = saved
+
+
+def engine_batching():
+    gen, items = _serve_two(2)
+    check("batch2.two_jobs_one_forward",
+          gen.enqueued == [(0, 1, 8), (1, 1, 8)] and gen.iterations[:1] == [2],
+          f"enqueued={gen.enqueued} iterations={gen.iterations}")
+    check("batch2.result_routed_by_serial",
+          [i.get("text") for i in items] == ["job0", "job1"], f"={[i.get('text') for i in items]}")
+    check("batch2.no_503_on_two_streams",
+          all("error" not in i for i in items), f"={items}")
+    gen1, items1 = _serve_two(1)
+    check("batch1.reference_two_forwards",
+          gen1.enqueued == [(0, 1, 8), (1, 1, 8)] and gen1.iterations == [1, 1],
+          f"enqueued={gen1.enqueued} iterations={gen1.iterations}")
+    check("batch1.same_text_as_batch2",
+          [i.get("text") for i in items1] == [i.get("text") for i in items],
+          f"={[i.get('text') for i in items1]}")
+
+
 def main():
     prepare_accepts()
     prepare_refusals()
@@ -192,6 +275,7 @@ def main():
     tool_messages()
     engine_contract()
     engine_validation()
+    engine_batching()
     print(f"RESULT {'PASS' if not FAILS else 'FAIL'} fails={len(FAILS)}", flush = True)
     return 0 if not FAILS else 1
 
