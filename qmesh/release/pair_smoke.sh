@@ -571,6 +571,26 @@ esac
 awk -v got="$pf_tps" -v want="$SMOKE_PREFILL_MIN_TPS" 'BEGIN { exit !(got + 0 >= want + 0) }' \
   || fail "prefill_slow depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS"
 echo "SMOKE_PREFILL_OK depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS aborts=0"
+# The OpenAI-compatible server is on no critical path -- nothing in the release calls it unless an
+# operator does -- so the default smoke does not pay for a second load. PAIR_SMOKE_SERVER=1 adds it:
+# pair_server_smoke.sh starts the pair's server, exercises it (models, completion usage, chat
+# streaming identity, a repeated ~4k prefix that must report cached_tokens, a positive tool call) and
+# stops only the process it started. Opt-in because the prefill arm above has just paid for the load
+# this needs, and because a pair that fails here should fail the smoke rather than a user's client.
+if [ "${PAIR_SMOKE_SERVER:-0}" = 1 ]; then
+  pair_step "SMOKE_HTTP_SERVER pair=$PAIR ct=$P7CT port=${PAIR_SRV_PORT:-${SRV_PORT:-8000}}"
+  # No port argument: pair_server_smoke.sh resolves PAIR_SRV_PORT/SRV_PORT/8000 itself, the same way
+  # pair_server.sh picked the port this pair serves on.
+  srv_out=$("$HERE/pair_server_smoke.sh" "$PAIR" 2>&1)
+  srv_rc=$?
+  printf '%s\n' "$srv_out" | tail -40
+  [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$srv_out" >> "$PAIR_LOG"
+  srv_ok=$(printf '%s\n' "$srv_out" | grep -c '^SMOKE_OK ')
+  if [ "$srv_rc" != 0 ] || [ "$srv_ok" -lt 1 ]; then
+    fail "http_server rc=$srv_rc $(printf '%s\n' "$srv_out" | grep -m1 -E '^SMOKE_FAIL|^PAIR_SRV' | cut -c1-300)"
+  fi
+  echo "SMOKE_HTTP_OK $(printf '%s\n' "$srv_out" | grep -m1 '^SMOKE_OK ')"
+fi
 echo "SMOKE_OK $PAIR $SHA $BUILD_ID"
 # The pidfile stays: the EXIT trap uses it to stop the server it started. Deleting it on the passing
 # path is what turned a measured update into a server nobody could attribute an hour later.
