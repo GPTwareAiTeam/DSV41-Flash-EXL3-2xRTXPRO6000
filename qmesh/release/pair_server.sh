@@ -37,9 +37,12 @@ SRV_PORT=${SRV_PORT:-8000}
 # chunk the load may take is the shipping 8192-row width unless the caller says otherwise.
 CACHE_TOKENS=${CACHE_TOKENS:-65536}
 MAX_CHUNK=${MAX_CHUNK:-8192}
-# The hot pack both pairs ship: 4460 cold experts per layer, drafter HC1 (pair_arm.sh:35). Its
-# placement hash must be the one the GX box's cold pack carries or the seam's Hello refuses us.
-CHECKPOINT=${CHECKPOINT:-${PAIR_ARM_CHECKPOINT:-/models/dsv41/exl3-p7hot-4460-hc1}}
+# The client half is the one whose PACK_MANIFEST.json declares the placement_sha256 the GX box's cold pack
+# carries (pair_lib.sh's pair_ckpt_auto); a hard-coded one here would serve the old pack's client into the
+# new pack after the 4780p8 switch and be refused by the Hello, or worse, load. CHECKPOINT= names it by hand.
+CHECKPOINT=${CHECKPOINT:-${PAIR_ARM_CHECKPOINT:-auto}}
+CHECKPOINT=$(pair_ckpt_resolve "$CHECKPOINT") || pair_die "CHECKPOINT: no client half for this pack"
+pair_step "PAIR_SRV_CKPT checkpoint=$CHECKPOINT cold=$(pair_cold_src) sha=$(pair_cold_placement)"
 PAIR_SRV_READY_S=${PAIR_SRV_READY_S:-1800}   # s: weight load + warm-up before SERVER_READY
 PAIR_SRV_STOP_S=${PAIR_SRV_STOP_S:-60}
 

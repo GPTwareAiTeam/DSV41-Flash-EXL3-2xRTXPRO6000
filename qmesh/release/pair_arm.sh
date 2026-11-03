@@ -30,9 +30,11 @@ PAIR_ARG=${1:?usage: pair_arm.sh <pair> [--rows N] ...}
 shift
 ROWS=1; MAX_NEW=8; WARMUP=0; CACHE=1048576; ARM_TIMEOUT=300; OUT=""; IDS=0
 PROMPTS=${PAIR_ARM_PROMPTS:-/artifacts/2x-rtx-tp2/dtrain/prompts_held.json}
-# The hot pack both pairs ship: 4460 cold experts per layer, drafter HC1. Its placement hash must be
-# the one the GX box's cold pack carries (844251e7…), or the server's Hello refuses the session.
-CHECKPOINT=${PAIR_ARM_CHECKPOINT:-/models/dsv41/exl3-p7hot-4460-hc1}
+# The client half is the one whose PACK_MANIFEST.json declares the placement_sha256 the GX box's cold pack
+# carries (pair_lib.sh's pair_ckpt_auto): a pair is one checkpoint split in two, so after the 4780p8 pack
+# switch a hard-coded 4460 client would be paired with a 4780p8 cold half. --checkpoint/PAIR_ARM_CHECKPOINT
+# still name one by hand; the default is resolved below, once the pair (and so the box) is known.
+CHECKPOINT=${PAIR_ARM_CHECKPOINT:-auto}
 CORPUS=${PAIR_ARM_CORPUS:-/artifacts/2x-rtx-tp2/corpus/prose_24k.txt}
 PREFILL_DEPTH=""; SRC=""
 while [ $# -gt 0 ]; do
@@ -53,6 +55,8 @@ while [ $# -gt 0 ]; do
   shift
 done
 pair_load "$PAIR_ARG"
+CHECKPOINT=$(pair_ckpt_resolve "$CHECKPOINT") || pair_die "CHECKPOINT: no client half for this pack"
+pair_step "PAIR_ARM_CKPT checkpoint=$CHECKPOINT cold=$(pair_cold_src) sha=$(pair_cold_placement)"
 # The client half must name the release it is running, or the server's session handshake accepts a
 # mixed pair (`SEAM_SESSION_START ... build=unknown proto=3`, 2026-11-01). A released tree has no
 # .git, so qes.build_id() falls back to <tree>/qmesh/BUILD_ID (written by pair_cut.sh); exporting it

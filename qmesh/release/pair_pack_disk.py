@@ -40,7 +40,12 @@ sys.path.insert(0, HERE)
 import pair_containers as pc  # config parser and spec loader: one source of truth
 
 P7_ALLOW = os.environ.get("PAIR_PACK_P7_ROOT", "/models/dsv41")
-P7_PACK = os.environ.get("PAIR_PACK_P7", os.path.join(P7_ALLOW, "exl3-p7hot-4460-hc1"))
+# Which hot half is the client of the pack the GX box serves is a property of THE PAIR, not of this
+# file: the cold half names it through its PACK_MANIFEST placement_sha256, pair_ckpt_resolve reads that
+# off /cold, and pair_smoke.sh passes the answer in. A hard-coded exl3-p7hot-4460-hc1 here silently
+# validated the PREVIOUS pack's placement refs after the 4780p8 switch (2026-11-03), so an unnamed
+# hot half is refused rather than checked against a stale one.
+P7_PACK = os.environ.get("PAIR_PACK_P7", "")
 # Filesystems that put the bytes somewhere other than the box's own disk. virtiofs is a VM's local
 # disk handed through, so it is not in the list; an NFS mount of a local disk is.
 REMOTE_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "sshfs", "fuse.sshfs", "ceph", "glusterfs",
@@ -256,6 +261,11 @@ def main(argv):
     if os.environ.get("PAIR_PACK_DISK") == "0":
         print(f"PACK_DISK_SKIPPED pair={args[0]} PAIR_PACK_DISK=0")
         return 0
+    if not P7_PACK:
+        print("PACK_DISK_USAGE pair=%s PAIR_PACK_P7 is not set: this check validates the P7 hot half that is"
+              " the client of the GX box's /cold pack, and only the pair knows which one that is --"
+              " pair_smoke.sh derives it (pair_ckpt_resolve) and exports it" % args[0], file=sys.stderr)
+        return 2
     cfg = pc.load_conf(args[0])
     fails = []
     check_p7(cfg, fails, quiet)

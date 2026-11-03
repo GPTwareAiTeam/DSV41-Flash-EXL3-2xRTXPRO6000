@@ -149,6 +149,14 @@ fi
 # serving box's own disk is refused without a server start or a GPU second. PAIR_PACK_DISK=0 skips it
 # (tests whose stub ssh has no filesystem to resolve).
 if [ "${PAIR_PACK_DISK:-1}" = 1 ]; then
+  # The hot half this check validates must be the client of the pack the GX box serves -- a promoted
+  # cold pack checked against the previous hot half's placement refs passes on a hash that belongs to a
+  # different pair of halves. Derived from that container's /cold (pair_lib.sh pair_ckpt_resolve), and a
+  # refusal here is a refusal of the smoke: there is no default hot pack to fall back on any more.
+  [ -n "${PAIR_PACK_P7:-}" ] || PAIR_PACK_P7=$(pair_ckpt_resolve auto) \
+    || fail "PAIR_PACK_P7: cannot name the client half of $(pair_cold_src) sha=$(pair_cold_placement)"
+  export PAIR_PACK_P7
+  echo "  SMOKE_PACK p7=${PAIR_PACK_P7} cold=$(pair_cold_src) sha=$(pair_cold_placement)"
   pack_out=$(python3 "$HERE/pair_pack_disk.py" "$PAIR" 2>&1); pack_rc=$?
   printf '%s\n' "$pack_out" | sed 's/^/  /'
   [ "$pack_rc" = 0 ] || fail "pack_disk rc=$pack_rc (a pack is not on the serving box's own disk)"

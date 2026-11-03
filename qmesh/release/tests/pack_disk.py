@@ -204,5 +204,20 @@ try:
 finally:
     shutil.rmtree(W, ignore_errors=True)
 
+# 8. the hot half is not a constant of the checker: a pair whose cold half is switched (4460 -> 4780p8,
+#    2026-11-03) must not be validated against the previous pack's placement refs by default.
+_old_pack, _old_env = pd.P7_PACK, os.environ.pop("PAIR_PACK_P7", None)
+pd.P7_PACK = ""
+_err = io.StringIO()
+_rc = 0
+with contextlib.redirect_stderr(_err), contextlib.redirect_stdout(io.StringIO()):
+    _rc = pd.main(["pair_pack_disk.py", "dev"])
+check("an unnamed hot half is refused, not checked against the previous pack",
+      _rc == 2 and "PACK_DISK_USAGE" in _err.getvalue() and "PAIR_PACK_P7" in _err.getvalue(),
+      "rc=%s err=%s" % (_rc, _err.getvalue().strip()[:120]))
+if _old_env is not None:
+    os.environ["PAIR_PACK_P7"] = _old_env
+pd.P7_PACK = _old_pack
+
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", fails))
 sys.exit(1 if fails else 0)

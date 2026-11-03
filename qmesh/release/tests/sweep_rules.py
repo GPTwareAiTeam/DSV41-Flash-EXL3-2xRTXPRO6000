@@ -1182,6 +1182,30 @@ check("the ids gap shim forwards (obj, name, value)",
       'setattr(object.__getattribute__(self, "_g"), name, value)' in _gap
       and 'getattr(object.__getattribute__(self, "_g"), name)' in _gap, "")
 
+# ---- the client half is looked up from the pack, never written down -------------------------------
+# The dev pair's cold pack is switched by moving the GX container's /cold mount (4460 -> 4780p8,
+# 2026-11-03). If any script here named the hot half, the pair would be cut with the previous pack's
+# client: the Hello refuses it, or -- if the tags ever line up -- it serves a mixture of two builds.
+_lib = src("pair_lib.sh")
+check("pair_lib joins the two halves on the pack's placement sha, not on a directory name",
+      'pair_cold_placement()' in _lib and 'placement_sha256' in _lib
+      and 'pair_p7_placements()' in _lib and 'pair_ckpt_auto()' in _lib
+      and 'pair_ckpt_resolve()' in _lib, "")
+check("pair_ckpt_resolve refuses rather than guessing when the halves do not pair",
+      'matches=$n' in _lib and 'return 1' in _lib, "")
+for _f in ("pair_arm.sh", "pair_server.sh", "pair_smoke.sh", "pair_pack_disk.py"):
+    check("no code names the hot half by hand: " + _f,
+          "exl3-p7hot-4460" not in "".join(code_lines(src(_f))), "")
+check("pair_arm resolves the client half after the pair is loaded",
+      _pa.index('pair_load "$PAIR_ARG"') < _pa.index("pair_ckpt_resolve"), "")
+check("pair_server resolves the client half and dies when it cannot be named",
+      'CHECKPOINT=$(pair_ckpt_resolve "$CHECKPOINT") || pair_die' in src("pair_server.sh"), "")
+check("the smoke hands the pack check the half it is actually serving",
+      'PAIR_PACK_P7=$(pair_ckpt_resolve auto)' in src("pair_smoke.sh")
+      and "export PAIR_PACK_P7" in src("pair_smoke.sh"), "")
+check("an unnamed hot half is refused, not checked against the previous pack's refs",
+      'PACK_DISK_USAGE' in src("pair_pack_disk.py")
+      and 'PAIR_PACK_P7", "")' in src("pair_pack_disk.py"), "")
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

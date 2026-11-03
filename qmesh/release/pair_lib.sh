@@ -150,6 +150,60 @@ pair_ct_path() {  # <host path> -> path inside the pair containers
     *) echo "$p" ;;
   esac
 }
+
+# ---- the client checkpoint is a property of the cold pack, not of this file ---------------------
+# A pair is ONE checkpoint split in two, and the split is the pack. Both halves carry a PACK_MANIFEST.json
+# naming the placement they were built for (`placement_sha256`), and only the two halves with the SAME sha
+# are one model: the old client with a new pack loads and then dies at the placement preflight, or, worse,
+# if the tags happened to line up, serves a mixture of two builds. So the P7 checkpoint to load is read
+# from the GX container's own /cold manifest and matched by that sha, never written down here -- the
+# 4780p8 switch (2026-11-03) is a mount change, and no script in this tree should be edited for it.
+#   pair_cold_src       <gxct>        -> host path behind that container's /cold
+#   pair_cold_placement <gxct>        -> placement_sha256 that container's pack declares
+#   pair_p7_placements  <p7ct>        -> "<sha>\t<dir>" per hot pack on the P7 side
+#   pair_ckpt_auto      <p7ct> <gxct> -> the one P7 hot half with the pack's sha ("" when not exactly one)
+#   pair_ckpt_resolve   <want|auto>   -> what to load, or a refusal on stderr
+pair_cold_src() {  # <gxct> -> host path behind /cold ("" when the container has none)
+  pair_gxsh "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/cold\"}}{{.Source}}{{end}}{{end}}' ${1:-$GXCT}" 2>/dev/null | tail -1 | tr -d '\r'
+}
+pair_cold_placement() {  # <gxct> -> placement_sha256 the pack behind /cold declares
+  pair_gxsh "docker exec ${1:-$GXCT} python3 -c 'import json;print(json.load(open(\"/cold/PACK_MANIFEST.json\")).get(\"placement_sha256\",\"\"))'" 2>/dev/null | tail -1 | tr -d '\r'
+}
+pair_p7_placements() {  # <p7ct> -> "<placement_sha256>\t<dir>" for every hot pack that declares one
+  docker exec "${1:-$P7CT}" python3 -c 'import glob, json, os
+for d in sorted(glob.glob("/models/dsv41/exl3-p7hot-*")):
+    try: m = json.load(open(os.path.join(d, "PACK_MANIFEST.json")))
+    except Exception: continue
+    sha = m.get("placement_sha256") or ""
+    if sha: print(sha, d, sep="\t")' 2>/dev/null | tr -d '\r'
+}
+pair_ckpt_auto() {  # <p7ct> <gxct> -> P7 hot half with the pack's placement_sha256; empty if 0 or >1 match
+  local p7=${1:-$P7CT} gx=${2:-$GXCT} sha hits n
+  sha=$(pair_cold_placement "$gx")
+  [ -n "$sha" ] || return 0
+  hits=$(pair_p7_placements "$p7" | awk -F'\t' -v s="$sha" '$1 == s { print $2 }')
+  n=$(printf '%s\n' "$hits" | grep -c .)
+  [ "$n" = 1 ] && printf '%s\n' "$hits"
+}
+pair_ckpt_resolve() {  # <want|auto|""> [p7ct gxct] -> checkpoint on stdout; 1 when it cannot be named
+  local want=${1:-auto} p7=${2:-$P7CT} gx=${3:-$GXCT} hits n sha src
+  case "$want" in
+    ""|auto)
+      hits=$(pair_ckpt_auto "$p7" "$gx"); n=$(printf '%s\n' "$hits" | grep -c .)
+      if [ "$n" = 1 ]; then echo "$hits"; return 0; fi
+      sha=$(pair_cold_placement "$gx"); src=$(pair_cold_src "$gx")
+      if [ "$PAIR_DRY" = 1 ]; then  # dry run: print the shape that would be used rather than refuse
+        echo "/models/dsv41/exl3-p7hot-<pack-placement-${sha:0:8}>"; return 0
+      fi
+      echo "pair_ckpt_resolve: cannot name the P7 client half for $gx:/cold='${src##*/}'" \
+           "placement_sha256='${sha}' matches=$n; the pair is one checkpoint split in two, so the" \
+           "client half must declare that sha -- pass CHECKPOINT=/ PAIR_ARM_CHECKPOINT= to name it by hand" >&2
+      return 1
+      ;;
+    *) echo "$want"; return 0 ;;
+  esac
+}
+
 pair_gxsh() {
   if [ "$PAIR_DRY" = 1 ] && [ -n "$PAIR_DRY_SSH" ]; then
     "$PAIR_DRY_SSH" "${PAIR_SSH_OPTS[@]}" "$GX" "$1"
