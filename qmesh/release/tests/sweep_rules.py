@@ -1082,6 +1082,17 @@ check("pair_sync_check's side script formats",
       and len(_lit.group(1) % {k: "x" for k in re.findall(r"%\((\w+)\)", _lit.group(1))}) > 0
       and "%%s->%%s" in _lit.group(1), "")
 
+# The worker's argv differs by launch path (ensure starts it relative, the serve path absolute), so an
+# argv-anchored match saw a resident pack as absent and the smoke loaded a second one beside it
+# (2026-11-03 box_busy with 1005 MiB free). One selection by comm, used by the count, the box scan and
+# every kill; and no `pkill -f` on a name a wrapper also carries.
+_ens = open(os.path.join(HERE, "seam_server_ensure.sh")).read()
+check("the worker is selected by comm, not by an argv prefix",
+      _ens.count("pgrep -x python3 -a") >= 2
+      and "worker_seam_server[.]py" in _ens
+      and "pkill -f" not in _ens
+      and 'kill ${1:+$1 }' in _ens, "")
+
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

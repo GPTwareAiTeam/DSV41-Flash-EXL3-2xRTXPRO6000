@@ -106,9 +106,16 @@ seam_archive_log() {
   [ -s "$dest" ] || { rm -f "$dest"; return 0; }
   echo "SEAM_LOG_ARCHIVED build=${build:-unknown} bytes=$(wc -c < "$dest") dest=$dest"
 }
-# Anchored: the "docker exec ... bash -lc '... python3 -u qmesh/worker_seam_server.py ...'" wrapper also
-# carries the script name in its argv, so an unanchored match counts every server twice.
-seam_pids()  { seam_gxct "pgrep -fc \"^python3 -u qmesh/worker_seam_server.py\"" 2>/dev/null | tr -dc 0-9; }
+# The worker is `python3 ... worker_seam_server.py` whatever path it was started with: the ensure path
+# starts it relative (`qmesh/worker_seam_server.py`), the release serve path absolute
+# (`/pair/current/src/qmesh/worker_seam_server.py`), and an argv-anchored match saw only the first --
+# so a resident pack was invisible to this file and to the box scan, the smoke loaded a second one
+# beside it and failed box_busy with 1005 MiB free (2026-11-03). Match the interpreter's comm (pgrep -x,
+# so the `bash -lc` wrapper that carries the script name in its argv cannot be counted) and the script
+# name anywhere in its arguments (bracketed, so no grep in this file matches its own line).
+seam_pids()  { seam_gxct "pgrep -x python3 -a" 2>/dev/null | grep -c 'worker_seam_server[.]py'; }
+# The same selection as a kill list: never a pattern kill on a name that a wrapper also carries.
+seam_kill_pattern() { printf '%s' "for p in \$(pgrep -x python3 -a | grep 'worker_seam_server[.]py' | cut -d' ' -f1); do kill ${1:+$1 }\$p; done"; }
 # ---- the GX gate ------------------------------------------------------------------------------
 # The file is pair_lib.sh's: <queue dir>/gx<N>.gate, one line "owner=<label> pid=<pid> until=<epoch>".
 # A claim whose until is past, whose pid is gone, or that is malformed does not protect anything, so
@@ -304,7 +311,7 @@ fi
 self=$CT
 for c in \$(docker ps --format '{{.Names}}' 2>/dev/null); do
   [ "\$c" = "\$self" ] && continue
-  p=\$(docker exec "\$c" pgrep -f '^python3 -u qmesh/worker_seam_server.py' 2>/dev/null | head -1)
+  p=\$(docker exec "\$c" sh -c "pgrep -x python3 -a" 2>/dev/null | grep 'worker_seam_server[.]py' | cut -d' ' -f1 | head -1)
   [ -n "\$p" ] && echo "server_in=\$c:\$p"
 done
 # Who holds the memory when it is short. cgroup v2 memory.current is the container's whole charge
@@ -418,9 +425,9 @@ seam_server_ensure() {
     fi
   fi
   [ "$fresh" = 1 ] && echo "SEAM_ENSURE state=restarting (--fresh)"
-  # Anchored, like seam_pids: the launcher's shell carries the script name in its cmdline until it
-  # execs, and an unanchored stop TERMed the shell and left the worker holding the pack.
-  seam_gxct "pkill -f '^python3 -u qmesh/worker_seam_server.py'" >/dev/null 2>&1
+  # By comm, like seam_pids: the launcher's shell carries the script name in its cmdline until it
+  # execs, and a pattern stop TERMed the shell and left the worker holding the pack.
+  seam_gxct "$(seam_kill_pattern)" >/dev/null 2>&1
   sleep 3
   if [ "$(seam_pids)" -ge 1 ]; then
     echo "SEAM_ENSURE state=error old server still alive" >&2; return 2
@@ -516,12 +523,12 @@ seam_server_ensure() {
 }
 
 seam_server_stop() {
-  # Same anchoring as above: stop the worker, not the shell that spawned it.
-  seam_gxct "pkill -f '^python3 -u qmesh/worker_seam_server.py'" >/dev/null 2>&1
+  # Same selection as above: stop the worker, not the shell that spawned it.
+  seam_gxct "$(seam_kill_pattern)" >/dev/null 2>&1
   local i
   for i in $(seq 1 30); do [ "$(seam_pids)" = "0" ] && break; sleep 1; done
   if [ "$(seam_pids)" != "0" ]; then
-    seam_gxct "pkill -9 -f '^python3 -u qmesh/worker_seam_server.py'" >/dev/null 2>&1; sleep 2
+    seam_gxct "$(seam_kill_pattern -9)" >/dev/null 2>&1; sleep 2
   fi
   # The log outlives the process, so a dead server's READY line would make seam_ready (and every
   # caller that trusts it without checking the pid) believe the cold experts are still up.

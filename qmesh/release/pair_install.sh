@@ -58,6 +58,7 @@ if [ -z "$DST" ]; then
   done
 fi
 [ -n "$DST" ] && [ -d "$DST" ] || die "cannot resolve the installed script dir (pass --dst)"
+SRC=$(cd "$SRC" && pwd)
 DST=$(cd "$DST" && pwd)
 # Invoked from the repo tree, the resolution above finds the checkout's own release dir first and
 # installs the files over themselves: it printed INSTALL_OK n=6 dst=<repo>/qmesh/release while the
