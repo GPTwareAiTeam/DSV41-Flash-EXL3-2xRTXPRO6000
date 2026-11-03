@@ -433,6 +433,25 @@ rc=${PIPESTATUS[0]}
 # ---- 6. smoke -----------------------------------------------------------------------------------
 phase smoke
 status_write 20 "server start + one decode row"
+# The smoke the canary runs is the *installed* one (this file is $PAIR_SCRIPTS/pair_update_run.sh), so a
+# change to the release tree's smoke scripts is not exercised until it is installed: on 2026-11-03 a dev
+# canary of 90186b6c passed its prefill at 814.4 tok/s with the box at avail_mib=507 under the installed
+# smoke, which predated SMOKE_PREFILL_MIN_AVAIL_MIB -- the release's new gate never ran. Compare the
+# copy this ticket reads with the release tree and say which it is, so a canary is never read as proof
+# that a test change works. A mismatch is a warning, not a failure: script-only differences do not make
+# the release worse than the one it replaces.
+smoke_files="pair_smoke.sh pair_arm.sh pair_server_smoke.sh pair_server.sh pair_lib.sh"
+diffs=""
+for f in $smoke_files; do
+  [ -f "$REL/qmesh/release/$f" ] || continue
+  [ "$(md5sum "$HERE/$f" 2>/dev/null | cut -d' ' -f1)" = \
+    "$(md5sum "$REL/qmesh/release/$f" 2>/dev/null | cut -d' ' -f1)" ] || diffs="$diffs $f"
+done
+if [ -n "$diffs" ]; then
+  pair_step "SMOKE_SCRIPT_STALE pair=$PAIR differs=$diffs installed=$HERE release=$REL this canary exercises the installed test scripts, not the release's"
+else
+  pair_step "SMOKE_SCRIPT_CHECK pair=$PAIR match=yes files=$(printf '%s' $smoke_files | tr ' ' ',')"
+fi
 # The smoke stops the worker it loaded, pass or fail: a server that outlives its ticket is a leak, and
 # the pair starts one again through the ensure when a client needs it.
 smoke_out=$("$HERE/pair_smoke.sh" "$PAIR" "$SHA" 2>&1)
