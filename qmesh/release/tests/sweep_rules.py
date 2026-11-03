@@ -705,6 +705,12 @@ check("the stage that builds the seam lib builds and stamps the hook too",
 check("the build skips the hook when the release does not declare it",
       'native") or {}).get("moe_cpp")' in src("pair_build_lib.sh")
       and "CPP_SKIP $side $arch release declares" in src("pair_build_lib.sh"), "")
+check("both compiled artefacts are stripped before they are stamped, so a rebuild reproduces the cut's bytes",
+      src("pair_build_lib.sh").count("strip --strip-unneeded") == 2
+      and src("pair_build_lib.sh").index("strip --strip-unneeded $tmp/$PAIR_LIB.$arch.so")
+      < src("pair_build_lib.sh").index("sha256sum bin/$PAIR_LIB.$arch.so")
+      and src("pair_build_lib.sh").index("strip --strip-unneeded $moe_tmp/$moe")
+      < src("pair_build_lib.sh").index("sha256sum bin/$moe"), "")
 check("the cut declares whether the hook is required",
       'cat-file -e "$SHA:qmesh/native/build_moe.sh"' in src("pair_cut.sh")
       and '"native": {"moe_cpp"' in src("pair_cut.sh"), "")

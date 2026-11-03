@@ -10,6 +10,16 @@
 # .so hash -- is what pair_check compares. Nothing is ever copied between boxes: each box builds for
 # its own arch (x86_64/sm_120 on P7, aarch64/sm_121 on GX).
 #
+# Both .so files are stripped (--strip-unneeded) before they are stamped. nvcc names its intermediate
+# files from the pid (tmpxft_0000d510_...-6_<src>.cudafe1.cpp) and those names are the only bytes two
+# builds of the same source disagree on -- six of them, in .strtab -- so an unstripped build never
+# hashed the same twice, and every rebuild invalidated the manifest that the previous stamp produced
+# (2026-11-03: a prepare rebuilt dev's seam lib on both halves and pair_check read
+# lib_so_hash_vs_manifest for a source nobody had changed). Stripping the symbol table leaves .dynsym,
+# .nv_fatbin and .rodata alone -- the same 35 exported qes_* symbols resolve -- and makes a rebuild of
+# an unchanged source reproduce the cut's bytes, so a rebuild and the manifest written from its stamp
+# agree instead of being a second, differently-hashed artifact.
+#
 # Guards, because an in-place build under a live server has already killed a box (SIGBUS):
 #   * no worker_seam_server.py in this pair's own container,
 #   * no compiler already active anywhere on the box (ninja/cc1plus/nvcc/cicc),
@@ -178,6 +188,7 @@ build_side() {
   else pair_gxsh "mkdir -p '$bindir'"; fi
   inner="set -e; cd /pair/releases/$SHA/src/qmesh/native; mkdir -p bin $tmp; rm -rf $tmp/*; \
          nice -n 15 env MAX_JOBS=8 /usr/local/cuda/bin/nvcc $flags; \
+         strip --strip-unneeded $tmp/$PAIR_LIB.$arch.so; \
          mv -f $tmp/$PAIR_LIB.$arch.so bin/$PAIR_LIB.$arch.so; rmdir $tmp; \
          chown $uid:$gid bin bin/$PAIR_LIB.$arch.so; \
          sha256sum bin/$PAIR_LIB.$arch.so"
@@ -257,6 +268,7 @@ exit 1'
   local moeflags="build_moe.sh: nvcc -O2 -std=c++17 -arch=$sm (kernels), g++ -O2 -std=c++20 -fPIC -pthread (torch ABI), link libtorch${incenv:+ inc=$incdir}"
   inner="set -e; cd /pair/releases/$SHA/src/qmesh/native; mkdir -p bin; rm -rf $moe_tmp; mkdir -p $moe_tmp; \
          nice -n 15 env MAX_JOBS=8 CUDA_ARCH=$sm MOE_OUT=$moe_tmp MOE_OBJ=$moe_tmp/obj $incenv bash build_moe.sh; \
+         strip --strip-unneeded $moe_tmp/$moe; \
          mv -f $moe_tmp/$moe bin/$moe; rm -rf $moe_tmp; \
          chown $uid:$gid bin/$moe; \
          sha256sum bin/$moe"

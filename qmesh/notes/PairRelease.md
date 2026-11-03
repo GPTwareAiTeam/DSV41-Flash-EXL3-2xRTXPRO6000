@@ -551,6 +551,21 @@ to that lib's sha and must be re-baselined when a release takes the tree over. I
 compute lock) while it serves no release tree: `pair_check.sh` reporting `DRIFT` there is expected
 until a release owns that container.
 
+2026-11-03: the reason a rebuild no longer moves a hash. `pair_build_lib.sh` now strips both compiled
+artefacts (`strip --strip-unneeded`) before it stamps them. Two builds of one commit differed by
+exactly six bytes, all in `.strtab`: nvcc names its intermediates from the pid
+(`tmpxft_0000d510_00000000-6_qmesh_expert_seam.cudafe1.cpp`) and that name is a symbol. So an
+unstripped lib never hashed the same twice -- prod's and dev's `35bfaecb` libs, built from the same
+commit on the same box, read `332251d3…` and `c03a0c38…` -- and every prepare that rebuilt one
+invalidated the manifest `pair_manifest.py write` had produced from the previous stamp: at 17:04Z
+prepare rebuilt dev's seam lib on both halves and `pair_check.sh dev` read `lib_so_hash_vs_manifest`
+for a source nobody had changed. Stripped, those two trees' libs are bit-identical (97592 B,
+`3209220e…`), `.dynsym` still carries the same 35 `qes_*`/`_Z…` symbols, and the hook is unchanged
+too (166656 -> 142896 B, `b9c35cb8…` after strip). `pair_prepare.sh` additionally writes the manifest
+from the stamps it just produced (`pair_manifest.py write … --by pair_prepare`), but only when the
+prepared sha is the sha the pair actually points at: a candidate prepared beside a serving pair must
+not rewrite the description of what is being served.
+
 ## Release 2 does not measure like a hand-patched tree
 
 Release 2 (`3c361e8f`, the `--no-ff` merge of `39f07dc4`) is release 1 plus the compute lock, the
