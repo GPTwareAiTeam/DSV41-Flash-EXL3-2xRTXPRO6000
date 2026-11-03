@@ -19,6 +19,27 @@ PAIR_DRY=${PAIR_DRY:-0}
 PAIR_DRY_SSH=${PAIR_DRY_SSH:-}
 PAIR_MOUNT=${PAIR_MOUNT:-/pair}                 # container path of the pair root
 PAIR_SRC_LINK=${PAIR_SRC_LINK:-/src/exllamav3}  # container symlink -> /pair/current/src
+# EXLLAMAV3_TUNE_CACHE: where exllamav3's coop autotuner keeps its picks (exllamav3_ext/quant/
+# coop_autotune.cu disk_cache_path(); unset, it resolves to $XDG_CACHE_HOME or $HOME/.cache/exllamav3/
+# autotune *inside the container*). Nothing else in the pair sets it, so those picks land in the
+# container's writable layer and die with it -- and the pair re-creates a container rather than never.
+# So pin them inside /pair: that is the pair root bind-mounted into both containers (containers/*.json
+# mount __PAIR_ROOT__ at /pair) and the one writable place a re-create and a release cut both leave
+# alone. The value is the CONTAINER path because both carriers are `docker exec -e`: pair_arm.sh's
+# client and pair_server_env() -> seam_server_ensure's worker. Per pair, not shared: /pair is *this*
+# pair's root on each box, so the same string is a different file for prod and dev (host
+# $PAIR_ROOT/tunecache/coop_autotune_v1.bin on each side). One file per pair is safe to keep across
+# releases: the record key is the GEMM shape plus device, compute capability and max-SM count
+# (exl3_gemm.cu gemm_autotune_hash) and it is salted with COOP_AUTOTUNE_VERSION (coop_autotune.cu
+# salt_hash), so a different card or a bumped search space misses instead of misreading. Pass the file
+# and not its directory: the loader appends coop_autotune_v1.bin only when the path already *is* a
+# directory, so a path that does not exist yet would silently become the cache file itself. The writer
+# creates the parent directory (append_disk_cache_locked -> create_directories), so no mkdir is needed.
+# The vendor cold-expert kernel has nothing to pin here: cuda-exl3's MoE gemm keeps its picks in a
+# process-local map (vendor/cuda-exl3/src/cuda_exl3/csrc/gemm.cu tune_cache) -- in memory only -- and
+# the one persisted vendor tuner (mla_decode.cu, CUDA_EXL3_TUNE_CACHE) is MLA attention, which this
+# pair never calls: the worker runs only the exl3_moe_* ops and P7's attention is Triton.
+PAIR_TUNE_CACHE=${PAIR_TUNE_CACHE:-$PAIR_MOUNT/tunecache/coop_autotune_v1.bin}
 PAIR_LIB=libqmesh_expert_seam                   # qmesh/native/bin/<this>.<arch>.so
 PAIR_CPP_LIB=libqmesh_moe_cpp                    # the C moe hook: same bin/, same stamp rule
 PAIR_SEAM_FILES=(qmesh/native/qmesh_expert_seam.cu qmesh/native/qmesh_expert_seam.h qmesh/native/qes.py)
@@ -85,7 +106,7 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   SRV_ENV_EXTRA=${PAIR_SRV_EXTRA_ENVS:-}
   CX_MARGIN_MIB=${CX_MARGIN_MIB:-1536}
   MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB SEAM_MOE_CPP=$MOE_CPP $SRV_ENV_EXTRA"
-  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV MOE_CPP SRV_ENV_EXTRA
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV MOE_CPP SRV_ENV_EXTRA PAIR_TUNE_CACHE
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
   PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}
@@ -102,9 +123,9 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
 
 # The server half's environment as ONE string: the shipping config every number in the notes was
 # taken on. Every starter (the smoke, the restore path, an operator) passes this and nothing else, so
-# a server can not come up on a different kernel or piece size than the pair serves.
-pair_server_env() {  # <build_id> -> "SEAM_BUILD_ID=… SEAM_LOAD_MARGIN_MIB=… <MOE_ENV> <WS_ENV>"
-  printf 'SEAM_BUILD_ID=%s SEAM_LOAD_MARGIN_MIB=%s %s %s' "$1" "$LOAD_MARGIN" "$MOE_ENV" "$WS_ENV"
+# a server can not come up on a different kernel, piece size or tuner cache than the pair serves.
+pair_server_env() {  # <build_id> -> "SEAM_BUILD_ID=… SEAM_LOAD_MARGIN_MIB=… EXLLAMAV3_TUNE_CACHE=… <MOE_ENV> <WS_ENV>"
+  printf 'SEAM_BUILD_ID=%s SEAM_LOAD_MARGIN_MIB=%s EXLLAMAV3_TUNE_CACHE=%s %s %s' "$1" "$LOAD_MARGIN" "$PAIR_TUNE_CACHE" "$MOE_ENV" "$WS_ENV"
 }
 
 pair_arch_for() {  # <sm_120|sm_121> -> x86_64|aarch64  (lib name per side)

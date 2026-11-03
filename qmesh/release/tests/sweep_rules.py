@@ -464,14 +464,14 @@ check("installs wait for the queue and rename into place",
 check("the load margin is the pair's number, not the worker's default",
       pc.load_conf("dev")["load_margin"] == "2048"
       and pc.load_conf("prod")["load_margin"] == "2048", "")
-# The server's environment is a release property in three parts -- the load margin, the MOE kernel with
-# its memory margin, and the piece size with the picker off -- and it used to be written out at each
-# start. Two copies is how the rollback once restarted a server with the worker's own defaults while the
-# smoke used the pair's numbers; there is one builder (pair_server_env in pair_lib.sh) and both starts
-# call it, so a knob cannot reach one and not the other.
+# The server's environment is a release property in four parts -- the load margin, the tuner cache, the
+# MOE kernel with its memory margin, and the piece size with the picker off -- and it used to be written
+# out at each start. Two copies is how the rollback once restarted a server with the worker's own
+# defaults while the smoke used the pair's numbers; there is one builder (pair_server_env in pair_lib.sh)
+# and both starts call it, so a knob cannot reach one and not the other.
 check("the server environment has one definition",
       "pair_server_env() {" in src("pair_lib.sh")
-      and '%s %s %s\' "$1" "$LOAD_MARGIN" "$MOE_ENV" "$WS_ENV"' in src("pair_lib.sh")
+      and '%s %s %s\' "$1" "$LOAD_MARGIN" "$PAIR_TUNE_CACHE" "$MOE_ENV" "$WS_ENV"' in src("pair_lib.sh")
       and "SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1" in "\n".join(code_lines(src("pair_lib.sh")))
       and "SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB" in "\n".join(code_lines(src("pair_lib.sh"))), "")
 check("both server starts use that definition",

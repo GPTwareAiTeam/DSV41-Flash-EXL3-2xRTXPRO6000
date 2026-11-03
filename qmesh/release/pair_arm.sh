@@ -85,6 +85,10 @@ envs=(
   # to reach the release cache through an inherited variable. For the release tree these are the two
   # values the container already carries, so the shipped exec is unchanged.
   -e "PYTHONPATH=$SRC" -e "TORCH_EXTENSIONS_DIR=$EXT_DIR"
+  # Same pin the worker gets from pair_server_env, for the client's half of the autotuner: unset,
+  # EXLLAMAV3_TUNE_CACHE resolves under $HOME *inside* the container, so the picks die with it (see
+  # the constant in pair_lib.sh). A container path, like the two above, not a host one.
+  -e "EXLLAMAV3_TUNE_CACHE=$PAIR_TUNE_CACHE"
   # pairs.conf's `gpu` is a *host* index: the container spec spends it on --gpus device=<gpu>, so
   # inside the container that one card is device 0 again. Passing the host index here asked dev's
   # container (which had every GPU) for GPU 1 and asked a scoped one for a GPU it cannot see.
