@@ -550,6 +550,9 @@ check("a release that does not declare the hook is not asked for it", _ok, _out.
 check("the stage that builds the seam lib builds and stamps the hook too",
       all(s in src("pair_build_lib.sh") for s in
           ("CPP_BUILD", "CPP_OK", "build_moe.sh", "PAIR_CPP_LIB", "MOE_OBJ=$moe_tmp")), "")
+check("the build skips the hook when the release does not declare it",
+      'native") or {}).get("moe_cpp")' in src("pair_build_lib.sh")
+      and "CPP_SKIP $side $arch release declares" in src("pair_build_lib.sh"), "")
 check("the cut declares whether the hook is required",
       'cat-file -e "$SHA:qmesh/native/build_moe.sh"' in src("pair_cut.sh")
       and '"native": {"moe_cpp"' in src("pair_cut.sh"), "")

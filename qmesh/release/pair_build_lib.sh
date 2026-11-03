@@ -218,6 +218,16 @@ PY
   stamp_write "$PAIR_LIB" "$flags" "$sha_lib" || { pair_step "LIB_FAIL $side stamp_write"; return 1; }
   pair_step "LIB_OK $side arch=$arch sha256=$sha_lib build=$BUILD_ID stamp=$PAIR_LIB.$arch.so.stamp"
 
+  # The declaration, not the file list, decides: a release cut before the hook existed tracks no
+  # build_moe.sh and has nothing to build, and prepare must not fail on a tree that never had it.
+  local cpp_req
+  cpp_req=$(python3 -c 'import json,sys;print(str(bool((json.load(open(sys.argv[1])).get("native") or {}).get("moe_cpp"))).lower())' \
+    "$REL/RELEASE.json" 2>/dev/null)
+  if [ "$cpp_req" != true ]; then
+    pair_step "CPP_SKIP $side $arch release declares native.moe_cpp=false"
+    return 0
+  fi
+
   # ---- the C moe hook -----------------------------------------------------------------------------
   # A second compiled artefact from the same tree, built under the same guards and stamped the same
   # way. It links libtorch on purpose (the hook calls the vendored cuda-exl3 kernels through the
