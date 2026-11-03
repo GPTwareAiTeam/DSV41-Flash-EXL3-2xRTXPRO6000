@@ -78,6 +78,13 @@ if [ "$PAIR" = dev ]; then
 else
   SMOKE_PREFILL_MIN_TPS=${SMOKE_PREFILL_MIN_TPS:-760}
 fi
+# The prefill rate is only a statement about the release when the box could serve the pack out of
+# memory. On 2026-11-03 the rel-2 canary read 698.9 tok/s against a bar of 800 while the GX worker sat
+# at avail_mib 788 with 1567 MiB of its own load already swapped out: that arm measured swap I/O, not
+# the seam. So when the box's available memory is below this floor at either end of the prefill window
+# the rate is printed, warned and NOT judged -- the same way the swap gate prints a prefill growth
+# instead of refusing it. It never skips the abort/compute checks below, which do not depend on speed.
+SMOKE_PREFILL_MIN_AVAIL_MIB=${SMOKE_PREFILL_MIN_AVAIL_MIB:-4000}
 ENSURE=${SEAM_ENSURE:-}
 if [ -z "$ENSURE" ]; then
   for c in "$PAIR_SCRIPTS/seam_server_ensure.sh" "$HERE/seam_server_ensure.sh"; do
@@ -532,7 +539,8 @@ fi
 # 837.6/908.0 were taken with. Tokens without a rate (an aborted arm) can not pass: the abort is the
 # failure mode this exists to catch, so both are read from the same line.
 pair_step "SMOKE_PREFILL pair=$PAIR depth=$SMOKE_PREFILL_DEPTH min_tps=$SMOKE_PREFILL_MIN_TPS timeout=${SMOKE_PREFILL_TIMEOUT}s"
-echo "SMOKE_MEM_PREFILL_BEFORE $(gx_mem)"
+pf_mem_before=$(gx_mem)
+echo "SMOKE_MEM_PREFILL_BEFORE $pf_mem_before"
 pf_log=$PAIR_STATE_DIR/logs/smoke-prefill-$PAIR-$(date -u +%Y%m%dT%H%M%SZ).log
 mkdir -p "$(dirname "$pf_log")" 2>/dev/null || true
 pf_out=$(ARM_IDS_OUT="" "$HERE/pair_arm.sh" "$PAIR" --prefill "$SMOKE_PREFILL_DEPTH" \
@@ -555,7 +563,8 @@ pf_tps=$(printf '%s\n' "$pf_line" | sed -n 's/.*tok_per_s=\([0-9.]*\).*/\1/p')
 pf_ab=$(printf '%s\n' "$pf_line" | sed -n 's/.*aborted=\([0-9]*\).*/\1/p')
 echo "SMOKE_PREFILL_LOG $pf_log"
 echo "SMOKE_PREFILL depth=$SMOKE_PREFILL_DEPTH ${pf_kv% } line_rc=0"
-echo "SMOKE_MEM_PREFILL_AFTER $(gx_mem)"
+pf_mem_after=$(gx_mem)
+echo "SMOKE_MEM_PREFILL_AFTER $pf_mem_after"
 # The prefill window is judged for the absolute level only (a second pack would show there too): growth
 # here is expected -- 356 MiB at ws 256, 734 at ws 1024 after a 32k prefill -- so it is printed and
 # warned, never refused.
@@ -567,10 +576,18 @@ case "$(printf '%s\n' "$pf_out")" in
     fail "prefill_compute_fail $(printf '%s' "$pf_out" | grep -m1 SEAM_COMPUTE_FAIL | cut -c1-240)" ;;
 esac
 [ -n "${pf_tps:-}" ] || fail "prefill_no_rate depth=$SMOKE_PREFILL_DEPTH line=$pf_line"
-# awk, not test: tok/s is fractional and the gate is a real threshold, not a string compare.
-awk -v got="$pf_tps" -v want="$SMOKE_PREFILL_MIN_TPS" 'BEGIN { exit !(got + 0 >= want + 0) }' \
-  || fail "prefill_slow depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS"
-echo "SMOKE_PREFILL_OK depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS aborts=0"
+# awk, not test: tok/s is fractional and the gate is a real threshold, not a string compare. The rate
+# is only judged when the box had memory to serve the pack at both ends of the window (see
+# SMOKE_PREFILL_MIN_AVAIL_MIB): a starved box measures swap I/O and would fail a healthy release.
+pf_avail_min=$(printf '%s\n%s\n' "$pf_mem_before" "$pf_mem_after" \
+  | sed -n 's/.*avail_mib=\([0-9]\{1,\}\).*/\1/p' | sort -n | sed -n '1p')
+if [ -n "$pf_avail_min" ] && [ "$pf_avail_min" -lt "$SMOKE_PREFILL_MIN_AVAIL_MIB" ]; then
+  echo "SMOKE_PREFILL_UNJUDGED depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS avail_mib_min=$pf_avail_min min_avail=$SMOKE_PREFILL_MIN_AVAIL_MIB why=box_starved"
+else
+  awk -v got="$pf_tps" -v want="$SMOKE_PREFILL_MIN_TPS" 'BEGIN { exit !(got + 0 >= want + 0) }' \
+    || fail "prefill_slow depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS avail_mib_min=${pf_avail_min:-unknown}"
+  echo "SMOKE_PREFILL_OK depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS aborts=0"
+fi
 # The OpenAI-compatible server is on no critical path -- nothing in the release calls it unless an
 # operator does -- so the default smoke does not pay for a second load. PAIR_SMOKE_SERVER=1 adds it:
 # pair_server_smoke.sh starts the pair's server, exercises it (models, completion usage, chat

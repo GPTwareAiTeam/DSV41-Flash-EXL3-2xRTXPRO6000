@@ -68,9 +68,9 @@ evidence() {
   [ "${PAIR_DRY:-0}" = 1 ] && return 0
   python3 - "$PAIR_STATE_DIR/evidence/${SHA:-none}.json" "$PAIR" "${SHA:-}" "${BUILD_ID:-}" \
            "$ok" "$why" "$PHASE" "${PAIR_LOG:-}" "${SMOKE_ROW:-}" "${SMOKE_IDS:-}" \
-           "$P7CT" "$GXCT" "${REL:-}" "${SMOKE_MIX:-}" <<'PY' 2>&1 | sed 's/^/  /' | tee -a "${PAIR_LOG:-/dev/null}"
+           "$P7CT" "$GXCT" "${REL:-}" "${SMOKE_MIX:-}" "${SMOKE_PREFILL_STATE:-}" <<'PY' 2>&1 | sed 's/^/  /' | tee -a "${PAIR_LOG:-/dev/null}"
 import datetime, json, os, sys
-path, pair, sha, build_id, ok, why, phase, log, row, ids, p7ct, gxct, rel, mix = sys.argv[1:15]
+path, pair, sha, build_id, ok, why, phase, log, row, ids, p7ct, gxct, rel, mix, pfstate = sys.argv[1:16]
 if not sha:
     print("EVIDENCE_SKIP no release sha yet")
     sys.exit(0)
@@ -104,7 +104,10 @@ doc = {
     "ok": ok == "ok",
     "failed_at_phase": "" if ok == "ok" else phase,
     "why": why,
-    "smoke": {"row": row, "ids": ids_doc, "kernel": mix_doc},
+    # prefill: "judged" means the 32k prefill rate was within the box's memory floor and cleared the
+    # threshold; "unjudged" means the box was starved (see SMOKE_PREFILL_MIN_AVAIL_MIB) and the rate
+    # says nothing about the release -- a promotion of this sha must see which one it was.
+    "smoke": {"row": row, "ids": ids_doc, "kernel": mix_doc, "prefill": pfstate or "none"},
     "containers": {"p7": p7ct, "gx": gxct},
     "log": log,
     "written_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -451,7 +454,10 @@ SMOKE_IDS=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_ARM_IDS_TOTAL n=\([0-9
 # The layer set the smoke was served by, carried into the evidence next to the ids: a digest alone
 # cannot say whether a mismatch came from the release or from a different restack.
 SMOKE_MIX=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_KERNEL_MIX //p' | head -1)
-pair_step "UPDATE_SMOKE pair=$PAIR $row ${SMOKE_IDS:-ids=none} mix=${SMOKE_MIX:-unknown}"
+# Whether the prefill rate was judged at all: "unjudged" when the box was starved of memory at either
+# end of the prefill window, so the evidence never claims a speed check that did not happen.
+SMOKE_PREFILL_STATE=$(printf '%s\n' "$smoke_out" | sed -n 's/^SMOKE_PREFILL_OK .*/judged/p;s/^SMOKE_PREFILL_UNJUDGED .*/unjudged/p' | head -1)
+pair_step "UPDATE_SMOKE pair=$PAIR $row ${SMOKE_IDS:-ids=none} mix=${SMOKE_MIX:-unknown} prefill=${SMOKE_PREFILL_STATE:-none}"
 
 # prod's decode ids must equal the ids dev's smoke of this same sha produced: same packs, same code,
 # so the engine has to emit the same tokens on both boxes. The gate already refuses a sha dev never
