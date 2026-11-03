@@ -84,7 +84,12 @@ SEAM_GATE_CT=${SEAM_GATE_CT:-$CT}
 SEAM_GATE_REQUIRED=${SEAM_GATE_REQUIRED:-1}
 
 seam_gxsh() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$GX" "$1"; }
-seam_gxct() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$GX" "docker exec $CT bash -lc '$1'"; }
+# The payload goes through two shells (ssh's, then `docker exec … bash -lc`), so a single quote inside it used to
+# end the wrapper's argument and hand bash -lc a truncated command: `grep -aq '^SEAM_SERVER_READY' $SEAM_LOG`
+# arrived as two words and the probe answered "not ready" forever, and `seam_kill_pattern` sent no signal at all
+# (2026-11-03, VisionTest found it by shlex-splitting this exact string). Escape each inner quote for the outer
+# shell; nothing else is touched, so callers still write $VAR and \$(...) deliberately.
+seam_gxct() { local q=${1//\'/\'\\\'\'}; ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$GX" "docker exec $CT bash -lc '$q'"; }
 # ---- server log archive ----------------------------------------------------------------------
 # Every start below ends in `rm -f $SEAM_LOG`, and that log carries the only per-load record of
 # which layers the cuda-exl3 restack refused (`SEAM_MOE_NOFIT layer=N`). Those lines decide whether
@@ -114,8 +119,14 @@ seam_archive_log() {
 # so the `bash -lc` wrapper that carries the script name in its argv cannot be counted) and the script
 # name anywhere in its arguments (bracketed, so no grep in this file matches its own line).
 seam_pids()  { seam_gxct "pgrep -x python3 -a" 2>/dev/null | grep -c 'worker_seam_server[.]py'; }
-# The same selection as a kill list: never a pattern kill on a name that a wrapper also carries.
-seam_kill_pattern() { printf '%s' "for p in \$(pgrep -x python3 -a | grep 'worker_seam_server[.]py' | cut -d' ' -f1); do kill ${1:+$1 }\$p; done"; }
+# Every payload above is quote-free for the same reason: one string through ssh's shell and then bash -lc.
+# A `'` there is escaped by seam_gxct now, but a payload that needs no quotes cannot be broken by a future
+# wrapper change either -- and tests/sweep_rules.py refuses one.
+# The same selection as a kill list: never a pattern kill on a name that a wrapper also carries. Quote-free on
+# purpose -- it is pasted into seam_gxct and an inner quote there ends the wrapper's argument -- and the match is
+# read from /proc, so neither the `bash -lc … stdbuf … worker_seam_server.py` launcher nor ssh's own command line
+# can be selected. `[.]` anywhere in this file would also make a grep match itself; /proc cannot.
+seam_kill_pattern() { printf '%s' "for p in \$(pgrep -x python3); do grep -qa worker_seam_server /proc/\$p/cmdline && kill ${1:+$1 }\$p; done"; }
 # ---- the GX gate ------------------------------------------------------------------------------
 # The file is pair_lib.sh's: <queue dir>/gx<N>.gate, one line "owner=<label> pid=<pid> until=<epoch>".
 # A claim whose until is past, whose pid is gone, or that is malformed does not protect anything, so
@@ -178,9 +189,9 @@ seam_ready() {
   local n
   n=$(seam_pids)
   [ "${n:-0}" -gt 0 ] || return 1
-  seam_gxct "grep -aq '^SEAM_SERVER_READY' $SEAM_LOG" >/dev/null 2>&1
+  seam_gxct "grep -aq ^SEAM_SERVER_READY $SEAM_LOG" >/dev/null 2>&1
 }
-seam_ready_line() { seam_gxct "grep -a '^SEAM_SERVER_READY' $SEAM_LOG | tail -1"; }
+seam_ready_line() { seam_gxct "grep -a ^SEAM_SERVER_READY $SEAM_LOG | tail -1"; }
 seam_served() {  # buckets=... from the READY line, e.g. "1,2,3,4,5,6,64"
   seam_ready_line 2>/dev/null | sed -n 's/.*buckets=\([0-9,]*\).*/\1/p'
 }
@@ -188,7 +199,7 @@ seam_slots() {  # slots=... from the READY line (protocol v3); empty on an older
   seam_ready_line 2>/dev/null | sed -n 's/.*slots=\([0-9]*\).*/\1/p'
 }
 seam_slack() {  # avail_mib=/swapped_mib=/ws_mib= from the server's own memory gate
-  seam_gxct "grep -a '^SEAM_SERVER_SLAB' $SEAM_LOG | tail -1"
+  seam_gxct "grep -a ^SEAM_SERVER_SLAB $SEAM_LOG | tail -1"
 }
 # A server can pass `fits=1` and still be unusable: on 2026-11-01 09:13 GX2 started with
 # avail_mib=1226 swapped_mib=3630 (a 113.54 GiB pack on a 124.5 GiB box) and its 47th call, a
@@ -227,7 +238,7 @@ seam_slack_gate() {
 SEAM_SLOTS_OK=""
 seam_slots_supported() {
   if [ -z "$SEAM_SLOTS_OK" ]; then
-    if seam_gxct "grep -qs -- '--slab-slots' /src/exllamav3/qmesh/worker_seam_server.py" >/dev/null 2>&1; then
+    if seam_gxct "grep -qs -- --slab-slots /src/exllamav3/qmesh/worker_seam_server.py" >/dev/null 2>&1; then
       SEAM_SLOTS_OK=1
     else
       SEAM_SLOTS_OK=0
@@ -240,8 +251,8 @@ seam_slots_supported() {
 # SEAM_SERVER_LOADED. Accept that as "started" so a converted script still works there, but only in the
 # start path and only after the new build has had 20 s to print READY; reuse never accepts it, because
 # such a server dies with its one client.
-seam_loaded() { seam_gxct "grep -aq '^SEAM_SERVER_LOADED' $SEAM_LOG" >/dev/null 2>&1; }
-seam_loaded_line() { seam_gxct "grep -a '^SEAM_SERVER_LOADED' $SEAM_LOG | tail -1"; }
+seam_loaded() { seam_gxct "grep -aq ^SEAM_SERVER_LOADED $SEAM_LOG" >/dev/null 2>&1; }
+seam_loaded_line() { seam_gxct "grep -a ^SEAM_SERVER_LOADED $SEAM_LOG | tail -1"; }
 seam_kind() {  # 1 = stub (no experts loaded, every forward answered with zeros), 0 = real pack
   seam_loaded_line 2>/dev/null | sed -n 's/.*stub=\([01]\).*/\1/p'
 }

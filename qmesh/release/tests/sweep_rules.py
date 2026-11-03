@@ -1223,5 +1223,37 @@ check("an unnamed hot half is refused, not checked against the previous pack's r
       and 'PAIR_PACK_P7", "")' in src("pair_pack_disk.py"), "")
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
+# 2026-11-03: seam_gxct pastes its payload into `ssh … "docker exec $CT bash -lc '<payload>'"`, so a single
+# quote inside the payload closed the wrapper's argument. `seam_kill_pattern` then reached bash as
+# `for p in $(pgrep -x python3 -a | grep ` -- unterminated, no signal ever sent -- and the six `grep -aq
+# '^SEAM_SERVER_*'` probes ran as a bare `grep` with no file. Both are silent: the stop "failed" after a 30 s
+# poll and the worker kept the pack. The escape in seam_gxct is the fix; this keeps payloads quote-free anyway.
+import re as _re
+import glob as _glob
+_gxct_bad = []
+for _f in sorted(_glob.glob(os.path.join(HERE, "*.sh"))):
+    for _n, _line in enumerate(open(_f), 1):
+        for _arg in _re.findall(r'seam_gxct\s+"((?:[^"\\]|\\.)*)"', _line):
+            if "'" in _arg:
+                _gxct_bad.append("%s:%d %s" % (os.path.basename(_f), _n, _arg.strip()[:70]))
+check("no seam_gxct payload carries a single quote",
+      not _gxct_bad, "; ".join(_gxct_bad)[:300])
+_ens = src("seam_server_ensure.sh")
+check("seam_gxct escapes a quote rather than trusting its callers",
+      "${1//\\'/\\'\\\\\\'\\'}" in _ens
+      and 'bash -lc \'$q\'' in _ens, "")
+# Ask the function what it emits rather than reading it: the printf format carries quotes of its own, the
+# payload must not. Both callers (plain stop and the -9 retry) are checked.
+_kp = _re.search(r'^seam_kill_pattern\(\) \{.*$', _ens, _re.M)
+_kp_body = _kp.group(0) if _kp else ""
+_kp_out = {}
+for _sig in ("", "-9"):
+    _r = subprocess.run(["bash", "-c", 'eval "$1"; seam_kill_pattern "$2"', "_", _kp_body, _sig],
+                        capture_output=True, text=True)
+    _kp_out[_sig] = _r.stdout
+check("the kill list is quote-free and selects by /proc cmdline",
+      all("grep -qa worker_seam_server /proc/" in v and "'" not in v for v in _kp_out.values())
+      and 'kill $p; done' in _kp_out[""] and "kill -9 $p; done" in _kp_out["-9"],
+      repr(_kp_out)[:220])
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
 sys.exit(1 if fails else 0)
