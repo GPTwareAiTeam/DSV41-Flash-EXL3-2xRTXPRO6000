@@ -20,6 +20,12 @@ side-by-side; if a rung does not fit, passing 2048 splits both arms at the deplo
 floor rung instead. The C side takes its piece size at open, so `--cpp-ws` names it; the Python
 side takes it from server.ws_rows. The C arm is timed twice, fp32 and then bf16, so the wire's
 per-call cost is measured on the same buffers as the reference, not inferred.
+
+`--parity` adds a third opinion: the layer's own op sequence in fp64 (decode, Hadamard, both GEMMs,
+the combine) scores both arms, and the two answers are byte-compared, so "the arms differ" and "both
+of them are off the exact answer by x" are separate numbers. The reference's decode is checked
+against the vendor's `reconstruct` on one expert per layer (SEAM_MOE_CPP_FP64), and `--w-mode normal`
+puts distinct routing weights in the slab, where a weight folded in twice or not at all would show.
 """
 from __future__ import annotations
 
@@ -104,7 +110,184 @@ def compare(out_before, out_after):
             float(np.median(np.abs(a))), float(np.abs(a).max()),
             int((rel > 1e-3).sum()))
 
-def fill_inputs(x_ptr, ids_ptr, rows, ncold, args, seed=0):
+
+# -- fp64 reference (parity only) ---------------------------------------------------------------------
+# The Python op sequence -- had_in, gemm13, glu, gemm2, combine -- in fp64, with none of its half
+# roundings: W = diag(suh) H W_hat H diag(svh) per 128-block on both sides, applied on the left so
+# the rotated weight is never materialized. Port of tests/testlib/trellis.py's decode (ring bits,
+# codebook, tile order), checked against the vendor's own `reconstruct` on one expert per layer
+# (SEAM_MOE_CPP_FP64): a reference with a decode bug would report a large error for both arms and
+# look like a parity problem, so the decode is verified separately from the comparison that uses it.
+_PERM = {}
+_LUT = {}
+_ST = []
+
+
+def _tile_perm(dev):
+    """(256,) row-major element of the 16x16 tile that ring position i holds (trellis.py:tile_perm)"""
+    p = _PERM.get(dev)
+    if p is None:
+        t = torch.arange(32, device=dev)[:, None]
+        j = torch.arange(8, device=dev)[None, :]
+        r = (t % 4) * 2 + (j & 1) + torch.where((j & 2) != 0, 8, 0)
+        c = t // 4 + torch.where((j & 4) != 0, 8, 0)
+        p = _PERM[dev] = (r * 16 + c).reshape(-1)
+    return p
+
+
+def _step_widths(K, dev):
+    """(256,) bits that ring position i adds to the bit pointer (trellis.py:step_widths).
+
+    An integer rate steps one bit per position; a half-integer rate steps one bit and, on alternate
+    positions, a second, which is where the 16-bit window of each codebook value starts.
+    """
+    ka = int(K)
+    if float(K).is_integer():
+        return torch.full((256,), ka, dtype=torch.int64, device=dev)
+    assert ka + 0.5 == K, f"K must be a whole or half bit rate, got {K}"
+    return ka + ((torch.tensor(0xAAAA, device=dev) >> (torch.arange(256, device=dev) & 15)) & 1)
+
+
+def _f16_bits(b):
+    """The fp16 that bit pattern b is, in fp64 (exact: every fp16 value is a double)"""
+    b = b & 0xFFFF
+    return (b - ((b & 0x8000) << 1)).to(torch.int16).view(torch.float16).double()
+
+
+def _cb_lut(cb, dev):
+    """(65536,) fp64: the codebook value of every 16-bit window, one fp16 rounding like the kernel.
+
+    decode() is a pure function of the window, so 64 Ki entries cover every tile of every expert and
+    every layer: 3inst and mcg fold the window through one 32-bit mix and add its two halves, mul1
+    adds the window's bytes to a fixed fp16 exponent.
+    """
+    lut = _LUT.get(cb)
+    if lut is not None:
+        return lut
+    idx = torch.arange(65536, device=dev)
+    if cb == 2:                                          # mul1: the window sums to an fp16 mantissa
+        x = (idx * 0x83DCD12D) & 0xFFFFFFFF
+        bsum = sum(((x >> sh) & 0xFF) for sh in (0, 8, 16, 24)).double()
+        k_inv = float(_f16_bits(torch.tensor(0x1EEE, device=dev)))
+        k_bias = float(_f16_bits(torch.tensor(0xC931, device=dev)))
+        lut = ((bsum + 1024.0) * k_inv + k_bias).half().double()
+    else:                                                # 3inst / mcg: two fp16 halves, summed
+        mul, add = (89226354, 64248484) if cb == 0 else (0xCBAC1FED, 0)
+        x = (idx * mul + add) & 0xFFFFFFFF
+        x = (x & 0x8FFF8FFF) ^ 0x3B603B60
+        lut = (_f16_bits(x & 0xFFFF) + _f16_bits(x >> 16)).half().double()
+    _LUT[cb] = lut
+    return lut
+
+
+def _windows(packed, dev):
+    """(T, W) packed int16 tiles -> (T, 256) uint16 codebook windows, in ring order.
+
+    Windows are bit ranges of the tile's ring of 256*K bits, which the packer writes MSB-first into
+    W big-endian u32 words; window i starts at ring bit S(i) - 16 and wraps mod the ring
+    (trellis.py:unpack). Read as the three bytes at that bit position rather than as 16 bit planes:
+    the shift is 8 - (start % 8), never 0, so no window is straddling four bytes.
+    """
+    p = packed.reshape(-1, packed.shape[-1]).contiguous()
+    T, W = p.shape
+    nby = W * 2                                  # W int16 words = W/2 big-endian u32 words
+    u16 = p.view(torch.uint16).to(torch.int32)
+    u32 = u16[:, 0::2] | (u16[:, 1::2] << 16)
+    by = torch.stack([(u32 >> sh) & 0xFF for sh in (24, 16, 8, 0)], -1).reshape(T, nby).to(torch.uint8)
+    pos = (torch.cumsum(_step_widths(W / 16, dev), 0) - 16) % (W * 16)
+    bi = pos // 8
+    b0, b1, b2 = (by[:, (bi + k) % nby].to(torch.int32) for k in range(3))
+    v = (b0 << 16) | (b1 << 8) | b2
+    return (v >> (8 - pos % 8)) & 0xFFFF
+
+
+def _w_hat(packed, cb, dev):
+    """(tk, tn, W) packed tile grid -> (16 tk, 16 tn) fp64 rotated weight (codebook values only).
+
+    Ring order within a tile is not row-major: element perm[i] of the 16x16 tile is ring slot i, so
+    the tile is un-permuted before it is laid back out as 16x16 blocks.
+    """
+    tk, tn, W = packed.shape
+    vals = _cb_lut(cb, dev)[_windows(packed, dev).long()]
+    tiles = torch.empty_like(vals)
+    tiles[:, _tile_perm(dev)] = vals
+    return tiles.reshape(tk, tn, 16, 16).transpose(1, 2).reshape(tk * 16, tn * 16)
+
+
+def _sylvester(dev, n=128):
+    """H/sqrt(n): EXL3's normalized 128-point Hadamard (exl3_had.cuh's RSCALE is 1/sqrt(128))"""
+    h = torch.ones((1, 1), dtype=torch.float64, device=dev)
+    while h.shape[0] < n:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    return h / n ** 0.5
+
+
+def _had(v, Hd):
+    """The EXL3 Hadamard, per 128-block along the last axis"""
+    return (v.reshape(-1, 128) @ Hd).reshape(v.shape)
+
+
+def fp64_selftest(cx, dev):
+    """The reference's decode against the vendor's `reconstruct` on one expert of this layer.
+
+    ext.reconstruct() is the dense path's W_hat: same ring bits, same codebook, same tile order, one
+    fp16 rounding. If the two agree bit for bit then --parity's fp64 reference is measuring
+    precision, so a large py_fp64_rel is a real divergence rather than a broken reference.
+    """
+    from exllamav3.ext import exllamav3_ext as ext
+    grp = next((g for g in cx.groups if g.n_experts), None)
+    if grp is None:
+        print("SEAM_MOE_CPP_FP64 skipped=no_group", flush=True)
+        return
+    parts = []
+    for name, packed in (("w13", grp.trellis13[0]), ("w2", grp.trellis2[0])):
+        W = torch.empty((packed.shape[0] * 16, packed.shape[1] * 16), dtype=torch.half, device=dev)
+        ext.reconstruct(W, packed, packed.shape[-1] / 16, grp.cb == 1, grp.cb == 2)
+        wd = W.double()
+        mine = _w_hat(packed, grp.cb, dev)
+        rel = float((mine - wd).abs().max() / max(float(wd.abs().max()), 1e-30))
+        parts.append(f"{name}_K={packed.shape[-1] / 16:g} "
+                     f"{name}_eq={float((mine == wd).float().mean()) * 100:.2f}% "
+                     f"{name}_max_rel={rel:.3e}")
+    print(f"SEAM_MOE_CPP_FP64 cb={grp.cb} n_experts={grp.n_experts} " + " ".join(parts), flush=True)
+
+
+def ref_fp64(cx, x_t, ids_t, w_t, Hd):
+    """(tokens, HIDDEN) fp64 of this layer's answer, one expert at a time.
+
+    Picks are gathered per expert exactly once, so an expert that two picks of one token land on
+    carries both weights (that is what the combine's pick-order sum does too). One expert's two
+    matrices are ~280 MiB in fp64, which is why nothing is cached across experts.
+    """
+    dev = x_t.device
+    out = torch.zeros((x_t.shape[0], HIDDEN), dtype=torch.float64, device=dev)
+    for grp in cx.groups:
+        if grp.n_experts == 0:
+            continue
+        loc = grp.remap[ids_t.clamp(min=0)]                     # local expert index, -1 outside
+        live = (loc >= 0) & (ids_t >= 0)                        # -1 is an invalid pick, not remap's
+        if not bool(live.any()):
+            continue
+        wm = torch.zeros((x_t.shape[0], grp.n_experts), dtype=torch.float64, device=dev)
+        wm.scatter_add_(1, loc.clamp(min=0), torch.where(live, w_t, torch.zeros_like(w_t)))
+        I = int(grp.svh13.shape[1]) // 2
+        for e in torch.nonzero(wm.any(0)).reshape(-1).tolist():
+            tok = torch.nonzero(wm[:, e]).reshape(-1)
+            xr = x_t[tok].double()
+            w13 = _w_hat(grp.trellis13[e], grp.cb, dev)        # (H, 2I)
+            halves = []
+            for h, n0 in ((0, 0), (1, I)):
+                a1 = _had(xr * grp.suh13[e, h].double(), Hd)
+                halves.append(_had(a1 @ w13[:, n0:n0 + I], Hd) * grp.svh13[e, n0:n0 + I].double())
+            g, u = halves
+            act = (g * torch.sigmoid(g)) * u
+            a2 = _had(act * grp.suh2[e, 0].double(), Hd)
+            r = _had(a2 @ _w_hat(grp.trellis2[e], grp.cb, dev), Hd) * grp.svh2[e].double()
+            out[tok] += wm[tok, e, None] * r
+    return out
+
+
+def fill_inputs(x_ptr, ids_ptr, w_ptr, rows, ncold, args, seed=0):
     """(Re)fill the pinned slab: activation samples at a chosen magnitude, and routing ids.
 
     The probe's all-ones activation is a synthetic case: the layer's own answer was ~8.6e-6 per
@@ -125,10 +308,28 @@ def fill_inputs(x_ptr, ids_ptr, rows, ncold, args, seed=0):
         a *= args.scale
     view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN)[:] = \
         torch.from_numpy(a).bfloat16().view(torch.uint16).numpy()
+    # The slab ships unit weights, which make the routing weight a no-op in both implementations
+    # and so hide a fold that scales the answer by the weight twice or not at all. --w-mode normal
+    # draws distinct positive weights (what a router's own top-k softmax produces); drawn after x
+    # so the default stream of activations is unchanged.
+    if args.w_mode == "normal":
+        wv = rng.random((rows, TOPK)).astype(np.float32)
+        view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:] = \
+            torch.from_numpy(wv).bfloat16().view(torch.uint16).numpy()
 
     if args.ids_mode == "probe":
         return None
-    if args.ids_mode == "file":
+    # auto: the captured routing where the trace has this (layer, rows), Zipf where it does not (the
+    # capture stops at 6 rows, so 64 and 8192 have no real routing to replay). One row count is then
+    # not fed by a different sampling rule than another without the IDS line saying which.
+    mode = args.ids_mode
+    if mode == "auto":
+        mode = "zipf"
+        if args.ids_file and str(args.ids_file).endswith(".npz"):
+            with np.load(args.ids_file) as zz:
+                if f"L{args.layer}_r{rows}" in zz.files:
+                    mode = "file"
+    if mode == "file":
         # A .npz is the all-layer form (one capture, forty layers): key L<layer>_r<rows>. A .npy
         # stays the single-layer form, so the existing one-layer command lines keep working.
         if str(args.ids_file).endswith(".npz"):
@@ -161,7 +362,7 @@ def fill_inputs(x_ptr, ids_ptr, rows, ncold, args, seed=0):
     view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK)[:] = ids
     hist = np.bincount(ids.reshape(-1).clip(0), minlength=ncold)
     top_n = np.sort(hist)[::-1][:8]
-    print(f"SEAM_MOE_CPP_IDS rows={rows} mode={args.ids_mode} n_cold={ncold} "
+    print(f"SEAM_MOE_CPP_IDS rows={rows} mode={mode} n_cold={ncold} "
           f"distinct={int((hist > 0).sum())} top8={top_n.tolist()} "
           f"max_count={int(hist.max())} mean_count={float(hist.mean()):.1f}", flush=True)
     return hist
@@ -312,10 +513,12 @@ def run_all_layers(args, layers):
                 # needs, so it goes through untouched.
                 if m.group(1) == "TRAFFIC":
                     print(ln, flush=True)
-            elif ln.startswith(("SEAM_MOE_CPP_OUT", "SEAM_MOE_CPP_IDS")):
+            elif ln.startswith(("SEAM_MOE_CPP_OUT", "SEAM_MOE_CPP_IDS", "SEAM_MOE_CPP_PARITY",
+                                "SEAM_MOE_CPP_FP64")):
                 # Not summarised anywhere, and they must survive the driver: OUT/OUT_PY are the
                 # per-arm tensor identity (two arms of one call are a controlled comparison only if
-                # their bytes match), IDS is which experts the routing actually picked.
+                # their bytes match), IDS is which experts the routing actually picked, PARITY is
+                # the same comparison against an fp64 reference (and FP64 its own decode check).
                 print(ln, flush=True)
         if p.returncode != 0 or ("AFTER", rows_list[0]) not in got:
             failed.append(layer)
@@ -389,9 +592,15 @@ def main():
                     help="activation samples in the slab: all-ones (the old probe) or N(0,1)")
     ap.add_argument("--scale", type=float, default=1.0,
                     help="multiply the activation before rounding to bf16 (magnitude sweep)")
-    ap.add_argument("--ids-mode", choices=["probe", "zipf", "file"], default="probe",
-                    help="probe = arange%%n_cold, zipf = skewed distinct per token, file = --ids-file")
-    ap.add_argument("--ids-file", default=None, help=".npy of (rows, TOPK) int32 for --ids-mode file")
+    ap.add_argument("--w-mode", choices=["ones", "normal"], default="ones",
+                    help="routing weights in the slab: all-ones (the probe, where the weight is a "
+                         "no-op in both arms) or distinct positive weights (routing weight folded "
+                         "in exactly once)")
+    ap.add_argument("--ids-mode", choices=["probe", "zipf", "file", "auto"], default="probe",
+                    help="probe = arange%%n_cold, zipf = skewed distinct per token, file = --ids-file, "
+                         "auto = the .npz key for (layer, rows) when it has one, else zipf")
+    ap.add_argument("--ids-file", default=None,
+                    help=".npy of (rows, TOPK) int32, or .npz keyed L<layer>_r<rows>")
     ap.add_argument("--zipf-s", type=float, default=1.0, help="Zipf exponent of the id popularity")
     ap.add_argument("--ids-seed", type=int, default=0, help="seed of the x and id sampling")
     ap.add_argument("--dump-align", action="store_true",
@@ -406,6 +615,18 @@ def main():
                     help="save the C arm's fp32 output as DIR/L<layer>_r<rows>.npy and print its "
                          "sha256 and magnitude (SEAM_MOE_CPP_OUT); two builds that print the same "
                          "sha cannot differ downstream. No effect on the measured call")
+    ap.add_argument("--parity", action="store_true",
+                    help="score the two arms against an fp64 reference of this layer's own op "
+                         "sequence and print one SEAM_MOE_CPP_PARITY line per row count (identical "
+                         "bytes, max abs/rel, and each arm's error against the reference). The "
+                         "reference covers the first --parity-tokens rows: one expert at a time in "
+                         "fp64 is the same cost at 1 row as at 8, and the routing is representative")
+    ap.add_argument("--parity-tokens", type=int, default=8,
+                    help="rows the fp64 reference covers (default 8; the rest are still byte-compared)")
+    ap.add_argument("--parity-ref", default=None,
+                    help="read the fp64 reference from DIR/L<layer>_r<rows>_ref.npy (written by an "
+                         "earlier run's --parity --dump-out) instead of recomputing it, so a second "
+                         "arm is scored against the same reference without the fp64 pass")
     args = ap.parse_args()
     if args.layers:
         return run_all_layers(args, parse_layers(args.layers))
@@ -447,7 +668,7 @@ def main():
               f"iters={args.iters} x_mode={args.x_mode} scale={args.scale} "
               f"ids_mode={args.ids_mode} avail_mib={_avail_mib()} swapped_mib={_swap_used_mib()}",
               flush=True)
-        hist = fill_inputs(x_ptr, ids_ptr, rows, ncold, args, seed=args.ids_seed)
+        hist = fill_inputs(x_ptr, ids_ptr, w_ptr, rows, ncold, args, seed=args.ids_seed)
         ids_np = view(ids_ptr, rows * TOPK * 4, np.int32).reshape(rows, TOPK).copy()
 
         if args.dump_align:
@@ -519,6 +740,60 @@ def main():
                   f"sha={hashlib.sha256(b).hexdigest()[:16]} bytes={len(b)} "
                   f"sum={float(after.astype(np.float64).sum()):.6e} "
                   f"absmax={float(np.abs(after).max()):.6e} path={path}", flush=True)
+        # Parity: the two implementations on identical inputs, scored against the same fp64
+        # reference, so a difference between the arms is either a rounding both of them inherit
+        # (both fp64 columns equal) or a real one. The byte test is on the fp32 tensors this
+        # process read back, so it is the same "identical" the response sha's are counted on.
+        if args.parity and before is not None:
+            try:
+                if cx is None:
+                    cx = server._cx_moe(args.layer, ffn)
+                if not _ST:
+                    _ST.append(1)
+                    fp64_selftest(cx, dev)
+                tok = max(1, min(rows, args.parity_tokens))
+                x_np = view(x_ptr, rows * HIDDEN * 2, np.uint16).reshape(rows, HIDDEN)[:tok].copy()
+                w_np = view(w_ptr, rows * TOPK * 2, np.uint16).reshape(rows, TOPK)[:tok].copy()
+                x_t = torch.from_numpy(x_np).view(torch.bfloat16).to(dev)
+                w_t = torch.from_numpy(w_np).view(torch.bfloat16).to(dev).double()
+                ids_t = torch.from_numpy(ids_np[:tok].astype(np.int64)).to(dev)
+                # The reference is a pure function of this layer's weights and the first `tok` rows'
+                # x/ids/w, so a second arm on identical inputs can reuse it: same tensor, no fp64
+                # pass, and both arms then differ only in the code under test.
+                rp = (os.path.join(args.parity_ref, f"L{args.layer}_r{rows}_ref.npy")
+                      if args.parity_ref else None)
+                if rp and os.path.exists(rp):
+                    ref = np.load(rp)
+                    if ref.shape != (tok, HIDDEN):
+                        raise RuntimeError(f"{rp} is {ref.shape}, expected {(tok, HIDDEN)}")
+                    src = f"file={rp}"
+                else:
+                    ref = ref_fp64(cx, x_t, ids_t, w_t, _sylvester(dev)).cpu().numpy()
+                    src = "computed"
+                torch.cuda.empty_cache()
+                py64 = before[:tok].astype(np.float64)
+                cpp64 = after[:tok].astype(np.float64)
+                rn = max(float(np.linalg.norm(ref)), 1e-30)
+                ab = np.ascontiguousarray(before)
+                aa = np.ascontiguousarray(after)
+                d = np.abs(after.astype(np.float64) - before.astype(np.float64))
+                rel = d / np.maximum(np.abs(before.astype(np.float64)), 1e-30)
+                if args.dump_out:
+                    path = os.path.join(args.dump_out, f"L{args.layer}_r{rows}_ref.npy")
+                    np.save(path, ref)
+                print(f"SEAM_MOE_CPP_PARITY layer={args.layer} rows={rows} tokens={tok} "
+                      f"w_mode={args.w_mode} ref={src} "
+                      f"identical={int(ab.tobytes() == aa.tobytes())} "
+                      f"n_bits={int((ab.view(np.uint32) != aa.view(np.uint32)).sum())} "
+                      f"max_abs={float(d.max()):.3e} max_rel={float(rel.max()):.3e} "
+                      f"py_fp64={float(np.linalg.norm(py64 - ref) / rn):.3e} "
+                      f"py_fp64_maxabs={float(np.abs(py64 - ref).max()):.3e} "
+                      f"cpp_fp64={float(np.linalg.norm(cpp64 - ref) / rn):.3e} "
+                      f"cpp_fp64_maxabs={float(np.abs(cpp64 - ref).max()):.3e} "
+                      f"ref_absmax={float(np.abs(ref).max()):.3e}", flush=True)
+            except Exception as e:  # noqa: BLE001 - a parity probe must not kill the measurement
+                print(f"SEAM_MOE_CPP_PARITY_FAILED layer={args.layer} rows={rows} "
+                      f"err={type(e).__name__}: {str(e).splitlines()[0][:160]}", flush=True)
         # What a call actually reads, so its time has a denominator: at 1-6 rows the experts behind
         # the picks decide whether a ~1.2 ms call is a bandwidth floor or dispatch overhead. Taken
         # after the C arm, so the dev_ms/host_ms beside it came from this same routing.

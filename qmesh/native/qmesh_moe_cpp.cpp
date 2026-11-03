@@ -14,8 +14,12 @@
  *
  * The math is the vendored cuda-exl3 kernels, called through the torch dispatcher exactly as the
  * Python path called them (`cuda_exl3_C::exl3_moe_*`), so a change in the vendor extension reaches
- * both paths at once. Numerics differ from the Python path only in the order of the
- * down-projection's fp32 atomics within an expert's block (measured in the ticket).
+ * both paths at once. Numerics differ from the Python path in the epilogue of the down projection:
+ * by default the routing weight is folded into that gemm's fp32 atomics, so the answer depends on
+ * the order the blocks retire in and on block_m, and it is neither reproducible run to run nor
+ * comparable per layer with the Python path's. SEAM_MOE_CPP_DET=1 runs the Python path's
+ * deterministic branch instead (`exl3_moe_combine` into a half, one fp32 add per group), which is
+ * the mode a byte comparison between the two paths is made in.
  *
  * The piece ladder is duplicated from worker_seam_server._pick_step, with the same constants and
  * the same SEAM_WS_* environment: the C hook is installed *instead of* the Python _forward, so it
@@ -173,6 +177,19 @@ at::Tensor moe_gemm(const at::Tensor& a_had, const at::Tensor& trellis, const at
   return a.at(0).toTensor();
 }
 
+/* exl3_moe_combine(rows_out, sorted_ids, topk_weights, num_tokens, expert_ids, block_m): the
+ * vendor's pick-order gather, one half output per (token, hidden) - the Python path's
+ * deterministic combine, called instead of re-implemented so the two paths cannot drift. */
+at::Tensor moe_combine(const at::Tensor& rows_out, const at::Tensor& sorted_ids,
+                       const at::Tensor& topk_w, int num_tokens, const at::Tensor& expert_ids,
+                       int block_m) {
+  std::vector<c10::IValue> a{c10::IValue(rows_out), c10::IValue(sorted_ids),
+                             c10::IValue(topk_w),    iv_i64(num_tokens),
+                             c10::IValue(expert_ids), iv_i64(block_m)};
+  op_handle("cuda_exl3_C::exl3_moe_combine").callBoxed(a);
+  return a.at(0).toTensor();
+}
+
 /* exl3_moe_cuda.pick_block_m, including CUDA_EXL3_MOE_BLOCK_M: first minimum wins, as min(..., key=) */
 int pick_block_m(int live, int n_experts) {
   static const int override_bm = env_int("CUDA_EXL3_MOE_BLOCK_M", 0);
@@ -295,6 +312,9 @@ struct Ctx {
   bool dump = false; /* SEAM_MOE_CPP_DUMP: mirror each group's alignment into host buffers */
   bool trace = false;
   bool bound = false; /* SEAM_MOE_CPP_BOUND: align from the picks' bound, no per-piece readback */
+  bool det = false; /* SEAM_MOE_CPP_DET: the Python path's deterministic epilogue branch, op for op
+                     * (see run_piece). Refuses the bounded alignment, whose epilogue is the other,
+                     * order-dependent sum. */
   int ws_pick = -1;
   int n_groups_max = 0;
   std::mutex mu;
@@ -500,7 +520,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
    * own sync.
    *
    * A dump needs this piece's exact per-group numbers, so it keeps the readback. */
-  const bool bound_mode = c.bound && !c.dump && rows <= kBoundMaxRows;
+  const bool bound_mode = c.bound && !c.dump && !c.det && rows <= kBoundMaxRows;
   if (cudaMemsetAsync(b.counts, 0, (size_t)L.n_groups * QMC_MAX_EXPERTS * 4, s) != cudaSuccess ||
       ((!bound_mode || first_piece) && cudaMemsetAsync(b.bad, 0, 4, s) != cudaSuccess)) {
     set_err("histogram clear failed: %s", cudaGetErrorString(cudaGetLastError()));
@@ -626,8 +646,26 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
                  {(int64_t)q.inter, (int64_t)q.inter}, q.cb, bm[g], at::kHalf, sorted_t, true,
                  at::Tensor(), false, rows, T, inter, true, false);
         moe_glu(inter, a2, L.grp[g].suh2, eids_t, nr_t, bm[g]);
-        moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H}, q.cb,
-                 bm[g], at::kFloat, sorted_t, true, w_f, true, rows, T, acc, true, wrote);
+        if (c.det) {
+          /* SEAM_MOE_CPP_DET: the Python path's deterministic branch (exl3_moe_cuda.py:482-491), the
+           * only difference being the epilogue -- the down gemm unweighted into a half, the vendor's
+           * pick-order combine into a second half, one fp32 add per group. The default epilogue folds
+           * the routing weight into the down gemm's fp32 atomics instead, so its answer depends on
+           * the order blocks retire in (and on block_m); this one depends on nothing but the group
+           * order. That is what makes a per-layer byte comparison between the two paths mean
+           * anything (the measured agreement of the default arm was 13/40 layers at 1 row). */
+          const at::Tensor routed =
+              moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H},
+                       q.cb, bm[g], at::kHalf, sorted_t, true, at::Tensor(), false, rows, T,
+                       at::Tensor(), false, false);
+          const at::Tensor combined = moe_combine(routed, sorted_t, w_f, rows, eids_t, bm[g]);
+          /* total = out.float() on the first contributing group and total + out.float() after: the
+           * assign-vs-add distinction is -0.0's, and it is what the Python path does. */
+          qmc_k_h2f_add(combined.data_ptr(), b.acc, rows * H, wrote ? 1 : 0, s);
+        } else {
+          moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H}, q.cb,
+                   bm[g], at::kFloat, sorted_t, true, w_f, true, rows, T, acc, true, wrote);
+        }
       } catch (const std::exception& e) {
         set_err("layer %d group %d raised: %s", layer, g, e.what());
         rc = kRefuseCompute;
@@ -692,6 +730,13 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
    * group to min(n_experts, m_valid) costs more blocks than the sync saves at decode widths. On is a
    * measurement arm. */
   c->bound = env_int("SEAM_MOE_CPP_BOUND", 0) != 0;
+  /* The Python path's deterministic epilogue (see run_piece): an unweighted half out of the down gemm,
+   * the vendor's pick-order combine, one fp32 add per group. It is the only mode whose answer is the
+   * same on every run and at every block_m, which is what makes a per-layer byte comparison between
+   * the two paths meaningful; it also refuses SEAM_MOE_CPP_BOUND, whose epilogue is the other,
+   * order-dependent sum. Off by default: the combine is an extra pass over rows*H halves and a
+   * host-visible allocation, and the default epilogue is faster. */
+  c->det = env_int("SEAM_MOE_CPP_DET", 0) != 0;
   /* Response format. Default fp32: the shipped seam slot is fp32 and off_resp's stride is
    * rows*HIDDEN*4 (qmesh_expert_seam.cu, and Seam.collect in remote_seam_host.py), so anything else
    * must be a deliberate, matching change on the client side. */

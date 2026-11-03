@@ -131,6 +131,18 @@ __global__ void k_f32_to_half(const float *src, void *dst, int n, int mode) {
     ((__half *)dst)[i] = __float2half_rn(v);
 }
 
+/* The deterministic combine's fp32 fold: the Python path's `total = out.float() if total is None
+ * else total + out.float()`, with out the half the vendor's exl3_moe_combine returned. One thread
+ * per output element, so the sum is the same one on every run and on every block_m - which is the
+ * whole point of the mode (see run_piece). `accumulate` false assigns instead of adding, so a slab
+ * whose only contributing group is group 0 holds exactly the combined values, -0.0 included. */
+__global__ void k_h2f_add(const __half *src, float *dst, int n, int accumulate) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float v = __half2float(src[i]);
+  dst[i] = accumulate ? dst[i] + v : v;
+}
+
 }  // namespace
 
 void qmc_k_bf16_to_half(const uint16_t *src, void *dst_half, int n, cudaStream_t s) {
@@ -177,4 +189,9 @@ void qmc_k_align(const int32_t *counts, int n_experts, int block_m, int nblk_pad
 void qmc_k_f32_to_half(const float *src, void *dst, int n, int mode, cudaStream_t s) {
   if (n <= 0) return;
   k_f32_to_half<<<grid_for(n), kThreads, 0, s>>>(src, dst, n, mode);
+}
+
+void qmc_k_h2f_add(const void *src_half, float *dst, int n, int accumulate, cudaStream_t s) {
+  if (n <= 0) return;
+  k_h2f_add<<<grid_for(n), kThreads, 0, s>>>((const __half *)src_half, dst, n, accumulate);
 }

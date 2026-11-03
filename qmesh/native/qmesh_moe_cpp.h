@@ -124,6 +124,9 @@ void qmc_k_align(const int32_t *counts, int n_experts, int block_m, int nblk_pad
                  int32_t *eids, int32_t *nblk, int32_t *live, cudaStream_t s);
 /* mode 1 = bf16, 2 = fp16, round-to-nearest-even. */
 void qmc_k_f32_to_half(const float *src, void *dst, int n, int mode, cudaStream_t s);
+/* The deterministic combine's fold: dst[i] = dst[i] + (float)src_half[i], or dst[i] = (float)
+ * src_half[i] when accumulate is 0. Same element order every call and every block_m. */
+void qmc_k_h2f_add(const void *src_half, float *dst, int n, int accumulate, cudaStream_t s);
 
 #ifdef __cplusplus
 }
