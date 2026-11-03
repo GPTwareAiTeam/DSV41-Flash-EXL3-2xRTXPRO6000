@@ -99,7 +99,9 @@ CLIENT_PLACEMENT=${CX_PLACEMENT:-/models/dsv41/hot4cold2/packs/placement.hot4460
 RANKED=${CX_RANKED:-1}
 LOADS=${CX_LOADS:-2}      # 2 = the two-load acceptance arm; 1 = a single-load arm (C, ws geometry)
 
-say() { echo "$(date +%T) DIRECT $*" | tee -a "$LOG"; }
+# say owns the prefix: call sites that spell "DIRECT" themselves (FAIL/PASS/rc lines) must not print
+# it twice -- the 21:56 census logged "DIRECT DIRECT FAIL load1r1 left no digest to compare".
+say() { local m="$*"; echo "$(date +%T) DIRECT ${m#DIRECT }" | tee -a "$LOG"; }
 status() { [ -n "${GPU_RUN_STATUS:-}" ] && printf 'eta_min=%s doing=%s\n' "$1" "$2" > "$GPU_RUN_STATUS"; return 0; }
 
 gx_mem() {  # -> "avail_mib swapfree_mib"
