@@ -439,9 +439,16 @@ check("the client can take extra env without a second driver",
 _lb, _sm = src("pair_lib.sh"), src("pair_smoke.sh")
 check("the server can take extra env, and the smoke prints what the worker installed",
       'SRV_ENV_EXTRA=${PAIR_SRV_EXTRA_ENVS:-}' in _lb
-      and 'SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB $SRV_ENV_EXTRA"' in _lb
+      and 'SEAM_MOE_CPP=$MOE_CPP $SRV_ENV_EXTRA"' in _lb
       and 'SMOKE_SERVER_CPP asked=' in _sm
       and 'SEAM_MOE_CPP_(ON|OFF)' in _sm, "")
+# The hook is not a knob any more: it measured 113.98 -> 77.19 ms/tok with identical ids and text, so
+# the shipped server env carries SEAM_MOE_CPP=1 (MOE_CPP=0 is the A/B escape). A release that silently
+# dropped it would serve the slow path at every quoted number.
+check("the shipped server env serves the C cold path by default",
+      'MOE_CPP=${MOE_CPP:-1}' in _lb
+      and 'SEAM_MOE_CPP=$MOE_CPP' in _lb
+      and 'MOE_CPP SRV_ENV_EXTRA' in _lb, "")
 
 # Installing tooling is a release-system operation too: a `cp` over a script a running ticket has open
 # makes bash read shifted lines (2026-11-03 01:29Z, a prefill thrown away on `drv_host: unbound

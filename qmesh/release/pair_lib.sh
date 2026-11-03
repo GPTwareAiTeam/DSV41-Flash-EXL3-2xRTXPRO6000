@@ -75,10 +75,17 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   # and never by the P7 client, so an arm that sets them in the client's env measures nothing. Set
   # through the ensure's SEAM_ENV so it reaches the worker's own process, and it must stay EMPTY for
   # any number anyone quotes as the shipped shape: a value here is a different server.
+  # SEAM_MOE_CPP ships ON: the C hook served all 40 layers (fallback=[]) and measured 113.98 ->
+  # 77.19 ms/tok at rows=1 on one release, one box, back-to-back (04:59/05:14Z 2026-11-03, bca2373b,
+  # ws_rows=1024, prefill 769.0 -> 855.1 tok/s), with identical ids (0c9bbe87, same=1 diff=0) and
+  # identical text (58051d96) on both arms. It is fail-open: a missing .so or a failed registration
+  # prints SEAM_MOE_CPP_OFF and the worker serves the Python path. MOE_CPP=0 puts the Python path back
+  # for an A/B; PAIR_SRV_EXTRA_ENVS still appends afterwards, so it can override either way.
+  MOE_CPP=${MOE_CPP:-1}
   SRV_ENV_EXTRA=${PAIR_SRV_EXTRA_ENVS:-}
   CX_MARGIN_MIB=${CX_MARGIN_MIB:-1536}
-  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB $SRV_ENV_EXTRA"
-  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV SRV_ENV_EXTRA
+  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB SEAM_MOE_CPP=$MOE_CPP $SRV_ENV_EXTRA"
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV MOE_CPP SRV_ENV_EXTRA
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
   PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}
