@@ -189,6 +189,14 @@ if [ "$PACK_MIB" -gt 0 ]; then
     sleep 10; waited=$(( waited + 10 ))
   done
   echo "SMOKE_MEM_READY avail_mib=${avail:-0} want_mib=$want pack_mib=$PACK_MIB margin_mib=$LOAD_MARGIN waited=${waited}s"
+  # The wait is a courtesy for a server that just exited; it is not permission to load a box someone
+  # else is holding. On 2026-11-03 dev read avail 325 MiB for the whole 120 s while prod read 119805
+  # on the same pack, the load still went through (page cache is evictable), and the 32k prefill came
+  # out 757.2 tok/s against prod's 973.0 -- a number about the box, attributed to the release. A load
+  # that cannot get its pack plus margin in MemAvailable is refused with the numbers.
+  if [ "${avail:-0}" -lt "$want" ] && [ "${SMOKE_MEM_STRICT:-1}" = 1 ]; then
+    fail "memory box_busy avail_mib=${avail:-0} want_mib=$want pack_mib=$PACK_MIB margin_mib=$LOAD_MARGIN waited=${waited}s (another tenant holds GX RAM; a load here is served from disk -- SMOKE_MEM_STRICT=0 measures it anyway)"
+  fi
 fi
 # A stamp proves the artifact was the one built; it does not prove a client's next import is a hit.
 # torch's version hash covers the include-path spelling and the flags, so a cache written under a

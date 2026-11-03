@@ -145,6 +145,9 @@ check("smoke samples the worker's own swap at every phase and refuses a paged lo
                             "SMOKE_WSWAP after_prefill", "paging_before_decode",
                             "worker_seam_server.py"))
       and "SMOKE_WSWAP_MAX=${SMOKE_WSWAP_MAX:-256}" in sm, "")
+check("smoke refuses a box another tenant is holding",
+      "SMOKE_MEM_STRICT" in sm and 'fail "memory box_busy' in sm
+      and sm.index("SMOKE_MEM_READY") < sm.index('fail "memory box_busy'), "")
 check("smoke decodes before it prefills",
       sm.index('pair_step "SMOKE_ARM') < sm.index('pair_step "SMOKE_PREFILL'), "")
 
