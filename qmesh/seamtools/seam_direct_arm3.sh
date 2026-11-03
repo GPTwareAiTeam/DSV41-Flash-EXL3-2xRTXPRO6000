@@ -28,6 +28,11 @@
 #                    (qmesh/tests/refusal_stub.sh; exit 12 if it is not)
 #   ORACLE           cx_direct_check.py on two real layers, both ways, byte for byte (exit 10)
 #   PREFILL          32k/8192, the rate the references were taken at (exit 14 if it did not finish)
+#   SHAPE            after each load: the server's own SEAM_SERVER_SLAB ws_rows must equal the shape
+#                    this arm asked for, and the grant (rows_max, pieces per prefill chunk, which is
+#                    min(ws_rows, rows_max) when SEAM_WS_ROWS_AUTO=0) is printed beside the numbers
+#                    (exit 25 if the server was started at another shape -- a load measured under
+#                    the wrong label is worse than no load)
 #
 #   queue/run_dev.sh SeamRobust 40 bash <this script>
 # The gate is taken for gx2 and dropped in the trap; my server is stopped at the end. The dev pair's
@@ -226,6 +231,26 @@ fi
 [ -z "$CLIENT_PLACEMENT" ] || CLIENT_ENV+=(-e "PLACEMENT=$CLIENT_PLACEMENT")
 CLIENT_ENV+=(-e "ARM_IDS_GAP=${CX_IDS_GAP:-1}")
 
+# What the *server* was actually started with, from its own line, not from what this arm exported.
+# The workspace knob has two spellings (the pair's WS_ROWS pin and this arm's SEAM_WS_ROWS) and a
+# start path that goes through the pair's own environment overrides the second one silently: on
+# 2026-11-02 that is how a "256-row" load can be a 1024-row load with a 256-row label, which would
+# make the whole census mislabelled rather than wrong. `rows_max` is the largest bucket granted, so
+# with SEAM_WS_ROWS_AUTO=0 the server serves one request in pieces of min(ws_rows, rows_max): 1024
+# rows against an 8192 bucket is 8 pieces, 256 is 32, and that is a different prefill shape, not
+# only a different workspace - print it beside the number instead of letting a reader infer it.
+shape_assert() {  # <tag>
+  local tag=$1 line wr rm wm sl
+  line=$(grep -a '^SEAM_SERVER_SLAB ' "$E/server_$tag.log" 2>/dev/null | tail -1)
+  wr=$(sed -n 's/.* ws_rows=\([0-9]*\).*/\1/p' <<< "$line")
+  rm=$(sed -n 's/.* rows_max=\([0-9]*\).*/\1/p' <<< "$line")
+  wm=$(sed -n 's/.* ws_mib=\([0-9.]*\).*/\1/p' <<< "$line")
+  sl=$(sed -n 's/.* slab_mib=\([0-9.]*\).*/\1/p' <<< "$line")
+  [ -n "$wr" ] || { say "SHAPE $tag server_ws_rows=? requested=${CX_WS_ROWS:-1024} (no SLAB line; not asserting)"; return 0; }
+  say "SHAPE $tag server_ws_rows=$wr requested=${CX_WS_ROWS:-1024} rows_max=${rm:-?} ws_mib=${wm:-?} slab_mib=${sl:-?} pieces_per_${rm:-?}=$(( (${rm:-1} + wr - 1) / wr ))"
+  [ "$wr" = "${CX_WS_ROWS:-1024}" ] ||
+    { say "DIRECT FAIL $tag the server was started at ws_rows=$wr, not ${CX_WS_ROWS:-1024}: every number from this load would carry the wrong label"; exit 25; }
+}
 server_log() {  # <tag> -> archive the container log; print the SEAM_ summary lines and the counts
   local tag=$1 host=$E/server_$1.log
   timeout 60 ssh -o BatchMode=yes "$GX" "docker cp $CT:/tmp/seam_server.log /tmp/srv_$tag.log" >/dev/null 2>&1
@@ -425,6 +450,9 @@ for n in $(seq 1 "$LOADS"); do
   done
   [ "$rc" = 0 ] || { say "DIRECT FAIL load$n ensure_rc=$rc"; exit 5; }
   server_log "load$n" || exit 6
+  # Before any number is attributed to this load: was the server started at the shape this arm
+  # asked for? A 256-row label on a 1024-row server is silent everywhere else.
+  shape_assert "load$n"
   host_census "after_load$n"
   sampler_once "after_load$n"
   say "DET load$n server_deterministic=$(det_env | tr -d '\n' | sed 's/^$/0/') client=${CX_DETERMINISTIC:-0} ws_rows=${CX_WS_ROWS:-1024}"

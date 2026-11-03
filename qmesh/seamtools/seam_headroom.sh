@@ -98,6 +98,16 @@ SRC="$SRC" GX="$GX" CX_CT="$CT" bash "$HERE/cx_verify_tree.sh" 2>&1 | tee -a "$A
   { say "HR FAIL the container is not running $sha; nothing it prints would be evidence"; exit 13; }
 grep -ah '^VERIFY lib \|^VERIFY target ' "$AB/verify.log" | sed 's/^/HR /' | tee -a "$LOG"
 
+# Two things a reader of this table would otherwise have to know from elsewhere.
+#  - d330dcf5 has no prefix cache (a fresh Cache per client process, e2e_prompts.py:271), so the
+#    second shape's load is not helped by the first one's prefixes and a faster load2 is not a
+#    warm-cache artifact. Equally, nothing here benefits from one.
+#  - the two shapes do not answer a prefill in the same number of pieces (see HR GRANT): ws_rows is
+#    a ceiling on the *piece*, the client chunks a prefill at the largest granted bucket, so 256
+#    rows turns one 8192-row chunk into 32 pieces and 1024 into 8. Prefill seconds therefore compare
+#    weight re-reads, not throughput; the comparison this census is for is VmRSS/VmSwap/Pss and
+#    SUnreclaim at each phase.
+say "HR NOTE prefix_cache=none(d330dcf5) piece_split=min(ws_rows,rows_max) prefill_compare=swap_only"
 rcs=""
 fails=0
 for WS in $ROWS; do
@@ -131,6 +141,16 @@ for WS in $ROWS; do
   # The two lines the workspace question is answered from: the pack's own slab/workspace bill, and the
   # allocator-internal split (free/total of the unified pool, allocated vs reserved) once per load.
   grep -ah 'SEAM_SERVER_SLAB ' "$SRV" | sed "s/^/HR SRVSLAB ws=$WS /" | tee -a "$LOG"
+  # The grant, stated instead of inferred: with SEAM_WS_ROWS_AUTO=0 the server serves one request in
+  # pieces of min(ws_rows, rows_max), so a 256-row server answers an 8192-row prefill chunk in 32
+  # pieces where a 1024-row one answers it in 8. That is a different prefill shape as well as a
+  # different workspace (the client's chunk_rows is the largest granted bucket, not ws_rows), which
+  # is why the two arms' prefill seconds are not a throughput A/B. Printed so no reader has to hold
+  # the bucket list in their head to notice it.
+  grep -ah 'SEAM_SERVER_SLAB ' "$SRV" | tail -1 |
+    sed -n 's/.* ws_rows=\([0-9]*\) .* rows_max=\([0-9]*\) .*/\1 \2/p' |
+    awk '{ printf "server_ws_rows=%s rows_max=%s pieces_per_prefill_chunk=%d\n",
+                  $1, $2, ($2 + $1 - 1) / $1 }' | sed "s/^/HR GRANT ws=$WS /" | tee -a "$LOG"
   grep -ah 'SEAM_SERVER_DEVMEM ' "$SRV" | sed "s/^/HR DEVMEM ws=$WS /" | tee -a "$LOG"
   grep -ah 'SLAB_SHIP \|SAMPLE_SHIP ' "$AB/armH$WS.log" | sed "s/.*DIRECT /HR /" | tee -a "$LOG"
   # Host samples around the load (clear box, 113 GiB resident) and after the prefill; SUnreclaim is
@@ -142,7 +162,11 @@ for WS in $ROWS; do
   # SUnreclaim = kernel slab, VmRSS/Pss = inside the worker, VmSwap = the worker's own pages).
   grep -ah 'SAMPLE_START \|SAMPLES load' "$AB/armH$WS.log" | sed "s/.*DIRECT /HR /;s/$/ ws=$WS/" | tee -a "$LOG"
   grep -ah 'DIRECT SAMP load1 ' "$AB/armH$WS.log" | sed "s/.*DIRECT SAMP load1 SAMP /HR SAMP ws=$WS /" | tee -a "$LOG"
-  grep -ah 'SEAM_SERVER_SWAP_WARN ' "$SRV" | sed "s/^/HR SWAPWARN ws=$WS /" | tee -a "$LOG"
+  # From this load's own SEAM_SERVER_READY, never the tail: the container log is truncated by the
+  # ensure path, but a restore that starts a server with >> would leave the previous load's warn at
+  # the top of the file and a tail-based grep would quote it as this shape's.
+  awk '/^SEAM_SERVER_READY/{n=NR} {a[NR]=$0} END{ if (n) for (i=n;i<=NR;i++) print a[i]; else for (i=1;i<=NR;i++) print a[i] }' "$SRV" |
+    grep -ah 'SEAM_SERVER_SWAP_WARN ' | sed "s/^/HR SWAPWARN ws=$WS /" | tee -a "$LOG"
   grep -ah 'PREFILL_ARM ' "$PL" | sed "s/^/HR PREFILL ws=$WS /" | tee -a "$LOG"
 done
 # The comparison the owner reads first: worker swap and RSS at the three phases, per shape.
