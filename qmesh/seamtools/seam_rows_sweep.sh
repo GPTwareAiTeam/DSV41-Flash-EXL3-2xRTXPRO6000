@@ -95,6 +95,7 @@ for ws in $WS_LIST; do
   status $(( 8 + left * 11 )) "arm $i/$nws ws_rows=$ws: fresh pack load, client run, 32k prefill"
   say "ARM START ws=$ws evidence=$E"
   CX_WT="$WT" CX_GATE=own CX_ARM_TAG="W$ws" CX_EVIDENCE="$E" CX_LOADS=1 CX_IDS_RUNS=1 CX_WS_ROWS=$ws \
+  CX_IDS_MAX_NEW=${CX_IDS_MAX_NEW:-128} CX_IDS_WARMUP_NEW=${CX_IDS_WARMUP_NEW:-8} \
   CX_DETERMINISTIC=0 CX_PREFILL=1 CX_WANT_DIGEST=any \
   CX_SERVER_PLACEMENT=/cold/placement.exl3.json \
   CX_PLACEMENT=/models/dsv41/hot4cold2/packs/placement.hot4460-cold2800x4-8100x2.json \
@@ -119,12 +120,30 @@ for ws in $WS_LIST; do
   pf=$(grep -ah 'PREFILL_ARM depth=32768 ' "$PL" 2>/dev/null | tail -1)
   pfs=$(printf '%s' "$pf" | sed -n 's/.*prefill_s=\([0-9.]*\).*/\1/p')
   pfr=$(printf '%s' "$pf" | sed -n 's/.*tokens=\([0-9]*\).*/\1/p')
+  # The decode number and the Option-B swap window, both from this arm's own log and this load: a
+  # width is only interesting if it is faster per token without paging inside the decode window.
+  dec=$(grep -ah 'DECODE tag=' "$AL" 2>/dev/null | tail -1)
+  dms=$(printf '%s' "$dec" | sed -n 's/.*decode_ms_per_tok=\([0-9.]*\).*/\1/p')
+  dps=$(printf '%s' "$dec" | sed -n 's/.*decode_tok_per_s=\([0-9.]*\).*/\1/p')
+  dnt=$(printf '%s' "$dec" | sed -n 's/.*new_tokens=\([0-9]*\).*/\1/p')
+  read -r swapb swapa <<< "$(grep -ah 'DIRECT PHASESAMP ' "$AL" 2>/dev/null | sed 's/.*DIRECT PHASESAMP //' |
+    awk '{ ph=$1; for (i=2;i<=NF;i++) { split($i,kv,"="); f[kv[1]]=kv[2] }
+           if (ph=="after_load1") b=f["vm_swap_mib"]
+           if (ph=="after_decode1") a=f["vm_swap_mib"] }
+         END{ print (b==""?"?":b), (a==""?"?":a) }')"
+  swapg="?"; swapok=0
+  case "${swapb}${swapa}" in
+    ''|*[!0-9]*) ;;
+    *) swapg=$(( swapa - swapb )); [ "$swapg" -le "${CX_SWAP_GROW_MAX:-128}" ] && swapok=1 ;;
+  esac
   counts=0; why=""
   if [ "$rc" != 0 ]; then why="arm_rc_$rc"
   elif [ -z "${av:-}" ]; then why="no_slack_line"
   elif [ "$av" -lt "$SLACK_MIN" ]; then why="below_slack_$SLACK_MIN"
+  elif [ -z "${dms:-}" ]; then why="no_decode_line"
+  elif [ "$swapok" != 1 ]; then why="swap_decode_window_${swapg}_over_${CX_SWAP_GROW_MAX:-128}"
   else counts=1; fi
-  say "SWEEP ROW ws=$ws rc=$rc load_avail_mib=${loadav:-?} ws_mib=${wsmib:-?} rows_max=${rmax:-?} fits=${fits:-?} prefill_avail_mib=${av:-?} swap_free_mib=${swp:-?} swap_warn=$wsw prefill_tokens=${pfr:-?} prefill_s=${pfs:-?} counts=$counts why=${why:-ok}"
+  say "SWEEP ROW ws=$ws rc=$rc load_avail_mib=${loadav:-?} ws_mib=${wsmib:-?} rows_max=${rmax:-?} fits=${fits:-?} decode_ms_per_tok=${dms:-?} decode_tok_per_s=${dps:-?} decode_tokens=${dnt:-?} swap_before_arm_mib=${swapb:-?} swap_after_decode_mib=${swapa:-?} swap_growth_mib=$swapg prefill_avail_mib=${av:-?} swap_free_mib=${swp:-?} swap_warn=$wsw prefill_tokens=${pfr:-?} prefill_s=${pfs:-?} prefill_tok_per_s=$(awk -v t="${pfr:-0}" -v s="${pfs:-0}" 'BEGIN{ printf (s>0)?"%.1f":"?", t/s }') counts=$counts why=${why:-ok}"
 done
 
 status 4 "verdict"

@@ -44,7 +44,9 @@ mkdir -p "$AB"; : > "$LOG"
 ROWS=${CX_HR_ROWS:-1024 256}
 WS=                             # set per iteration; kept for the log lines that name the shape
 
-say() { echo "$(date +%T) HR $*" | tee -a "$LOG"; }
+# say owns the prefix: a call site that spells "HR" itself (the NOTE/GRANT/PASS lines) must not print
+# it twice -- the 21:56 census read "HR HR GRANT ws=1024 ..." for exactly that reason.
+say() { local m="$*"; echo "$(date +%T) HR ${m#HR }" | tee -a "$LOG"; }
 status() { [ -n "${GPU_RUN_STATUS:-}" ] && printf 'eta_min=%s doing=%s\n' "$1" "$2" > "$GPU_RUN_STATUS"; return 0; }
 gx_mem() {  # -> "avail_mib swapfree_mib"
   timeout 20 ssh -o BatchMode=yes "$GX" \
@@ -98,12 +100,27 @@ SRC="$SRC" GX="$GX" CX_CT="$CT" bash "$HERE/cx_verify_tree.sh" 2>&1 | tee -a "$A
   { say "HR FAIL the container is not running $sha; nothing it prints would be evidence"; exit 13; }
 grep -ah '^VERIFY lib \|^VERIFY target ' "$AB/verify.log" | sed 's/^/HR /' | tee -a "$LOG"
 
+# Two things a reader of this table would otherwise have to know from elsewhere.
+#  - d330dcf5 has no prefix cache (a fresh Cache per client process, e2e_prompts.py:271), so the
+#    second shape's load is not helped by the first one's prefixes and a faster load2 is not a
+#    warm-cache artifact. Equally, nothing here benefits from one.
+#  - the two shapes do not answer a prefill in the same number of pieces (see HR GRANT): ws_rows is
+#    a ceiling on the *piece*, the client chunks a prefill at the largest granted bucket, so 256
+#    rows turns one 8192-row chunk into 32 pieces and 1024 into 8. Prefill seconds therefore compare
+#    weight re-reads, not throughput; the comparison this census is for is VmRSS/VmSwap/Pss and
+#    SUnreclaim at each phase.
+say "HR NOTE prefix_cache=none(d330dcf5) piece_split=min(ws_rows,rows_max) prefill_compare=swap_only"
 rcs=""
 fails=0
 for WS in $ROWS; do
   E=$AB/H$WS
   mkdir -p "$E"
   status 12 "--fresh load at ws_rows $WS: load, decode arm, 32k prefill, 10 s sampling"
+  # The shape here comes from SEAM_ENV, so it is unpinned by construction -- but pair_serve.sh,
+  # pair_smoke.sh, pair_update_run.sh and the decode/roundprof tickets all take their shape from the
+  # pair line's WS_ROWS (pairs.conf, default 1024) through pair_server_env. A row here can therefore
+  # never be compared against a server that came up from one of those paths unless the pair line said
+  # 256; HR GRANT is the line that settles which shape a load actually had.
   # CX_WT is passed, not inherited: arm3 verifies the container against ${CX_WT:-<robust worktree>},
   # so a driver that verified one tree and an arm that verified another would compare the container
   # twice against different bytes and the arm's exit 13 would blame the wrong commit.
@@ -131,6 +148,16 @@ for WS in $ROWS; do
   # The two lines the workspace question is answered from: the pack's own slab/workspace bill, and the
   # allocator-internal split (free/total of the unified pool, allocated vs reserved) once per load.
   grep -ah 'SEAM_SERVER_SLAB ' "$SRV" | sed "s/^/HR SRVSLAB ws=$WS /" | tee -a "$LOG"
+  # The grant, stated instead of inferred: with SEAM_WS_ROWS_AUTO=0 the server serves one request in
+  # pieces of min(ws_rows, rows_max), so a 256-row server answers an 8192-row prefill chunk in 32
+  # pieces where a 1024-row one answers it in 8. That is a different prefill shape as well as a
+  # different workspace (the client's chunk_rows is the largest granted bucket, not ws_rows), which
+  # is why the two arms' prefill seconds are not a throughput A/B. Printed so no reader has to hold
+  # the bucket list in their head to notice it.
+  read -r SRVWS RMAX <<< "$(grep -ah 'SEAM_SERVER_SLAB ' "$SRV" | tail -1 |
+    sed -n 's/.* ws_rows=\([0-9]*\) .* rows_max=\([0-9]*\) .*/\1 \2/p')"
+  PPC=$(( (${RMAX:-1} + ${SRVWS:-1} - 1) / ${SRVWS:-1} ))
+  say "HR GRANT ws=$WS server_ws_rows=${SRVWS:-?} rows_max=${RMAX:-?} pieces_per_prefill_chunk=$PPC auto=0"
   grep -ah 'SEAM_SERVER_DEVMEM ' "$SRV" | sed "s/^/HR DEVMEM ws=$WS /" | tee -a "$LOG"
   grep -ah 'SLAB_SHIP \|SAMPLE_SHIP ' "$AB/armH$WS.log" | sed "s/.*DIRECT /HR /" | tee -a "$LOG"
   # Host samples around the load (clear box, 113 GiB resident) and after the prefill; SUnreclaim is
@@ -142,8 +169,14 @@ for WS in $ROWS; do
   # SUnreclaim = kernel slab, VmRSS/Pss = inside the worker, VmSwap = the worker's own pages).
   grep -ah 'SAMPLE_START \|SAMPLES load' "$AB/armH$WS.log" | sed "s/.*DIRECT /HR /;s/$/ ws=$WS/" | tee -a "$LOG"
   grep -ah 'DIRECT SAMP load1 ' "$AB/armH$WS.log" | sed "s/.*DIRECT SAMP load1 SAMP /HR SAMP ws=$WS /" | tee -a "$LOG"
-  grep -ah 'SEAM_SERVER_SWAP_WARN ' "$SRV" | sed "s/^/HR SWAPWARN ws=$WS /" | tee -a "$LOG"
-  grep -ah 'PREFILL_ARM ' "$PL" | sed "s/^/HR PREFILL ws=$WS /" | tee -a "$LOG"
+  # From this load's own SEAM_SERVER_READY, never the tail: the container log is truncated by the
+  # ensure path, but a restore that starts a server with >> would leave the previous load's warn at
+  # the top of the file and a tail-based grep would quote it as this shape's.
+  awk '/^SEAM_SERVER_READY/{n=NR} {a[NR]=$0} END{ if (n) for (i=n;i<=NR;i++) print a[i]; else for (i=1;i<=NR;i++) print a[i] }' "$SRV" |
+    grep -ah 'SEAM_SERVER_SWAP_WARN ' | sed "s/^/HR SWAPWARN ws=$WS /" | tee -a "$LOG"
+  # The piece count rides on the prefill line: the seconds there are 8192 tokens over PPC weight
+  # passes, so nobody divides tokens by seconds and calls the result a shape comparison.
+  grep -ah 'PREFILL_ARM ' "$PL" | sed "s/^/HR PREFILL ws=$WS pieces_per_chunk=$PPC /" | tee -a "$LOG"
 done
 # The comparison the owner reads first: worker swap and RSS at the three phases, per shape.
 say "SHAPE TABLE (worker, from the phase samples)"
@@ -158,6 +191,49 @@ for WS in $ROWS; do
         printf "HR SHAPE ws=%s phase=%s vm_rss_mib=%s vm_swap_mib=%s avail_mib=%s\n", w, ph, rss, vsw, av }' |
     tee -a "$LOG"
 done
+# Option-B swap gate (owner decision, 2026-11-03): a worker VmSwap level is not a refusal -- an idle
+# GX2 with no pack already holds ~1.6 GiB of box swap -- so the only refusal here is growth inside the
+# measured decode window, after_load1 -> after_decode1. Prefill growth (~356 MiB at ws 256, ~734 at
+# 1024 after a 32k prefill) is expected and printed as a warning. A post-load reading whose avail_mib
+# is still above ~2000 MiB cannot be post-residency, so it is withheld from judgement, not judged.
+# Levels are printed (worker VmSwap, box swap, avail, pid, and the load's own swapped_mib) beside
+# every verdict so a reader can see the pressure the number was taken at.
+num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; }
+say "SWAPGATE rule=decode_window_growth>${CX_SWAP_GROW_MAX:-128}MiB:fail levels:warn prefill_growth:warn post_load_avail>${CX_SWAP_JUDGE_AVAIL_MAX:-2000}MiB:withhold"
+swapfail=0
+for WS in $ROWS; do
+  E=$AB/H$WS
+  vals=$(grep -ah 'DIRECT PHASESAMP ' "$AB/armH$WS.log" 2>/dev/null | sed 's/.*DIRECT PHASESAMP //' |
+    awk -v tot="${CX_SWAP_TOTAL_MIB:-16384}" '
+      { ph=$1
+        for (i=2;i<=NF;i++) { split($i,kv,"="); f[kv[1]]=kv[2] }
+        if (ph=="after_load1")    { b=f["vm_swap_mib"]; a0=f["avail_mib"]; box=tot-f["swapfree_mib"]; pid=f["pid"] }
+        if (ph=="after_decode1")  { ad=f["vm_swap_mib"]; a1=f["avail_mib"]; pid1=f["pid"] }
+        if (ph=="after_prefill1") { ap=f["vm_swap_mib"]; a2=f["avail_mib"] } }
+      END{ print (b==""?"?":b), (ad==""?"?":ad), (ap==""?"?":ap), (a0==""?"?":a0), (a1==""?"?":a1),
+                 (a2==""?"?":a2), (box==""?"?":box), (pid==""?"?":pid), (pid1==""?"?":pid1) }')
+  read -r B AD AP A0 A1 A2 BOX PID PID1 <<< "${vals:-? ? ? ? ? ? ? ? ?}"
+  LSW=$(grep -ah 'SEAM_PACK_LOAD ' "$E/server_load1.log" 2>/dev/null | tail -1 |
+    sed -n 's/.* swapped_mib=\([0-9]*\).*/\1/p')
+  if ! num "$B" || ! num "$AD"; then
+    say "SWAPGATE ws=$WS before_arm_vm_swap_mib=${B:-?} after_decode_vm_swap_mib=${AD:-?} box_swap_mib=${BOX:-?} avail_mib=${A0:-?} pid=${PID:-?} load_swapped_mib=${LSW:-?} verdict=withheld reason=no_phase_sample"
+  elif num "$A0" && [ "$A0" -gt "${CX_SWAP_JUDGE_AVAIL_MAX:-2000}" ]; then
+    say "SWAPGATE ws=$WS before_arm_vm_swap_mib=$B after_decode_vm_swap_mib=$AD growth_mib=$(( AD - B )) box_swap_mib=$BOX avail_mib=$A0 pid=$PID load_swapped_mib=${LSW:-?} verdict=withheld reason=avail_mib_over_${CX_SWAP_JUDGE_AVAIL_MAX:-2000}_not_post_residency WARNING=level_only"
+  else
+    g=$(( AD - B ))
+    if [ "$g" -gt "${CX_SWAP_GROW_MAX:-128}" ]; then
+      v="FAIL(growth_over_${CX_SWAP_GROW_MAX:-128}MiB)"; swapfail=$((swapfail + 1))
+    else
+      v=pass
+    fi
+    say "SWAPGATE ws=$WS before_arm_vm_swap_mib=$B after_decode_vm_swap_mib=$AD growth_mib=$g box_swap_mib=$BOX avail_mib=$A0 after_decode_avail_mib=$A1 pid=$PID/$PID1 load_swapped_mib=${LSW:-?} verdict=$v"
+  fi
+  if num "$AD" && num "$AP"; then
+    say "SWAPGATE-PREFILL ws=$WS after_decode_vm_swap_mib=$AD after_prefill_vm_swap_mib=$AP growth_mib=$(( AP - AD )) avail_after_prefill_mib=${A2:-?} WARNING=level_only"
+  fi
+done
+say "SWAPGATE-SUMMARY shapes_failing_growth=$swapfail of ws_rows=[$ROWS] bar=${CX_SWAP_GROW_MAX:-128}MiB"
 say "FINAL gx=[$(gx_mem)] rc=$rcs"
-[ "$fails" = 0 ] || { say "HR FAIL arms failed:$rcs"; exit 24; }
-say "HR PASS ws_rows=[$ROWS] census printed above; nothing above the shipping shape is tested until the owner reads it"
+[ "$fails" = 0 ] || { say "FAIL arms failed:$rcs"; exit 24; }
+[ "${swapfail:-0}" = 0 ] || { say "FAIL swap growth inside the decode window exceeded ${CX_SWAP_GROW_MAX:-128} MiB on ${swapfail} shape(s) (Option B: the only level that refuses)"; exit 26; }
+say "PASS ws_rows=[$ROWS] census printed above; nothing above the shipping shape is tested until the owner reads it"
