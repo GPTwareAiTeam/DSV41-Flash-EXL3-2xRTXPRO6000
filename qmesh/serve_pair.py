@@ -247,7 +247,12 @@ class Engine:
                         entries.append(self.pending.get_nowait())
                     except queue.Empty:
                         break
-                for index, request in enumerate(entries):
+                # pending carries (request, events) tuples -- the events queue rides along so the
+                # failure path can tell a waiter its job will never run. Unpack once here: the first
+                # cut indexed the tuple as if it were the request, so every request died with
+                # "tuple indices must be integers or slices, not str" and the server answered 503.
+                for entry in entries:
+                    request, events = entry
                     ids = torch.tensor([request["input_ids"]], dtype=torch.long)
                     sampler = ComboSampler(temperature=request["temperature"], top_p=request["top_p"],
                                            pres_p=request["presence"], freq_p=request["frequency"])
@@ -256,7 +261,7 @@ class Engine:
                               stop_conditions=[self.tokenizer.eos_token_id] + request["stop"],
                               decode_special_tokens=request["tools"])
                     self.generator.enqueue(job)
-                    active[job.serial_number] = (request, entries[index][1], job)
+                    active[job.serial_number] = (request, events, job)
                 if active:
                     for result in self.generator.iterate():
                         entry = active.get(result.get("serial"))
