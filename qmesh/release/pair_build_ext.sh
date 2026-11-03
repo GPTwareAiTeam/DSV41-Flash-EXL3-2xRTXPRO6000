@@ -135,7 +135,7 @@ cat > /tmp/pair_ext_probe.py
 # file_baton.wait (3 x 600 s) with no compiler running, which looks exactly like a hung host
 # (2026-11-03 02:07Z: 20 min, pid 3475093, lock left by a probe killed at 02:02Z).
 for lck in $rel_c/ext/exllamav3_ext/lock $MOUNT/extcache/exllamav3_ext/lock; do
-  [ -e "\$lck" ] && rm -f "\$lck" && echo "EXT_LOCK cleared=\$lck"
+  [ -e \$lck ] && rm -f \$lck && echo EXT_LOCK cleared=\$lck
 done
 cd $link && nice -n 15 env MAX_JOBS=$JOBS NINJAFLAGS=-j$JOBS MAKEFLAGS=-j$JOBS \
 PYTHONPATH=$link TORCH_CUDA_ARCH_LIST=$archlist TORCH_EXTENSIONS_DIR=$rel_c/ext \
