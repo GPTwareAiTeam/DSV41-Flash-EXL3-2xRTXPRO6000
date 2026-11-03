@@ -304,6 +304,16 @@ fi
 # what walks the worker's own memory out (0 -> 1068 MiB on a 32k+512k run, 2026-11-02), so a decode
 # measured after one is a decode measured on a paging server.
 #
+# The worker names the release it loaded, and that name is the release this smoke is measuring: a
+# build_id mismatch is the box serving something else, and every number below would belong to it.
+loaded=$(pair_gxsh "docker exec $GXCT sh -c \"grep -m1 '^SEAM_SERVER_LOADED' /tmp/seam_server.log\"" 2>/dev/null | tail -1)
+echo "SMOKE_SERVER_LOADED $loaded"
+case "$loaded" in
+  *"build=$BUILD_ID"*) ;;
+  *) fail "server_build_mismatch loaded=${loaded:-none} want=$BUILD_ID" ;;
+esac
+echo "SMOKE_MEM_SERVER $(gx_mem)"
+#
 # The load's own box pressure travels with every reading: a worker at 344 MiB of swap whose load found
 # avail_mib=1132 / swapped_mib=1765 is this box reclaiming under a 116 GiB mapping, not a release that
 # pages; the same worker at 344 MiB on a load that found 119205 / 0 is a different story. Both numbers

@@ -170,6 +170,15 @@ check("every reading names the load's box pressure and the worker it read",
 check("smoke refuses a box another tenant is holding",
       "SMOKE_MEM_STRICT" in sm and 'fail "memory box_busy' in sm
       and sm.index("SMOKE_MEM_READY") < sm.index('fail "memory box_busy'), "")
+# The worker's own SEAM_SERVER_LOADED line names the release it loaded; the smoke has to read it and
+# refuse a worker that is not the release under test, before it prints a single reading. Without it a
+# number taken on a stale worker is indistinguishable from the release's (2026-11-03: the check was
+# lost in an edit and every reading printed `load_swapped_mib=-`).
+check("smoke verifies the worker loaded the release it is smoking",
+      'grep -m1 \'^SEAM_SERVER_LOADED\'' in sm and "SMOKE_SERVER_LOADED $loaded" in sm
+      and "server_build_mismatch" in sm
+      and sm.index("server_build_mismatch") < sm.index("ws_check after_load")
+      and sm.index("SMOKE_SERVER_LOADED") < sm.index("SRV_LOAD_SWAPPED"), "")
 check("smoke decodes before it prefills",
       sm.index('pair_step "SMOKE_ARM') < sm.index('pair_step "SMOKE_PREFILL'), "")
 
