@@ -345,6 +345,24 @@ check("the client half is told which build it runs",
 # never a shipping value.
 _pa = src("pair_arm.sh")
 _loop = 'for kv in ${PAIR_ARM_EXTRA_ENVS:-}; do envs+=(-e "$kv"); done'
+# A client that imports another checkout must not share the release's extension cache: torch's
+# version hash follows the include-path spelling, so the second tree rebuilds the pair's .so in
+# place (2026-11-03: /artifacts/dspark-tpr/src wrote 5780205b into a cache stamped 04a61140 and
+# pair_serve refused the pair as DRIFT for an hour). One supported way in, and it is isolated.
+_pa = src("pair_arm.sh")
+check("a client run from another src gets its own extension cache",
+      "--src) SRC=$2" in _pa
+      and "/src/exllamav3|/src/exllamav3/|/pair/current/src) EXT_DIR=/pair/extcache" in _pa
+      and 'EXT_DIR=$(pair_ct_path "$PAIR_STATE_DIR/extcache/$ext_tag")' in _pa
+      and _pa.count('mkdir -p "$PAIR_STATE_DIR/extcache/$ext_tag"') == 1
+      and '-e "PYTHONPATH=$SRC" -e "TORCH_EXTENSIONS_DIR=$EXT_DIR"' in _pa
+      and _pa.count("cd $SRC &&") == 2 and "cd /src/exllamav3 &&" not in _pa, "")
+_ps = src("pair_sync_check.py")
+check("...and verify names the tree that wrote the cache",
+      _ps.count('EXTSRC $(grep -ho') == 1
+      and 'extcache_foreign_src={src_spelled}->{src_real} want={want_src}' in _ps
+      and 'want_src = f"{rel_dir}/src"' in _ps, "")
+
 check("the client can take extra env without a second driver",
       _pa.count(_loop) == 1
       and _pa.index("SEAM_COPY_STREAM=1") < _pa.index(_loop)

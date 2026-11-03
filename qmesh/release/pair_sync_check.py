@@ -122,6 +122,12 @@ echo "EXTSTAMP $(tr -d '\n' < "$rel/ext/BUILD_STAMP.json" 2>/dev/null)"
 # place (2026-11-02: a probe build's 27,513,952-byte .so became the client's 27,509,856-byte one and
 # the pair still read IN_SYNC). Hash the artifact, not just the stamp.
 echo "EXTSHA $(sha256sum "$rel/ext/exllamav3_ext/exllamav3_ext.so" 2>/dev/null | cut -d' ' -f1)"
+# Which trees have written this cache. torch's version hash covers the include-path spelling, so a
+# client importing a second checkout rebuilds exllamav3_ext in place and the stamp no longer
+# describes the binary; the ninja file it leaves behind names the tree it built from. Every root in
+# it must resolve to this release's src, or a foreign tree owns the cache and pair_serve will DRIFT
+# on the next flip (2026-11-03: /artifacts/dspark-tpr/src, .so 5780205b against a stamped 04a61140).
+echo "EXTSRC $(grep -ho '/[A-Za-z0-9_./-]*exllamav3' "$rel/ext/exllamav3_ext/build.ninja" 2>/dev/null | sort -u | while read -r r; do printf '%s->%s ' "$r" "$(readlink -f "$r" 2>/dev/null)"; done)"
 echo "CXSHA $(sha256sum "$tree"/vendor/cuda-exl3/src/cuda_exl3/_C*.so 2>/dev/null | cut -d' ' -f1 | head -1)"
 if [ "$probe_ct" = 1 ]; then
 echo "CT_STATE $(docker inspect -f '{{.State.Running}}' "$ct" 2>/dev/null)"
@@ -303,6 +309,14 @@ def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
             problems.append("ext_so=unreadable")
         elif ext.get("sha256") != ext_sha:
             problems.append(f"ext_so={ext_sha[:8]} want={str(ext.get('sha256'))[:8]}")
+        # A hash mismatch above already fails the side, but by then the pair cannot serve: name the
+        # owner. The ninja file in the cache lists the tree it was built from; a root that does not
+        # resolve to this release's src is a client that rebuilt the pair's cache in place.
+        want_src = f"{rel_dir}/src"
+        for item in (state.get("EXTSRC") or "").split():
+            src_spelled, _, src_real = item.partition("->")
+            if src_real and src_real != want_src:
+                problems.append(f"extcache_foreign_src={src_spelled}->{src_real} want={want_src}")
         # cuda-exl3 is gitignored and built per checkout, so the GX stamp has to name it: without it
         # the release would verify clean and then serve every layer on the mixed-K module.
         if side == "gx":

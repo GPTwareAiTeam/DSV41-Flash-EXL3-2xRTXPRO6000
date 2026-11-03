@@ -34,7 +34,7 @@ PROMPTS=${PAIR_ARM_PROMPTS:-/artifacts/2x-rtx-tp2/dtrain/prompts_held.json}
 # the one the GX box's cold pack carries (844251e7…), or the server's Hello refuses the session.
 CHECKPOINT=${PAIR_ARM_CHECKPOINT:-/models/dsv41/exl3-p7hot-4460-hc1}
 CORPUS=${PAIR_ARM_CORPUS:-/artifacts/2x-rtx-tp2/corpus/prose_24k.txt}
-PREFILL_DEPTH=""
+PREFILL_DEPTH=""; SRC=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --rows) ROWS=$2; shift ;;
@@ -47,6 +47,7 @@ while [ $# -gt 0 ]; do
     --out) OUT=$2; shift ;;
     --prefill) PREFILL_DEPTH=$2; shift ;;
     --ids) IDS=1 ;;
+    --src) SRC=$2; shift ;;
     *) pair_die "unknown flag $1" ;;
   esac
   shift
@@ -59,7 +60,31 @@ pair_load "$PAIR_ARG"
 BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' \
   "$PAIR_ROOT/current/RELEASE.json" 2>/dev/null) || BUILD_ID=""
 
+
+# Which tree the client imports, and therefore which extension cache it may write. torch's version
+# hash covers the *include path spelling*, not the content, so a client that imports a second
+# checkout of the same sources rebuilds the extension in place -- in the cache it was pointed at. On
+# 2026-11-03 20:59:31 a client running /artifacts/dspark-tpr/src with the pair's own
+# TORCH_EXTENSIONS_DIR=/pair/extcache rebuilt exllamav3_ext.so in the pair's release cache (5780205b
+# replacing the stamped 04a61140), and `pair_serve.sh` then refused the pair as DRIFT for an hour
+# while every later client import rebuilt or hung on it. So the release cache
+# (/pair/extcache, the release's own ext/) is for the release tree only; any other --src gets a
+# cache of its own, under the pair's state dir, named by the tree so two agents cannot collide.
+SRC=${SRC:-/src/exllamav3}
+case "$SRC" in
+  /src/exllamav3|/src/exllamav3/|/pair/current/src) EXT_DIR=/pair/extcache ;;
+  *)
+    ext_tag=$(printf '%s' "$SRC" | sed 's#^/*##; s#/*$##; s#[^A-Za-z0-9._-]#_#g')
+    mkdir -p "$PAIR_STATE_DIR/extcache/$ext_tag"
+    EXT_DIR=$(pair_ct_path "$PAIR_STATE_DIR/extcache/$ext_tag")
+    echo "ARM_SRC_ISOLATED src=$SRC extcache=$EXT_DIR (not the release cache)"
+    ;;
+esac
 envs=(
+  # Stated, not inherited: the container's env is the release's, and a --src above must not be able
+  # to reach the release cache through an inherited variable. For the release tree these are the two
+  # values the container already carries, so the shipped exec is unchanged.
+  -e "PYTHONPATH=$SRC" -e "TORCH_EXTENSIONS_DIR=$EXT_DIR"
   # pairs.conf's `gpu` is a *host* index: the container spec spends it on --gpus device=<gpu>, so
   # inside the container that one card is device 0 again. Passing the host index here asked dev's
   # container (which had every GPU) for GPU 1 and asked a scoped one for a GPU it cannot see.
@@ -116,8 +141,8 @@ if [ "$IDS" = 1 ]; then
 fi
 
 if [ "$PAIR_DRY" = 1 ]; then
-  echo "DRY docker exec ${envs[*]} $P7CT bash -lc 'cd /src/exllamav3 && timeout $ARM_TIMEOUT python3 -u ${drv:-qmesh/e2e_prompts.py}'"
+  echo "DRY docker exec ${envs[*]} $P7CT bash -lc 'cd $SRC && timeout $ARM_TIMEOUT python3 -u ${drv:-qmesh/e2e_prompts.py}'"
   exit 0
 fi
 timeout "$ARM_TIMEOUT" docker exec "${envs[@]}" "$P7CT" \
-  bash -lc "cd /src/exllamav3 && python3 -u ${drv:-qmesh/e2e_prompts.py}"
+  bash -lc "cd $SRC && python3 -u ${drv:-qmesh/e2e_prompts.py}"
