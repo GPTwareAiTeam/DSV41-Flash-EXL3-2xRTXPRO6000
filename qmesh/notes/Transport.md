@@ -146,7 +146,14 @@ Result:
   count, a malformed bucket count, a disjoint bucket list, a peer that says nothing, twelve bad data
   hellos, one legitimate session, two sessions in a row on different bucket subsets, and a client
   that arrives during a live session - in both refuse and queue modes. The test passes only if it is
-  the same pid afterwards, with >=5 control rejections and >=12 `stale-data-conn` lines in the log.
-- Not measured on the release yet: the battery must not run in `seam-gx2-dev` while a pair
-  baseline or canary is being measured, so it is queued behind those windows. The pass/fail and the
+- Not measured on the release yet: the battery must not run in `seam-gx2-dev` while a pair baseline
+  or canary is being measured, so it is queued behind those windows. The pass/fail and the
   reject/queue counts belong here when it runs.
+
+How to reproduce any of this: the drivers are `qmesh/seamtools/` (committed, and the copies under
+`recipe-artifacts/seamrobust/scripts/` are symlinks into it, so the sha a ticket prints names these
+bytes). `seam_ctl_robust.sh` is the battery above, `seam_headroom.sh` the memory census, and both
+queue through `gpu0-gx1/queue/run_dev.sh <agent> <min> bash <driver>` with
+`CX_STAGE_SHA=d330dcf5 CX_WT=/home/treadall/recipe-seam-rel` so the census is attributed to the
+release under test rather than to whatever worktree is on disk. Every driver prints its own sha, its
+arm's sha and the `cx_verify_tree.sh` verdict before it measures anything.
