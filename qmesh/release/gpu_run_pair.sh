@@ -98,7 +98,86 @@ check_release() {
   log "PAIR_CHECK_ERROR $name rc=$rc refuse=$AGENT :: $(printf '%s' "$out" | tail -3 | tr '\n' ';')"
   return 5
 }
-gpu_busy() { [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i ${QGPUS:?QGPUS})" ]; }
+# ---- what "busy" means -------------------------------------------------------------------------
+# One queue serves one pair (one P7 GPU + its GX box). Up to 2026-11-03 only the P7 side was looked at,
+# and that is blind to the half where the model actually lives: a serve whose client has exited keeps
+# its worker resident on the GX GPU with nothing at all on the P7 side, so the queue read "free" and
+# started the next load on top of it (10:17Z: a ticket killed with an orphan client plus a live
+# neighbour, two 92 GiB workers contending for one box). The box is busy when any of four things says
+# so: a compute app on the ticket's own P7 GPU, a live claim in the pair's gx gate file, a compute app
+# on the pair's GX box, or (handled by the caller) a ticket whose wrapper is alive.
+#
+# The GX box and its gate name are read from pairs.conf -- the one file that says which box, container
+# and address belong to which pair -- joined on the `gpu` column so run_dev.sh/run_prod.sh keep
+# carrying nothing but QGPUS. No file, no matching row, or an unreachable box leaves the probe silent
+# instead of wedging the queue; the log says which, once.
+QPAIR_ROW=""
+for _pc in "$BASE/../../scripts/pairs.conf" "$BASE/../scripts/pairs.conf"; do
+  [ -r "$_pc" ] && { QPAIR_ROW=$(awk -v g="${QGPUS:-}" '!/^#/ && NF >= 9 && $3 == g { print; exit }' "$_pc"); break; }
+done
+# columns: pair p7ct gpu seam_dev gid gxgid peer_ip gx_mgmt gxct release_root … (see pairs.conf header)
+QGX_HOST=$(printf '%s' "$QPAIR_ROW" | awk '{print $8}')
+QGX_CT=$(printf '%s' "$QPAIR_ROW" | awk '{print $9}')
+# seam-gx2-dev -> 2: the gate file is named after the GX container, like pair_gx_gate_file() does.
+_qn=${QGX_CT#seam-gx}; _qn=${_qn%%[!0-9]*}
+QGATE=${_qn:+$(dirname "$BASE")/gx$_qn.gate}
+QGX_PROBE_TTL=${QGX_PROBE_TTL:-20}
+# "Any compute app on the GX box" is not the predicate: that box also runs a desktops' remote-access
+# helper (rustdesk holds a 228 MiB context there, always, up 9h47m when this was written), so the rule
+# would read the box as busy forever and wedge every ticket. What must not be started beside is the
+# pack or a comparable job, so: a `worker_seam_server` process, or an app holding more than
+# QGX_MIN_MIB. Both are one ssh round trip.
+QGX_MIN_MIB=${QGX_MIN_MIB:-1024}
+_gx_state=init; _gx_ts=0
+gx_busy() {  # 0 when a seam worker (or a >QGX_MIN_MIB app) is resident on the pair's GX box
+  local now out apps procs rc mib seen=""
+  [ -n "$QGX_HOST" ] || { [ "$_gx_state" = init ] && { log "gx_guard off: no pairs.conf row for QGPUS=${QGPUS:-} (GX side unguarded)"; _gx_state=noconf; }; return 1; }
+  now=$(date +%s)
+  if [ "$_gx_state" != init ] && [ "$_gx_state" != noconf ] && [ $((now - _gx_ts)) -lt "$QGX_PROBE_TTL" ]; then
+    [ "$_gx_state" = busy ]
+    return
+  fi
+  # `pgrep` exits 1 when it finds nothing, and ssh hands that back as "unreachable" -- so the remote
+  # side always ends with exit 0 and only a transport failure sets rc != 0.
+  out=$(timeout 12 ssh -o BatchMode=yes -o ConnectTimeout=6 "$QGX_HOST" \
+          'nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv,noheader 2>/dev/null;
+           echo "---SEAM---"; pgrep -f "[w]orker_seam_server" 2>/dev/null; exit 0' 2>/dev/null); rc=$?
+  if [ "$rc" != 0 ]; then
+    [ "$_gx_state" = init ] && log "gx_guard blind: ssh $QGX_HOST rc=$rc (GX side unguarded this wait)"
+    _gx_state=unreach; _gx_ts=$now; return 1
+  fi
+  apps=${out%%---SEAM---*}; procs=${out#*---SEAM---}
+  if [ -n "$(printf '%s' "$procs" | tr -d '[:space:]')" ]; then
+    seen="worker pid(s) $(printf '%s' "$procs" | tr -s '[:space:]' ' ')"
+  else
+    while read -r mib; do
+      [ -n "$mib" ] && [ "$mib" -ge "$QGX_MIN_MIB" ] && seen="$seen app ${mib}MiB"
+    done <<<"$(printf '%s\n' "$apps" | sed -n 's/^[0-9]*, *\([0-9][0-9]*\) MiB.*/\1/p')"
+  fi
+  if [ -n "$seen" ]; then
+    [ "$_gx_state" = init ] && log "gx_busy $QGX_HOST:$seen"
+    _gx_state=busy; _gx_ts=$now; return 0
+  fi
+  [ "$_gx_state" = busy ] && log "gx_idle $QGX_HOST"
+  _gx_state=idle; _gx_ts=$now; return 1
+}
+gate_busy() {  # 0 when the pair's gate file holds an unexpired claim that is not this ticket
+  local f=${QGATE:-} line pid until
+  [ -n "$f" ] && [ -r "$f" ] || return 1
+  line=$(cat "$f" 2>/dev/null)
+  pid=$(printf '%s' "$line" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+  until=$(printf '%s' "$line" | sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' | head -1)
+  [ -n "$until" ] && [ "$until" -le "$(date +%s)" ] && return 1
+  [ -n "$pid" ] && [ "$pid" != "$$" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  return 0
+}
+gpu_busy() {  # 0 when any half of the pair is in use
+  [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i ${QGPUS:?QGPUS})" ] && return 0
+  gate_busy && return 0
+  gx_busy && return 0
+  return 1
+}
 # running_owner: the live ticket that holds the box, empty when $RUNFILE is absent or nothing that
 # belongs to it is alive. The marker names two pids: the wrapper (`pid=`) and the command it launched
 # (`cmd_pid=`, appended right after the launch). The box is held while *either* lives, because on
