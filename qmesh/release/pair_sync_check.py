@@ -114,6 +114,8 @@ echo "EXT_LIVE $(readlink -f "$root/extcache" 2>/dev/null)"
 echo "RELJSON $(tr -d '\n' < "$rel/RELEASE.json" 2>/dev/null)"
 echo "LIBSTAMP $(tr -d '\n' < "$tree/qmesh/native/bin/%(lib)s.%(arch)s.so.stamp" 2>/dev/null)"
 echo "LIBSHA $(sha256sum "$tree/qmesh/native/bin/%(lib)s.%(arch)s.so" 2>/dev/null | cut -d' ' -f1)"
+echo "CPPSTAMP $(tr -d '\n' < "$tree/qmesh/native/bin/libqmesh_moe_cpp.%(arch)s.so.stamp" 2>/dev/null)"
+echo "CPPSHA $(sha256sum "$tree/qmesh/native/bin/libqmesh_moe_cpp.%(arch)s.so" 2>/dev/null | cut -d' ' -f1)"
 echo "EXTSTAMP $(tr -d '\n' < "$rel/ext/BUILD_STAMP.json" 2>/dev/null)"
 # The stamp is an identity, not a receipt: it says which sources the build was started from. The
 # binary is what the container imports, and a stray client import from another tree rebuilds it in
@@ -246,6 +248,36 @@ def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
         if want and libsha and want != libsha:
             problems.append("lib_so_hash_vs_manifest")
 
+    # 4b. the C moe hook: same rule as the seam lib, because it is a second compiled .so in the
+    # release tree. Until this existed a release root carrying a stale or missing hook read IN_SYNC
+    # (the check hashed exactly one native artefact), and the hook moves tree_digest, so "the source
+    # every piece was built from" would have been untrue of the one piece built last.
+    # Only a release that declares the hook is required (RELEASE.json native.moe_cpp, set by the cut
+    # when the commit tracks qmesh/native/build_moe.sh) is checked for it: a release cut before the
+    # hook had a build script never built one, and demanding it would turn every such root into DRIFT.
+    if (rj.get("native") or {}).get("moe_cpp"):
+        cpp = state.get("CPPSTAMP") or ""
+        try:
+            cpp = json.loads(cpp) if cpp else {}
+        except ValueError:
+            cpp = {}
+        if not cpp:
+            problems.append("cpp_stamp=missing")
+        else:
+            if cpp.get("build_id") != build_id:
+                problems.append(f"cpp_build_id={cpp.get('build_id')} want={build_id}")
+            if cpp.get("source_sha") != sha:
+                problems.append(f"cpp_source={str(cpp.get('source_sha'))[:8]} want={sha[:8]}")
+            if cpp.get("arch") != arch:
+                problems.append(f"cpp_arch={cpp.get('arch')} want={arch}")
+            cpp_sha = state.get("CPPSHA", "")
+            if not cpp.get("sha256"):
+                problems.append("cpp_stamp_no_sha")
+            elif not cpp_sha:
+                problems.append("cpp_so=unreadable")
+            elif cpp["sha256"] != cpp_sha:
+                problems.append(f"cpp_so={cpp_sha[:8]} want={str(cpp['sha256'])[:8]}")
+
     # 5. torch ext cache: per release, per container, built from THIS source, for THIS arch
     ext = state.get("EXTSTAMP") or ""
     try:
@@ -335,7 +367,8 @@ def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
         print(f"RESULT {manifest['pair']} {label} DRIFT {' '.join(problems)}")
         return False
     if not quiet:
-        print(f"STAMP {manifest['pair']} {label} lib={arch} ext={sm} build_id={build_id} OK")
+        cpp_tok = f"cpp={arch}" if (rj.get("native") or {}).get("moe_cpp") else "cpp=-"
+        print(f"STAMP {manifest['pair']} {label} lib={arch} {cpp_tok} ext={sm} build_id={build_id} OK")
     print(f"RESULT {manifest['pair']} {label} IN_SYNC")
     return True
 

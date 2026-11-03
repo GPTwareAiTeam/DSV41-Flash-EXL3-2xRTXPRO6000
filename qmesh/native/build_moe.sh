@@ -27,8 +27,10 @@ PY="${PYTHON:-python3}"
 LIBDIR="$([[ $ARCH == x86_64 ]] && echo /usr/lib/x86_64-linux-gnu || echo /usr/lib/aarch64-linux-gnu)"
 unset LD_LIBRARY_PATH || true
 export LIBRARY_PATH="${LIBDIR}${LIBRARY_PATH:+:$LIBRARY_PATH}"
-OUT="$ROOT/bin"
-OBJ="$ROOT/obj"
+# MOE_OUT/MOE_OBJ let the pair build stage write into its own tmp dir and mv the .so into bin/,
+# so a release tree never grows an obj/ directory and a failed build leaves nothing behind.
+OUT="${MOE_OUT:-$ROOT/bin}"
+OBJ="${MOE_OBJ:-$ROOT/obj}"
 mkdir -p "$OUT" "$OBJ"
 
 TORCH_DIR="$("$PY" -c 'import os, torch; print(os.path.dirname(torch.__file__))')"

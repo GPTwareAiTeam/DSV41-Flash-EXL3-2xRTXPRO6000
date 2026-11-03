@@ -20,6 +20,7 @@ PAIR_DRY_SSH=${PAIR_DRY_SSH:-}
 PAIR_MOUNT=${PAIR_MOUNT:-/pair}                 # container path of the pair root
 PAIR_SRC_LINK=${PAIR_SRC_LINK:-/src/exllamav3}  # container symlink -> /pair/current/src
 PAIR_LIB=libqmesh_expert_seam                   # qmesh/native/bin/<this>.<arch>.so
+PAIR_CPP_LIB=libqmesh_moe_cpp                    # the C moe hook: same bin/, same stamp rule
 PAIR_SEAM_FILES=(qmesh/native/qmesh_expert_seam.cu qmesh/native/qmesh_expert_seam.h qmesh/native/qes.py)
 PAIR_VERIFY_PATHS=(qmesh exllamav3)             # what "the tree is the commit" covers
 PAIR_SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)

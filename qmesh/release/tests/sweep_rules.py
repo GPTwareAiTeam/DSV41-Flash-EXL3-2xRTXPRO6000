@@ -531,6 +531,32 @@ _ok, _out = _check_side("gx", _state("gx", CXSHA="0bad"))
 check("a cuda-exl3 .so rebuilt under its stamp is DRIFT",
       not _ok and "cx_so=0bad want=cafe" in _out, _out.strip()[-160:])
 
+# The release carries a second compiled artefact, the C moe hook, and until now nothing hashed it: a
+# release root with a stale or missing libqmesh_moe_cpp.<arch>.so read IN_SYNC. The declaration in
+# RELEASE.json (native.moe_cpp, written by the cut when the commit tracks build_moe.sh) decides
+# whether it is required, so a release cut before the hook had a build script is not asked for one.
+_decl = _json.dumps({"sha": _sha, "build_id": _bid, "native": {"moe_cpp": True}})
+_cpp = _json.dumps({"build_id": _bid, "source_sha": _sha, "arch": "x86_64", "sha256": "ff"})
+_ok, _out = _check_side("p7", _state("p7", RELJSON=_decl))
+check("a release that declares the hook but carries no stamp is DRIFT",
+      not _ok and "cpp_stamp=missing" in _out, _out.strip()[-160:])
+_ok, _out = _check_side("p7", _state("p7", RELJSON=_decl, CPPSTAMP=_cpp, CPPSHA="ff"))
+check("a hook .so that is the stamp's .so verifies", _ok, _out.strip()[-160:])
+_ok, _out = _check_side("p7", _state("p7", RELJSON=_decl, CPPSTAMP=_cpp, CPPSHA="ee"))
+check("a hook rebuilt under its stamp is DRIFT, not IN_SYNC",
+      not _ok and "cpp_so=ee want=ff" in _out, _out.strip()[-160:])
+_ok, _out = _check_side("p7", _state("p7"))
+check("a release that does not declare the hook is not asked for it", _ok, _out.strip()[-160:])
+check("the stage that builds the seam lib builds and stamps the hook too",
+      all(s in src("pair_build_lib.sh") for s in
+          ("CPP_BUILD", "CPP_OK", "build_moe.sh", "PAIR_CPP_LIB", "MOE_OBJ=$moe_tmp")), "")
+check("the cut declares whether the hook is required",
+      'cat-file -e "$SHA:qmesh/native/build_moe.sh"' in src("pair_cut.sh")
+      and '"native": {"moe_cpp"' in src("pair_cut.sh"), "")
+check("pair_check reads the hook stamp and hashes the hook",
+      "CPPSTAMP" in src("pair_sync_check.py")
+      and "libqmesh_moe_cpp.%(arch)s.so" in src("pair_sync_check.py"), "")
+
 
 # Owner rule 2026-11-02: an expert pack lives on the local drive of the box that serves it. The P7
 # containers used to be handed /mnt/data12 (the 12 TB drive) so that the hot pack's links could be

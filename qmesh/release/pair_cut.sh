@@ -58,6 +58,14 @@ SEAM_VER=$(seam_of_commit qmesh/native/qes.py | sed -n 's/^PROTO_VERSION *= *\([
 [ -z "$SEAM_VER" ] && SEAM_VER=$(seam_of_commit qmesh/native/qmesh_expert_seam.h \
   | sed -n 's/^#define QES_PROTO_VERSION *\([0-9][0-9]*\).*/\1/p' | head -1)
 SEAM_VER=${SEAM_VER:--}
+# A release that tracks the hook's build script is one whose hook must be built and hashed; the
+# declaration travels in RELEASE.json so pair_check can tell it from a release cut before the hook
+# had a build (those roots carry no .so and cannot be made to grow one without touching the tree).
+if git -C "$PAIR_REPO" cat-file -e "$SHA:qmesh/native/build_moe.sh" 2>/dev/null; then
+  CPP_REQ=true
+else
+  CPP_REQ=false
+fi
 DIGEST=$(git -C "$PAIR_REPO" ls-tree -r "$SHA" -- "${PAIR_VERIFY_PATHS[@]}" | python3 -c '
 import hashlib, sys
 rows = []
@@ -106,9 +114,9 @@ print(d.get("build_id") or "")
   pair_step "CUT_ADOPT $PAIR sha=${SHA:0:8} build_id=$BUILD_ID (the pair already has this release)"
 else
 RELEASE_JSON=$(
-  python3 - "$SHA" "$BRANCH_TIP" "$BUILD_ID" "$DIGEST" "$SEAM_FP" "$SEAM_VER" "$FILES" "$PAIR" "$STAMP" <<'PY'
+  python3 - "$SHA" "$BRANCH_TIP" "$BUILD_ID" "$DIGEST" "$SEAM_FP" "$SEAM_VER" "$FILES" "$PAIR" "$STAMP" "$CPP_REQ" <<'PY'
 import json, sys
-sha, tip, bid, digest, fp, ver, files, pair, stamp = sys.argv[1:]
+sha, tip, bid, digest, fp, ver, files, pair, stamp, cpp = sys.argv[1:]
 print(json.dumps({
     "format": 1,
     "sha": sha,
@@ -118,6 +126,7 @@ print(json.dumps({
     "digest": digest,
     "files": int(files),
     "seam": {"fingerprint": fp, "version": None if ver == "-" else int(ver)},
+    "native": {"moe_cpp": cpp == "true"},
     "pair": pair,
     "cut_at": stamp,
     "cut_from": "git archive",
@@ -127,7 +136,7 @@ PY
 [ -n "$RELEASE_JSON" ] || pair_die "failed to render RELEASE.json"
 fi
 
-pair_step "CUT $PAIR sha=${SHA:0:8} build_id=$BUILD_ID seam=fp:$SEAM_FP/proto:$SEAM_VER files=$FILES"
+pair_step "CUT $PAIR sha=${SHA:0:8} build_id=$BUILD_ID seam=fp:$SEAM_FP/proto:$SEAM_VER files=$FILES cpp=$CPP_REQ"
 
 cut_side() {  # <p7|gx> <root>
   local side=$1 root=$2 rel="$2/releases/$SHA" tmp="$2/releases/$TMPNAME" log

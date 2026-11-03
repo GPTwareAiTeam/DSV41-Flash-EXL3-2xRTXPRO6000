@@ -43,6 +43,7 @@ REL=$(pair_release_dir "$SHA")
 BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build_id"])' "$REL/RELEASE.json") \
   || pair_die "no RELEASE.json in $REL"
 LIB_TIMEOUT=${LIB_TIMEOUT:-900}
+MOE_TIMEOUT=${MOE_TIMEOUT:-1200}                # the hook links libtorch: two compiles per side
 
 SEAM_FP=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["seam"]["fingerprint"])' "$REL/RELEASE.json")
 GX_BUILD_AVAIL_GIB=${GX_BUILD_AVAIL_GIB:-60}
@@ -63,35 +64,49 @@ side_hostsh() {  # <side> <shell-string>
   if [ "$side" = p7 ]; then bash -c "$2"; else pair_gxsh "$2"; fi
 }
 
-# Verify is read-only: it reads the stamp and hashes the .so, so it needs no build guard -- a
-# flip-only ticket verifies while a server loads on GX and while other builds own the box.
-verify_side() {
-  local side=$1 arch sm lib
-  sm=$(side_sm "$side"); arch=$(pair_arch_for "$sm"); lib="src/qmesh/native/bin/$PAIR_LIB.$arch.so"
-
-    local stamp="src/qmesh/native/bin/$PAIR_LIB.$arch.so.stamp" got want
-    if [ "$side" = p7 ]; then
-      got=$(cat "$REL/$stamp" 2>/dev/null)
-      want=$(sha256sum "$REL/$lib" 2>/dev/null | cut -d' ' -f1)
-    else
-      got=$(pair_gxsh "cat '$REL/$stamp' 2>/dev/null")
-      want=$(pair_gxsh "sha256sum '$REL/$lib' 2>/dev/null" | cut -d' ' -f1)
-    fi
-    python3 - "$got" "$want" "$BUILD_ID" "$SHA" "$arch" "$side" <<'PY' || return 1
+# Verify is read-only: it reads the stamps and hashes both .so files, so it needs no build guard --
+# a flip-only ticket verifies while a server loads on GX and while other builds own the box.
+# Two artefacts carry two stamps with one rule: a stamp must name THIS commit and this arch, and the
+# .so beside it must be the one the stamp hashed. A release cut before the hook had a build script
+# declares native.moe_cpp=false in RELEASE.json and is not asked for the hook (it never had one).
+verify_one() {  # <side> <arch> <name> <tag>
+  local side=$1 arch=$2 name=$3 tag=$4
+  local path="src/qmesh/native/bin/$name.$arch.so" got want
+  if [ "$side" = p7 ]; then
+    got=$(cat "$REL/$path.stamp" 2>/dev/null)
+    want=$(sha256sum "$REL/$path" 2>/dev/null | cut -d' ' -f1)
+  else
+    got=$(pair_gxsh "cat '$REL/$path.stamp' 2>/dev/null")
+    want=$(pair_gxsh "sha256sum '$REL/$path' 2>/dev/null" | cut -d' ' -f1)
+  fi
+  python3 - "$got" "$want" "$BUILD_ID" "$SHA" "$arch" "$side" "$tag" <<'PY'
 import json, sys
-got, want, bid, sha, arch, side = sys.argv[1:7]
+got, want, bid, sha, arch, side, tag = sys.argv[1:8]
 try:
     d = json.loads(got)
 except Exception:
-    print(f"LIB_STAMP_MISSING {side} {arch}"); sys.exit(1)
+    print(f"{tag}_STAMP_MISSING {side} {arch}"); sys.exit(1)
 bad = [k for k, v in (("build_id", bid), ("source_sha", sha), ("arch", arch)) if d.get(k) != v]
 if bad:
-    print(f"LIB_STAMP_MISMATCH {side} {' '.join(f'{k}={d.get(k)}' for k in bad)}"); sys.exit(1)
+    print(f"{tag}_STAMP_MISMATCH {side} {' '.join(f'{k}={d.get(k)}' for k in bad)}"); sys.exit(1)
 if want and d.get("sha256") != want:
-    print(f"LIB_SHA_MISMATCH {side} on_disk={want} stamp={d.get('sha256')}"); sys.exit(1)
-print(f"LIB_OK {side} {arch} sha256={d.get('sha256')} build={d.get('build_id')}")
+    print(f"{tag}_SHA_MISMATCH {side} on_disk={want} stamp={d.get('sha256')}"); sys.exit(1)
+print(f"{tag}_OK {side} {arch} sha256={d.get('sha256')} build={d.get('build_id')}")
 PY
-    return $?
+}
+
+verify_side() {
+  local side=$1 sm arch cpp_req
+  sm=$(side_sm "$side"); arch=$(pair_arch_for "$sm")
+  cpp_req=$(python3 -c 'import json,sys;print(str(bool((json.load(open(sys.argv[1])).get("native") or {}).get("moe_cpp"))).lower())' \
+    "$REL/RELEASE.json" 2>/dev/null)
+  verify_one "$side" "$arch" "$PAIR_LIB" LIB || return 1
+  if [ "$cpp_req" = true ]; then
+    verify_one "$side" "$arch" "$PAIR_CPP_LIB" CPP || return 1
+  else
+    pair_step "CPP_SKIP $side $arch release declares native.moe_cpp=false"
+  fi
+  return 0
 }
 
 if [ "$MODE" = verify ]; then
@@ -110,12 +125,14 @@ if [ "$PAIR_DRY" = 1 ]; then
     ct=$([ "$side" = p7 ] && echo "$P7CT" || echo "$GXCT")
     sm=$([ "$side" = p7 ] && echo "$P7_ARCH" || echo "$GX_ARCH")
     pair_step "DRY LIB_BUILD $side $ct arch=$(pair_arch_for "$sm") sm=$sm build=$BUILD_ID"
+    pair_step "DRY CPP_BUILD $side $ct arch=$(pair_arch_for "$sm") sm=$sm build=$BUILD_ID"
   done
   exit 0
 fi
 
 build_side() {
   local side=$1 ct arch sm libdir inner out
+  # Both artefacts share one guarded stage: the guards are about the box, not about one library.
   ct=$(side_ct "$side"); sm=$(side_sm "$side")
   arch=$(pair_arch_for "$sm"); libdir=$(side_libdir "$side")
   local lib="src/qmesh/native/bin/$PAIR_LIB.$arch.so"
@@ -177,26 +194,54 @@ build_side() {
 
   local cc
   cc=$(side_docker "$side" exec "$ct" /usr/local/cuda/bin/nvcc --version 2>/dev/null | tail -1 | tr -s ' ')
-  local stamp
-  stamp=$(python3 - "$BUILD_ID" "$SHA" "$arch" "$sm" "$SEAM_FP" "$sha_lib" "$cc" "$flags" "$side" <<'PY'
+  stamp_write() {  # <name> <flags> <sha256>
+    local name=$1 sflags=$2 sha_lib=$3 stamp stamp_path
+    stamp=$(python3 - "$BUILD_ID" "$SHA" "$arch" "$sm" "$SEAM_FP" "$sha_lib" "$cc" "$sflags" "$side" "$name" <<'PY'
 import datetime, json, sys
-bid, sha, arch, sm, fp, libsha, cc, flags, side = sys.argv[1:10]
+bid, sha, arch, sm, fp, libsha, cc, flags, side, name = sys.argv[1:11]
 print(json.dumps({
-    "build_id": bid, "source_sha": sha, "arch": arch, "sm": sm,
+    "build_id": bid, "source_sha": sha, "arch": arch, "sm": sm, "lib": name,
     "seam": fp, "sha256": libsha, "compiler": cc, "flags": flags,
     "host": side, "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }, indent=2, sort_keys=True))
 PY
 )
-  local stamp_path="$REL/src/qmesh/native/bin/$PAIR_LIB.$arch.so.stamp"
-  if [ "$side" = p7 ]; then
-    printf '%s\n' "$stamp" > "$stamp_path" || { pair_step "LIB_FAIL $side stamp_write"; return 1; }
-    chmod 644 "$stamp_path"
-  else
-    printf '%s\n' "$stamp" | pair_gxsh "cat > '$stamp_path'" || { pair_step "LIB_FAIL gx stamp_write"; return 1; }
-    pair_gxsh "chmod 644 '$stamp_path'"
+    stamp_path="$REL/src/qmesh/native/bin/$name.$arch.so.stamp"
+    if [ "$side" = p7 ]; then
+      printf '%s\n' "$stamp" > "$stamp_path" || return 1
+      chmod 644 "$stamp_path"
+    else
+      printf '%s\n' "$stamp" | pair_gxsh "cat > '$stamp_path'" || return 1
+      pair_gxsh "chmod 644 '$stamp_path'"
+    fi
+  }
+  stamp_write "$PAIR_LIB" "$flags" "$sha_lib" || { pair_step "LIB_FAIL $side stamp_write"; return 1; }
+  pair_step "LIB_OK $side arch=$arch sha256=$sha_lib build=$BUILD_ID stamp=$PAIR_LIB.$arch.so.stamp"
+
+  # ---- the C moe hook -----------------------------------------------------------------------------
+  # A second compiled artefact from the same tree, built under the same guards and stamped the same
+  # way. It links libtorch on purpose (the hook calls the vendored cuda-exl3 kernels through the
+  # dispatcher, so the python and C paths share one implementation), which is why its build is not
+  # one nvcc line: build_moe.sh, tracked at the same commit, owns the flags. It is built even while
+  # SEAM_MOE_CPP is unset in the pair env -- a default nobody has compiled is not a default.
+  local moe="$PAIR_CPP_LIB.$arch.so" moe_tmp="/pair/releases/$SHA/.moe-$arch-$$"
+  local moeflags="build_moe.sh: nvcc -O2 -std=c++17 -arch=$sm (kernels), g++ -O2 -std=c++20 -fPIC -pthread (torch ABI), link libtorch"
+  inner="set -e; cd /pair/releases/$SHA/src/qmesh/native; mkdir -p bin; rm -rf $moe_tmp; mkdir -p $moe_tmp; \
+         nice -n 15 env MAX_JOBS=8 CUDA_ARCH=$sm MOE_OUT=$moe_tmp MOE_OBJ=$moe_tmp/obj bash build_moe.sh; \
+         mv -f $moe_tmp/$moe bin/$moe; rm -rf $moe_tmp; \
+         chown $uid:$gid bin/$moe; \
+         sha256sum bin/$moe"
+  pair_step "CPP_BUILD $side $ct arch=$arch sm=$sm build=$BUILD_ID"
+  out=$(side_docker "$side" exec "$ct" bash -lc "$inner" 2>&1)
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    pair_step "CPP_FAIL $side rc=$rc $(printf '%s' "$out" | tail -5 | tr '\n' ' ')"
+    return 1
   fi
-  pair_step "LIB_OK $side arch=$arch sha256=$sha_lib build=$BUILD_ID stamp=$(basename "$stamp_path")"
+  sha_lib=$(printf '%s\n' "$out" | awk '/^[0-9a-f]{64} /{print $1}' | tail -1)
+  [ -n "$sha_lib" ] || { pair_step "CPP_FAIL $side no_sha_in_output"; return 1; }
+  stamp_write "$PAIR_CPP_LIB" "$moeflags" "$sha_lib" || { pair_step "CPP_FAIL $side stamp_write"; return 1; }
+  pair_step "CPP_OK $side arch=$arch sha256=$sha_lib build=$BUILD_ID stamp=$moe.stamp"
   return 0
 }
 
@@ -207,7 +252,8 @@ PY
 rc=0
 case "$SIDES" in
   both|gx)
-    if ! pair_gx_gate_take "build_lib-$PAIR" $(( (LIB_TIMEOUT + 300) / 60 )) "${GX_GATE_WAIT_MIN:-20}"; then
+    # the claim covers the whole stage: the seam lib and the hook are built back to back
+    if ! pair_gx_gate_take "build_lib-$PAIR" $(( (LIB_TIMEOUT + MOE_TIMEOUT + 300) / 60 )) "${GX_GATE_WAIT_MIN:-20}"; then
       pair_die "GX_GATE_BUSY $GXCT $(pair_gx_gate_state): the box is claimed by another job"
     fi
     trap pair_gx_gate_down EXIT ;;
