@@ -113,3 +113,40 @@ Client: P7 `qes_bench client rocep142s0f0 5 10.0.100.2 47311 <ROWS> 200 0` with 
 ### Files
 - `qmesh/bench_seam_layer.py` (new): per-layer CUDA-event timing.
 - `qmesh/worker_seam_server.py`: `build_layer` restores `ffn.load(device)`.
+
+## Sessions: many lifetimes, one loaded pack
+
+Design (as built in `d330dcf5`):
+- The cold pack is loaded once. The control port (`--port`) answers a versioned hello with the row
+  buckets it can serve and the data port of each, and a session lives exactly as long as its control
+  connection (`worker_seam_server.py:11-15`). Client exit - clean, ctrl-c, kill -9 - tears down that
+  session's QPs only, so a second run, or a second pair, connects to the same loaded server instead
+  of paying the ~150-220 s load again.
+- Every data hello is checked field by field against the session it claims to belong to: magic,
+  layers, rows, slots, port, session id (`qmesh_expert_seam.cu:1264-1287`). A hello that fails gets
+  the reason back, its fd closed, that session's handle torn down and `*stale` set
+  (`:1856-1875`); the accept loop then logs `SEAM_REJECT reason=stale-data-conn` and continues
+  (`:1965-1971`). The comment at `:1967` is the design statement: strangers can keep the loop busy,
+  they cannot kill it.
+- The control port refuses a second client while one is live - `ST_BUSY` with the active sid and ip
+  (`:2240-2246`), or `ST_QUEUED` with a position when the client asks to wait and the server allows
+  it (`:2223-2238`). A status query answers `idle`/busy without starting anything (`:2206-2219`).
+- The old behaviour - one unparseable hello aborting the process with `qes: peer layout mismatch` -
+  is gone: `check_hello` returns a reason string instead of calling `fail()`. The only things that
+  still stop a loaded server are a dead CUDA context and the session that owns the failure
+  (`worker_seam_server.py:136-141`).
+
+Result:
+- Static audit of `d330dcf5` (`b84f1a81` transport plus the Python server): no reachable
+  `abort`/`exit` on any wrong-client path. The seven control-port rejections
+  (`:2081,2156,2167,2180,2189,2199,2242`), the data-port stale rejection, and queue admission all
+  return to their loops.
+- Regression test: `qmesh/tests/server_ctl_robust.sh` with `ctl_robust.py`. A `--stub` server (no
+  pack, no GPU memory, ports 47911+) is sent a bad magic, a wrong protocol version, a wrong layer
+  count, a malformed bucket count, a disjoint bucket list, a peer that says nothing, twelve bad data
+  hellos, one legitimate session, two sessions in a row on different bucket subsets, and a client
+  that arrives during a live session - in both refuse and queue modes. The test passes only if it is
+  the same pid afterwards, with >=5 control rejections and >=12 `stale-data-conn` lines in the log.
+- Not measured on the release yet: the battery must not run in `seam-gx2-dev` while a pair
+  baseline or canary is being measured, so it is queued behind those windows. The pass/fail and the
+  reject/queue counts belong here when it runs.
