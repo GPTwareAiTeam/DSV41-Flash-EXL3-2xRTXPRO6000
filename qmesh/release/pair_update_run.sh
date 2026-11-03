@@ -145,10 +145,17 @@ PY
 # race us, but an arm exec'd into the container (or a server still up) will be killed by the recreate.
 pair_others_busy() {
   local n
-  n=$(docker exec "$P7CT" pgrep -fc 'worker_seam_server|pair_arm|pair_p7_smoke|qes' 2>/dev/null)
+  # pgrep -f counts a *defunct* process, and a defunct process holds nothing -- no memory, no GPU, no port. A
+  # bench that was killed leaves a zombie whose parent is the container's PID 1, and PID 1 in these containers
+  # never reaps, so the zombie is permanent. On 2026-11-03 10:14 the a16465e4 canary was refused with
+  # `pair_busy p7_procs=1` while the only match was `[qes_bench.x86_6] <defunct>` from a ticket that had
+  # already ended -- a refusal with no live process behind it, and it would have refused every ticket after it.
+  # So the count comes from ps state+args rather than pgrep: a Z state is skipped, and the awk that does the
+  # skipping excludes its own command line.
+  n=$(docker exec "$P7CT" ps -eo stat=,args= 2>/dev/null |
+        awk '$1 !~ /^Z/ && /worker_seam_server|pair_arm|pair_p7_smoke|qes/ && !/awk/ {n++} END{print n+0}')
   if [ "${n:-0}" != 0 ]; then printf 'p7_procs=%s ' "$n"; fi
-  n=$(pair_gxsh "docker exec $GXCT pgrep -fc 'worker_seam_server|pair_arm|qes' 2>/dev/null")
-  if [ "${n:-0}" != 0 ]; then printf 'gx_procs=%s ' "$n"; fi
+  n=$(pair_gxsh "docker exec $GXCT ps -eo stat=,args= 2>/dev/null | awk '\$1 !~ /^Z/ && /worker_seam_server|pair_arm|qes/ && !/awk/ {n++} END{print n+0}'")
 }
 gpu_free() {
   # A dry run has no GPU to look at -- on a shared box it would be looking at somebody else's job (a
