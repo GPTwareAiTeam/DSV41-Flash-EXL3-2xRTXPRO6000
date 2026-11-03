@@ -53,11 +53,14 @@ class Segment:
                 return tuple(out) if isinstance(out, (tuple, list)) else (out,)
             self._capture(args)
         tens = [a for a in args if isinstance(a, torch.Tensor)]
-        for dst, src in zip(self.static_in, tens):
-            dst.copy_(src, non_blocking = True)
+        # One batched copy per replay instead of one launch per input/carry tensor
         params = self._params(args)
-        for k, dst in self.carry_in.items():
-            dst.copy_(params[k], non_blocking = True)
+        dsts = list(self.static_in)
+        srcs = tens
+        if self.carry_in:
+            dsts += list(self.carry_in.values())
+            srcs += [params[k] for k in self.carry_in]
+        torch._foreach_copy_(dsts, srcs, non_blocking = True)
         self.graph.replay()
         for k, t in self.carry_out.items():
             params[k] = t
@@ -81,8 +84,13 @@ class Segment:
         s.wait_stream(torch.cuda.current_stream())
         g = torch.cuda.CUDAGraph()
         with torch.cuda.stream(s):
-            with torch.cuda.graph(g, pool = _pool(), stream = s, capture_error_mode = "thread_local"):
+            # capture_begin/end directly: the torch.cuda.graph context manager device-syncs and
+            # flushes the allocator on enter, once per segment, inside the decode window
+            g.capture_begin(pool = _pool(), capture_error_mode = "thread_local")
+            try:
                 out = self.fn(*self._interleave(self.static_in))
+            finally:
+                g.capture_end()
         torch.cuda.current_stream().wait_stream(s)
         self.graph = g
         self.static_out = tuple(out) if isinstance(out, (tuple, list)) else (out,)
