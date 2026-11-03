@@ -138,13 +138,35 @@ check("smoke keeps the arm's bytes", "SMOKE_ARM_LOG" in sm, "")
 check("smoke prints the server log tail", "SMOKE_SERVER_TAIL" in sm, "")
 # A decode takes ~6 rows per layer and touches the whole CPU-expert split; a worker whose own memory
 # is in swap answers it from the disk. The smoke therefore decodes first (on the fresh load), prefills
-# last, and says what the worker's own swap was at each phase -- and a fresh load that is already
-# paged is refused rather than recorded as a slow release.
-check("smoke samples the worker's own swap at every phase and refuses a paged load",
-      all(k in sm for k in ("ws_check after_load", "ws_check before_arm",
-                            "SMOKE_WSWAP after_prefill", "paging_before_decode",
-                            "worker_seam_server.py"))
-      and "SMOKE_WSWAP_MAX=${SMOKE_WSWAP_MAX:-256}" in sm, "")
+# last, and prints what the worker's own swap was at every phase, beside the box's avail and swap and
+# the worker's pid, so a row can be labelled with the state it was taken in.
+check("smoke samples the worker's own swap at every phase, selecting it by comm",
+      all(k in sm for k in ("ws_check after_load", "ws_check before_arm", "ws_check after_decode",
+                            "ws_check after_prefill", "worker_seam_server[.]py"))
+      and "paging_level" in sm, "")
+# Option B (owner, 2026-11-03): the absolute 256 MiB refusal is gone, because GX2 walks 1.2-1.7 GiB
+# into swap merely by mapping the pack on a ~121 GiB box with nothing of ours running -- it refused
+# every honest fresh load (344 MiB at after_load, 22:02). What is refused is GROWTH inside the decode
+# window: baseline at `before_arm` in the same run, sample right after the decode rows, > 128 MiB. The
+# prefill window is warned, never refused (356 MiB at ws 256 / 734 at ws 1024 are expected), and one
+# absolute level survives for a second tenant's pack.
+check("the swap gate is growth over the decode window, not an absolute level",
+      "SMOKE_WSWAP_GROW_MAX=${SMOKE_WSWAP_GROW_MAX:-128}" in sm
+      and "SMOKE_WSWAP_MAX=${SMOKE_WSWAP_MAX:-2048}" in sm
+      and 'ws_growth_check decode "$ws_before_arm" "$ws_after_decode" 1' in sm
+      and 'ws_growth_check prefill "$ws_before_arm" "$ws_after_prefill" 0' in sm
+      and "paging_growth" in sm and "paging_before_decode" not in sm, "")
+check("the decode window closes before any prefill or parsing",
+      sm.index('ws_check after_decode') < sm.index('ws_growth_check decode')
+      and sm.index('ws_check after_decode') < sm.index('ws_growth_check prefill')
+      and sm.index('ws_check after_decode') < sm.index('pair_step "SMOKE_PREFILL'), "")
+check("a post-load reading that cannot be post-residency is printed, not judged",
+      "SMOKE_WSWAP_JUDGE_MIN=${SMOKE_WSWAP_JUDGE_MIN:-2000}" in sm
+      and sm.count("SMOKE_WSWAP_UNJUDGED") >= 2
+      and sm.index("SMOKE_WSWAP_JUDGE_MIN") < sm.index("paging_level"), "")
+check("every reading names the load's box pressure and the worker it read",
+      all(k in sm for k in ("load_swapped_mib", "load_avail_mib", "box_swap_used_mib",
+                            "avail_mib=%d box_swap_used_mib=%d", "pid=%d vm_swap_mib=%d rss_mib=%d")), "")
 check("smoke refuses a box another tenant is holding",
       "SMOKE_MEM_STRICT" in sm and 'fail "memory box_busy' in sm
       and sm.index("SMOKE_MEM_READY") < sm.index('fail "memory box_busy'), "")

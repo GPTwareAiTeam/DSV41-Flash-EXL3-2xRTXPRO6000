@@ -12,11 +12,13 @@
 #   3. refuses a server that came up without the cuda-exl3 kernel -- SEAM_MOE_NOEXT means the vendored
 #      extension was not built into this release and every layer runs the mixed-K module at a
 #      fraction of the rate -- and one where too few layers could be restacked,
-#   4. records the memory *after* the pack is loaded and the slack the ensure script reports -- on GX2
-#      a 116 GiB pack leaves ~1.4 GiB, and a server that dies of that has to be caught here, not in
-#      the middle of someone's arm,
-#   5. runs one decode row through the P7 client half and checks it produced tokens and ids and that
-#      the wire did not answer `peer layout mismatch` / `remote invalid request`,
+#   4. records the box's memory *after* the pack is loaded and the slack the ensure script reports --
+#      on GX2 a 116 GiB pack leaves ~1.4 GiB, and a server that dies of that has to be caught here,
+#      not in the middle of someone's arm -- and from then on prints, at every phase, the box's
+#      avail_mib and swap, and the worker's own pid, VmSwap and RSS beside the load's swapped_mib,
+#   5. runs one decode row through the P7 client half and checks it produced tokens and ids, that
+#      the wire did not answer `peer layout mismatch` / `remote invalid request`, and that the
+#      worker's own swap did not grow inside that window (the growth gate; see SMOKE_WSWAP_GROW_MAX),
 #   6. runs one 32k prefill arm and gates its rate and aborts (dev: the owner's canary bar; prod: what
 #      the same release measured on prod's own hardware),
 #   7. prints SMOKE_OK or SMOKE_FAIL <reason> and exits 0/1.
@@ -49,9 +51,16 @@ SMOKE_SLACK_GATE=${SMOKE_SLACK_GATE:-0}          # 1 = a thin slack refuses the 
 # pipeline a split prefill, and on GX2 (~1.4 GiB free after the load) the extra slab is what a paging
 # wall costs. seam_server_ensure.sh only passes --slab-slots to a worker that knows the flag.
 SMOKE_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-1}
-# A freshly loaded worker that is already past this much of its own memory in swap is paging, and its
-# decode number would measure the disk: refuse (`paging_before_decode`) instead of recording it.
-SMOKE_WSWAP_MAX=${SMOKE_WSWAP_MAX:-256}
+# The swap gate (owner decision 2026-11-03, "Option B"). GX2 puts 1.2-1.7 GiB into swap merely by
+# mapping a 116 GiB pack on a ~121 GiB machine, with nothing of ours running, so an absolute level on
+# the worker refuses every honest fresh load. What is judged is GROWTH inside a measured window:
+# `before_arm` -> the reading right after the decode rows, refused above SMOKE_WSWAP_GROW_MAX. Prefill
+# growth is expected (356 MiB at ws 256, 734 at ws 1024) and is printed and warned, never refused.
+# One absolute level survives -- a second tenant's pack -- at SMOKE_WSWAP_MAX, and a reading whose
+# avail_mib says it cannot be post-residency (> SMOKE_WSWAP_JUDGE_MIN) is printed but not judged.
+SMOKE_WSWAP_MAX=${SMOKE_WSWAP_MAX:-2048}
+SMOKE_WSWAP_GROW_MAX=${SMOKE_WSWAP_GROW_MAX:-128}
+SMOKE_WSWAP_JUDGE_MIN=${SMOKE_WSWAP_JUDGE_MIN:-2000}
 # The grant the smoke server is given: the pair's own list (pairs.conf). Workspace for a bucket nobody
 # asks for still comes out of the box (242 MiB slab at 8192 rows), so the smoke grants exactly what
 # the pair grants -- otherwise it would pass a release on a config nobody serves.
@@ -82,31 +91,38 @@ gx_mem() {  # prints "avail_mib=<n> swap_free_mib=<n> swap_total_mib=<n>"
     | tail -1
 }
 
-# The worker's OWN swap, not the box's: the box can be 1 GiB into swap from processes that have
-# nothing to do with this pair (it was, all day) while the worker is resident, and the reverse -- a
-# fresh load that starts clean and then walks 0 -> 1068 MiB of its own memory out during a 32k+512k
-# prefill -- is the state that makes a later decode number describe paging instead of the release.
-# A decode takes ~6 rows per layer and touches the whole CPU-expert split, so a swapped worker is a
-# measurement of the disk. Prints "vm_swap_mib=<n> rss_mib=<n>", or "-" when no worker is up.
+# The worker's OWN swap, not the box's: the box sits 1.3 GiB into swap merely from mapping the pack
+# (measured 2026-11-03 with zero workers) while the worker itself can be clean, and the reverse -- a
+# load that starts clean and then walks its own memory out during a 32k+512k prefill -- is the state
+# that makes a later decode number describe paging instead of the release. So a reading is a set of
+# numbers that names itself: the host's avail_mib and box swap (SwapTotal-SwapFree), and the worker's
+# pid, VmSwap and RSS. One ssh round-trip, so the parts of a reading cannot interleave with a phase
+# change. Prints "avail_mib=<n> box_swap_used_mib=<n> pid=<n>|- vm_swap_mib=<n>|- rss_mib=<n>|-".
 gx_ws() {
   local script out
   # Sent on stdin, not as one ssh argument: the probe is a shell program inside a `docker exec sh -c`
   # inside an ssh command, and three levels of quoting is how the first version silently read an empty
   # pid and reported 0 MiB. The container name is substituted, everything else travels literally.
   script=$(sed "s/@CT@/$GXCT/g" <<'EOS'
+awk '/^MemAvailable:/{a=int($2/1024)} /^SwapTotal:/{t=int($2/1024)} /^SwapFree:/{f=int($2/1024)} END{printf "avail_mib=%d box_swap_used_mib=%d\n", a, t-f}' /proc/meminfo
 docker exec @CT@ sh -c '
 best=""; bestr=0
-for p in $(pgrep -f worker_seam_server.py); do
+for p in $(pgrep -x python3 -a | grep "worker_seam_server[.]py" | cut -d" " -f1); do
   r=$(awk "/^VmRSS:/{print \$2}" /proc/$p/status 2>/dev/null); r=${r:-0}
   [ "$r" -gt "$bestr" ] && { bestr=$r; best=$p; }
 done
-if [ -n "$best" ]; then awk "/^VmSwap:/{s=\$2} /^VmRSS:/{r=\$2} END{printf \"vm_swap_mib=%d rss_mib=%d\n\", s/1024, r/1024}" /proc/$best/status; else echo -; fi'
+if [ -n "$best" ]; then awk "/^VmSwap:/{s=\$2} /^VmRSS:/{r=\$2} END{printf \"pid=%d vm_swap_mib=%d rss_mib=%d\n\", $best, s/1024, r/1024}" /proc/$best/status; else echo "pid=- vm_swap_mib=- rss_mib=-"; fi'
 EOS
 )
   # The worker is the python3 process, not the `bash -lc` wrapper that also carries its name; the
-  # wrapper is 288 kB of swap and 364 kB of rss, which reads as a happy worker.
-  out=$(printf '%s\n' "$script" | pair_gxstdin 2>/dev/null | tail -1)
-  echo "${out:--}"
+  # wrapper is 288 kB of swap and 364 kB of rss, which reads as a happy worker. Selecting by comm,
+  # not by argv, is what makes an absolute-path worker (/pair/current/src/qmesh/...) visible too.
+  out=$(printf '%s\n' "$script" | pair_gxstdin 2>/dev/null | tr '\n' ' ')
+  case "$out" in
+    *avail_mib=*pid=*) ;;
+    *) out="avail_mib=- box_swap_used_mib=- pid=- vm_swap_mib=- rss_mib=-" ;;
+  esac
+  echo "$out"
 }
 
 if [ "$PAIR_DRY" = 1 ]; then
@@ -284,26 +300,64 @@ else
   echo "SMOKE_SERVER_PID unrecorded"
 fi
 
-loaded=$(pair_gxsh "docker exec $GXCT sh -c \"grep -m1 '^SEAM_SERVER_LOADED' /tmp/seam_server.log\"" 2>/dev/null | tail -1)
-echo "SMOKE_SERVER_LOADED $loaded"
-case "$loaded" in
-  *"build=$BUILD_ID"*) ;;
-  *) fail "server_build_mismatch loaded=${loaded:-none} want=$BUILD_ID" ;;
-esac
-echo "SMOKE_MEM_SERVER $(gx_mem)"
 # The decode arm runs FIRST, on the freshly loaded worker, and the prefill runs last -- a prefill is
-# what walks the worker's own memory into swap (0 -> 1068 MiB on a 32k+512k run, 2026-11-02), so a
-# decode measured after one is a decode measured on a paging server. Every phase prints the worker's
-# swap so a row can be labelled with the state it was taken in, and a load that is already paged
-# refuses here: the number would be the disk's, not the release's.
-ws_mib_of() { printf '%s' "$1" | sed -n 's/^vm_swap_mib=\([0-9]*\).*/\1/p'; }
-ws_check() {  # <phase>
-  local line mib
-  line=$(gx_ws); echo "SMOKE_WSWAP $1 $line"
-  mib=$(ws_mib_of "$line")
-  [ -n "${mib:-}" ] || return 0
+# what walks the worker's own memory out (0 -> 1068 MiB on a 32k+512k run, 2026-11-02), so a decode
+# measured after one is a decode measured on a paging server.
+#
+# The load's own box pressure travels with every reading: a worker at 344 MiB of swap whose load found
+# avail_mib=1132 / swapped_mib=1765 is this box reclaiming under a 116 GiB mapping, not a release that
+# pages; the same worker at 344 MiB on a load that found 119205 / 0 is a different story. Both numbers
+# are printed beside every phase and neither refuses anything.
+SRV_LOAD_SWAPPED=$(printf '%s' "$loaded" | sed -n 's/.* swapped_mib=\([0-9][0-9]*\).*/\1/p')
+SRV_LOAD_AVAIL=$(printf '%s' "$loaded" | sed -n 's/.* avail_mib=\([0-9][0-9]*\).*/\1/p')
+ws_field() {  # <line> <key> -> "<n>", or "" (a "-" reading names no worker and is unjudgeable)
+  printf '%s' "$1" | sed -n "s/.*[[:space:]]$2=\([0-9][0-9]*\).*/\1/p"
+}
+ws_before_arm=
+ws_after_decode=
+ws_after_prefill=
+ws_check() {  # <phase> -> print the reading; refuse only a level a second pack explains
+  local phase=$1 line avail mib
+  line=$(gx_ws)
+  printf 'SMOKE_WSWAP %s %s load_swapped_mib=%s load_avail_mib=%s\n' "$phase" "$line" \
+    "${SRV_LOAD_SWAPPED:--}" "${SRV_LOAD_AVAIL:--}"
+  case "$phase" in
+    before_arm) ws_before_arm=$line ;;
+    after_decode) ws_after_decode=$line ;;
+    after_prefill) ws_after_prefill=$line ;;
+  esac
+  avail=$(ws_field "$line" avail_mib); mib=$(ws_field "$line" vm_swap_mib)
+  [ -n "$mib" ] || { echo "SMOKE_WSWAP_UNJUDGED phase=$phase why=no_worker"; return 0; }
+  if [ -n "$avail" ] && [ "$avail" -gt "$SMOKE_WSWAP_JUDGE_MIN" ]; then
+    echo "SMOKE_WSWAP_UNJUDGED phase=$phase avail_mib=$avail min=$SMOKE_WSWAP_JUDGE_MIN why=not_post_residency"
+    return 0
+  fi
   [ "$mib" -le "$SMOKE_WSWAP_MAX" ] && return 0
-  fail "paging_before_decode phase=$1 vm_swap_mib=$mib max=$SMOKE_WSWAP_MAX fresh_load=1 $(printf '%s' "$line" | sed 's/^vm_swap_mib=[0-9]* //') -- the worker is already in swap, so a decode here measures the disk; free the box (stop the other container's pack) and re-run"
+  fail "paging_level phase=$phase vm_swap_mib=$mib max=$SMOKE_WSWAP_MAX $(printf '%s' "$line" | sed 's/^vm_swap_mib=[0-9]* //') -- the worker is this deep in swap with avail_mib=${avail:-?}: that is a second pack on the box, not this release; free it (stop the other container's pack) and re-run"
+}
+
+# The growth gate over one measured window: <label> <before-line> <after-line> <refuse 0|1>. Only a
+# window that starts and ends post-residency can be judged, and only growth is a fault -- a worker that
+# reclaims less than it swapped in (delta < 0) is not one.
+ws_growth_check() {  # <label> <before> <after> <refuse>
+  local label=$1 before=$2 after=$3 refuse=$4 bv av av_a d
+  bv=$(ws_field "$before" vm_swap_mib); av=$(ws_field "$after" vm_swap_mib)
+  av_a=$(ws_field "$after" avail_mib)
+  if [ -z "$bv" ] || [ -z "$av" ]; then
+    echo "SMOKE_WSWAP_UNJUDGED window=$label why=no_worker"; return 0
+  fi
+  if [ -n "$av_a" ] && [ "$av_a" -gt "$SMOKE_WSWAP_JUDGE_MIN" ]; then
+    echo "SMOKE_WSWAP_UNJUDGED window=$label avail_mib=$av_a min=$SMOKE_WSWAP_JUDGE_MIN why=not_post_residency"
+    return 0
+  fi
+  d=$(( av - bv ))
+  if [ "$d" -le "$SMOKE_WSWAP_GROW_MAX" ]; then
+    echo "SMOKE_WSWAP_GROW window=$label before_mib=$bv after_mib=$av delta_mib=$d max=$SMOKE_WSWAP_GROW_MAX verdict=ok"
+  elif [ "$refuse" = 1 ]; then
+    fail "paging_growth window=$label before_mib=$bv after_mib=$av delta_mib=$d max=$SMOKE_WSWAP_GROW_MAX -- the worker walked $d MiB of its own memory out inside this window, so these numbers describe the disk; free the box and re-run"
+  else
+    echo "SMOKE_WSWAP_GROW window=$label before_mib=$bv after_mib=$av delta_mib=$d max=$SMOKE_WSWAP_GROW_MAX verdict=warn (expected after a prefill: this is printed, not refused)"
+  fi
 }
 ws_check after_load
 
@@ -379,6 +433,12 @@ case "$arm_out" in
   *"peer layout mismatch"*|*"remote invalid request"*)
     fail "wire_mismatch $(printf '%s' "$arm_out" | grep -m1 -E 'peer layout mismatch|remote invalid request' | cut -c1-300)" ;;
 esac
+
+# The decode window closes here, before any parsing or any prefill: baseline `before_arm` -> this
+# reading, refused above SMOKE_WSWAP_GROW_MAX. A decode that walked the worker's own memory out is a
+# decode of the disk, whatever its tok/s says, so it must not become a number anybody quotes.
+ws_check after_decode
+ws_growth_check decode "$ws_before_arm" "$ws_after_decode" 1
 
 # The grant, not the request, is the shape the pair runs: the server advertises its --buckets and the
 # client adopts the intersection, so a client asking for less than the server grants silently caps
@@ -459,7 +519,11 @@ pf_ab=$(printf '%s\n' "$pf_line" | sed -n 's/.*aborted=\([0-9]*\).*/\1/p')
 echo "SMOKE_PREFILL_LOG $pf_log"
 echo "SMOKE_PREFILL depth=$SMOKE_PREFILL_DEPTH ${pf_kv% } line_rc=0"
 echo "SMOKE_MEM_PREFILL_AFTER $(gx_mem)"
-echo "SMOKE_WSWAP after_prefill $(gx_ws)"
+# The prefill window is judged for the absolute level only (a second pack would show there too): growth
+# here is expected -- 356 MiB at ws 256, 734 at ws 1024 after a 32k prefill -- so it is printed and
+# warned, never refused.
+ws_check after_prefill
+ws_growth_check prefill "$ws_before_arm" "$ws_after_prefill" 0
 [ "${pf_ab:-1}" = 0 ] || fail "prefill_aborted depth=$SMOKE_PREFILL_DEPTH aborted=$pf_ab line=$pf_line"
 case "$(printf '%s\n' "$pf_out")" in
   *"SEAM_COMPUTE_FAIL"*)
