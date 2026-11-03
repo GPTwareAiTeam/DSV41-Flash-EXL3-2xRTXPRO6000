@@ -178,3 +178,8 @@ void qmc_k_f32_to_half(const float *src, void *dst, int n, int mode, cudaStream_
   if (n <= 0) return;
   k_f32_to_half<<<grid_for(n), kThreads, 0, s>>>(src, dst, n, mode);
 }
+
+/* The fused stage kernels live in their own file so they can be compile-checked alone, but
+ * build_moe.sh compiles exactly one .cu per architecture: include it here rather than growing the
+ * build script (which the seam server owns). */
+#include "qmesh_moe_fused.cu"

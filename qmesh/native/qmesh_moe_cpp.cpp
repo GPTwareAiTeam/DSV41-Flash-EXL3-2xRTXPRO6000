@@ -295,6 +295,9 @@ struct Ctx {
   bool dump = false; /* SEAM_MOE_CPP_DUMP: mirror each group's alignment into host buffers */
   bool trace = false;
   bool bound = false; /* SEAM_MOE_CPP_BOUND: align from the picks' bound, no per-piece readback */
+  int fused = 0; /* SEAM_MOE_CPP_FUSED: 1 = one launch per projection, 2 = require it (refuse the
+                  * vendor fallback, so a green run is evidence the fused kernels actually ran) */
+  bool h_acc = false; /* CUDA_EXL3_FP16_ACC: the vendor's fp16 accumulator, which fused refuses */
   int ws_pick = -1;
   int n_groups_max = 0;
   std::mutex mu;
@@ -620,14 +623,54 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       const at::Tensor a2 = dev_tensor(b.a2, {1, total[g], (int64_t)q.inter}, at::kHalf, c.dev);
       const at::Tensor acc = dev_tensor(b.acc, {rows, H}, at::kFloat, c.dev);
 
+      /* Fused: the two Hadamard transforms run inside the GEMMs that read them, so neither a13 nor
+       * a2 is ever written (qmesh_moe_fused.cu). Same tile (block_m=16) and same accumulators as
+       * the vendor path; anything the fused kernels are not instantiated for -- another block_m, a
+       * fractional bitrate, fp16 accumulation -- falls through to the four vendor ops below. */
+      const bool use_fused =
+          c.fused != 0 && !c.h_acc && bm[g] == 16 && total[g] % 16 == 0 && q.words13 % 16 == 0 &&
+          q.words2 % 16 == 0 && H % 128 == 0 && q.inter % 128 == 0;
+      /* SEAM_MOE_CPP_FUSED=2: the caller is measuring the fused kernels and a fallback would measure
+       * something else, so what cannot be fused is refused with the reason it could not be. */
+      if (c.fused == 2 && !use_fused) {
+        set_err("layer %d group %d: fused required but not applicable (bm=%d total=%d words13=%d "
+                "words2=%d h_acc=%d)", layer, g, bm[g], total[g], (int)q.words13, (int)q.words2,
+                (int)c.h_acc);
+        rc = kRefuseCompute;
+        break;
+      }
       try {
-        moe_had_in(x_h, a13, L.grp[g].suh13, sorted_t, eids_t, nr_t, bm[g], T, m_valid);
-        moe_gemm(a13, L.grp[g].t13, L.grp[g].suh13, L.grp[g].svh13, eids_t, nr_t,
-                 {(int64_t)q.inter, (int64_t)q.inter}, q.cb, bm[g], at::kHalf, sorted_t, true,
-                 at::Tensor(), false, rows, T, inter, true, false);
-        moe_glu(inter, a2, L.grp[g].suh2, eids_t, nr_t, bm[g]);
-        moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H}, q.cb,
-                 bm[g], at::kFloat, sorted_t, true, w_f, true, rows, T, acc, true, wrote);
+        if (use_fused) {
+          if (!wrote && cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+            set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
+            rc = kRefuseCompute;
+            break;
+          }
+          const int64_t bs13 = (int64_t)(H / 16) * (2 * q.inter / 16) * q.words13;
+          const int64_t bs2 = (int64_t)(q.inter / 16) * (H / 16) * q.words2;
+          const int mblocks = total[g] / bm[g];
+          if (qmc_fused_w13(b.x_h, b.sorted, q.suh13, b.inter, q.trellis13, q.svh13, eids_g,
+                            b.n_rows + g, H, 2 * q.inter, q.inter, 2, q.words13 / 16, q.cb, bm[g],
+                            bs13, m_valid, T, mblocks, s) != 0 ||
+              qmc_fused_down(b.inter, b.sorted, q.suh2, b.acc, q.trellis2, q.svh2, eids_g,
+                             b.n_rows + g, b.w_f, q.inter, H, q.words2 / 16, q.cb, bm[g], bs2,
+                             m_valid, T, mblocks, s) != 0) {
+            /* Both stages report 2 for a refused launch and 1 for a shape with no instantiation;
+             * either way the layer's numbers are not usable, so it is a refusal, not a result. */
+            set_err("layer %d group %d: fused stage failed (bits=%d cb=%d bm=%d): no instantiation "
+                    "or launch refused", layer, g, (int)(q.words13 / 16), (int)q.cb, bm[g]);
+            rc = kRefuseCompute;
+            break;
+          }
+        } else {
+          moe_had_in(x_h, a13, L.grp[g].suh13, sorted_t, eids_t, nr_t, bm[g], T, m_valid);
+          moe_gemm(a13, L.grp[g].t13, L.grp[g].suh13, L.grp[g].svh13, eids_t, nr_t,
+                   {(int64_t)q.inter, (int64_t)q.inter}, q.cb, bm[g], at::kHalf, sorted_t, true,
+                   at::Tensor(), false, rows, T, inter, true, false);
+          moe_glu(inter, a2, L.grp[g].suh2, eids_t, nr_t, bm[g]);
+          moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H}, q.cb,
+                   bm[g], at::kFloat, sorted_t, true, w_f, true, rows, T, acc, true, wrote);
+        }
       } catch (const std::exception& e) {
         set_err("layer %d group %d raised: %s", layer, g, e.what());
         rc = kRefuseCompute;
@@ -692,6 +735,19 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
    * group to min(n_experts, m_valid) costs more blocks than the sync saves at decode widths. On is a
    * measurement arm. */
   c->bound = env_int("SEAM_MOE_CPP_BOUND", 0) != 0;
+  /* One launch per projection instead of four (see qmesh_moe_fused.cu). Only the block_m=16 tile is
+   * instantiated, and only fp32 accumulation: a fused kernel has no second pass to fall back on, so
+   * CUDA_EXL3_FP16_ACC is refused here and the vendor path keeps it. Off by default until the
+   * 40-layer dump comparison says the answer is identical. 2 = require: any layer the fused kernels
+   * cannot take is a refusal rather than a silent run of the vendor path, which is what makes an
+   * identity comparison between the two arms mean something. */
+  c->fused = (int)env_int("SEAM_MOE_CPP_FUSED", 0);
+  {
+    /* The vendor reads this through exl3_env, which also honours the VLLM_EXL3_ alias; the seam
+     * process only ever sets the CUDA_ name, and a set-but-empty or "0" value means off there too. */
+    const char* ha = getenv("CUDA_EXL3_FP16_ACC");
+    c->h_acc = ha && *ha && *ha != '0';
+  }
   /* Response format. Default fp32: the shipped seam slot is fp32 and off_resp's stride is
    * rows*HIDDEN*4 (qmesh_expert_seam.cu, and Seam.collect in remote_seam_host.py), so anything else
    * must be a deliberate, matching change on the client side. */
