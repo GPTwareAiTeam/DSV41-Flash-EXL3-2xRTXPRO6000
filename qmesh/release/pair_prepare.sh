@@ -103,6 +103,16 @@ done
 # reached over NFS (or through a symlink that lands on someone else's drive) makes serving speed
 # depend on the network, so it is refused here -- before a release is cut or a library built -- and
 # again by the smoke, which is the last gate before `current` moves.
+# The gate refuses to *run* without PAIR_PACK_P7, because only the pair knows which client half of the
+# split checkpoint serves GX's /cold; the smoke has always derived it (pair_ckpt_resolve) and prepare
+# did not, so every caller that did not export it got PREPARE_FAILED phase=packs rc=2 with a usage
+# message (2026-11-03 16:55Z, the /src repair ticket). Derive it here the same way, then the gate
+# judges locality instead of refusing to have been told.
+if [ -z "${PAIR_PACK_P7:-}" ]; then
+  PAIR_PACK_P7=$(pair_ckpt_resolve auto 2>/dev/null) || PAIR_PACK_P7=
+fi
+export PAIR_PACK_P7
+pair_step "PREPARE_PACK_P7 ${PAIR_PACK_P7:-unnamed} cold=$(pair_cold_src "$GXCT" 2>/dev/null) sha=$(pair_cold_placement "$GXCT" 2>/dev/null | cut -c1-12)"
 pack_out=$(python3 "$HERE/pair_pack_disk.py" "$PAIR" 2>&1); pack_rc=$?
 printf '%s\n' "$pack_out" | sed 's/^/  /'
 [ "$pack_rc" = 0 ] || pair_die "PREPARE_FAILED $PAIR phase=packs rc=$pack_rc (a pack is not on the serving box's own disk)"

@@ -1237,6 +1237,9 @@ check("pair_server resolves the client half and dies when it cannot be named",
 check("the smoke hands the pack check the half it is actually serving",
       'PAIR_PACK_P7=$(pair_ckpt_resolve auto)' in src("pair_smoke.sh")
       and "export PAIR_PACK_P7" in src("pair_smoke.sh"), "")
+check("prepare derives the client half too, so its pack gate can judge",
+      'PAIR_PACK_P7=$(pair_ckpt_resolve auto 2>/dev/null)' in src("pair_prepare.sh")
+      and src("pair_prepare.sh").index("pair_ckpt_resolve") < src("pair_prepare.sh").index("pair_pack_disk.py"), "")
 check("an unnamed hot half is refused, not checked against the previous pack's refs",
       'PACK_DISK_USAGE' in src("pair_pack_disk.py")
       and 'PAIR_PACK_P7", "")' in src("pair_pack_disk.py"), "")
