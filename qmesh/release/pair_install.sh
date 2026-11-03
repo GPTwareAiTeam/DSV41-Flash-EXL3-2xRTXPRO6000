@@ -50,20 +50,27 @@ if [ -z "$SRC" ]; then
   [ -d "$tree/qmesh/release" ] && SRC=$tree/qmesh/release || SRC=$HERE
 fi
 [ -d "$SRC" ] || die "src $SRC is not a directory"
+# Canonicalise the source before anything looks at a destination: the check below compares paths, and
+# run from the repo tree "$HERE" *is* the source -- which is how a caller got INSTALL_OK n=6
+# dst=<repo>/qmesh/release while the artifacts dir stayed stale, followed by CMP_FAIL on five files
+# (2026-11-03 02:35Z, the CanaryB84 ticket: the installed installer at that time had neither this
+# resolution nor the refusal, so the comparison was right and the destination was wrong).
+SRC=$(cd "$SRC" && pwd)
 
 if [ -z "$DST" ]; then
-  # <artifacts>/scripts; this file may be run from the repo or from its installed copy.
+  # <artifacts>/scripts; this file may be run from the repo or from its installed copy. A candidate
+  # that is the source tree is skipped rather than installed into, so the default invocation from a
+  # checkout still lands on the pairs' script dir instead of dying on its own source.
   for cand in "$HERE" "$(dirname "$HERE")/scripts" "/home/treadall/recipe-artifacts/gpu0-gx1/scripts"; do
-    [ -d "$cand" ] && [ -f "$cand/pair_lib.sh" ] && DST=$cand && break
+    [ -d "$cand" ] && [ -f "$cand/pair_lib.sh" ] || continue
+    [ "$(cd "$cand" && pwd)" = "$SRC" ] && continue
+    DST=$cand; break
   done
 fi
 [ -n "$DST" ] && [ -d "$DST" ] || die "cannot resolve the installed script dir (pass --dst)"
-SRC=$(cd "$SRC" && pwd)
 DST=$(cd "$DST" && pwd)
-# Invoked from the repo tree, the resolution above finds the checkout's own release dir first and
-# installs the files over themselves: it printed INSTALL_OK n=6 dst=<repo>/qmesh/release while the
-# artifacts dir stayed stale, and the caller's cmp then failed on five files (2026-11-03 21:35Z).
-# A dst that is the source is always that mistake.
+# Whatever the resolution did, a dst that is the source is always that mistake: the files would be
+# copied over themselves, INSTALL_OK would name the repo, and nothing would reach the pairs.
 [ "$DST" != "$SRC" ] || die "dst_is_src dst=$DST -- pass --dst <the pairs' script dir>"
 
 # Is $1 an ancestor of this process?

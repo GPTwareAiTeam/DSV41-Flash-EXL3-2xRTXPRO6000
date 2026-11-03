@@ -1092,6 +1092,30 @@ check("the hook build finds a toolkit that carries cusparse.h",
 
 check("the installer refuses a dst that is its own source tree",
       'dst_is_src' in _pi and _pi.index("dst_is_src") < _pi.rindex("INSTALL_OK"), "")
+# ...and it does not have to reach that refusal to be safe: the default resolution runs from a checkout
+# with "$HERE" = the source tree, which is how CanaryB84 installed over itself, printed INSTALL_OK
+# dst=<repo>/qmesh/release and then CMP_FAIL on five files while artifacts/scripts stayed stale
+# (2026-11-03 02:35Z). The source is canonicalised first and skipped as a candidate.
+check("the installer never resolves its destination to its own source tree",
+      _pi.index('SRC=$(cd "$SRC" && pwd)') < _pi.index("for cand in")
+      and '[ "$(cd "$cand" && pwd)" = "$SRC" ] && continue' in _pi, "")
+# Behavioural, and independent of the queue: the refusal comes before the ticket scan, so this runs
+# wherever the sweep does. A dst that is the src must exit 2 and must not have replaced anything.
+_wt = _tf.mkdtemp(prefix="pairsweep-inst.")
+try:
+    os.makedirs(f"{_wt}/rel"); os.makedirs(f"{_wt}/pairstate")
+    open(f"{_wt}/rel/pair_lib.sh", "w").write("x\n")
+    open(f"{_wt}/rel/pair_arm.sh", "w").write("#!/bin/bash\necho old\n")
+    before = open(f"{_wt}/rel/pair_arm.sh").read()
+    r = subprocess.run(["bash", os.path.join(HERE, "pair_install.sh"), "--src", f"{_wt}/rel",
+                        "--dst", f"{_wt}/rel", "pair_arm.sh"], capture_output=True, text=True)
+    check("...and a dst equal to the src is refused before anything is written",
+          r.returncode == 2 and "INSTALL_FAIL dst_is_src" in r.stderr
+          and open(f"{_wt}/rel/pair_arm.sh").read() == before
+          and "INSTALL installed pair_arm.sh" not in r.stdout,
+          "rc=%d err=%s" % (r.returncode, r.stderr.strip()[:160]))
+finally:
+    _sh.rmtree(_wt, ignore_errors=True)
 
 # SIDE_SCRIPT is %-formatted as a whole, so a bare printf verb inside it is a format error, not a
 # print: `printf '%s->%s '` in the EXTSRC line took every pair_check down with "not enough arguments
