@@ -785,7 +785,7 @@ both pairs run `d330dcf5`; the order below is the order they will be taken in.
    host/device timing correction. Both are recorded as tools in `EXL3_PORT_BACKLOG.md` items 9 and
    10 -- they measure the pairs, they are not runtime, and nothing about them queues.
 
-## The C hook is a release, and DRIFT must be able to see it (2026-11-02, planning only)
+## The C hook is a release, and DRIFT must be able to see it (2026-11-02; tooling closed 23:40Z)
 
 `gxport2/cpp-compute` (`a995b10e`, the merged hook) plus the staged `SEAM_MOE_CPP_BOUND` 1 → 0 flip
 travels as **a fresh release cut from `tools/pair-release` after the merge**, then a dev re-canary,
@@ -808,3 +808,27 @@ Before that release is cut, two gaps close, because today a pair could drift the
 
 Nothing here runs until the firmware hold lifts and both pairs are back on a release with an IN_SYNC
 verdict.
+
+### Closed, 2026-11-02 23:40Z
+
+Both gaps above are implemented and installed (`ec907bd7`, `c96ad657`): the hook is built by
+`build_moe.sh` in the same guarded stage as the seam lib, into a temporary `MOE_OUT`/`MOE_OBJ` so the
+release tree never grows `obj/`, then renamed into `qmesh/native/bin/` -- the exact path
+`qmesh/moe_cpp.py:lib_path()` loads -- and stamped with the release sha, the arch it built for and its
+`sha256`. `pair_sync_check.py` hashes it (`CPPSTAMP`/`CPPSHA`, `cpp_so=<disk> want=<stamp>`), and a
+release that carries no hook stays IN_SYNC with `cpp=-`.
+
+The requirement is declared, not assumed: `pair_cut.sh` writes `native.moe_cpp` into `RELEASE.json`
+from whether the commit tracks `qmesh/native/build_moe.sh`, and both the build (`CPP_SKIP`) and the
+verify honour it. So release 1 keeps verifying, and a hook release cannot read IN_SYNC without a
+matching stamp and hash on both sides.
+
+### Tooling reaches `<artifacts>/scripts` through `pair_install.sh`
+
+`pair_install.sh` is the only path now: it refuses while a queue ticket is live (`ticket_in_flight
+queue=<q> agent=<a> pid=<p>`) and renames each file into place after a syntax check. The reason is
+measured, not theoretical: at 01:29Z a patched `pair_arm.sh` was copied over the installed file while
+a prod smoke was executing it, bash read the shifted lines and the prefill arm exited 1 with
+`ir_arm_ids.py: command not found` / `drv_host: unbound variable` -- from line numbers that had
+already run -- so a 792.5 tok/s measurement was thrown away as garbage. A ticket owns the scripts it
+reads; nothing in there changes under it.
