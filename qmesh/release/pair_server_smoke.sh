@@ -102,7 +102,17 @@ def fail(name, detail):
 
 
 # ---- the model list a client discovers the endpoint with -------------------------------------
+# A 401 here is not "the wire is wrong": either a leftover server is enforcing a key this shell does not
+# have, or this smoke started one and the key did not travel. Say which, because the bare "status=401"
+# reads like a broken endpoint and costs a debugging round on a server that is in fact healthy.
 status, body = call("/v1/models")
+if status == 401:
+    fail("auth" if os.environ.get("API_KEY") else "auth_missing_key",
+         "401 on /v1/models with %s: the serving process enforces an API_KEY this smoke %s "
+         "(a reused server started under a different key, or a start that did not carry it); "
+         "re-run with the server's key or stop it so this smoke starts its own"
+         % ("API_KEY set" if os.environ.get("API_KEY") else "no API_KEY",
+            "does not match" if os.environ.get("API_KEY") else "was not given"))
 models = body.get("data") or []
 if status != 200 or not models:
     fail("models", "status=%s body=%s" % (status, body))
