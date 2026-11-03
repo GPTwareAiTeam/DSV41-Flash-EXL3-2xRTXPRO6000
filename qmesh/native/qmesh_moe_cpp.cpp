@@ -653,7 +653,10 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
            * the routing weight into the down gemm's fp32 atomics instead, so its answer depends on
            * the order blocks retire in (and on block_m); this one depends on nothing but the group
            * order. That is what makes a per-layer byte comparison between the two paths mean
-           * anything (the measured agreement of the default arm was 13/40 layers at 1 row). */
+           * anything: measured on 2026-11-03 over 40 layers at rows 1/6/64/8192, the default arm
+           * agrees with the Python path on 0/40 layers and this branch on 40/40 (max_abs exactly 0).
+           * The "13/40 identical" figure often quoted next to this code is fused-vs-native, a
+           * different comparison: both of those sum by fp32 atomicAdd in block-retirement order. */
           const at::Tensor routed =
               moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H},
                        q.cb, bm[g], at::kHalf, sorted_t, true, at::Tensor(), false, rows, T,
