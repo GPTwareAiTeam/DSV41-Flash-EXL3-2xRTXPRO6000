@@ -7,11 +7,54 @@ from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, ML
 from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
 from ..util.segment import Segment
+import math
 import os
 
 # Piecewise decode graphs (EXL3_WHOLE_GRAPH=1): each block runs graph A (attn HC mix + norm), the eager
 # attention core, then graph B (attn residual + MLP + HC apply). Each block's residual is final at its exit.
 _PIECEWISE = os.environ.get("EXL3_WHOLE_GRAPH", "0") != "0"
+_PIECEWISE_MAXSEQ = int(os.environ.get("EXL3_WHOLE_GRAPH_MAXSEQ", "8"))
+# Temporary A/B switch for the merged block-boundary graph (EXL3_PW_MERGE=0 keeps graph B separate). Remove at cutover
+_PW_MERGE = os.environ.get("EXL3_PW_MERGE", "1") != "0"
+_PW_TPCOLLECT = os.environ.get("EXL3_PW_TPCOLLECT", "0") == "1"
+_PW_PAIR = os.environ.get("EXL3_PW_PAIR", "0") == "1"
+_B1_EAGER_DIAG = os.environ.get("EXL3_DSV4_B1_EAGER_DIAG", "0") == "1"
+_B1_MULTIROW = os.environ.get("EXL3_DSV4_B1_MULTIROW", "1") == "1"
+_B1_PDUMP = os.environ.get("EXL3_DSV4_PDUMP", "") != ""
+
+# DSpark tap export. EXL3_DSPARK_TAP_SCALE: power-of-two scale applied before the fp16 cast. The drafter's only
+# consumer is main_proj (no bias) -> main_norm (RMSNorm, scale-invariant up to eps), so the scale is absorbed.
+# EXL3_TAP_PROBE=N logs the first N exports per layer (pre-cast magnitudes, overflow counts).
+_DSPARK_TAP_SCALE = float(os.environ.get("EXL3_DSPARK_TAP_SCALE", "1.0"))
+assert math.frexp(_DSPARK_TAP_SCALE)[0] == 0.5, "EXL3_DSPARK_TAP_SCALE must be a power of two"
+_TAP_PROBE = int(os.environ.get("EXL3_TAP_PROBE", "0"))
+_tap_probe_calls: dict = {}
+
+
+def _tap_probe(layer_idx: int, x: torch.Tensor):
+    n = _tap_probe_calls.get(layer_idx, 0)
+    if n >= _TAP_PROBE:
+        return
+    _tap_probe_calls[layer_idx] = n + 1
+    xf = x.float()
+    fin = torch.isfinite(xf)
+    mag = xf.abs().masked_fill(~fin, 0.0)
+    tok = mag.reshape(-1, mag.shape[-1]).amax(dim = -1)
+    nz = mag[mag > 0]
+    hot = (tok > 4096.0).nonzero().flatten()[:8].tolist()
+    print(f"[TAPPROBE] layer={layer_idx} dtype={x.dtype} shape={tuple(x.shape)} amax={float(mag.max()):.1f} "
+          f"nonfinite={int((~fin).sum())} ge65504={int((xf.abs() >= 65504.0).sum())} "
+          f"gt4096={int((mag > 4096.0).sum())} subfp16_min={int((nz < 6.1e-5).sum())}/{nz.numel()} "
+          f"hot_tokens={[(i, round(float(tok[i]), 1)) for i in hot]} n_tokens={tok.numel()}", flush = True)
+
+
+def _tap_to_half(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+    """Export cast for DSpark taps: fp32 scale (power of two), fp16 cast, clamp kept as a safety net."""
+    if _DSPARK_TAP_SCALE != 1.0:
+        x = x.float() * _DSPARK_TAP_SCALE
+    if _TAP_PROBE:
+        _tap_probe(layer_idx, x)
+    return x.half().clamp_(-65504.0, 65504.0)
 
 # Opt-in per-phase decode marks (EXL3_ROUND_PROF=1): the attention core and the MLP core of each
 # block, so an eager decode run attributes the verify forward between attention+dense and the MoE
@@ -30,6 +73,7 @@ def _rpmark(name):
         _rp_mark_fn = _m
     if _rp_mark_fn:
         _rp_mark_fn(name)
+
 
 class TransformerBlock(Module):
 
@@ -171,9 +215,11 @@ class TransformerBlock(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
-
-        if _PIECEWISE and x.shape[1] == 1 and self.attn_hc is not None and self.mlp_hc is not None:
-            return self._forward_piecewise(x, params, out_dtype)
+        pending = params.pop("pw_pending", None)
+        if (_PIECEWISE and 1 <= x.shape[1] <= _PIECEWISE_MAXSEQ and self.attn_hc is not None and
+            self.mlp_hc is not None and not getattr(params.get("backend"), "disable_piecewise_capture", False)):
+            return self._forward_piecewise(x, params, out_dtype, pending)
+        assert pending is None, "deferred piecewise MLP half reached a non-piecewise block"
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
@@ -257,29 +303,201 @@ class TransformerBlock(Module):
             # With hyperconnections the residual is a stream stack; export the stream mean as
             # the collapsed hidden state (streams start as broadcast copies of the embedding)
             x_ = x.mean(dim = 2) if self.attn_hc else x
-            if x_.dtype == torch.half:
-                s.append(x_.clamp_(-65504.0, 65504.0))
-            else:
-                x_ = x_.half()
-                x_.clamp_(-65504.0, 65504.0)
-                s.append(x_)
+            s.append(_tap_to_half(x_, self.layer_idx))
 
         if self.layer_scalar_f is not None:
             x *= self.layer_scalar_f
 
         return to2(x, out_dtype, self.out_dtype)
 
-    def _forward_piecewise(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None):
-        """Decode (seq 1) body split around the attention core. Graph A: attn HC mix + norm, outputs
-        (post, comb, y). Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply.
-        Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs of A."""
-        if not hasattr(self, "_seg_a"):
-            self._seg_a = Segment(self._piece_a, carry = ("hc_pre",))
-            self._seg_b = Segment(self._piece_b, carry = ("hc_pre",))
-        post, comb, y = self._seg_a(x, params)
+    def _pw_defer(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None) -> bool:
+        """True when this block's MLP half may stay pending and run inside the next block's graph A (one replay per
+        block boundary instead of two). The driver names the next module in params["pw_next"]; the next block must
+        take the piecewise path too (same shape gate as forward)"""
+        nxt = params.get("pw_next")
+        if not _PW_MERGE or type(nxt) is not TransformerBlock or nxt.attn_hc is None or nxt.mlp_hc is None:
+            return False
+        if not (1 <= x.shape[1] <= _PIECEWISE_MAXSEQ) or params.get("prefill"):
+            return False
+        if out_dtype is not None or self.out_dtype is not None:
+            return False
+        export_state = params.get("export_state_layers")
+        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+            return False
+        return nxt.device == self.device
+
+    def _forward_piecewise(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None, pending = None):
+        """Decode body split around the attention core. Graph A: attn HC mix + norm, outputs (post, comb, y).
+        Eager: attn.forward. Graph B: attn HC apply, MLP HC mix + norm, MLP, MLP HC apply. A block whose graph B is
+        deferred (pending = the previous block's (block, x, post, comb, y_attn)) runs that graph B inside its own
+        graph A. Residual x is threaded through the segments as a static buffer; HC post/comb are static outputs."""
+        if (x.shape[1] == 1 or (_B1_MULTIROW and x.shape[0] == 1 and x.shape[1] <= 8)) and \
+           self.attn is not None and hasattr(self.attn, "b1_prep"):
+            b1 = self.attn.b1_prep(params, x.shape[1])
+            if b1 is not None:
+                pair = params.get("pw_pair")
+                if (_PW_PAIR and _PW_MERGE and _PW_TPCOLLECT and pair and
+                    getattr(params.get("backend"), "piecewise_p2p_capture", False) and
+                    not params.get("export_state_layers") and out_dtype is None and self.out_dtype is None):
+                    nxt, after = pair
+                    if (type(nxt) is TransformerBlock and nxt is not self and nxt.device == self.device and
+                        nxt.attn_hc is not None and nxt.mlp_hc is not None and nxt.out_dtype is None and
+                        nxt.attn is not None and hasattr(nxt.attn, "b1_prep") and
+                        self.attn.tp_owner is None and nxt.attn.tp_owner is None and
+                        nxt.layer_idx != self.layer_idx):
+                        b1_next = nxt.attn.b1_prep(params, x.shape[1])
+                        if b1_next is not None:
+                            return self._forward_piecewise_pair(x, params, pending, b1, nxt, b1_next, after)
+                return self._forward_piecewise_b1(x, params, out_dtype, pending, b1)
+        if not hasattr(self, "_segments"):
+            self._segments = {}
+        key = (tuple(x.shape), x.dtype, out_dtype, None if pending is None else id(pending[0]))
+        segs = self._segments.get(key)
+        if segs is None:
+            if pending is None:
+                segs = (Segment(self._piece_a, carry = ("hc_pre",)), Segment(self._piece_b, carry = ("hc_pre",)))
+            else:
+                prev = pending[0]
+                segs = (Segment(lambda *a: self._piece_ba(prev, *a), carry = ("hc_pre",)),
+                        Segment(self._piece_b, carry = ("hc_pre",)))
+            self._segments[key] = segs
+        seg_a, seg_b = segs
+        if pending is None:
+            post, comb, y = seg_a(x, params)
+        else:
+            _, x_b, post_b, comb_b, y_b = pending
+            x, post, comb, y = seg_a(x_b, post_b, comb_b, y_b, params)
         y_attn = self.attn.forward(y, params)
-        x, = self._seg_b(x, post, comb, y_attn, params)
+        if self._pw_defer(x, params, out_dtype):
+            params["pw_pending"] = (self, x, post, comb, y_attn)
+            return x
+        x, = seg_b(x, post, comb, y_attn, params)
+        export_state = params.get("export_state_layers")
+        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+            states = params.get("export_states")
+            if not states:
+                states = params["export_states"] = []
+            states.append(_tap_to_half(x.mean(dim = 2), self.layer_idx))
         return to2(x, out_dtype, self.out_dtype)
+
+    def _piece_ba(self, prev, x_b, post_b, comb_b, y_b, params):
+        """Previous block's graph B (its deferred MLP half), then this block's graph A"""
+        x, = prev._piece_b(x_b, post_b, comb_b, y_b, params)
+        post, comb, y = self._piece_a(x, params)
+        return x, post, comb, y
+
+    def _forward_piecewise_b1(self, x, params, out_dtype, pending, b1):
+        """Decode body with the device-driven attention core inside the segment: graph A, the attention body
+        (attn._batch_body) and graph B of the previous block (when pending) are one captured replay. The attention
+        collective runs eagerly unless P2P capture is enabled; graph B defers exactly as in _forward_piecewise.
+        b1 is the attention's host prepass (ctx, arr, bt_st) for this step."""
+        ctx, arr, bt_st = b1
+        prev = None if pending is None else pending[0]
+        capture_collect = (_PW_TPCOLLECT and self.attn.tp_owner is None and
+                           getattr(params.get("backend"), "piecewise_p2p_capture", False))
+        # ctx[5] is the indexer selection regime and ctx[6] the step's new-entry run length: a step that
+        # changes either must capture a body of its own (the run's base entry stays device-driven)
+        key = ("b1", tuple(x.shape), x.dtype, out_dtype, id(ctx[0]), id(ctx[1]), ctx[5], ctx[6],
+               None if prev is None else id(prev), capture_collect)
+        if not hasattr(self, "_segments"):
+            self._segments = {}
+        segs = self._segments.get(key)
+        if segs is None:
+            segs = (Segment(lambda *a: self._piece_b1(ctx, prev, capture_collect, *a), carry = ("hc_pre",)),
+                    Segment(self._piece_b, carry = ("hc_pre",)))
+            self._segments[key] = segs
+        seg_a, seg_b = segs
+        if pending is None:
+            x, post, comb, y = (self._piece_b1(ctx, prev, capture_collect, x, arr, bt_st, params)
+                                if _B1_EAGER_DIAG else seg_a(x, arr, bt_st, params))
+        else:
+            _, x_b, post_b, comb_b, y_b = pending
+            x, post, comb, y = (self._piece_b1(ctx, prev, capture_collect, x_b, post_b, comb_b, y_b, arr, bt_st, params)
+                                if _B1_EAGER_DIAG else seg_a(x_b, post_b, comb_b, y_b, arr, bt_st, params))
+        if _B1_PDUMP:
+            # Parity dump of the captured body's selection buffers, taken from the host after the step
+            from .dsv4 import _pdup_host
+            _pdup_host(self.layer_idx, params, x.shape[1] if x.dim() > 1 else x.shape[0])
+        if self.attn.tp_reduce and not capture_collect:
+            self.attn.tp_collect(params["backend"], y)
+        if self._pw_defer(x, params, out_dtype):
+            params["pw_pending"] = (self, x, post, comb, y)
+            return x
+        x, = seg_b(x, post, comb, y, params)
+        export_state = params.get("export_state_layers")
+        if export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0:
+            states = params.get("export_states")
+            if not states:
+                states = params["export_states"] = []
+            states.append(_tap_to_half(x.mean(dim = 2), self.layer_idx))
+        return to2(x, out_dtype, self.out_dtype)
+
+    def _forward_piecewise_pair(self, x, params, pending, b1, nxt, b1_next, after):
+        ctx, arr, bt = b1
+        next_ctx, next_arr, next_bt = b1_next
+        prev = None if pending is None else pending[0]
+        key = ("pair", id(nxt), tuple(x.shape), x.dtype, id(ctx[0]), id(ctx[1]), ctx[5], ctx[6],
+               id(next_ctx[0]), id(next_ctx[1]), next_ctx[5], next_ctx[6], id(bt), id(next_bt),
+               None if prev is None else id(prev))
+        if not hasattr(self, "_segments"):
+            self._segments = {}
+        segs = self._segments.get(key)
+        if segs is None:
+            segs = (Segment(lambda *a: self._piece_pair(nxt, ctx, next_ctx, prev, *a), carry = ("hc_pre",)),
+                    Segment(nxt._piece_b, carry = ("hc_pre",)))
+            self._segments[key] = segs
+        seg, seg_b = segs
+        old_next = params.get("pw_next")
+        params["pw_next"] = after
+        try:
+            defer = nxt._pw_defer(x, params, None)
+        finally:
+            params["pw_next"] = old_next
+        if pending is None:
+            x, post, comb, y = seg(x, arr, bt, next_arr, next_bt, params)
+        else:
+            _, x_b, post_b, comb_b, y_b = pending
+            x, post, comb, y = seg(x_b, post_b, comb_b, y_b, arr, bt, next_arr, next_bt, params)
+        if _B1_PDUMP:
+            # Both blocks' attention bodies ran inside this one replay: dump each layer's registered
+            # buffers before the next segment reuses them
+            from .dsv4 import _pdup_host
+            _pw = x.shape[1] if x.dim() > 1 else x.shape[0]
+            _pdup_host(self.layer_idx, params, _pw)
+            _pdup_host(nxt.layer_idx, params, _pw)
+        params["pw_skip_next"] = True
+        if defer:
+            params["pw_pending"] = (nxt, x, post, comb, y)
+            return x
+        x, = seg_b(x, post, comb, y, params)
+        return to2(x, None, nxt.out_dtype)
+
+    def _piece_pair(self, nxt, ctx, next_ctx, prev, *args):
+        if prev is None:
+            x, arr, bt, next_arr, next_bt, params = args
+            x, post, comb, y = self._piece_b1(ctx, None, True, x, arr, bt, params)
+        else:
+            x_b, post_b, comb_b, y_b, arr, bt, next_arr, next_bt, params = args
+            x, post, comb, y = self._piece_b1(ctx, prev, True, x_b, post_b, comb_b, y_b, arr, bt, params)
+        # HC scratch is shared across blocks: B(N) must complete before A(N+1).
+        x, = self._piece_b(x, post, comb, y, params)
+        return nxt._piece_b1(next_ctx, None, True, x, next_arr, next_bt, params)
+
+    def _piece_b1(self, ctx, prev, capture_collect, *a):
+        """Previous block's graph B, graph A, attention body, and optionally the attention collective."""
+        if prev is None:
+            x, arr, bt_st, params = a
+        else:
+            x_b, post_b, comb_b, y_b, arr, bt_st, params = a
+            x, = prev._piece_b(x_b, post_b, comb_b, y_b, params)
+        post, comb, y = self._piece_a(x, params)
+        rsl, kl, m, w, kp, cand_regime, nnew = ctx
+        y_attn = self.attn._batch_body(y, arr, y.shape[0], y.shape[1], y.shape[0] * y.shape[1], rsl, kl, bt_st, m, w, kp,
+                                       params, None, cand_regime = cand_regime, nnew = nnew)
+        if capture_collect and self.attn.tp_reduce:
+            self.attn.tp_collect(params["backend"], y_attn)
+        return x, post, comb, y_attn
+
 
     def _piece_a(self, x, params):
         post, comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
