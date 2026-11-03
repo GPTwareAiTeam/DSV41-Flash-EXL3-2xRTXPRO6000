@@ -272,13 +272,23 @@ ids_arm() {  # <tag> -> decode arm with --ids; the ARM_IDS sha256 is the load's 
   : > "$logf"
   rm -f "$out" "$ctr"
   timeout 420 docker exec "${CLIENT_ENV[@]}" \
-    -e "MAX_PROMPTS=1" -e "MAX_NEW=8" -e "WARMUP=0" -e "WARMUP_NEW=0" \
+    -e "MAX_PROMPTS=1" -e "MAX_NEW=${CX_IDS_MAX_NEW:-8}" -e "WARMUP=${CX_IDS_WARMUP:-0}" -e "WARMUP_NEW=${CX_IDS_WARMUP_NEW:-0}" \
     -e "ARM_IDS_OUT=$ctr" \
     "$P7CT" bash -lc "cd /src/exllamav3 && nice -n 10 python3 -u ${CX_ID_DRIVER:-/artifacts/gpu0-gx1/scripts/pair_arm_ids_gap.py}" \
     2>&1 | tee -a "$logf" >> "$LOG"
   local rc=${PIPESTATUS[0]}
   if [ -s "$ctr" ]; then cp -f "$ctr" "$out"; else say "IDS_NOTE no json at $ctr (rc=$rc)"; fi
   say "IDS tag=$tag rc=$rc $(grep -a '^ARM_IDS ' "$logf" | head -1 | cut -c1-160) gx=[$(gx_mem)]"
+  # Decode cost, from the arm's own per-prompt row (e2e_prompts.py: decode_ms_per_tok). Raised
+  # CX_IDS_MAX_NEW turns the digest arm into the decode-timing arm as well, so a ws_rows width A/B
+  # takes its decode number from the same load and the same session as its prefill number.
+  local row dms dnt dtt dar
+  row=$(grep -a '^{"i":' "$logf" 2>/dev/null | tail -1)
+  dms=$(printf '%s' "$row" | sed -n 's/.*"decode_ms_per_tok": \([0-9.]*\).*/\1/p')
+  dnt=$(printf '%s' "$row" | sed -n 's/.*"new_tokens": \([0-9]*\).*/\1/p')
+  dtt=$(printf '%s' "$row" | sed -n 's/.*"ttft_ms": \([0-9.]*\).*/\1/p')
+  dar=$(printf '%s' "$row" | sed -n 's/.*"accept_rate": \([0-9.]*\).*/\1/p')
+  [ -n "$dms" ] && say "DECODE tag=$tag decode_ms_per_tok=$dms decode_tok_per_s=$(awk -v m="$dms" 'BEGIN{ printf "%.1f", 1000/m }') new_tokens=${dnt:-?} ttft_ms=${dtt:-?} accept_rate=${dar:-?} max_new=${CX_IDS_MAX_NEW:-8}"
   # The margin behind each chosen token, for the ties that make two digests out of one computation.
   grep -a '^ARM_GAP ' "$logf" | sed "s/^/DIRECT $tag   /" | tee -a "$LOG"
   return $rc
