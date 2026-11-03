@@ -314,6 +314,13 @@ case "$loaded" in
   *"build=$BUILD_ID"*) ;;
   *) fail "server_build_mismatch loaded=${loaded:-none} want=$BUILD_ID" ;;
 esac
+# Which cold-expert path the worker installed, and what the pair asked of it. SEAM_MOE_CPP is read by
+# worker_seam_server.py, not by the client, so an arm that sets it in the client's environment is the
+# same arm as its control -- 2026-11-03 04:16/04:31 ran exactly that and produced two identical rows
+# (115.53 vs 114.64 ms/tok, same ids). The server knob is PAIR_SRV_EXTRA_ENVS; print both sides of it
+# here so a hook that failed to install (SEAM_MOE_CPP_OFF err=...) can never be reported as a win.
+cpp_line=$(pair_gxsh "docker exec $GXCT sh -c \"grep -m1 -E '^SEAM_MOE_CPP_(ON|OFF)' /tmp/seam_server.log\"" 2>/dev/null | tail -1)
+echo "SMOKE_SERVER_CPP asked='${SRV_ENV_EXTRA:-none}' worker='${cpp_line:-python (no SEAM_MOE_CPP line)}'"
 echo "SMOKE_MEM_SERVER $(gx_mem)"
 #
 # The load's own box pressure travels with every reading: a worker at 344 MiB of swap whose load found

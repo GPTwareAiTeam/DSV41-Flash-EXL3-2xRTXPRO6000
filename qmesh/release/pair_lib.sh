@@ -69,9 +69,16 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   # module, at a fraction of the measured rate. The smoke refuses to call such a release verified.
   # SEAM_CX_MARGIN_MIB is what must stay free after the load for the restack + workspace (the
   # worker's own default; the validated numbers were taken with it).
+  # PAIR_SRV_EXTRA_ENVS: the server half's A/B hook, the counterpart of PAIR_ARM_EXTRA_ENVS. The
+  # knobs that decide what the GX half *does* -- SEAM_MOE_CPP=1 (serve cold experts from the C hook
+  # instead of the Python piece) is the one this was added for -- are read by worker_seam_server.py
+  # and never by the P7 client, so an arm that sets them in the client's env measures nothing. Set
+  # through the ensure's SEAM_ENV so it reaches the worker's own process, and it must stay EMPTY for
+  # any number anyone quotes as the shipped shape: a value here is a different server.
+  SRV_ENV_EXTRA=${PAIR_SRV_EXTRA_ENVS:-}
   CX_MARGIN_MIB=${CX_MARGIN_MIB:-1536}
-  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB"
-  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV
+  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB $SRV_ENV_EXTRA"
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV SRV_ENV_EXTRA
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
   PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}

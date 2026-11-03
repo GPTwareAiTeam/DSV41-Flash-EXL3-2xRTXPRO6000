@@ -431,6 +431,17 @@ check("the client can take extra env without a second driver",
       _pa.count(_loop) == 1
       and _pa.index("SEAM_COPY_STREAM=1") < _pa.index(_loop)
       < _pa.index('envs+=(-e "PREFILL_ARMS=$PREFILL_DEPTH:8192"'), "")
+# The server half needs the same door, for the knobs the *worker* reads. SEAM_MOE_CPP is one of them:
+# set in the client's env it is inert, and on 2026-11-03 04:16/04:31 an A/B "hook-on vs hook-off" ran
+# the identical Python path twice (rows of 115.53 and 114.64 ms/tok, one ids digest). The hook must
+# reach the worker's own process through the ensure's SEAM_ENV, must be empty by default, and the
+# smoke has to print what the worker actually installed.
+_lb, _sm = src("pair_lib.sh"), src("pair_smoke.sh")
+check("the server can take extra env, and the smoke prints what the worker installed",
+      'SRV_ENV_EXTRA=${PAIR_SRV_EXTRA_ENVS:-}' in _lb
+      and 'SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB $SRV_ENV_EXTRA"' in _lb
+      and 'SMOKE_SERVER_CPP asked=' in _sm
+      and 'SEAM_MOE_CPP_(ON|OFF)' in _sm, "")
 
 # Installing tooling is a release-system operation too: a `cp` over a script a running ticket has open
 # makes bash read shifted lines (2026-11-03 01:29Z, a prefill thrown away on `drv_host: unbound
