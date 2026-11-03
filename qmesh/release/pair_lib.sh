@@ -163,6 +163,7 @@ pair_ct_path() {  # <host path> -> path inside the pair containers
 #   pair_p7_pool        <p7ct>        -> host path any P7 container mounts at /models/dsv41
 #   pair_p7_placements  <p7ct>        -> "<sha>\t<dir>" per hot pack on the P7 side
 #   pair_ckpt_auto      <p7ct> <gxct> -> the one P7 hot half with the pack's sha ("" when not exactly one)
+#   pair_ckpt_verified  <want|auto>   -> the same, after its placement file hashes to its manifest
 #   pair_ckpt_resolve   <want|auto>   -> what to load, or a refusal on stderr
 pair_cold_src() {  # <gxct> -> host path behind /cold ("" when the container has none)
   pair_gxsh "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/cold\"}}{{.Source}}{{end}}{{end}}' ${1:-$GXCT}" 2>/dev/null | tail -1 | tr -d '\r'
@@ -221,6 +222,42 @@ pair_ckpt_auto() {  # <p7ct> <gxct> -> P7 hot half with the pack's placement_sha
   hits=$(pair_p7_placements "$p7" | awk -F'\t' -v s="$sha" '$1 == s { print $2 }')
   n=$(printf '%s\n' "$hits" | grep -c .)
   [ "$n" = 1 ] && printf '%s\n' "$hits"
+}
+pair_p7_verify() {  # <dir in the container> [p7ct] -> "ok <sha>" | "mismatch <declared> <actual>" | "unverified <why>"
+  local name=${1##*/} pool=${PAIR_P7_POOL:-}
+  [ -n "$pool" ] || pool=$(pair_p7_pool "${2:-$P7CT}") || { echo "unverified no-pool"; return 0; }
+  [ -d "$pool" ] || { echo "unverified no-pool"; return 0; }
+  python3 - "$pool" "$name" <<'PY2' 2>/dev/null || echo "unverified reader"
+import hashlib, json, os, sys
+pool, name = sys.argv[1], sys.argv[2]
+d = os.path.join(pool, name)
+try:
+    m = json.load(open(os.path.join(d, "PACK_MANIFEST.json")))
+except Exception:
+    print("unverified manifest"); raise SystemExit
+sha, pl = m.get("placement_sha256") or "", m.get("placement") or ""
+if not sha or not pl:
+    print("unverified no-placement"); raise SystemExit
+path = pl if os.path.isabs(pl) else os.path.join(d, pl)
+try:
+    got = hashlib.sha256(open(path, "rb").read()).hexdigest()
+except Exception:
+    print("unverified placement"); raise SystemExit
+print("ok " + sha if got == sha else "mismatch " + sha + " " + got)
+PY2
+}
+pair_ckpt_verified() {  # <ckpt|auto> [p7ct gxct] -> prints PAIR_CKPT_VERIFIED …, 1 when the pack is inconsistent
+  local want=${1:-auto} p7=${2:-$P7CT} gx=${3:-$GXCT} ckpt state
+  ckpt=$(pair_ckpt_resolve "$want" "$p7" "$gx") || return 1
+  # A pack is written before it is announced: a half-finished one has a manifest whose placement file
+  # does not hash to the sha the manifest declares, and loading it costs a whole arm to find out. The
+  # manifest names the placement file itself, so this needs no container -- just the pool on this box.
+  state=$(pair_p7_verify "$ckpt" "$p7")
+  case "$state" in
+    ok*)       echo "PAIR_CKPT_VERIFIED ckpt=$ckpt sha=${state#ok } state=ok"; return 0 ;;
+    mismatch*) echo "PAIR_CKPT_VERIFIED ckpt=$ckpt declared=${state#mismatch } state=mismatch" >&2; return 1 ;;
+    *)         echo "PAIR_CKPT_VERIFIED ckpt=$ckpt state=${state#unverified }"; return 0 ;;
+  esac
 }
 pair_ckpt_resolve() {  # <want|auto|""> [p7ct gxct] -> checkpoint on stdout; 1 when it cannot be named
   local want=${1:-auto} p7=${2:-$P7CT} gx=${3:-$GXCT} hits n sha src

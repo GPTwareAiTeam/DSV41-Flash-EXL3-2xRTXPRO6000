@@ -57,6 +57,10 @@ done
 pair_load "$PAIR_ARG"
 CHECKPOINT=$(pair_ckpt_resolve "$CHECKPOINT") || pair_die "CHECKPOINT: no client half for this pack"
 pair_step "PAIR_ARM_CKPT checkpoint=$CHECKPOINT cold=$(pair_cold_src) sha=$(pair_cold_placement)"
+if ! ckpt_line=$(pair_ckpt_verified "$CHECKPOINT" 2>&1); then
+  pair_die "CHECKPOINT: $CHECKPOINT is not the pack its manifest describes ($ckpt_line)"
+fi
+pair_step "$ckpt_line"
 # The client half must name the release it is running, or the server's session handshake accepts a
 # mixed pair (`SEAM_SESSION_START ... build=unknown proto=3`, 2026-11-01). A released tree has no
 # .git, so qes.build_id() falls back to <tree>/qmesh/BUILD_ID (written by pair_cut.sh); exporting it

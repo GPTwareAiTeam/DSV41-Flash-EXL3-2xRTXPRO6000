@@ -42,6 +42,9 @@ MAX_CHUNK=${MAX_CHUNK:-8192}
 # new pack after the 4780p8 switch and be refused by the Hello, or worse, load. CHECKPOINT= names it by hand.
 CHECKPOINT=${CHECKPOINT:-${PAIR_ARM_CHECKPOINT:-auto}}
 CHECKPOINT=$(pair_ckpt_resolve "$CHECKPOINT") || pair_die "CHECKPOINT: no client half for this pack"
+ckpt_line=$(pair_ckpt_verified "$CHECKPOINT" 2>&1) \
+  || pair_die "CHECKPOINT: $CHECKPOINT is not the pack its manifest describes ($ckpt_line)"
+pair_step "$ckpt_line"
 pair_step "PAIR_SRV_CKPT checkpoint=$CHECKPOINT cold=$(pair_cold_src) sha=$(pair_cold_placement)"
 PAIR_SRV_READY_S=${PAIR_SRV_READY_S:-1800}   # s: weight load + warm-up before SERVER_READY
 PAIR_SRV_STOP_S=${PAIR_SRV_STOP_S:-60}
