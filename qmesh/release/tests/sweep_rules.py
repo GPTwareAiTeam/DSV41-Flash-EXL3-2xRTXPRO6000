@@ -136,6 +136,17 @@ check("the smoke's ext probe runs as a client would (neutral cwd, image env)",
 sm = src("pair_smoke.sh")
 check("smoke keeps the arm's bytes", "SMOKE_ARM_LOG" in sm, "")
 check("smoke prints the server log tail", "SMOKE_SERVER_TAIL" in sm, "")
+# A decode takes ~6 rows per layer and touches the whole CPU-expert split; a worker whose own memory
+# is in swap answers it from the disk. The smoke therefore decodes first (on the fresh load), prefills
+# last, and says what the worker's own swap was at each phase -- and a fresh load that is already
+# paged is refused rather than recorded as a slow release.
+check("smoke samples the worker's own swap at every phase and refuses a paged load",
+      all(k in sm for k in ("ws_check after_load", "ws_check before_arm",
+                            "SMOKE_WSWAP after_prefill", "paging_before_decode",
+                            "worker_seam_server.py"))
+      and "SMOKE_WSWAP_MAX=${SMOKE_WSWAP_MAX:-256}" in sm, "")
+check("smoke decodes before it prefills",
+      sm.index('pair_step "SMOKE_ARM') < sm.index('pair_step "SMOKE_PREFILL'), "")
 
 ur = src("pair_update_run.sh")
 check("update records whether the pair was serving", "UPDATE_SERVER_BEFORE" in ur, "")

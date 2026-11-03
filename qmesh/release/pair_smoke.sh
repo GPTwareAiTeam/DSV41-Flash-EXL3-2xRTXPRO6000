@@ -49,6 +49,9 @@ SMOKE_SLACK_GATE=${SMOKE_SLACK_GATE:-0}          # 1 = a thin slack refuses the 
 # pipeline a split prefill, and on GX2 (~1.4 GiB free after the load) the extra slab is what a paging
 # wall costs. seam_server_ensure.sh only passes --slab-slots to a worker that knows the flag.
 SMOKE_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-1}
+# A freshly loaded worker that is already past this much of its own memory in swap is paging, and its
+# decode number would measure the disk: refuse (`paging_before_decode`) instead of recording it.
+SMOKE_WSWAP_MAX=${SMOKE_WSWAP_MAX:-256}
 # The grant the smoke server is given: the pair's own list (pairs.conf). Workspace for a bucket nobody
 # asks for still comes out of the box (242 MiB slab at 8192 rows), so the smoke grants exactly what
 # the pair grants -- otherwise it would pass a release on a config nobody serves.
@@ -77,6 +80,33 @@ fail() { echo "SMOKE_FAIL $*"; exit 1; }
 gx_mem() {  # prints "avail_mib=<n> swap_free_mib=<n> swap_total_mib=<n>"
   pair_gxsh "awk '/^MemAvailable:/{a=int(\$2/1024)} /^SwapFree:/{f=int(\$2/1024)} /^SwapTotal:/{t=int(\$2/1024)} END{printf \"avail_mib=%d swap_free_mib=%d swap_total_mib=%d\n\", a, f, t}' /proc/meminfo" \
     | tail -1
+}
+
+# The worker's OWN swap, not the box's: the box can be 1 GiB into swap from processes that have
+# nothing to do with this pair (it was, all day) while the worker is resident, and the reverse -- a
+# fresh load that starts clean and then walks 0 -> 1068 MiB of its own memory out during a 32k+512k
+# prefill -- is the state that makes a later decode number describe paging instead of the release.
+# A decode takes ~6 rows per layer and touches the whole CPU-expert split, so a swapped worker is a
+# measurement of the disk. Prints "vm_swap_mib=<n> rss_mib=<n>", or "-" when no worker is up.
+gx_ws() {
+  local script out
+  # Sent on stdin, not as one ssh argument: the probe is a shell program inside a `docker exec sh -c`
+  # inside an ssh command, and three levels of quoting is how the first version silently read an empty
+  # pid and reported 0 MiB. The container name is substituted, everything else travels literally.
+  script=$(sed "s/@CT@/$GXCT/g" <<'EOS'
+docker exec @CT@ sh -c '
+best=""; bestr=0
+for p in $(pgrep -f worker_seam_server.py); do
+  r=$(awk "/^VmRSS:/{print \$2}" /proc/$p/status 2>/dev/null); r=${r:-0}
+  [ "$r" -gt "$bestr" ] && { bestr=$r; best=$p; }
+done
+if [ -n "$best" ]; then awk "/^VmSwap:/{s=\$2} /^VmRSS:/{r=\$2} END{printf \"vm_swap_mib=%d rss_mib=%d\n\", s/1024, r/1024}" /proc/$best/status; else echo -; fi'
+EOS
+)
+  # The worker is the python3 process, not the `bash -lc` wrapper that also carries its name; the
+  # wrapper is 288 kB of swap and 364 kB of rss, which reads as a happy worker.
+  out=$(printf '%s\n' "$script" | pair_gxstdin 2>/dev/null | tail -1)
+  echo "${out:--}"
 }
 
 if [ "$PAIR_DRY" = 1 ]; then
@@ -253,6 +283,21 @@ case "$loaded" in
   *) fail "server_build_mismatch loaded=${loaded:-none} want=$BUILD_ID" ;;
 esac
 echo "SMOKE_MEM_SERVER $(gx_mem)"
+# The decode arm runs FIRST, on the freshly loaded worker, and the prefill runs last -- a prefill is
+# what walks the worker's own memory into swap (0 -> 1068 MiB on a 32k+512k run, 2026-11-02), so a
+# decode measured after one is a decode measured on a paging server. Every phase prints the worker's
+# swap so a row can be labelled with the state it was taken in, and a load that is already paged
+# refuses here: the number would be the disk's, not the release's.
+ws_mib_of() { printf '%s' "$1" | sed -n 's/^vm_swap_mib=\([0-9]*\).*/\1/p'; }
+ws_check() {  # <phase>
+  local line mib
+  line=$(gx_ws); echo "SMOKE_WSWAP $1 $line"
+  mib=$(ws_mib_of "$line")
+  [ -n "${mib:-}" ] || return 0
+  [ "$mib" -le "$SMOKE_WSWAP_MAX" ] && return 0
+  fail "paging_before_decode phase=$1 vm_swap_mib=$mib max=$SMOKE_WSWAP_MAX fresh_load=1 $(printf '%s' "$line" | sed 's/^vm_swap_mib=[0-9]* //') -- the worker is already in swap, so a decode here measures the disk; free the box (stop the other container's pack) and re-run"
+}
+ws_check after_load
 
 # The kernel the server actually serves on. cuda-exl3 is imported from the release's vendored tree
 # (qmesh/exl3_moe_cuda.py), whose .so is untracked and therefore has to be built per cut: a release
@@ -290,6 +335,7 @@ echo "SMOKE_KERNEL_MIX cx_layers=$cx_n mixedk_layers=$mx_n nofit_layers=${mixed_
 # pair whose next failure will look like a CUDA abort (2026-11-01 16:44, GX1).
 printf '%s\n' "$srv_out" | grep -E '^SEAM_SERIAL|^SEAM_SLACK|^SEAM_SERVER_SLAB' | sed 's/^/SMOKE_SERVER /'
 
+ws_check before_arm
 pair_step "SMOKE_ARM pair=$PAIR rows=1 new=$SMOKE_NEW"
 # The arm's own log: a client that hangs (a silent JIT rebuild, a stale lock baton, a seam handshake
 # that never answers) produces no output at all by the time timeout(1) kills it, and "rc=124" then
@@ -405,6 +451,7 @@ pf_ab=$(printf '%s\n' "$pf_line" | sed -n 's/.*aborted=\([0-9]*\).*/\1/p')
 echo "SMOKE_PREFILL_LOG $pf_log"
 echo "SMOKE_PREFILL depth=$SMOKE_PREFILL_DEPTH ${pf_kv% } line_rc=0"
 echo "SMOKE_MEM_PREFILL_AFTER $(gx_mem)"
+echo "SMOKE_WSWAP after_prefill $(gx_ws)"
 [ "${pf_ab:-1}" = 0 ] || fail "prefill_aborted depth=$SMOKE_PREFILL_DEPTH aborted=$pf_ab line=$pf_line"
 case "$(printf '%s\n' "$pf_out")" in
   *"SEAM_COMPUTE_FAIL"*)
