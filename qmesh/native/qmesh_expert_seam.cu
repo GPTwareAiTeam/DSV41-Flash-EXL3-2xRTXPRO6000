@@ -427,6 +427,20 @@ __global__ void publish_kernel(uint64_t* seq, uint64_t* hdr_seq) {
   asm volatile("st.release.sys.u64 [%0], %1;" :: "l"(seq), "l"(v) : "memory");
 }
 
+/* The slot header's constant fields (everything but `seq`, which publish_kernel owns). Written by a
+ * 1-thread kernel from the values the issuing call was made with, so a captured graph's replay writes
+ * the layer, row count and cold bound *it* was captured for. Staging them in host memory instead
+ * cannot work: the fill runs at capture time only, and one line per layer is shared by all of that
+ * layer's graphs. Kernel arguments are baked per graph, so there is nothing to share. */
+__global__ void hdr_kernel(uint8_t* slot_hdr, uint32_t magic, uint32_t layer, uint32_t rows,
+                           uint32_t n_cold) {
+  SlotHdr* h = reinterpret_cast<SlotHdr*>(slot_hdr);
+  h->magic = magic;
+  h->layer = layer;
+  h->rows = rows;
+  h->n_cold = n_cold;
+}
+
 /* Spin until resp_seq >= req_seq. A dead transport must never trap the GPU: `__trap()` raised a
  * sticky `unspecified launch failure` that killed the whole client process for one lost handle.
  * After WAIT_TIMEOUT_NS the kernel raises the slot's fail word (bytes 8..11 of the freq line, which
@@ -490,10 +504,6 @@ struct qes_handle {
   ibv_mr* mr = nullptr;
   ibv_port_attr port_attr{};
   uint8_t* slab = nullptr; /* pinned, mapped host */
-  /* One pinned header line per layer (QES_NL lines). qes_issue copies the header into the slot from
-   * here instead of writing it, so a captured graph's replay carries the header of the layer it is
-   * replaying rather than the last layer that wrote that slot on the host. */
-  uint8_t* hdr_stage = nullptr;
   int slots = 1;           /* payload slots in this slab (in-flight requests per handle) */
   size_t slab_bytes = 0, stride = 0, req_len = 0, resp_len = 0, resp_off = 0;
   size_t ids_off = 0, w_off = 0;
@@ -1314,10 +1324,6 @@ void stop_handle(qes_handle* h) {
     cudaFreeHost(h->slab);
     h->slab = nullptr;
   }
-  if (h->hdr_stage) {
-    cudaFreeHost(h->hdr_stage);
-    h->hdr_stage = nullptr;
-  }
   if (h->dump_src) {
     cudaFreeHost(h->dump_src);
     h->dump_src = nullptr;
@@ -1504,14 +1510,6 @@ extern "C" qes_handle* qes_client_handle(qes_client_session* s, const char* dev_
     return nullptr;
   }
   memset(h->slab, 0, h->slab_bytes);
-  if (cudaHostAlloc(&h->hdr_stage, (size_t)QES_NL * sizeof(SlotHdr),
-                    cudaHostAllocPortable) != cudaSuccess) {
-    set_err("qes_client_handle: cudaHostAlloc %zu bytes for the header stage failed",
-            (size_t)QES_NL * sizeof(SlotHdr));
-    stop_handle(h);
-    return nullptr;
-  }
-  memset(h->hdr_stage, 0, (size_t)QES_NL * sizeof(SlotHdr));
   if (dump_ids() && h->rows <= 8) {
     /* Small pinned mirror, one slice per slot, so the dump can show the ids argument itself next
      * to the slab bytes the proxy forwards (see qes_handle::dump_src). */
@@ -2589,16 +2587,20 @@ extern "C" int qes_issue(qes_handle* h, int layer, const void* x_bf16, const int
    * be right for the eager path; publish_kernel rewrites the field on the device (see SlotHdr::seq),
    * which is what a replayed graph needs. */
   hdr.seq = load_acq(h->slab, off_freq(h, slot)) + 1;
-  /* Copied to the slot instead of memcpy'd into it: the destination is the wire, and under graph
-   * capture a host memcpy here happens once at capture time, so the slot would carry whatever layer
-   * last wrote it while the replay's payloads belong to the layer being replayed (measured
-   * 2026-11-01: "layer=19 slot=3 ... 268" -- layer 19's header over a layer 4/5 request, 268 being
-   * that layer's cold count). One pinned stage line per layer keeps the replayed copy this layer's
-   * own bytes, and the copy is stream-ordered ahead of the publish below. */
-  memcpy(h->hdr_stage + (size_t)layer * sizeof(SlotHdr), &hdr, sizeof(hdr));
-  if (cudaMemcpyAsync(h->slab + off_hdr(h, slot), h->hdr_stage + (size_t)layer * sizeof(SlotHdr),
-                      sizeof(SlotHdr), cudaMemcpyHostToDevice, stream))
-    return -2;
+  /* Written on the device, not staged in host memory: the destination is the wire, and a copy that
+   * fills a host stage line runs at capture time only, so its content at replay is whatever the
+   * *last capture* of that line left there. One line per layer is shared by every graph of that
+   * layer, i.e. by every row count decode captures, so a replay of a narrower graph advertised the
+   * wider graph's `rows` (measured 2026-11-02, gp-ab12: `rows=5 ... 2 of 30 pick(s) outside
+   * [-1,251), first at 18` -- 18 is row 3 of a request that carried 3 rows, so the proxy
+   * range-checked two rows no request had written and the GX would have computed them). Baked
+   * kernel arguments are per graph, so a replay always writes its own constants; the write is
+   * stream-ordered ahead of the publish below, which is the doorbell the proxy waits for (this is
+   * also what the old per-layer line was for: a header from the layer being replayed, not from
+   * whatever layer last wrote the slot -- 2026-11-01, "layer=19 slot=3 ... 268"). */
+  hdr_kernel<<<1, 1, 0, stream>>>(h->slab + off_hdr(h, slot), hdr.magic, hdr.layer, hdr.rows,
+                                 hdr.n_cold);
+  if (cudaGetLastError() != cudaSuccess) return -3;
   uint8_t* req = h->slab + off_req(h, slot);
   if (cudaMemcpyAsync(req, x_bf16, (size_t)nrows * QES_HIDDEN * 2, cudaMemcpyDeviceToHost, stream))
     return -2;
