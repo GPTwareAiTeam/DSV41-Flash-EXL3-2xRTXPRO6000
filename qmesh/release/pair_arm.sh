@@ -90,6 +90,13 @@ envs+=(
   -e "SEAM_ROWS=8192"
   -e "SEAM_NS=1" -e "SEAM_OVERLAP=1" -e "SEAM_COPY_STREAM=1"
 )
+
+# PAIR_ARM_EXTRA_ENVS: space-separated K=V, each appended as `-e K=V` after the list above (docker
+# keeps the last one, so this can also override a shipping knob). It exists for measurement-only
+# instrumentation -- e.g. EXL3_SEAM_MARK_MIN_ROWS lowered so a 6-row decode call is not skipped by the
+# seam timeline's 512-row floor -- and must stay empty for anything whose numbers are quoted as the
+# shipped shape. Unset, the exec is byte-for-byte the one it was before.
+for kv in ${PAIR_ARM_EXTRA_ENVS:-}; do envs+=(-e "$kv"); done
 if [ -n "$PREFILL_DEPTH" ]; then
   envs+=(-e "PREFILL_ARMS=$PREFILL_DEPTH:8192" -e "CORPUS=$CORPUS"
          -e "ARM_MAX_S=${PAIR_ARM_ARM_MAX_S:-1200}" -e "LOAD_ONLY=0")

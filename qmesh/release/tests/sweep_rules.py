@@ -326,6 +326,25 @@ check("the client half is told which build it runs",
       'envs+=(-e "SEAM_BUILD_ID=$BUILD_ID")' in src("pair_arm.sh")
       and '"$PAIR_ROOT/current/RELEASE.json"' in src("pair_arm.sh"), "")
 
+# Measurement-only instrumentation has to be reachable without adding a second driver, and it has to
+# be opt-in: appended after the shipping list (so a dry run of a plain arm is unchanged), one place,
+# never a shipping value.
+_pa = src("pair_arm.sh")
+_loop = 'for kv in ${PAIR_ARM_EXTRA_ENVS:-}; do envs+=(-e "$kv"); done'
+check("the client can take extra env without a second driver",
+      _pa.count(_loop) == 1
+      and _pa.index("SEAM_COPY_STREAM=1") < _pa.index(_loop)
+      < _pa.index('envs+=(-e "PREFILL_ARMS=$PREFILL_DEPTH:8192"'), "")
+
+# Installing tooling is a release-system operation too: a `cp` over a script a running ticket has open
+# makes bash read shifted lines (2026-11-03 01:29Z, a prefill thrown away on `drv_host: unbound
+# variable` from lines that had already run). The installer takes the queue, then renames.
+_pi = src("pair_install.sh")
+check("installs wait for the queue and rename into place",
+      'ticket_in_flight queue=$q agent=' in _pi and 'kill -0 "$pid"' in _pi
+      and 'mv -f -- "$tmp" "$DST/$f"' in _pi
+      and 'cp -- "$src" "$DST/$f"' not in _pi, "")
+
 # No load may run on the worker's own 2048 MiB default: the pair states what the pack load must
 # leave behind, and both places that start a server have to pass it (measured GX numbers).
 check("the load margin is the pair's number, not the worker's default",
