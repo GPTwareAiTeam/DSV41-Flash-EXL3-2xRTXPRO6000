@@ -79,8 +79,20 @@ BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build
 # (/pair/extcache, the release's own ext/) is for the release tree only; any other --src gets a
 # cache of its own, under the pair's state dir, named by the tree so two agents cannot collide.
 SRC=${SRC:-/src/exllamav3}
+# `/pair/current/src` is the same tree as `/src/exllamav3` but not the same *spelling*, and torch's
+# version hash covers the spelling, so importing through it against the release cache rebuilds
+# exllamav3_ext.so in place and leaves BUILD_STAMP.json naming the artifact it replaced. On
+# 2026-11-03 a client that did exactly that left the dev cache at ext_so=c7908310 want=e74d4951
+# (build.ninja `-I/pair/current/src/exllamav3`) and every dev ticket read DRIFT for hours. So
+# canonicalise the alias instead of giving it the release cache: one tree, one spelling, one cache.
 case "$SRC" in
-  /src/exllamav3|/src/exllamav3/|/pair/current/src) EXT_DIR=/pair/extcache ;;
+  /pair/current/src|/pair/current/src/)
+    echo "ARM_SRC_CANON src=$SRC -> /src/exllamav3 (the alias is not an include spelling)"
+    SRC=/src/exllamav3
+    ;;
+esac
+case "$SRC" in
+  /src/exllamav3|/src/exllamav3/) EXT_DIR=/pair/extcache ;;
   *)
     ext_tag=$(printf '%s' "$SRC" | sed 's#^/*##; s#/*$##; s#[^A-Za-z0-9._-]#_#g')
     mkdir -p "$PAIR_STATE_DIR/extcache/$ext_tag"

@@ -416,11 +416,27 @@ check("the compiler guard counts only live compilers",
 
 check("a client run from another src gets its own extension cache",
       "--src) SRC=$2" in _pa
-      and "/src/exllamav3|/src/exllamav3/|/pair/current/src) EXT_DIR=/pair/extcache" in _pa
+      and "/src/exllamav3|/src/exllamav3/) EXT_DIR=/pair/extcache" in _pa
       and 'EXT_DIR=$(pair_ct_path "$PAIR_STATE_DIR/extcache/$ext_tag")' in _pa
       and _pa.count('mkdir -p "$PAIR_STATE_DIR/extcache/$ext_tag"') == 1
       and '-e "PYTHONPATH=$SRC" -e "TORCH_EXTENSIONS_DIR=$EXT_DIR"' in _pa
       and _pa.count("cd $SRC &&") == 2 and "cd /src/exllamav3 &&" not in _pa, "")
+# `/pair/current/src` is the release tree under another spelling, and torch's version hash covers the
+# spelling: a client that imports through it while pointed at the release cache rebuilds
+# exllamav3_ext.so in place and leaves BUILD_STAMP.json naming the artifact it replaced. On 2026-11-03
+# the dev cache was left at ext_so=c7908310 want=e74d4951 (build.ninja `-I/pair/current/src/exllamav3`)
+# and every dev ticket read DRIFT until the cache was rebuilt through /src/exllamav3. So the alias is
+# canonicalised, and only the container's own link may name the release cache.
+check("the /pair/current/src alias is canonicalised, never given the release cache",
+      "ARM_SRC_CANON src=$SRC -> /src/exllamav3" in _pa
+      and "/pair/current/src|/pair/current/src/)" in _pa
+      and "/pair/current/src) EXT_DIR=/pair/extcache" not in _pa
+      and _pa.index("ARM_SRC_CANON") < _pa.index("EXT_DIR=/pair/extcache"), "")
+_pp = src("pair_prepare.sh")
+check("prepare creates /src, not only repoints it",
+      "relink_cmd='mkdir -p /src && ln -sfn /pair/current/src /src/exllamav3" in _pp
+      and _pp.count('sh -c "$relink_cmd"') + _pp.count("sh -c '$relink_cmd'") == 2
+      and "if [ -L /src/exllamav3 ]; then ln -sfn" not in _pp, "")
 _ps = src("pair_sync_check.py")
 check("...and verify names the tree that wrote the cache",
       _ps.count('EXTSRC $(grep -ho') == 1

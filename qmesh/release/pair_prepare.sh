@@ -46,6 +46,13 @@ pair_load "$PAIR_ARG"
 # container's `bash -lc`, so seam-gx2-dev stayed wired at the unflipped release and pair_check read GX
 # DRIFT with nothing able to import /pair/current/src. The build restores from its parent process now,
 # and this runs on every exit of prepare -- success, refusal, kill of the build -- as the last word.
+# It also *creates* the wiring: a container recreated from a spec that carries no /src mount (someone
+# `docker run`s one by hand beside pair_containers.py) comes back with no /src at all, and then the old
+# `if [ -L /src/exllamav3 ]` guard was false on both sides, so this printed RELINK_MISMATCH and left
+# the pair unrunnable -- `seam_server_ensure`'s `cd /src/exllamav3` fails, /tmp/seam_server.log is
+# never created, and pair_check reads container_src=- for every client (2026-11-03 16:32Z). mkdir and
+# repoint: a link of any other target is ours to overwrite on exit, that is the contract above.
+relink_cmd='mkdir -p /src && ln -sfn /pair/current/src /src/exllamav3; readlink -f /src/exllamav3'
 relink_current() {
   local side ct want got
   for side in p7 gx; do
@@ -53,10 +60,10 @@ relink_current() {
     ct=$([ "$side" = p7 ] && echo "$P7CT" || echo "$GXCT")
     if [ "$side" = p7 ]; then
       want=$(docker exec "$ct" readlink -f /pair/current/src 2>/dev/null)
-      got=$(docker exec "$ct" sh -c 'if [ -L /src/exllamav3 ]; then ln -sfn /pair/current/src /src/exllamav3; fi; readlink -f /src/exllamav3' 2>/dev/null)
+      got=$(docker exec "$ct" sh -c "$relink_cmd" 2>/dev/null)
     else
       want=$(pair_gxsh "docker exec $ct readlink -f /pair/current/src 2>/dev/null")
-      got=$(pair_gxsh "docker exec $ct sh -c 'if [ -L /src/exllamav3 ]; then ln -sfn /pair/current/src /src/exllamav3; fi; readlink -f /src/exllamav3' 2>/dev/null")
+      got=$(pair_gxsh "docker exec $ct sh -c '$relink_cmd' 2>/dev/null")
     fi
     if [ -z "$want" ]; then
       pair_step "RELINK_SKIP $side $ct (no /pair/current/src: unpromoted pair, nothing to restore)"
