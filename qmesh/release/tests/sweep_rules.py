@@ -1062,6 +1062,15 @@ check("a running marker is never left behind",
 _sh.rmtree(_qd, ignore_errors=True)
 
 _sh.rmtree(_gd, ignore_errors=True)
+check("the hook build finds a toolkit that carries cusparse.h",
+      _pl.count("CPLUS_INCLUDE_PATH=$incdir") == 1
+      and _pl.index("CPP_TOOLKIT") < _pl.rindex("CPP_BUILD")
+      and "no_cusparse_h" in _pl
+      and "$incenv bash build_moe.sh" in _pl, "")
+
+check("the installer refuses a dst that is its own source tree",
+      'dst_is_src' in _pi and _pi.index("dst_is_src") < _pi.rindex("INSTALL_OK"), "")
+
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))

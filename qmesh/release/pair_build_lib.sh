@@ -235,9 +235,28 @@ PY
   # one nvcc line: build_moe.sh, tracked at the same commit, owns the flags. It is built even while
   # SEAM_MOE_CPP is unset in the pair env -- a default nobody has compiled is not a default.
   local moe="$PAIR_CPP_LIB.$arch.so" moe_tmp="/pair/releases/$SHA/.moe-$arch-$$"
-  local moeflags="build_moe.sh: nvcc -O2 -std=c++17 -arch=$sm (kernels), g++ -O2 -std=c++20 -fPIC -pthread (torch ABI), link libtorch"
+  # A client image can carry a partial toolkit at /usr/local/cuda -- nvcc and cuda_runtime.h are there
+  # but cusparse.h is not, and torch's ATen/cuda/CUDAContextLight.h includes it from the host compiler,
+  # so the hook died on a missing header three files deep in torch's headers (2026-11-03, CPP_FAIL p7,
+  # while the same stage built on GX where the header exists). Find a directory that has it and hand it
+  # to g++ the way g++ reads it, CPLUS_INCLUDE_PATH; refuse if no directory does, because an include
+  # path that only works on one box is not a build.
+  inc_probe='if [ -f /usr/local/cuda/include/cusparse.h ]; then echo default; exit 0; fi
+for c in /opt/cuda/include /opt/cuda/targets/*/include /usr/local/cuda*/targets/*/include; do
+  [ -f "$c/cusparse.h" ] && { echo "$c"; exit 0; }
+done
+exit 1'
+  incdir=$(side_docker "$side" exec "$ct" bash -c "$inc_probe" 2>/dev/null | tail -1)
+  if [ -z "$incdir" ]; then
+    pair_step "CPP_FAIL $side no_cusparse_h (no include dir under /opt/cuda* or /usr/local/cuda*/targets carries cusparse.h, which ATen/cuda/CUDAContextLight.h includes)"
+    return 1
+  fi
+  local incenv=""
+  [ "$incdir" = default ] || incenv="CPLUS_INCLUDE_PATH=$incdir"
+  pair_step "CPP_TOOLKIT $side cusparse=$incdir"
+  local moeflags="build_moe.sh: nvcc -O2 -std=c++17 -arch=$sm (kernels), g++ -O2 -std=c++20 -fPIC -pthread (torch ABI), link libtorch${incenv:+ inc=$incdir}"
   inner="set -e; cd /pair/releases/$SHA/src/qmesh/native; mkdir -p bin; rm -rf $moe_tmp; mkdir -p $moe_tmp; \
-         nice -n 15 env MAX_JOBS=8 CUDA_ARCH=$sm MOE_OUT=$moe_tmp MOE_OBJ=$moe_tmp/obj bash build_moe.sh; \
+         nice -n 15 env MAX_JOBS=8 CUDA_ARCH=$sm MOE_OUT=$moe_tmp MOE_OBJ=$moe_tmp/obj $incenv bash build_moe.sh; \
          mv -f $moe_tmp/$moe bin/$moe; rm -rf $moe_tmp; \
          chown $uid:$gid bin/$moe; \
          sha256sum bin/$moe"
