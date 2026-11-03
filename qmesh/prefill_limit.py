@@ -40,6 +40,28 @@ PREFILL_FIRST_ROW_BYTES = float(os.environ.get("PREFILL_FIRST_ROW_KIB", "64")) *
 PREFILL_MARGIN_MIB = float(os.environ.get("PREFILL_MARGIN_MIB", "1024"))
 PREFILL_FRAG = float(os.environ.get("PREFILL_FRAG", "0"))
 PREFILL_ADAPTIVE_LOG = os.environ.get("PREFILL_ADAPTIVE_LOG", "0") == "1"
+# Load-time chunk sizing (resolve_max_chunk). The ladder is the set of chunks worth trying once, at load: the
+# largest whose predicted first-chunk transient still leaves the reserves below. CHUNK_VRAM_RESERVE_MIB is the
+# room a decode CUDA graph needs to capture into the card after prefill (PrefillChunkLimiter.prefill_done hands
+# torch's held-but-free blocks back for exactly this); DSPARK_RESERVE_MIB is charged only with CHUNK_DSPARK=1.
+def _chunk_ladder():
+    """PREFILL_CHUNK_STEPS as a descending deduped tuple of page-aligned row counts (unusable entries dropped)."""
+    out = set()
+    for tok in os.environ.get("PREFILL_CHUNK_STEPS", "16384,8192,4096,2048").split(","):
+        try:
+            rows = int(tok)
+        except ValueError:
+            continue
+        if rows >= PAGE_SIZE and rows % PAGE_SIZE == 0:
+            out.add(rows)
+    return tuple(sorted(out, reverse = True))
+
+
+PREFILL_CHUNK_LADDER = _chunk_ladder()
+PREFILL_CHUNK_MIN = int(os.environ.get("PREFILL_CHUNK_MIN", "512"))
+CHUNK_VRAM_RESERVE_MIB = float(os.environ.get("CHUNK_VRAM_RESERVE_MIB", "2048"))
+DSPARK_RESERVE_MIB = float(os.environ.get("DSPARK_RESERVE_MIB", "0"))
+CHUNK_DSPARK = os.environ.get("CHUNK_DSPARK", "0") == "1"
 
 
 def log(message):
@@ -63,6 +85,48 @@ def prefill_fit(start, room):
         (room - PREFILL_DEPTH_BASE - PREFILL_DEPTH_BYTES * start + PREFILL_ROW_BYTES * PREFILL_DEPTH_ROWS) \
         / (PREFILL_DEPTH_BYTES + PREFILL_ROW_BYTES)
     return min(by_rows, by_depth)
+
+
+def resolve_max_chunk(device, raw = None) -> int:
+    """Load-time prefill chunk: `raw` None/''/'auto' sizes it to the VRAM this card has left, else returns int(raw).
+
+    The chunk a load should start with is a first-chunk question: it is set once, after the weights are resident,
+    from the same per-row transient model the per-chunk limiter (prefill_rise/prefill_fit) fits and measures at run
+    time. That model is the right one here because the pair runs ONE card: every prefill transient in this module
+    is fit to measured rises on this deployment (a row term for activations, a depth term that takes over past
+    ~300k tokens, plus the first-chunk buffers), so a chunk of c rows is asked to fit prefill_rise(0, c) under
+    what the card has left rather than against a peak recorded elsewhere.
+
+    The 2xRTX reference's CHUNK_PEAK_TABLE is not reusable: it was sampled on two 96 GB cards and re-based by
+    arithmetic on the KV budget. Its own comment records why that arithmetic is unsafe - the shard's 89.81 GiB
+    on disk against an 87.6 GiB resident peak means a weights-plus-overhead (or total-device) model errs in the
+    unsafe direction, and a table of total-device peaks cannot be scaled down to one card. Here the transient is
+    the only predicted term, and it is predicted by the function this module already validates per chunk.
+
+    room = free + reserved - allocated - PREFILL_MARGIN_MIB - CHUNK_VRAM_RESERVE_MIB (- DSPARK_RESERVE_MIB).
+    Reserved-but-free blocks count as usable because expandable segments let any freed block serve any later
+    shape. CHUNK_VRAM_RESERVE_MIB is not slack: after a prefill, decode captures its CUDA graphs into memory the
+    card still has free, from a pool separate from torch's (see prefill_done), so a chunk sized to the last byte
+    leaves the capture nothing. Largest fitting candidate wins, floored at PREFILL_CHUNK_MIN and page-aligned;
+    PREFILL_CHUNK_MIN when none fits. Fixed chunks return unchanged and log nothing, as before this function.
+    """
+    if raw is not None:
+        token = str(raw).strip()
+        if token.lower() != "auto" and token != "":
+            return int(raw)
+    free, _total = torch.cuda.mem_get_info(device)
+    reserved = torch.cuda.memory_reserved(device)
+    allocated = torch.cuda.memory_allocated(device)
+    reserve = PREFILL_MARGIN_MIB + CHUNK_VRAM_RESERVE_MIB + (DSPARK_RESERVE_MIB if CHUNK_DSPARK else 0.0)
+    room = free + reserved - allocated - reserve * 2 ** 20
+    rows = next((c for c in PREFILL_CHUNK_LADDER if prefill_rise(0, c) <= room), PREFILL_CHUNK_MIN)
+    rows = max(PAGE_SIZE, max(PREFILL_CHUNK_MIN, rows) // PAGE_SIZE * PAGE_SIZE)
+    label = "auto" if raw is None else (str(raw).strip() or "auto")
+    log(f"CHUNK_AUTO chosen={rows} raw={label} "
+        f"free_MiB={free / 2**20:.0f} reserved_MiB={reserved / 2**20:.0f} "
+        f"allocated_MiB={allocated / 2**20:.0f} rise_MiB={prefill_rise(0, rows) / 2**20:.0f} "
+        f"reserve_MiB={reserve:.0f} candidates={','.join(str(c) for c in PREFILL_CHUNK_LADDER)}")
+    return rows
 
 
 class PrefillChunkLimiter:

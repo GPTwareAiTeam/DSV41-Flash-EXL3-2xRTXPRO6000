@@ -17,7 +17,8 @@ line per prompt plus a summary. Timing comes from the engine's own job accountin
   LONG_PROMPT_FILE  one long prompt read from a file (overrides CORPUS/LONG_TOKENS)
   MAX_NEW      new tokens per prompt (default 256)
   WARMUP_NEW   new tokens for warm-up prompts (default MAX_NEW)
-  MAX_CHUNK    prefill chunk (default 2048)
+  MAX_CHUNK    prefill chunk rows (default 2048); 'auto' sizes it once, after the loads, to the largest
+               chunk whose predicted transient still fits the VRAM the card has left
   DSPARK       1 to enable the DSpark draft model
   NUM_DRAFT    draft width K (default 5)
   ARMS         comma-separated arms measured in ONE process after a single load
@@ -48,7 +49,7 @@ os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
 import torch
 
 from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
-from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
+from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter, resolve_max_chunk
 from qmesh import placement as seam_placement
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
@@ -60,7 +61,7 @@ DRAFT_CHECKPOINT = os.environ.get("DRAFT_CHECKPOINT", CHECKPOINT)
 PLACEMENT = seam_placement.resolve(CHECKPOINT)
 
 MAX_NEW = int(os.environ.get("MAX_NEW", "256"))
-MAX_CHUNK = int(os.environ.get("MAX_CHUNK", "2048"))
+MAX_CHUNK_RAW = os.environ.get("MAX_CHUNK", "2048")   # int rows, or 'auto': resolved after the loads
 DSPARK = os.environ.get("DSPARK") == "1"
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 WARMUP = int(os.environ.get("WARMUP", "0"))
@@ -123,7 +124,7 @@ def load_prompts():
     return [(f"p{i}", p) for i, p in enumerate(DEFAULT_PROMPTS)]
 
 
-def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
+def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh, max_chunk=None):
     """Runs the whole prompt list for one arm and returns its SUMMARY dict. Both arms run in the
     same process after one load: 'dspark0' idles the drafter by zeroing the draft window, which
     the generator reads per iteration, instead of unloading it."""
@@ -187,7 +188,7 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
         free, total = torch.cuda.mem_get_info(0)
         row = {
             "i": idx, "label": label, "arm": spec,
-            "prompt_tokens": int(ids.shape[-1]), "new_tokens": new_tokens,
+            "prompt_tokens": int(ids.shape[-1]), "new_tokens": new_tokens, "max_chunk": max_chunk,
             "ttft_ms": round(1000.0 * prefill_s, 1),
             "decode_ms_per_tok": round(decode_ms, 2),
             "wall_s": round(wall, 3),
@@ -234,7 +235,7 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh):
     return {
         "arm": spec,
         "n": len(rows), "dspark": use_draft, "num_draft": NUM_DRAFT if use_draft else None,
-        "max_new": MAX_NEW,
+        "max_new": MAX_NEW, "max_chunk": max_chunk,
         "decode_ms_per_tok_mean": mean("decode_ms_per_tok"),
         "decode_ms_per_tok_median": med("decode_ms_per_tok"),
         "ttft_ms_mean": mean("ttft_ms"),
@@ -291,8 +292,12 @@ def main():
         draft_cache = Cache(draft_model, max_num_tokens=CACHE_TOKENS, max_history=5, **KV_CACHE_KWARGS)
         t1 = time.time()
         draft_model.load(device="cuda:0", progressbar=False)
-        print(f"DSPARK_LOADED {time.time() - t1:.1f}s", flush=True)
-    generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=MAX_CHUNK,
+    # MAX_CHUNK is resolved here, after every load and immediately before the Generator, because 'auto' reads
+    # what the card actually has left once the weights, the KV pool and the drafter are resident. A numeric
+    # MAX_CHUNK comes back unchanged.
+    max_chunk = resolve_max_chunk(torch.device("cuda:0"), MAX_CHUNK_RAW)
+    print(f"MAX_CHUNK_EFFECTIVE rows={max_chunk} raw={MAX_CHUNK_RAW}", flush=True)
+    generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=max_chunk,
                           draft_model=draft_model, draft_cache=draft_cache,
                           num_draft_tokens=NUM_DRAFT if want_draft else None)
     if MEM_BREAKDOWN:
@@ -346,7 +351,8 @@ def main():
     for spec in arms:
         print(f"ARM_START {spec} prompts={len(prompts)} max_new={MAX_NEW} "
               f"num_draft={NUM_DRAFT if spec != 'dspark0' else 0}", flush=True)
-        summary = run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh)
+        summary = run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh,
+                          max_chunk=max_chunk)
         print("SUMMARY " + json.dumps(summary), flush=True)
         if fh:
             fh.write("SUMMARY " + json.dumps(summary) + "\n")
