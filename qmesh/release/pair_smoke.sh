@@ -16,9 +16,11 @@
 #      on GX2 a 116 GiB pack leaves ~1.4 GiB, and a server that dies of that has to be caught here,
 #      not in the middle of someone's arm -- and from then on prints, at every phase, the box's
 #      avail_mib and swap, and the worker's own pid, VmSwap and RSS beside the load's swapped_mib,
-#   5. runs one decode row through the P7 client half and checks it produced tokens and ids, that
-#      the wire did not answer `peer layout mismatch` / `remote invalid request`, and that the
-#      worker's own swap did not grow inside that window (the growth gate; see SMOKE_WSWAP_GROW_MAX),
+#   5. runs one discarded decode through the P7 client half -- the same arm, so the first-touch
+#      allocation of the draft/verify buffers lands before the window rather than in it -- then takes
+#      the swap baseline and runs the real decode row, checks it produced tokens and ids, that the
+#      wire did not answer `peer layout mismatch` / `remote invalid request`, and that the worker's
+#      own swap did not grow inside that window (the growth gate; see SMOKE_WSWAP_GROW_MAX),
 #   6. runs one 32k prefill arm and gates its rate and aborts (dev: the owner's canary bar; prod: what
 #      the same release measured on prod's own hardware),
 #   7. prints SMOKE_OK or SMOKE_FAIL <reason> and exits 0/1.
@@ -407,14 +409,32 @@ echo "SMOKE_KERNEL_MIX cx_layers=$cx_n mixedk_layers=$mx_n nofit_layers=${mixed_
 # pair whose next failure will look like a CUDA abort (2026-11-01 16:44, GX1).
 printf '%s\n' "$srv_out" | grep -E '^SEAM_SERIAL|^SEAM_SLACK|^SEAM_SERVER_SLAB' | sed 's/^/SMOKE_SERVER /'
 
-ws_check before_arm
-pair_step "SMOKE_ARM pair=$PAIR rows=1 new=$SMOKE_NEW"
 # The arm's own log: a client that hangs (a silent JIT rebuild, a stale lock baton, a seam handshake
 # that never answers) produces no output at all by the time timeout(1) kills it, and "rc=124" then
 # says nothing about why. Keep the bytes, and on failure the server's log tail next to them.
 ARM_LOG=${SMOKE_ARM_LOG:-$PAIR_STATE_DIR/logs/smoke-arm-$PAIR-$(date -u +%Y%m%dT%H%M%SZ).log}
 mkdir -p "$(dirname "$ARM_LOG")" 2>/dev/null || true
 ARM_IDS_OUT=${ARM_IDS_OUT:-${ARM_LOG%.log}.ids.json}
+#
+# One arm's worth of decode, thrown away, before the window opens: the first forward in a client
+# allocates the draft and verify buffers, and on a box whose avail is under a gigabyte the kernel
+# answers that allocation by swapping ~330 MiB of the worker out. That spill belongs to the box, and
+# if it lands inside the window the gate can only refuse (2026-11-03 04:05: 0 -> 333 MiB inside an
+# 8-token decode, while the hook-off arm of the same pair had spilled its 336 before the arm and grew
+# not at all -- same work, same box, different side of the baseline). Warming the same path first
+# moves it before the baseline, so the window measures the arm and not the first touch; the baseline
+# is still taken right before the arm and the gate is unchanged.
+if [ "${SMOKE_ARM_WARM:-1}" = 1 ]; then
+  pair_step "SMOKE_ARM_WARM pair=$PAIR new=$SMOKE_NEW"
+  warm_out=$("$HERE/pair_arm.sh" "$PAIR" --rows 1 --max-new "$SMOKE_NEW" --cache-tokens "$SMOKE_CACHE_TOKENS" \
+             --timeout "$SMOKE_ARM_TIMEOUT" 2>&1)
+  warm_rc=$?
+  printf '%s\n' "$warm_out" > "${ARM_LOG%.log}.warm.log" 2>/dev/null || true
+  echo "SMOKE_ARM_WARM rc=$warm_rc $(printf '%s\n' "$warm_out" | grep -m1 'decode_ms_per_tok' | cut -c1-160)"
+  [ "$warm_rc" = 0 ] || fail "arm_warm rc=$warm_rc $(printf '%s\n' "$warm_out" | grep -m1 -E 'Traceback|Error|error' | cut -c1-300)"
+fi
+ws_check before_arm
+pair_step "SMOKE_ARM pair=$PAIR rows=1 new=$SMOKE_NEW"
 arm_out=$(ARM_IDS_OUT="$ARM_IDS_OUT" \
           "$HERE/pair_arm.sh" "$PAIR" --rows 1 --max-new "$SMOKE_NEW" --cache-tokens "$SMOKE_CACHE_TOKENS" \
           --timeout "$SMOKE_ARM_TIMEOUT" --ids 2>&1)

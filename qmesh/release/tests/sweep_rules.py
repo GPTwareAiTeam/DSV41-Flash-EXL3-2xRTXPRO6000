@@ -179,6 +179,14 @@ check("smoke verifies the worker loaded the release it is smoking",
       and "server_build_mismatch" in sm
       and sm.index("server_build_mismatch") < sm.index("ws_check after_load")
       and sm.index("SMOKE_SERVER_LOADED") < sm.index("SRV_LOAD_SWAPPED"), "")
+# The growth gate is only meaningful over steady state: on a box at 900 MiB avail the *first* forward
+# in a client swaps ~330 MiB of the worker out, so a window opened on a cold client measures the
+# box's first touch and refuses an arm whose own decode grew nothing (2026-11-03 04:05). The smoke
+# therefore runs the same arm once, discarded, before it takes the before_arm baseline.
+check("the decode window opens after one discarded arm, not on the client's first touch",
+      'SMOKE_ARM_WARM:-1' in sm
+      and sm.index("SMOKE_ARM_WARM") < sm.index("ws_check before_arm")
+      and sm.index("ws_check before_arm") < sm.index('pair_step "SMOKE_ARM pair='), "")
 check("smoke decodes before it prefills",
       sm.index('pair_step "SMOKE_ARM') < sm.index('pair_step "SMOKE_PREFILL'), "")
 
