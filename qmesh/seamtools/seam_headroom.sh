@@ -114,6 +114,11 @@ for WS in $ROWS; do
   E=$AB/H$WS
   mkdir -p "$E"
   status 12 "--fresh load at ws_rows $WS: load, decode arm, 32k prefill, 10 s sampling"
+  # The shape here comes from SEAM_ENV, so it is unpinned by construction -- but pair_serve.sh,
+  # pair_smoke.sh, pair_update_run.sh and the decode/roundprof tickets all take their shape from the
+  # pair line's WS_ROWS (pairs.conf, default 1024) through pair_server_env. A row here can therefore
+  # never be compared against a server that came up from one of those paths unless the pair line said
+  # 256; HR GRANT is the line that settles which shape a load actually had.
   # CX_WT is passed, not inherited: arm3 verifies the container against ${CX_WT:-<robust worktree>},
   # so a driver that verified one tree and an arm that verified another would compare the container
   # twice against different bytes and the arm's exit 13 would blame the wrong commit.
@@ -147,10 +152,10 @@ for WS in $ROWS; do
   # different workspace (the client's chunk_rows is the largest granted bucket, not ws_rows), which
   # is why the two arms' prefill seconds are not a throughput A/B. Printed so no reader has to hold
   # the bucket list in their head to notice it.
-  grep -ah 'SEAM_SERVER_SLAB ' "$SRV" | tail -1 |
-    sed -n 's/.* ws_rows=\([0-9]*\) .* rows_max=\([0-9]*\) .*/\1 \2/p' |
-    awk '{ printf "server_ws_rows=%s rows_max=%s pieces_per_prefill_chunk=%d\n",
-                  $1, $2, ($2 + $1 - 1) / $1 }' | sed "s/^/HR GRANT ws=$WS /" | tee -a "$LOG"
+  read -r SRVWS RMAX <<< "$(grep -ah 'SEAM_SERVER_SLAB ' "$SRV" | tail -1 |
+    sed -n 's/.* ws_rows=\([0-9]*\) .* rows_max=\([0-9]*\) .*/\1 \2/p')"
+  PPC=$(( (${RMAX:-1} + ${SRVWS:-1} - 1) / ${SRVWS:-1} ))
+  say "HR GRANT ws=$WS server_ws_rows=${SRVWS:-?} rows_max=${RMAX:-?} pieces_per_prefill_chunk=$PPC auto=0"
   grep -ah 'SEAM_SERVER_DEVMEM ' "$SRV" | sed "s/^/HR DEVMEM ws=$WS /" | tee -a "$LOG"
   grep -ah 'SLAB_SHIP \|SAMPLE_SHIP ' "$AB/armH$WS.log" | sed "s/.*DIRECT /HR /" | tee -a "$LOG"
   # Host samples around the load (clear box, 113 GiB resident) and after the prefill; SUnreclaim is
@@ -167,7 +172,9 @@ for WS in $ROWS; do
   # the top of the file and a tail-based grep would quote it as this shape's.
   awk '/^SEAM_SERVER_READY/{n=NR} {a[NR]=$0} END{ if (n) for (i=n;i<=NR;i++) print a[i]; else for (i=1;i<=NR;i++) print a[i] }' "$SRV" |
     grep -ah 'SEAM_SERVER_SWAP_WARN ' | sed "s/^/HR SWAPWARN ws=$WS /" | tee -a "$LOG"
-  grep -ah 'PREFILL_ARM ' "$PL" | sed "s/^/HR PREFILL ws=$WS /" | tee -a "$LOG"
+  # The piece count rides on the prefill line: the seconds there are 8192 tokens over PPC weight
+  # passes, so nobody divides tokens by seconds and calls the result a shape comparison.
+  grep -ah 'PREFILL_ARM ' "$PL" | sed "s/^/HR PREFILL ws=$WS pieces_per_chunk=$PPC /" | tee -a "$LOG"
 done
 # The comparison the owner reads first: worker swap and RSS at the three phases, per shape.
 say "SHAPE TABLE (worker, from the phase samples)"
