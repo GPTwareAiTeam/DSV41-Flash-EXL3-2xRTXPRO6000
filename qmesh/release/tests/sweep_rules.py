@@ -762,6 +762,19 @@ check("the pack check refuses a network filesystem",
 check("the smoke skips the pack probe when the harness has no filesystem",
       "PAIR_PACK_DISK=0" in src("tests/smoke_memory.sh") and "PAIR_PACK_DISK=0" in src("tests/memory_fail.sh"), "")
 
+check("the GX pack judged is the one behind /cold now, not the spec's (a pack switch must not read as drift)",
+      'pc.live(cfg, "gx")' in _pd and 'get("/cold"' in _pd
+      and "PACK_DISK_CONFIG gx /cold spec=" in _pd, "")
+check("...and a switched pack is labelled with both paths, so a run cannot be quoted under the wrong pack",
+      "pack switch: judging live" in _pd, "")
+check("the GX row records the placement_sha256 the live pack declares",
+      "placement_sha=" in _pd and "def cold_placement_sha" in _pd, "")
+check("the two halves must declare the same placement_sha256 (one checkpoint, two packs)",
+      "def p7_placement_sha" in _pd and 'w == "placement"' not in _pd
+      and '("gx", "placement", src' in _pd, "")
+check("pack_disk.py is tested against a switched /cold and against a half-mismatched sha",
+      "live=" in src("tests/pack_disk.py") and "placement_sha256 are refused" in src("tests/pack_disk.py"), "")
+
 # A spec change cannot reach a running pair any other way: the flip-only ticket refuses a RECREATE
 # plan unless the operator queued it with --recreate, and then the ticket itself re-creates from the
 # spec inside the queue (old container renamed, never removed). Without this branch the mount could

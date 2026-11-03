@@ -56,11 +56,26 @@ GOOD_P7 = p7_spec([["__PAIR_ROOT__", "/pair"], ["/models/dsv41", "/models/dsv41"
 GOOD_GX = gx_spec([["__PAIR_ROOT__", "/pair"], ["/home/treadall/exl3-cold-pack-4460", "/cold"]])
 
 
-def run(p7spec, p7probe, gxspec=None, gxprobe=None, placement=None, poolprobe=None, homeprobe=None):
-    """-> (fails, printed) with spec and probe stubbed."""
+def run(p7spec, p7probe, gxspec=None, gxprobe=None, placement=None, poolprobe=None, homeprobe=None,
+        live="spec", hot_sha="", cold_sha=""):
+    """-> (fails, printed) with spec, live mounts, manifests and probe stubbed.
+
+    `live` is what the running GX container mounts at /cold: "spec" (same as the spec, the common case),
+    a path string (a switched pack), or None (no container at all).
+    """
     pd.spec_mounts = lambda cfg, side: [tuple(m) for m in
                                         (p7spec if side == "p7" else (gxspec or GOOD_GX))["mounts"]]
     pd.manifest_refs = lambda pack: (placement, None)
+    pd.p7_placement_sha = lambda pack: hot_sha
+    pd.cold_placement_sha = lambda host, pack: cold_sha
+    spec_cold = next((s for s, d in pd.spec_mounts({"pair": "dev"}, "gx") if d == "/cold"), "")
+    if live == "spec":
+        live_cold = spec_cold
+    else:
+        live_cold = live or ""
+    # pc.live() inspects the real box; the live /cold source is the one thing check_gx needs from it
+    pd.pc.live = lambda cfg, side, _lc=live_cold: (
+        None if _lc is None else {"running": True, "mounts": {"/cold": _lc} if _lc else {}})
 
     def fake_probe(host, path):
         if host is None:
@@ -156,6 +171,27 @@ check("a GX pack on another device than the box's own disk is refused",
 fs, _ = run(GOOD_P7, probe_d(), homeprobe=probe_d(missing="/home/treadall"))
 check("a GX whose own disk cannot be probed is refused",
       any(s == "gx" and w == "home" for s, w, p, r in fs), reasons(fs))
+
+# 6b. a pack switch is a labelled config change, never a silent one and never a refusal of a valid live
+#     pack: the checker must judge what the container mounts now, not what the spec was written with.
+fs, shown = run(GOOD_P7, probe_d(), live="/home/treadall/exl3-cold-pack-4700p6",
+                gxprobe=probe_d("/home/treadall/exl3-cold-pack-4700p6", dev=ROOT_DEV))
+check("a /cold that is not the spec's pack is reported as a labelled config change",
+      "PACK_DISK_CONFIG gx /cold spec=/home/treadall/exl3-cold-pack-4460 "
+      "live=/home/treadall/exl3-cold-pack-4700p6" in shown, shown)
+check("...and the live pack is the one judged, so the switched pack passes", not fs, reasons(fs))
+fs, shown = run(GOOD_P7, probe_d(), live="/home/treadall/exl3-cold-pack-4700p6",
+                gxprobe=probe_d("/home/treadall/exl3-cold-pack-4700p6", fstype="nfs"))
+check("...so a switched pack served over NFS is still refused",
+      any(s == "gx" and "sits on nfs" in r for s, w, p, r in fs), reasons(fs))
+fs, shown = run(GOOD_P7, probe_d(), live=None)
+check("no container with a /cold mount is labelled, and the spec pack is judged",
+      "live=absent" in shown and not fs, shown + " / " + reasons(fs))
+fs, _ = run(GOOD_P7, probe_d(), hot_sha="a" * 64, cold_sha="b" * 64)
+check("two halves that declare different placement_sha256 are refused",
+      any(s == "gx" and w == "placement" for s, w, p, r in fs), reasons(fs))
+fs, _ = run(GOOD_P7, probe_d(), hot_sha="a" * 64, cold_sha="a" * 64)
+check("the same placement_sha256 on both halves passes", not fs, reasons(fs))
 
 # 7. end to end over a real tree: the shipped hot pack carries links, and a link into the 12 TB drive
 #    (which is what the 4460 pack did through its overlay before 2026-11-02) must be caught by the

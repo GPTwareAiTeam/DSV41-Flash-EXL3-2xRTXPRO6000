@@ -202,17 +202,54 @@ def check_p7(cfg, fails, quiet):
               f"placement={placement or '-'} overlay={overlay or '-'} links={nlinks}")
 
 
+def p7_placement_sha(pack):
+    """> placement_sha256 the P7 client half declares ("" when absent); it is a local file."""
+    try:
+        d = json.load(open(os.path.join(pack, "PACK_MANIFEST.json")))
+    except (OSError, ValueError):
+        return ""
+    v = d.get("placement_sha256")
+    return v if isinstance(v, str) else ""
+
+
+def cold_placement_sha(host, pack):
+    """placement_sha256 the pack's own manifest declares ("" when it cannot be read).
+
+    A pack switch is a config change, and the row that records it has to carry the sha the pack says it
+    holds -- otherwise two arms at different packs are indistinguishable in the log.
+    """
+    cmd = ssh_argv() + pc.SSH_OPTS + [host, "python3 -c "
+           + shlex.quote("import json,sys;print(json.load(open(sys.argv[1] + '/PACK_MANIFEST.json'))"
+                         ".get('placement_sha256',''))") + " " + shlex.quote(pack)]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
 def check_gx(cfg, fails, quiet):
-    src = None
+    spec_src = None
     for s, dst in spec_mounts(cfg, "gx"):
         if dst == "/cold":
-            src = s
+            spec_src = s
         elif s == "/mnt" or s.startswith("/mnt/") or dst == "/mnt" or dst.startswith("/mnt/"):
             fails.append(("gx", "mount", dst,
                           f"the GX container must not mount /mnt ({s}): that is P7's disk over NFS"))
-    if src is None:
+    if spec_src is None:
         fails.append(("gx", "mount", "/cold", "the spec mounts no /cold: the cold pack is unreachable"))
         return
+    # The pack to judge is the one behind /cold *now*, not the one the spec was written with: a run that
+    # switched packs (k=4/5/6 variants, 2026-11-03) is serving the live mount, and a checker reading the
+    # spec would either bless a pack nothing serves or refuse a pack that is fine. Both cases must show up
+    # as a labelled config change here -- printed even under --quiet, because which pack is served is the
+    # label every number measured under it has to carry, not chatter.
+    lv = pc.live(cfg, "gx") or {}
+    live_src = (lv.get("mounts") or {}).get("/cold", "")
+    src = live_src or spec_src
+    if live_src and spec_src and live_src != spec_src:
+        print(f"PACK_DISK_CONFIG gx /cold spec={spec_src} live={live_src} (pack switch: judging live; "
+              f"sync containers/{cfg['pair']}-gx.json so plan/apply do not recreate onto the old pack)")
+    elif not live_src:
+        print(f"PACK_DISK_CONFIG gx /cold spec={spec_src} live=absent (no container with a /cold mount; "
+              f"judging the spec)")
     r = probe(cfg["gx_host"], src)
     if r["missing"]:
         fails.append(("gx", "pack", src, f"does not exist on {cfg['gx_host']}"))
@@ -247,9 +284,19 @@ def check_gx(cfg, fails, quiet):
             for bad in ("/mnt", "/net"):
                 if under(target, bad):
                     fails.append(("gx", "link", name, f"points at {target} under {bad} (network disk)"))
+    cold_sha = cold_placement_sha(cfg["gx_host"], r["real"])
+    # One checkpoint split in two: the P7 client half has to declare the same placement_sha256 the cold
+    # pack declares, or the pair is serving two halves of different packs. Reading it from the live /cold
+    # is what makes a pack switch show up here instead of in a decode run that looks merely slow.
+    hot_sha = p7_placement_sha(P7_PACK)
+    if cold_sha and hot_sha and cold_sha != hot_sha:
+        fails.append(("gx", "placement", src,
+                      f"declares placement_sha256={cold_sha[:16]}, but the P7 client half ({P7_PACK}) "
+                      f"declares {hot_sha[:16]}: the two halves are different packs"))
     if not quiet:
         print(f"PACK_DISK gx pack=/cold src={src} real={r['real']} fstype={r['fstype']} "
-              f"dev={r['dev'] or '-'} root_dev={hd['dev'] or '-'} links={len(r['links'])}")
+              f"dev={r['dev'] or '-'} root_dev={hd['dev'] or '-'} links={len(r['links'])} "
+              f"placement_sha={(cold_sha or '-')[:16]}")
 
 
 def main(argv):
