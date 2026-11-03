@@ -442,6 +442,9 @@ check("...and verify names the tree that wrote the cache",
       _ps.count('EXTSRC $(grep -ho') == 1
       and 'extcache_foreign_src={src_spelled}->{src_real} want={want_src}' in _ps
       and 'want_src = f"{rel_dir}/src"' in _ps, "")
+check("...and names a cache built through an alias of the same tree",
+      'f"extcache_spelling={src_spelled} want=/src/exllamav3/..."' in _ps
+      and 'not src_spelled.startswith("/src/exllamav3")' in _ps, "")
 
 check("the client can take extra env without a second driver",
       _pa.count(_loop) == 1

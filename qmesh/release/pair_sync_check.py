@@ -317,6 +317,14 @@ def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
             src_spelled, _, src_real = item.partition("->")
             if src_real and src_real != want_src:
                 problems.append(f"extcache_foreign_src={src_spelled}->{src_real} want={want_src}")
+            # The resolve above is blind on a host that has no /pair (both P7 and GX hosts: the
+            # mount is inside the container), so a cache built through an *alias of this same tree*
+            # passed it silently -- /pair/current/src/exllamav3/exllamav3 resolves to the release's
+            # own src, yet torch's version hash covers the spelling and the rebuild replaced the
+            # stamped binary in place (2026-11-03, ext_so=c7908310 want=e74d4951, every dev ticket
+            # on DRIFT). One link, one spelling: the container's own /src/exllamav3.
+            if src_spelled and not src_spelled.startswith("/src/exllamav3"):
+                problems.append(f"extcache_spelling={src_spelled} want=/src/exllamav3/...")
         # cuda-exl3 is gitignored and built per checkout, so the GX stamp has to name it: without it
         # the release would verify clean and then serve every layer on the mixed-K module.
         if side == "gx":
