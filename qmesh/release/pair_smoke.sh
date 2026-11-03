@@ -28,7 +28,24 @@
 # A server that never prints READY is reported as `server_timeout` (never waited on indefinitely):
 # the bound comes from SMOKE_SERVER_TIMEOUT and is enforced by seam_server_ensure itself.
 set -uo pipefail
-HERE=$(cd "$(dirname "$0")" && pwd)
+# bash reads a script lazily, and this file sits in the installed directory that pair_install.sh replaces
+# in place: a replace or a hand edit while a smoke is running makes the rest of the file parse as garbage.
+# (2026-11-03: a canary smoke died at line 580 with "syntax error near unexpected token `('" -- the prefill
+# gate had already been measured and the arm was thrown away.) So run from a private copy of this file; the
+# copy takes HERE from PAIR_SELF_HERE, because its own $0 is in /tmp.
+if [ "${PAIR_SMOKE_SELF:-0}" != 1 ]; then
+  PAIR_SELF_COPY=$(mktemp "${TMPDIR:-/tmp}/pair_smoke.XXXXXX") || exit 2
+  PAIR_SELF_HERE=$(cd "$(dirname "$0")" && pwd)
+  if cp "$0" "$PAIR_SELF_COPY"; then
+    PAIR_SMOKE_SELF=1 PAIR_SELF_HERE=$PAIR_SELF_HERE PAIR_SELF_COPY=$PAIR_SELF_COPY \
+      exec bash "$PAIR_SELF_COPY" "${@}"
+  fi
+  echo "SMOKE_FAIL no_self_copy $0"; exit 2
+fi
+HERE=${PAIR_SELF_HERE:-$(cd "$(dirname "$0")" && pwd)}
+# Until smoke_exit (which owns the server and the box claim) is installed, a refusal in between must
+# still drop the private copy.
+trap 'rm -f "${PAIR_SELF_COPY:-}"' EXIT
 # shellcheck source=pair_lib.sh
 . "$HERE/pair_lib.sh"
 
@@ -178,6 +195,7 @@ fi
 smoke_exit() {
   pair_server_stop
   pair_gx_gate_down
+  [ -n "${PAIR_SELF_COPY:-}" ] && rm -f "$PAIR_SELF_COPY"
 }
 trap smoke_exit EXIT
 echo "SMOKE_GATE owner=smoke-$PAIR until=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$(pair_gx_gate_file)")"

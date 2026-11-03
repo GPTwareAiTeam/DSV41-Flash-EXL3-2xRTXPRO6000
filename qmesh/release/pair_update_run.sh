@@ -21,7 +21,23 @@
 # (so the next job sees the release it saw before) and exits; explicit failures are rolled back by
 # hand in restore().
 set -uo pipefail
-HERE=$(cd "$(dirname "$0")" && pwd)
+# bash reads a script lazily, and this file lives in the installed directory that pair_install.sh replaces in
+# place: a replace or a hand edit mid-run makes the rest of the file parse as garbage, and an update runs for
+# an hour (2026-11-03: a canary smoke died at line 580 with "syntax error near unexpected token `('" after the
+# arm had been measured, because the installed copy was edited underneath it). So run from a private copy; the
+# copy takes HERE from PAIR_SELF_HERE, because its own $0 is in /tmp.
+if [ "${PAIR_UPD_SELF:-0}" != 1 ]; then
+  PAIR_SELF_COPY=$(mktemp "${TMPDIR:-/tmp}/pair_update_run.XXXXXX") || exit 2
+  PAIR_SELF_HERE=$(cd "$(dirname "$0")" && pwd)
+  if cp "$0" "$PAIR_SELF_COPY"; then
+    PAIR_UPD_SELF=1 PAIR_SELF_HERE=$PAIR_SELF_HERE PAIR_SELF_COPY=$PAIR_SELF_COPY \
+      exec bash "$PAIR_SELF_COPY" "${@}"
+  fi
+  echo "UPDATE_FAILED no_self_copy $0"; exit 2
+fi
+HERE=${PAIR_SELF_HERE:-$(cd "$(dirname "$0")" && pwd)}
+# Until on_exit/on_term (which restore the pair) exist, a refusal in between must still drop the copy.
+trap 'rm -f "${PAIR_SELF_COPY:-}"' EXIT
 # shellcheck source=pair_lib.sh
 . "$HERE/pair_lib.sh"
 

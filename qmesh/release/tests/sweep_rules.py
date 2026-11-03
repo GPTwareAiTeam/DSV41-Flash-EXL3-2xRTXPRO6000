@@ -1197,6 +1197,11 @@ check("the cold half's sha is read off the mount source, not out of a running co
       _lib.index('PACK_MANIFEST.json') < _lib.index('docker exec $gx'), "")
 check("the hot halves resolve before the pair's client container exists",
       "pair_p7_pool()" in _lib and 'docker inspect -f' in _lib, "")
+check("the long-running scripts run from a private copy of themselves",
+      'PAIR_SMOKE_SELF' in src("pair_smoke.sh") and 'PAIR_UPD_SELF' in src("pair_update_run.sh")
+      and 'exec bash "$PAIR_SELF_COPY"' in src("pair_smoke.sh")
+      and 'exec bash "$PAIR_SELF_COPY"' in src("pair_update_run.sh")
+      and 'PAIR_SELF_HERE' in src("pair_smoke.sh") and 'PAIR_SELF_HERE' in src("pair_update_run.sh"), "")
 check("a half-written pack is refused before it is loaded",
       "pair_p7_verify()" in _lib and "hashlib.sha256" in _lib and 'state=mismatch' in _lib
       and 'is not the pack its manifest describes' in src("pair_arm.sh")
