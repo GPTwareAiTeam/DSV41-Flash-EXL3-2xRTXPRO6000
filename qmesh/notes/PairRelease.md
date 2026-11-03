@@ -139,6 +139,19 @@ mistake before any docker call:
 * `seam.fingerprint` = sha256 over `qmesh/native/qmesh_expert_seam.cu`, `...h` and `qes.py`. Those
   three define the wire. A pair whose halves disagree on it is a protocol mismatch by definition,
   whatever a constant in the code says.
+* `native.moe_cpp` (bool) = the release carries the C moe hook and therefore must have it built and
+  stamped. The cut sets it from whether `sha` tracks `qmesh/native/build_moe.sh`: a commit that has
+  the build script has the hook, one cut before it never did. This is a declaration, not a guess from
+  the file list, so releases that predate the hook (release 1, `d330dcf5`) keep reading `IN_SYNC`
+  with `cpp=-` instead of turning DRIFT for an artefact that could not have existed.
+
+Two artefacts are hashed per side, each beside its `.so`: `libqmesh_expert_seam.<arch>.so.stamp` (the
+wire) and `libqmesh_moe_cpp.<arch>.so.stamp` (the hook), both with `build_id`, `source_sha`, `arch`,
+`sha256` and now `lib`. Until 2026-11-02 only the first was checked, so a release root whose hook was
+stale, missing, or from another commit read `IN_SYNC` -- the last artefact built was the one nothing
+looked at. `pair_sync_check.py` prints `cpp_stamp=missing`, `cpp_stamp_no_sha`, `cpp_so=unreadable`
+or `cpp_so=<on disk> want=<stamp>` and `pair_build_lib.sh verify` prints the same as `CPP_*`,
+read-only, so a flip ticket re-checks the hook without building it.
 
 `pair_cut.sh` stamps a release **once and for both sides**. If one box already carries
 `releases/<sha>/RELEASE.json`, the other side takes that file verbatim (`CUT_ADOPT`) instead of
@@ -188,9 +201,13 @@ queue (rank 1, agent `PairUpdate`), so an update can never run concurrently with
 3. **containers** — `pair_containers.py apply` re-creates each side from `containers/<pair>-<side>.json`
    only when the live container differs (image, mounts, env, ulimits, devices), keeping the old one
    as `<name>.bak-<ts>`, wiring `/src/exllamav3`, then `plan` must be clean.
-4. **build** — native lib (`--side both`, `nice -n 15`, `MAX_JOBS<=8`) and the torch extension into
-   `releases/<sha>`, so `current` still points at the old release while the new one is being built.
-   The extension is built *through* `/src/exllamav3` (the link is repointed to the new release for
+4. **build** — two native artefacts and the torch extension into `releases/<sha>`, so `current` still
+   points at the old release while the new one is being built. `pair_build_lib.sh` builds the seam
+   lib (`--side both`, `nice -n 15`, `MAX_JOBS<=8`) and then the C moe hook
+   `libqmesh_moe_cpp.<arch>.so` through the tracked `qmesh/native/build_moe.sh`, with `MOE_OUT`/
+   `MOE_OBJ` pointing at a tmp dir that is moved into `bin/` so `obj/` never lands in the tree. Each
+   artefact gets its own `.so.stamp`; the GX claim covers both. The extension is built *through*
+   `/src/exllamav3` (the link is repointed to the new release for
    the length of the build and put back afterwards) because that path is part of the ninja command
    line; see the JIT incident below. Native libs are not byte-reproducible across containers: compare the source
    sha and build stamp written beside each lib, never a `.so` hash across boxes.
