@@ -60,7 +60,10 @@ BUILD_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["build
   "$PAIR_ROOT/current/RELEASE.json" 2>/dev/null) || BUILD_ID=""
 
 envs=(
-  -e "CUDA_VISIBLE_DEVICES=$GPU"
+  # pairs.conf's `gpu` is a *host* index: the container spec spends it on --gpus device=<gpu>, so
+  # inside the container that one card is device 0 again. Passing the host index here asked dev's
+  # container (which had every GPU) for GPU 1 and asked a scoped one for a GPU it cannot see.
+  -e "CUDA_VISIBLE_DEVICES=0"
   -e "REMOTE_TRANSPORT=seam"
   -e "SEAM_DEV=$SEAM_DEV" -e "SEAM_GID=$SEAM_GID" -e "SEAM_PEER=$SEAM_PEER"
   # SEAM_BUCKETS is a *request*: the server grants the intersection of this list and its own

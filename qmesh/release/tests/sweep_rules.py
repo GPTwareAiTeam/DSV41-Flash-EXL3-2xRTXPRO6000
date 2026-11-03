@@ -630,11 +630,20 @@ _got = {"running": True, "image": _want["image"], "workdir": _want["workdir"],
         "entrypoint": [_want["entrypoint"]], "cmd": list(_want["cmd"]),
         "mounts": {d: s for s, d in _want["mounts"]}, "env": dict(_want["env"]),
         "network": "host", "ipc": "host", "shm": 64 * 1024 ** 3, "security": ["label=disable"],
-        "ulimits": {"memlock": -1}, "devices": ["/dev/infiniband"], "gpus": True, "restart": "no"}
+        "ulimits": {"memlock": -1}, "devices": ["/dev/infiniband"],
+        "gpus": pc.spec_gpus(_want), "restart": "no"}
 pc.live = lambda cfg, side: _got
 _base = _REAL_PLAN(_cfg, "p7") or []
 check("an unchanged container plans nothing (baseline for the mount arrows)",
       not [w for w in _base if w.startswith("mount")], str(_base))
+# GPU scope is part of the plan: the P7 containers ran with every GPU on the host (three, one of
+# them another owner's A4000) and every prepare read them as matched, because the check only asked
+# whether a device request existed. A container that can see the neighbour's card is drift.
+_got["gpus"] = "all"
+_gd = " ".join(_REAL_PLAN(_cfg, "p7") or [])
+check("a container that sees more GPUs than its spec is planned as drift",
+      "gpus=all want=device=1" in _gd and bool(pc.real_reasons(_REAL_PLAN(_cfg, "p7") or [])), _gd)
+_got["gpus"] = pc.spec_gpus(_want)
 _got["mounts"]["/mnt/data12/models/exl3"] = "/mnt/data12/models/exl3"
 _why = " ".join(_REAL_PLAN(_cfg, "p7") or [])
 check("an extra live mount is planned as a removal, not an add",

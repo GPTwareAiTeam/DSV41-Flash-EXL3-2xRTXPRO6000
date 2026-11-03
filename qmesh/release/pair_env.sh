@@ -25,7 +25,11 @@ printf 'PAIR_RELEASE=%q\n' "$PAIR_ROOT/releases/$SHA"
 printf 'PAIR_BUILD_ID=%q\n' "$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1]))["build_id"])
 except Exception: print("")' "$PAIR_ROOT/releases/$SHA/RELEASE.json")"
-printf 'CUDA_VISIBLE_DEVICES=%q\n' "$GPU"
+# The container is device-scoped (spec --gpus device=<host index>), so the one card it can see is
+# device 0 inside it: anything exec'ing into $P7CT must export 0, not the host index. PAIR_GPU_HOST
+# is the host index, for the few host-side probes (nvidia-smi -i, --gpus) that need it.
+printf 'CUDA_VISIBLE_DEVICES=%q\n' 0
+printf 'PAIR_GPU_HOST=%q\n' "$GPU"
 printf 'SEAM_DEV=%q\n' "$SEAM_DEV"
 printf 'SEAM_GID=%q\n' "$SEAM_GID"
 printf 'GX_GID=%q\n' "$GX_GID"

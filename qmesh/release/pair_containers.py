@@ -116,6 +116,43 @@ def run_args(spec, name):
     return argv
 
 
+def _ids_key(x):
+    return (0, int(x)) if x.isdigit() else (1, x)
+
+
+def gpu_req(reqs):
+    """Normalised HostConfig.DeviceRequests: '' (no GPU), 'all', or 'device=N[,M]'.
+
+    `--gpus all` and `--gpus device=1` both leave a non-empty DeviceRequests, so reading it as a
+    boolean made them indistinguishable. That is how the P7 containers ran for a day with the host's
+    whole GPU list (nvidia-smi inside listed three, one of them the A4000 that is not ours) while
+    every plan/prepare read the spec as matched (2026-11-02).
+    """
+    ids, everything = set(), False
+    for r in reqs or []:
+        for d in r.get("DeviceIDs") or []:
+            ids.add(str(d))
+        if not (r.get("DeviceIDs") or []) and r.get("Count") in (-1, None):
+            everything = True
+    if ids:
+        return "device=" + ",".join(sorted(ids, key=_ids_key))
+    return "all" if everything else ""
+
+
+def spec_gpus(spec):
+    """The GPU scope a spec asks for, in the same form gpu_req() returns."""
+    args = spec.get("args") or []
+    if "--gpus" not in args:
+        return ""
+    raw = args[args.index("--gpus") + 1].strip().strip("'\"")
+    if raw.lower() in ("all", "a"):
+        return "all"
+    if raw.lower().startswith("device="):
+        ids = {x for x in raw.split("=", 1)[1].split(",") if x}
+        return "device=" + ",".join(sorted(ids, key=_ids_key))
+    return raw.lower()
+
+
 def live(cfg, side):
     ct = cfg["p7ct"] if side == "p7" else cfg["gxct"]
     rc, out, err = docker(cfg, side, ["inspect", ct])
@@ -142,7 +179,7 @@ def live(cfg, side):
         "security": d["HostConfig"].get("SecurityOpt") or [],
         "ulimits": ul,
         "devices": [x.get("PathOnHost", "") for x in (d["HostConfig"].get("Devices") or [])],
-        "gpus": bool(d["HostConfig"].get("DeviceRequests")),
+        "gpus": gpu_req(d["HostConfig"].get("DeviceRequests")),
         "restart": (d["HostConfig"].get("RestartPolicy") or {}).get("Name"),
     }
 
@@ -217,8 +254,12 @@ def plan_side(cfg, side):
         why.append(f"shm={got['shm']}")
     if got["security"] != ["label=disable"]:
         why.append(f"security={got['security']}")
-    if not got["gpus"]:
-        why.append("gpus=none")
+    # The GPU scope is compared, not only its presence: a container that sees more than its own GPU
+    # can run this pair's arm on the neighbour's card, and the whole point of pairs.conf's `gpu` is
+    # that it cannot.
+    want_gpu = spec_gpus(want)
+    if got["gpus"] != want_gpu:
+        why.append(f"gpus={got['gpus'] or 'none'} want={want_gpu or 'none'}")
     if "/dev/infiniband" not in got["devices"]:
         why.append("devices=missing_infiniband")
     if got["ulimits"].get("memlock") != -1:
