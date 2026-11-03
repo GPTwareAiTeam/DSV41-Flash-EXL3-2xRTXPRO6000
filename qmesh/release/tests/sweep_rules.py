@@ -350,6 +350,14 @@ _loop = 'for kv in ${PAIR_ARM_EXTRA_ENVS:-}; do envs+=(-e "$kv"); done'
 # place (2026-11-03: /artifacts/dspark-tpr/src wrote 5780205b into a cache stamped 04a61140 and
 # pair_serve refused the pair as DRIFT for an hour). One supported way in, and it is isolated.
 _pa = src("pair_arm.sh")
+# The queue stopped being idle for long enough to install out of band, so a mid-ticket install has to
+# be possible without a guard bypass: the caller proves membership by ancestry, and every other
+# ticket still refuses.
+_pi = src("pair_install.sh")
+check("pair_install runs inside the ticket it is part of, and only that one",
+      "in_ancestry() {" in _pi and '"${PAIR_INSTALL_SELF_TICKET:-0}" = 1 ] && in_ancestry "$pid"' in _pi
+      and _pi.count('die "ticket_in_flight') == 1 and "ps -o ppid=" in _pi, "")
+
 # A container whose pid 1 is `sleep infinity` never reaps: every build a killed probe leaves behind
 # becomes a Z-state child of init with a fresh etimes, and the compiler guard then waits the full
 # budget on processes that cannot finish anything (2026-11-03: 14 zombies held pair_build_ext for

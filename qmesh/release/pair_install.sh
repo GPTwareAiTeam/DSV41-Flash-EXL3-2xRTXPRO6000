@@ -12,6 +12,13 @@
 # thrown away. A rename would have kept the old inode alive for the reader, a copy does not, and
 # neither is safe to do under a live ticket -- so this refuses instead of relying on the writer.
 #
+# One exception, and it is provable rather than promised: a caller that runs *inside* the live ticket
+# can pass PAIR_INSTALL_SELF_TICKET=1, and then the running pid must be one of its own ancestors. The
+# scripts that ticket reads are the caller's own, and the caller names the files it is finished with,
+# so a mid-ticket install is safe. Any other ticket -- any queue, any agent -- still refuses, because
+# the danger is a reader we cannot see. 2026-11-03: the dev queue stopped being idle for long enough
+# to install out of band, so the four pending files rode in the first minute of a canary ticket.
+#
 # The destination defaults to the artifacts script dir next to this checkout's artifact root; the
 # files come from the repo tree (qmesh/release/) unless --src says otherwise. Every file is syntax
 # checked before it moves, and the move is a rename so a *reader* that starts after it gets either
@@ -52,6 +59,16 @@ if [ -z "$DST" ]; then
 fi
 [ -n "$DST" ] && [ -d "$DST" ] || die "cannot resolve the installed script dir (pass --dst)"
 
+# Is $1 an ancestor of this process?
+in_ancestry() {
+  local want=$1 p=$$
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+    [ "$p" = "$want" ] && return 0
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+
 # One queue per pair; a live pid in <queue>/running owns the box and owns the scripts it is reading.
 for q in dev prod; do
   for root in "$(dirname "$DST")/queue" /home/treadall/recipe-artifacts/gpu0-gx1/queue; do
@@ -61,7 +78,11 @@ for q in dev prod; do
     agent=$(tr ' ' '\n' < "$rf" | sed -n 's/^agent=\([^ ]*\)$/\1/p' | head -1)
     [ -n "$pid" ] || continue
     if kill -0 "$pid" 2>/dev/null; then
-      die "ticket_in_flight queue=$q agent=${agent:-?} pid=$pid -- installs wait for the queue to be idle"
+      if [ "${PAIR_INSTALL_SELF_TICKET:-0}" = 1 ] && in_ancestry "$pid"; then
+        step "self_ticket queue=$q agent=${agent:-?} pid=$pid -- the caller runs inside this ticket"
+      else
+        die "ticket_in_flight queue=$q agent=${agent:-?} pid=$pid -- installs wait for the queue to be idle"
+      fi
     fi
   done
 done
