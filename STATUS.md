@@ -1,6 +1,8 @@
 # STATUS — Recipe A (GPU0 + GX1)
 
-Last update: 2026-11-01. Work paused by owner. Details and commands in `qmesh/notes/`.
+Last update: 2026-11-03. Active pair bring-up on prod GPU0 + GX1 with a dev twin on GPU1 + GX2; the
+"2026-11-03 — pair state" section at the end says what is measured, what is only a gate knob, and what
+is deliberately off. Details and commands in `qmesh/notes/`.
 
 ## Caveat on hardware used so far
 Several measurements below were taken on **P7 GPU1** by mistake (same card model as GPU0, so numbers
@@ -134,3 +136,45 @@ neither the slot geometry nor the wire layout changes) and returns; `client_prox
 CQ error does; `qes_issue`/`qes_collect` then fail with −5 and `last_error()` reaches Python as a
 `RuntimeError`. A lost handle now costs one session, not the process. Failed `ibv_modify_qp` calls print the
 state the HCA really reports (`qes: qp rts failed errno=… state=… qpn=… peer_qpn=… port=… rows=…`).
+
+## 2026-11-03 — pair state
+
+Same recipe, now run as two identical pairs: **prod** = P7 GPU0 + GX1 (`10.0.100.2`, containers
+`seam-p7-prod` / `seam-gx1-prod`), **dev** = P7 GPU1 + GX2 (`10.0.4.33`, containers `seam-p7-dev` /
+`seam-gx2-dev`). Every GPU/GX job is admitted by one queue (`queue/run_dev.sh <agent> <min> <cmd…>`,
+`queue/run_prod.sh` for prod); nothing is launched beside it. A ticket owns the whole box, so a release
+arm is one ticket: cut/prepare, flip, measure, print clocks, load and GX memory on every line.
+
+Deployed on dev at the time of writing: `a16465e4` on both halves, pack
+`/home/treadall/exl3-cold-pack-4460` (placement `844251e79b9d1dc8…`), checkpoint
+`/models/dsv41/exl3-p7hot-4460-hc1`. Prod is still `35bfaecb`.
+
+**`SEAM_MOE_CPP_DET=1` is a gate knob, not a default.** The native MoE path gives the C++ side a
+deterministic expert order so two loads of the same pack produce identical token ids, which is what makes
+a token-identity gate meaningful on this pair. Two independent loads of the same pack then agree on the
+whole 2304-token id table (`eager_a == eager_b`, sha and ids both), and a load with the knob off does not
+have to. Speed arms run with it off, because that is the shape that ships. Any
+identity claim must name the knob on the same line; any speed claim must name it as off.
+
+**Piecewise decode graphs stay off** (`EXL3_WHOLE_GRAPH=0`, the shipped value). Two of the documented
+incompatibilities are known and only one is fixed: `EXL3_WHOLE_GRAPH=1` still cannot be combined with
+`DSPARK=1` (module-level export taps never run inside replay, so the drafter sees `target_hidden = None`),
+and under `SEAM_MOE_CPP_DET=1` the graphs arms additionally died reproducibly with out-of-range expert ids
+(`250` against 242 slots at layer 19, after ~3659 clean messages). The second one is a bug in `qes_issue`:
+the slot header was staged in one pinned host line per layer and copied by a *captured* `cudaMemcpyAsync`,
+so a replay copied whatever the last capture of that layer wrote; a narrower replay then advertised the
+wider capture's `rows`. It is fixed on branch `gate/det-d83b6955` at `ea8b70fb` (device-written header,
+`hdr_stage` gone) and is **not** in this release. Note for future cuts: that source builds into
+`qmesh/native/bin/libqmesh_expert_seam.<arch>.so`, which `pair_build_lib.sh` builds per release and per arch
+inside the release's own tree — `pair_build_ext.sh` does not touch it.
+
+**Swap policy for the pair gate.** Box swap, worker `VmSwap` and `MemAvailable` are printed on every gate
+line. A run is refused only for a clear foreign-tenant level (>2048 MiB worker `VmSwap`) or for a
+box-busy/memory-margin shortfall, and its decode window is refused when worker `VmSwap` grows by more than
+128 MiB between the baseline take and the end of decode; prefill-window growth is printed and warned but
+not refused, because a 32k prefill legitimately leaves a few hundred MiB behind. A post-load reading whose
+`MemAvailable` is still above ~2000 MiB is not judged (it cannot be post-residency) rather than refused.
+Swap optimisation is deliberately deferred.
+
+Quality rule unchanged: a lossy change must land inside wiki2 quick-8 ppl 2.0391 ± 0.005, measured on the
+same pack and `KV_BITS=4`; lossless changes are gated on token identity instead.
