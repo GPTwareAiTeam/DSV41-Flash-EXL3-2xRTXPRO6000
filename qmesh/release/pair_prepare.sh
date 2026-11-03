@@ -163,5 +163,25 @@ pair_step "PREPARE_EXT pair=$PAIR sides=$SIDES"
 rc=${PIPESTATUS[0]}
 [ "$rc" = 0 ] || pair_die "PREPARE_FAILED $PAIR phase=ext rc=$rc"
 
+# ---- 5. the pair manifest must describe what we just built ---------------------------------------
+# A lib or ext rebuild changes the artifact's sha256 and its stamp, and the pair manifest is what
+# pair_sync_check.py compares those against -- so a prepare that rebuilds and stops leaves the pair
+# permanently DRIFT on a hash nobody can fix by rebuilding (2026-11-03 17:04Z: the /src repair rebuilt
+# the seam lib both sides and ext on P7, stamps said 17:07, the manifest still named 13:15's build, and
+# both halves read `lib_so_hash_vs_manifest`). pair_update_run.sh writes the manifest after its own
+# build+flip; prepare is the other path that builds, so it refreshes the same way -- but only for the
+# release the pair actually points at: a candidate sha prepared beside a serving pair must not rewrite
+# the description of what is being served.
+cur=$(pair_current_sha "$PAIR_ROOT" 2>/dev/null)
+if [ "$cur" = "$SHA" ]; then
+  ref="$PAIR_STATE_DIR/refs-$SHA.json"
+  python3 "$HERE/pair_manifest.py" write "$PAIR" "$SHA" ${ref:+"--ref" "$ref"} --by pair_prepare 2>&1 \
+    | sed 's/^/  /'
+  [ "${PIPESTATUS[0]:-1}" = 0 ] || pair_die "PREPARE_FAILED $PAIR phase=manifest rc=${PIPESTATUS[0]}"
+  pair_step "PREPARE_MANIFEST pair=$PAIR sha=${SHA:0:12} refreshed"
+else
+  pair_step "PREPARE_MANIFEST pair=$PAIR skipped (built ${SHA:0:12} is not current=${cur:-none})"
+fi
+
 pair_step "PREPARED pair=$PAIR sha=$SHA build=$BUILD_ID sides=$SIDES"
 echo "$SHA"

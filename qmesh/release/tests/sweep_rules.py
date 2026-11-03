@@ -732,6 +732,16 @@ check("prepare gates on the pack's disk before it cuts",
       "pair_pack_disk.py" in src("pair_prepare.sh")
       and src("pair_prepare.sh").index("pair_pack_disk.py") < src("pair_prepare.sh").index("pair_cut.sh"),
       "")
+check("prepare refreshes the pair manifest when it rebuilds the release the pair points at",
+      "pair_manifest.py" in src("pair_prepare.sh")
+      and "pair_current_sha" in src("pair_prepare.sh")
+      and src("pair_prepare.sh").index("pair_manifest.py")
+      > src("pair_prepare.sh").index("pair_build_ext.sh"), "")
+check("...and only for the current release, never for a candidate prepared beside a serving pair",
+      'if [ "$cur" = "$SHA" ]' in src("pair_prepare.sh")
+      and "PREPARE_MANIFEST pair=$PAIR skipped" in src("pair_prepare.sh"), "")
+check("...and a manifest write that fails stops prepare (phase=manifest), it is not warn-only",
+      "PREPARE_FAILED $PAIR phase=manifest" in src("pair_prepare.sh"), "")
 check("the smoke gates on the pack's disk too",
       "pair_pack_disk.py" in src("pair_smoke.sh") and 'fail "pack_disk' in src("pair_smoke.sh"), "")
 check("the pack check is a tested file",
