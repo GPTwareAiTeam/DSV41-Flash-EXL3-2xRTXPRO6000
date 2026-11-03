@@ -41,6 +41,12 @@ GX_DEV=${GX_DEV:-rocep1s0f0}
 GX_GID=${GX_GID:-3}
 PORT=${PORT:-47311}
 SEAM_LOG=${SEAM_LOG:-/tmp/seam_server.log}
+# Exported, not just set: the preflight assembles its probe in a child shell, so an unexported SEAM_LOG
+# reaches that child as an unbound `${SEAM_LOG}` under `set -u` and the probe dies before it looks at the
+# box -- printed as `SEAM_LOG: unbound variable`, or as a bare failed grep when stderr is redirected
+# (2026-11-03, PairRelease: a caller that passed SEAM_LOG as a prefix assignment to `.` could not probe
+# a log at all; the ticket reported `probe_marker_not_reached` for a probe that was never run).
+export SEAM_LOG
 # Where the previous server log is copied before a start truncates it. Empty disables the copy; the
 # pair scripts set it to <pair state>/logs (pair_lib.sh), so every load -- smoke, update, serve,
 # restore -- leaves behind the record its successor would otherwise destroy.
