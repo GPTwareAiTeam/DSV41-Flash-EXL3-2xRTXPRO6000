@@ -294,7 +294,7 @@ struct Ctx {
   int block_m = 0;  /* 0 = pick_block_m from the previous call's live count (see run_piece) */
   bool dump = false; /* SEAM_MOE_CPP_DUMP: mirror each group's alignment into host buffers */
   bool trace = false;
-  bool bound = true; /* SEAM_MOE_CPP_BOUND: align from the picks' bound, no per-piece readback */
+  bool bound = false; /* SEAM_MOE_CPP_BOUND: align from the picks' bound, no per-piece readback */
   int ws_pick = -1;
   int n_groups_max = 0;
   std::mutex mu;
@@ -491,12 +491,13 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
    * host - offsets, repeat_interleave, the padded row count - is all in qmc_k_align, and the only
    * readback before the gemms is 8 bytes per group.
    *
-   * Bound mode (default, rows <= kBoundMaxRows) drops that readback: block_m comes from m_valid,
-   * the block count is bounded by min(n_experts, m_valid), and qmc_k_align marks every block past
-   * the live ones with -1. The extra blocks cost one early return each in the gemm (n_rows retires
-   * them before a byte of weights is read), so the piece is one enqueue with no host wait. What
-   * moves to the end of the request is the bad-id verdict: the histogram still flags an id outside
-   * [-1, n_cold) on device, but nothing reads the flag until qmc_compute's own sync.
+   * Bound mode (SEAM_MOE_CPP_BOUND=1, rows <= kBoundMaxRows) drops that readback: block_m comes
+   * from m_valid, the block count is bounded by min(n_experts, m_valid), and qmc_k_align marks
+   * every block past the live ones with -1. The extra blocks cost one early return each in the
+   * gemm (n_rows retires them before a byte of weights is read), so the piece is one enqueue with
+   * no host wait. What moves to the end of the request is the bad-id verdict: the histogram still
+   * flags an id outside [-1, n_cold) on device, but nothing reads the flag until qmc_compute's
+   * own sync.
    *
    * A dump needs this piece's exact per-group numbers, so it keeps the readback. */
   const bool bound_mode = c.bound && !c.dump && rows <= kBoundMaxRows;
@@ -686,10 +687,11 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
   c->block_m = env_int("SEAM_MOE_CPP_BLOCK_M", 0);
   c->dump = env_int("SEAM_MOE_CPP_DUMP", 0) != 0;
   c->trace = env_int("SEAM_MOE_CPP_TRACE", 0) != 0;
-  /* Alignment without the per-piece readback (see run_piece). Default on: it costs padding blocks,
-   * which the gemm retires on its first check, and buys the host round trip per piece. Off is a
-   * measurement arm, not a fallback. */
-  c->bound = env_int("SEAM_MOE_CPP_BOUND", 1) != 0;
+  /* Alignment without the per-piece readback (see run_piece). Default off: on real routing it is
+   * 3.3 % slower at 1 row and 5.1 % slower at 6 rows than the 8-byte readback, because padding every
+   * group to min(n_experts, m_valid) costs more blocks than the sync saves at decode widths. On is a
+   * measurement arm. */
+  c->bound = env_int("SEAM_MOE_CPP_BOUND", 0) != 0;
   /* Response format. Default fp32: the shipped seam slot is fp32 and off_resp's stride is
    * rows*HIDDEN*4 (qmesh_expert_seam.cu, and Seam.collect in remote_seam_host.py), so anything else
    * must be a deliberate, matching change on the client side. */
