@@ -127,7 +127,7 @@ echo "EXTSHA $(sha256sum "$rel/ext/exllamav3_ext/exllamav3_ext.so" 2>/dev/null |
 # describes the binary; the ninja file it leaves behind names the tree it built from. Every root in
 # it must resolve to this release's src, or a foreign tree owns the cache and pair_serve will DRIFT
 # on the next flip (2026-11-03: /artifacts/dspark-tpr/src, .so 5780205b against a stamped 04a61140).
-echo "EXTSRC $(grep -ho '/[A-Za-z0-9_./-]*exllamav3' "$rel/ext/exllamav3_ext/build.ninja" 2>/dev/null | sort -u | while read -r r; do printf '%s->%s ' "$r" "$(readlink -f "$r" 2>/dev/null)"; done)"
+echo "EXTSRC $(grep -ho '/[A-Za-z0-9_./-]*exllamav3' "$rel/ext/exllamav3_ext/build.ninja" 2>/dev/null | sort -u | while read -r r; do printf '%%s->%%s ' "$r" "$(readlink -f "$r" 2>/dev/null)"; done)"
 echo "CXSHA $(sha256sum "$tree"/vendor/cuda-exl3/src/cuda_exl3/_C*.so 2>/dev/null | cut -d' ' -f1 | head -1)"
 if [ "$probe_ct" = 1 ]; then
 echo "CT_STATE $(docker inspect -f '{{.State.Running}}' "$ct" 2>/dev/null)"

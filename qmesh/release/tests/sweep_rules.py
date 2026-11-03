@@ -1071,6 +1071,17 @@ check("the hook build finds a toolkit that carries cusparse.h",
 check("the installer refuses a dst that is its own source tree",
       'dst_is_src' in _pi and _pi.index("dst_is_src") < _pi.rindex("INSTALL_OK"), "")
 
+# SIDE_SCRIPT is %-formatted as a whole, so a bare printf verb inside it is a format error, not a
+# print: `printf '%s->%s '` in the EXTSRC line took every pair_check down with "not enough arguments
+# for format string" (2026-11-03, PAIR_DRIFT on both halves). Render it here with a placeholder for
+# every key the script names, so an unescaped verb fails the sweep instead of the pair.
+_sc = open(os.path.join(HERE, "pair_sync_check.py")).read()
+_lit = re.search(r'SIDE_SCRIPT = r"""(.*?)"""', _sc, re.S)
+check("pair_sync_check's side script formats",
+      _lit is not None
+      and len(_lit.group(1) % {k: "x" for k in re.findall(r"%\((\w+)\)", _lit.group(1))}) > 0
+      and "%%s->%%s" in _lit.group(1), "")
+
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
