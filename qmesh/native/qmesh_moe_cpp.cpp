@@ -344,6 +344,20 @@ struct Ctx {
   bool prof = false;
   int prof_min_rows = 512; /* SEAM_QMC_PROF_ROWS: pieces narrower than this (decode) are not timed */
   std::vector<cudaEvent_t> prof_ev; /* [kProfPieces * kProfPerPiece] */
+  /* SEAM_MOE_CPP_SIDE: the response D2H leaves the compute stream. Per piece the compute stream
+   * records side_join[p], the side stream waits for it and takes the copy, so the reply of piece p
+   * crosses the bus while piece p+1's copies and gemms run. The answer is the same bytes from the
+   * same buffer into the same slot; only the copy's stream changes, and ev_side_done joins the two
+   * at the end of the call so qmc_compute's existing sync still means "the reply slot is complete".
+   * side_join is sized per call to the call's own piece count, so no event is ever waited on after
+   * being re-recorded. */
+  bool side = false;
+  cudaStream_t side_stream = nullptr;
+  std::vector<cudaEvent_t> side_join;
+  /* side_done[slot]: the side stream has finished reading accumulator slot `slot`, so the piece two
+   * pieces later may write it (only two slots exist). */
+  std::vector<cudaEvent_t> side_done; /* [2] */
+  cudaEvent_t ev_side_done = nullptr;
 };
 
 bool cuda_alive() {
@@ -411,7 +425,10 @@ bool ensure_buffers(Ctx& c, int rows, int total_pad) {
     if (grow((void**)&b.ids, (size_t)rows * T * 4) != cudaSuccess) return false;
     if (grow((void**)&b.w_bf, (size_t)rows * T * 2) != cudaSuccess) return false;
     if (grow((void**)&b.w_f, (size_t)rows * T * 4) != cudaSuccess) return false;
-    if (grow((void**)&b.acc, (size_t)rows * H * 4) != cudaSuccess) return false;
+    /* SEAM_MOE_CPP_SIDE keeps two accumulator slots (see run_piece): the reply copy of piece p
+     * reads slot p&1 while piece p+1's down gemm writes the other. One extra piece-sized buffer
+     * (rows*H*4 = 20 MiB at 1024 rows), allocated only when the flag is on. */
+    if (grow((void**)&b.acc, (size_t)rows * H * 4 * (c.side ? 2 : 1)) != cudaSuccess) return false;
     if (grow(&b.out16, (size_t)rows * H * 2) != cudaSuccess) return false;
     b.cap_rows = rows;
   }
@@ -513,6 +530,19 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
     return kRefuseMem;
   }
   Buffers& b = c.b;
+  /* SEAM_MOE_CPP_SIDE: per-piece accumulator slot. The stride is cap_rows (the largest piece ever
+   * seen), not this piece's rows, or a short last piece would put the two slots on top of each
+   * other. */
+  float* accp = c.side ? b.acc + (size_t)(piece & 1) * (size_t)b.cap_rows * H : b.acc;
+  /* Two slots mean the third piece writes the slot the first piece's copy may still be reading, and
+   * nothing orders the side stream against this one. Piece p's copy marks side_done[p&1]; piece
+   * p+2 waits for it before its first write. By then the copy has had a whole piece of gemms to
+   * finish, so the wait is a formality that makes the two-stream schedule correct rather than
+   * likely. */
+  if (c.side && c.side_done.size() == 2 && piece >= 2) {
+    if (cudaStreamWaitEvent(s, c.side_done[(size_t)(piece & 1)], 0) != cudaSuccess)
+      cudaGetLastError(); /* a lost ordering marker is a stall, not a wrong answer */
+  }
 
   /* Request slot -> device. These are the copies worker_seam_server did with numpy .copy() and
    * .to(device); the bf16->half and the routing-weight conversions are the two kernels after. */
@@ -603,14 +633,14 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
     }
     if (total[g] > total_max) total_max = total[g];
   }
-  if (bound_mode && cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+  if (bound_mode && cudaMemsetAsync(accp, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
     set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
     return kRefuseCompute;
   }
   int rc = 0;
   if (total_max <= 0) {
     /* No group has a live pick: the layer's answer for these rows is zero. */
-    if (cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+    if (cudaMemsetAsync(accp, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
       set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
       return kRefuseCompute;
     }
@@ -663,7 +693,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       const at::Tensor inter =
           dev_tensor(b.inter, {total[g], 2 * (int64_t)q.inter}, at::kHalf, c.dev);
       const at::Tensor a2 = dev_tensor(b.a2, {1, total[g], (int64_t)q.inter}, at::kHalf, c.dev);
-      const at::Tensor acc = dev_tensor(b.acc, {rows, H}, at::kFloat, c.dev);
+      const at::Tensor acc = dev_tensor(accp, {rows, H}, at::kFloat, c.dev);
 
       /* Fused: the two Hadamard transforms run inside the GEMMs that read them, so neither a13 nor
        * a2 is ever written (qmesh_moe_fused.cu). Same tile (block_m=16) and same accumulators as
@@ -683,7 +713,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       }
       try {
         if (use_fused) {
-          if (!wrote && cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+          if (!wrote && cudaMemsetAsync(accp, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
             set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
             rc = kRefuseCompute;
             break;
@@ -694,7 +724,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
           if (qmc_fused_w13(b.x_h, b.sorted, q.suh13, b.inter, q.trellis13, q.svh13, eids_g,
                             b.n_rows + g, H, 2 * q.inter, q.inter, 2, q.words13 / 16, q.cb, bm[g],
                             bs13, m_valid, T, mblocks, s) != 0 ||
-              qmc_fused_down(b.inter, b.sorted, q.suh2, b.acc, q.trellis2, q.svh2, eids_g,
+              qmc_fused_down(b.inter, b.sorted, q.suh2, accp, q.trellis2, q.svh2, eids_g,
                              b.n_rows + g, b.w_f, q.inter, H, q.words2 / 16, q.cb, bm[g], bs2,
                              m_valid, T, mblocks, s) != 0) {
             /* Both stages report 2 for a refused launch and 1 for a shape with no instantiation;
@@ -737,7 +767,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
                 total[g], bound_mode ? -1 : live[g]);
     }
     if (rc == 0 && !wrote) {
-      if (cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+      if (cudaMemsetAsync(accp, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
         set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
         return kRefuseCompute;
       }
@@ -752,15 +782,31 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
    * (off_resp's stride in qmesh_expert_seam.cu and Seam.collect in remote_seam_host.py), not
    * this file's. */
   const size_t obytes = (size_t)rows * H * (c.out_mode ? 2 : 4);
-  const void* src = b.acc;
+  /* SEAM_MOE_CPP_SIDE: the copy (and, in a half wire format, the rounding that feeds it) is
+   * enqueued on the side stream behind a marker of everything the compute stream has done for this
+   * piece, so it overlaps the next piece instead of standing on the compute stream. */
+  cudaStream_t cs = s;
+  if (c.side && c.side_stream && piece >= 0 && piece < (int)c.side_join.size()) {
+    cudaError_t je = cudaEventRecord(c.side_join[(size_t)piece], s);
+    if (je == cudaSuccess) je = cudaStreamWaitEvent(c.side_stream, c.side_join[(size_t)piece], 0);
+    if (je == cudaSuccess)
+      cs = c.side_stream;
+    else
+      cudaGetLastError(); /* a failed hand-off is a slow piece, not a wrong answer: keep it on s */
+  }
+  const void* src = accp;
   if (c.out_mode) {
-    qmc_k_f32_to_half(b.acc, b.out16, rows * H, c.out_mode, s);
+    qmc_k_f32_to_half(accp, b.out16, rows * H, c.out_mode, cs);
     src = b.out16;
   }
-  if (cudaMemcpyAsync(outp, src, obytes, cudaMemcpyDeviceToHost, s) != cudaSuccess) {
+  if (cudaMemcpyAsync(outp, src, obytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
     set_err("D2H to the response slot failed: %s", cudaGetErrorString(cudaGetLastError()));
     return kRefuseCompute;
   }
+  if (cs == c.side_stream && c.side_done.size() == 2)
+    /* The side stream has now read accumulator slot (piece&1) to the end: the piece two later waits
+     * on this before writing it. */
+    cudaEventRecord(c.side_done[(size_t)(piece & 1)], c.side_stream);
   mark(kProfWrite);
   return 0;
 }
@@ -907,6 +953,37 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
     fprintf(stderr, "SEAM_QMC_PROF_ON min_rows=%d pieces=%d per_piece=%d\n", c->prof_min_rows,
             kProfPieces, kProfPerPiece);
   }
+  /* SEAM_MOE_CPP_SIDE: take the response D2H off the compute stream and let it overlap the next
+   * piece. Off by default (the shipped path must not change without a token-identity arm); a half
+   * wire format is refused here because its rounding kernel writes the single out16 slot that a
+   * still-flying copy would be reading. */
+  c->side = env_int("SEAM_MOE_CPP_SIDE", 0) != 0;
+  if (c->side && c->out_mode) {
+    fprintf(stderr, "SEAM_MOE_CPP_SIDE ignored: SEAM_MOE_CPP_OUT=%s needs the single out16 slot\n",
+            c->out_mode == 1 ? "bf16" : "fp16");
+    c->side = false;
+  }
+  if (c->side) {
+    bool ok = cudaStreamCreateWithFlags(&c->side_stream, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaEventCreateWithFlags(&c->ev_side_done, cudaEventDisableTiming) == cudaSuccess;
+    c->side_done.assign(2, nullptr);
+    for (size_t i = 0; ok && i < c->side_done.size(); i++)
+      ok = cudaEventCreateWithFlags(&c->side_done[i], cudaEventDisableTiming) == cudaSuccess;
+    if (!ok) {
+      set_err("side stream create failed: %s", cudaGetErrorString(cudaGetLastError()));
+      for (auto& e : c->side_done)
+        if (e) cudaEventDestroy(e);
+      c->side_done.clear();
+      if (c->side_stream) cudaStreamDestroy(c->side_stream);
+      c->side_stream = nullptr;
+      if (c->ev_side_done) cudaEventDestroy(c->ev_side_done);
+      c->ev_side_done = nullptr;
+      c->side = false;
+    } else {
+      fprintf(stderr, "SEAM_MOE_CPP_SIDE_ON reply_copy_overlaps_next_piece=1 acc_slots=2\n");
+    }
+    fflush(stderr);
+  }
   *out = c;
   return 0;
 }
@@ -1007,6 +1084,20 @@ extern "C" int qmc_compute(void* ctx, int layer, int rows, const void* x_bf16, c
   cudaEventRecord(c->ev0, s);
   int rc = 0;
   const int step = pick_step(*c, rows);
+  /* SEAM_MOE_CPP_SIDE: one join event per piece of this call, so run_piece can hand the compute
+   * stream's completion to the side stream without an event ever being re-recorded under a pending
+   * wait. Grown once per shape and kept for the next call. */
+  if (c->side && step > 0) {
+    const size_t npieces = (size_t)((rows + step - 1) / step);
+    while (c->side_join.size() < npieces) {
+      cudaEvent_t e = nullptr;
+      if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+        cudaGetLastError();
+        break;
+      }
+      c->side_join.push_back(e);
+    }
+  }
   /* Bound mode leaves every bad-id flag on device until here: run_piece clears the flag on the
    * first piece (once the buffers exist) and this request's single sync, which the timing already
    * needed, carries the verdict back. */
@@ -1024,6 +1115,13 @@ extern "C" int qmc_compute(void* ctx, int layer, int rows, const void* x_bf16, c
       cudaMemcpyAsync(c->b.h_bad, c->b.bad, 4, cudaMemcpyDeviceToHost, s) != cudaSuccess) {
     set_err("id flag readback failed: %s", cudaGetErrorString(cudaGetLastError()));
     rc = kRefuseCompute;
+  }
+  /* The reply of the last piece must be in the slot before this call returns: mark the side
+   * stream's completion and make the compute stream (whose sync below is the one this call does)
+   * wait for it. Empty side stream = a no-op. */
+  if (c->side && c->side_stream) {
+    if (cudaEventRecord(c->ev_side_done, c->side_stream) == cudaSuccess)
+      cudaStreamWaitEvent(s, c->ev_side_done, 0);
   }
   cudaEventRecord(c->ev1, s);
   const cudaError_t se = cudaStreamSynchronize(s);
@@ -1179,6 +1277,16 @@ extern "C" void qmc_close(void* ctx) {
     for (auto& e : c->prof_ev)
       if (e) cudaEventDestroy(e);
     c->prof_ev.clear();
+    for (auto& e : c->side_join)
+      if (e) cudaEventDestroy(e);
+    c->side_join.clear();
+    for (auto& e : c->side_done)
+      if (e) cudaEventDestroy(e);
+    c->side_done.clear();
+    if (c->ev_side_done) cudaEventDestroy(c->ev_side_done);
+    c->ev_side_done = nullptr;
+    if (c->side_stream) cudaStreamDestroy(c->side_stream);
+    c->side_stream = nullptr;
   }
   delete c; /* Buffers' destructor frees the rest */
 }
