@@ -52,6 +52,11 @@ constexpr int QMC_MAX_EXPERTS = 384; /* the model's 384 routed experts: the per-
                                       * count/offset vectors, and the padding bound of an alignment */
 constexpr int kBlockMTiers[4] = {16, 32, 64, 128}; /* exl3_moe_cuda.BLOCK_M_TIERS */
 constexpr int kBlockMRows = 24;                   /* exl3_moe_cuda.BLOCK_M_ROWS */
+/* A bounds-only alignment may pad up to min(n_experts, m_valid) blocks, i.e. one block per pick's
+ * worth of experts. That is free while m_valid is small; at rows*topk in the thousands it would be
+ * hundreds of blocks nobody asked for, so the readback stays for those pieces (the prefill path,
+ * where the sync is 5 % of a 54 ms call and the padding would not be). */
+constexpr int kBoundMaxRows = 64;
 constexpr int kRefuseMem = 4;
 constexpr int kRefuseCompute = 5;
 
@@ -289,6 +294,7 @@ struct Ctx {
   int block_m = 0;  /* 0 = pick_block_m from the previous call's live count (see run_piece) */
   bool dump = false; /* SEAM_MOE_CPP_DUMP: mirror each group's alignment into host buffers */
   bool trace = false;
+  bool bound = false; /* SEAM_MOE_CPP_BOUND: align from the picks' bound, no per-piece readback */
   int ws_pick = -1;
   int n_groups_max = 0;
   std::mutex mu;
@@ -451,8 +457,11 @@ bool grow_trio(Ctx& c, int total_pad, int inter) {
 }
 
 /* -- one piece ---------------------------------------------------------------------------------- */
+/* `first_piece` is only about the bad-id flag: bound mode clears it once per request (here, on the
+ * first piece, after the buffers exist) and reads it once after qmc_compute's sync, so a bad id in
+ * any piece of the request still refuses the whole request. */
 int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp,
-              const uint8_t* wp, float* outp) {
+              const uint8_t* wp, float* outp, bool first_piece) {
   Layer& L = c.layers[layer];
   const int H = c.hidden, T = c.topk;
   const int m_valid = rows * T;
@@ -480,9 +489,20 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
    * percent, and the tier is coarse), or the picks bound m_valid answers the first call of a
    * bucket. Nothing here reads the counts back, so the per-group arithmetic align_block did on the
    * host - offsets, repeat_interleave, the padded row count - is all in qmc_k_align, and the only
-   * readback before the gemms is 8 bytes per group. */
-  if (cudaMemsetAsync(b.bad, 0, 4, s) != cudaSuccess ||
-      cudaMemsetAsync(b.counts, 0, (size_t)L.n_groups * QMC_MAX_EXPERTS * 4, s) != cudaSuccess) {
+   * readback before the gemms is 8 bytes per group.
+   *
+   * Bound mode (SEAM_MOE_CPP_BOUND=1, rows <= kBoundMaxRows) drops that readback: block_m comes
+   * from m_valid, the block count is bounded by min(n_experts, m_valid), and qmc_k_align marks
+   * every block past the live ones with -1. The extra blocks cost one early return each in the
+   * gemm (n_rows retires them before a byte of weights is read), so the piece is one enqueue with
+   * no host wait. What moves to the end of the request is the bad-id verdict: the histogram still
+   * flags an id outside [-1, n_cold) on device, but nothing reads the flag until qmc_compute's
+   * own sync.
+   *
+   * A dump needs this piece's exact per-group numbers, so it keeps the readback. */
+  const bool bound_mode = c.bound && !c.dump && rows <= kBoundMaxRows;
+  if (cudaMemsetAsync(b.counts, 0, (size_t)L.n_groups * QMC_MAX_EXPERTS * 4, s) != cudaSuccess ||
+      ((!bound_mode || first_piece) && cudaMemsetAsync(b.bad, 0, 4, s) != cudaSuccess)) {
     set_err("histogram clear failed: %s", cudaGetErrorString(cudaGetLastError()));
     return kRefuseCompute;
   }
@@ -492,41 +512,56 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
                b.counts + (size_t)g * QMC_MAX_EXPERTS, b.bad, s);
   }
   int bm[QMC_MAX_GROUPS] = {0};
+  int nblk_pad[QMC_MAX_GROUPS] = {0};
   for (int g = 0; g < L.n_groups; g++) {
     const qmc_group& q = L.grp[g].g;
-    const int hint = L.grp[g].last_live > 0 ? L.grp[g].last_live : m_valid;
+    const int hint =
+        bound_mode ? m_valid : (L.grp[g].last_live > 0 ? L.grp[g].last_live : m_valid);
     bm[g] = c.block_m > 0 ? c.block_m : pick_block_m(hint, q.n_experts);
-    qmc_k_align(b.counts + (size_t)g * QMC_MAX_EXPERTS, q.n_experts, bm[g],
+    nblk_pad[g] = bound_mode ? (q.n_experts < m_valid ? q.n_experts : m_valid) : 0;
+    qmc_k_align(b.counts + (size_t)g * QMC_MAX_EXPERTS, q.n_experts, bm[g], nblk_pad[g],
                 b.blk_off + (size_t)g * QMC_MAX_EXPERTS,
                 b.eids + (size_t)g * b.cap_sorted, b.nblk + g, b.live + g, s);
   }
-  if (cudaMemcpyAsync(b.h_plan, b.nblk, (size_t)L.n_groups * 4, cudaMemcpyDeviceToHost, s) !=
-          cudaSuccess ||
-      cudaMemcpyAsync(b.h_plan + L.n_groups, b.live, (size_t)L.n_groups * 4,
-                      cudaMemcpyDeviceToHost, s) != cudaSuccess ||
-      cudaMemcpyAsync(b.h_bad, b.bad, 4, cudaMemcpyDeviceToHost, s) != cudaSuccess) {
-    set_err("plan readback failed: %s", cudaGetErrorString(cudaGetLastError()));
-    return kRefuseCompute;
-  }
-  if (cudaStreamSynchronize(s) != cudaSuccess) {
-    set_err("%s", cudaGetErrorString(cudaGetLastError()));
-    return kRefuseCompute;
-  }
-  if (*b.h_bad) {
-    set_err("request rejected: an id outside [-1, n_cold) for layer %d rows %d", layer, rows);
-    return kRefuseCompute;
+  if (!bound_mode) {
+    if (cudaMemcpyAsync(b.h_plan, b.nblk, (size_t)L.n_groups * 4, cudaMemcpyDeviceToHost, s) !=
+            cudaSuccess ||
+        cudaMemcpyAsync(b.h_plan + L.n_groups, b.live, (size_t)L.n_groups * 4,
+                        cudaMemcpyDeviceToHost, s) != cudaSuccess ||
+        cudaMemcpyAsync(b.h_bad, b.bad, 4, cudaMemcpyDeviceToHost, s) != cudaSuccess) {
+      set_err("plan readback failed: %s", cudaGetErrorString(cudaGetLastError()));
+      return kRefuseCompute;
+    }
+    if (cudaStreamSynchronize(s) != cudaSuccess) {
+      set_err("%s", cudaGetErrorString(cudaGetLastError()));
+      return kRefuseCompute;
+    }
+    if (*b.h_bad) {
+      set_err("request rejected: an id outside [-1, n_cold) for layer %d rows %d", layer, rows);
+      return kRefuseCompute;
+    }
   }
 
   const at::Tensor x_h = dev_tensor(b.x_h, {rows, H}, at::kHalf, c.dev);
   const at::Tensor w_f = dev_tensor(b.w_f, {rows, T}, at::kFloat, c.dev);
-  bool wrote = false;
+  /* In bound mode the accumulator is zeroed and every group adds into it, because an empty group
+   * cannot be recognised without the readback; the gemm adds nothing when n_rows is 0. */
+  bool wrote = bound_mode;
   int total_max = 0;
   int total[QMC_MAX_GROUPS] = {0}, live[QMC_MAX_GROUPS] = {0};
   for (int g = 0; g < L.n_groups; g++) {
-    live[g] = b.h_plan[L.n_groups + g];
-    total[g] = b.h_plan[g] * bm[g];
-    L.grp[g].last_live = live[g];
+    if (bound_mode) {
+      total[g] = nblk_pad[g] * bm[g];
+    } else {
+      live[g] = b.h_plan[L.n_groups + g];
+      total[g] = b.h_plan[g] * bm[g];
+      L.grp[g].last_live = live[g];
+    }
     if (total[g] > total_max) total_max = total[g];
+  }
+  if (bound_mode && cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+    set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
+    return kRefuseCompute;
   }
   int rc = 0;
   if (total_max <= 0) {
@@ -548,7 +583,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
     }
     for (int g = 0; g < L.n_groups && rc == 0; g++) {
       const qmc_group& q = L.grp[g].g;
-      if (live[g] == 0) continue;
+      if (!bound_mode && live[g] == 0) continue;
       int32_t* blk_off_g = b.blk_off + (size_t)g * QMC_MAX_EXPERTS;
       int32_t* eids_g = b.eids + (size_t)g * b.cap_sorted;
       if (cudaMemsetAsync(b.cursor + (size_t)g * QMC_MAX_EXPERTS, 0, (size_t)q.n_experts * 4, s) !=
@@ -567,7 +602,8 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
         L.dump_total[g] = total[g];
         if (cudaMemcpyAsync(b.h_sorted + (size_t)g * b.cap_sorted, b.sorted, (size_t)total[g] * 4,
                             cudaMemcpyDeviceToHost, s) != cudaSuccess ||
-            cudaMemcpyAsync(b.h_eids + (size_t)g * b.cap_sorted, eids_g, (size_t)b.h_plan[g] * 4,
+            cudaMemcpyAsync(b.h_eids + (size_t)g * b.cap_sorted, eids_g,
+                            (size_t)(bound_mode ? nblk_pad[g] : b.h_plan[g]) * 4,
                             cudaMemcpyDeviceToHost, s) != cudaSuccess) {
           set_err("alignment dump failed: %s", cudaGetErrorString(cudaGetLastError()));
           return kRefuseCompute;
@@ -575,7 +611,8 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       }
 
       const at::Tensor sorted_t = dev_tensor(b.sorted, {total[g]}, at::kInt, c.dev);
-      const at::Tensor eids_t = dev_tensor(eids_g, {b.h_plan[g]}, at::kInt, c.dev);
+      const int n_eids = bound_mode ? nblk_pad[g] : b.h_plan[g];
+      const at::Tensor eids_t = dev_tensor(eids_g, {n_eids}, at::kInt, c.dev);
       const at::Tensor nr_t = dev_tensor(b.n_rows + g, {1}, at::kInt, c.dev);
       const at::Tensor a13 = dev_tensor(b.a13, {2, total[g], H}, at::kHalf, c.dev);
       const at::Tensor inter =
@@ -598,8 +635,11 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       }
       wrote = true;
       if (c.trace)
+        /* blk is what the gemm grid ran over. In bound mode that is the padded count, not the
+         * read-back plan, and live is -1 because this piece never learned it. */
         fprintf(stderr, "SEAM_MOE_CPP_PIECE layer=%d rows=%d g=%d E=%d bm=%d blk=%d pad=%d live=%d\n",
-                layer, rows, g, q.n_experts, bm[g], b.h_plan[g], total[g], live[g]);
+                layer, rows, g, q.n_experts, bm[g], bound_mode ? nblk_pad[g] : b.h_plan[g],
+                total[g], bound_mode ? -1 : live[g]);
     }
     if (rc == 0 && !wrote) {
       if (cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
@@ -647,6 +687,11 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
   c->block_m = env_int("SEAM_MOE_CPP_BLOCK_M", 0);
   c->dump = env_int("SEAM_MOE_CPP_DUMP", 0) != 0;
   c->trace = env_int("SEAM_MOE_CPP_TRACE", 0) != 0;
+  /* Alignment without the per-piece readback (see run_piece). Default off: on real routing it is
+   * 3.3 % slower at 1 row and 5.1 % slower at 6 rows than the 8-byte readback, because padding every
+   * group to min(n_experts, m_valid) costs more blocks than the sync saves at decode widths. On is a
+   * measurement arm. */
+  c->bound = env_int("SEAM_MOE_CPP_BOUND", 0) != 0;
   /* Response format. Default fp32: the shipped seam slot is fp32 and off_resp's stride is
    * rows*HIDDEN*4 (qmesh_expert_seam.cu, and Seam.collect in remote_seam_host.py), so anything else
    * must be a deliberate, matching change on the client side. */
@@ -770,17 +815,30 @@ extern "C" int qmc_compute(void* ctx, int layer, int rows, const void* x_bf16, c
   cudaEventRecord(c->ev0, s);
   int rc = 0;
   const int step = pick_step(*c, rows);
+  /* Bound mode leaves every bad-id flag on device until here: run_piece clears the flag on the
+   * first piece (once the buffers exist) and this request's single sync, which the timing already
+   * needed, carries the verdict back. */
+  const bool req_bound = c->bound && !c->dump && std::min(step, rows) <= kBoundMaxRows;
   for (int r0 = 0; r0 < rows && rc == 0; r0 += step) {
     const int n = std::min(step, rows - r0);
     rc = run_piece(*c, layer, n, (const uint8_t*)x_bf16 + (size_t)r0 * c->hidden * 2,
                    ids + (size_t)r0 * c->topk,
                    (const uint8_t*)w_bf16 + (size_t)r0 * c->topk * 2,
-                   out_f32 + (size_t)r0 * c->hidden);
+                   out_f32 + (size_t)r0 * c->hidden, r0 == 0);
+  }
+  if (rc == 0 && req_bound &&
+      cudaMemcpyAsync(c->b.h_bad, c->b.bad, 4, cudaMemcpyDeviceToHost, s) != cudaSuccess) {
+    set_err("id flag readback failed: %s", cudaGetErrorString(cudaGetLastError()));
+    rc = kRefuseCompute;
   }
   cudaEventRecord(c->ev1, s);
   const cudaError_t se = cudaStreamSynchronize(s);
   if (rc == 0 && se != cudaSuccess) {
     set_err("stream sync: %s", cudaGetErrorString(se));
+    rc = kRefuseCompute;
+  }
+  if (rc == 0 && req_bound && *c->b.h_bad) {
+    set_err("request rejected: an id outside [-1, n_cold) for layer %d rows %d", layer, rows);
     rc = kRefuseCompute;
   }
   float dev_ms = 0.f;

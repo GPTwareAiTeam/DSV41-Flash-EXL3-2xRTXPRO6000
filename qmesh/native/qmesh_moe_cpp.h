@@ -116,9 +116,12 @@ void qmc_k_scatter(const int32_t *ids, int npick, int n_cold, const int32_t *rem
                    int32_t *cursor, const int32_t *blk_off, int block_m, int32_t *sorted_ids,
                    int32_t *n_rows, cudaStream_t s);
 /* counts -> block offsets, per-block expert id, block count and padded row count, on device: the
- * alignment align_block() computes host-side, without the readback that made a call uncapturable. */
-void qmc_k_align(const int32_t *counts, int n_experts, int block_m, int32_t *blk_off,
-                 int32_t *eids, int32_t *nblk, int32_t *total, cudaStream_t s);
+ * alignment align_block() computes host-side, without the readback that made a call uncapturable.
+ * `nblk_pad` is the caller's bound on the block count; eids[nblk..nblk_pad) is filled with -1 (a
+ * block that belongs to no expert, which the vendored kernel retires on its first check), so a
+ * caller that must not sync can size the sorted buffer from the bound instead of the readback. */
+void qmc_k_align(const int32_t *counts, int n_experts, int block_m, int nblk_pad, int32_t *blk_off,
+                 int32_t *eids, int32_t *nblk, int32_t *live, cudaStream_t s);
 /* mode 1 = bf16, 2 = fp16, round-to-nearest-even. */
 void qmc_k_f32_to_half(const float *src, void *dst, int n, int mode, cudaStream_t s);
 

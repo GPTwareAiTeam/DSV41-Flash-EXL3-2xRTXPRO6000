@@ -88,9 +88,15 @@ __global__ void k_scatter(const int32_t *__restrict__ ids, int npick, int n_cold
 
 /* align_block()'s host loop, on device: one thread walks the expert counts in id order, so the
  * block offsets, the block -> expert map and the padded row count are identical to the Python
- * path's. n_experts <= 384 and this runs once per group per call, next to a 74 ms gemm. */
+ * path's. n_experts <= 384 and this runs once per group per call, next to a 74 ms gemm.
+ *
+ * `nblk_pad` is the caller's bound on the block count (min(n_experts, m_valid)); blocks past the
+ * live ones are marked -1, the value align_block uses for "belongs to no expert". The consumer
+ * retires them on its first check, so a caller that cannot afford the readback still gets a
+ * completely defined eids array - stale entries from an earlier block_m would select a real
+ * expert's weights and compute a block of rows nobody reads. */
 __global__ void k_align(const int32_t *__restrict__ counts, int n_experts, int block_m,
-                        int32_t *__restrict__ blk_off, int32_t *__restrict__ eids,
+                        int nblk_pad, int32_t *__restrict__ blk_off, int32_t *__restrict__ eids,
                         int32_t *__restrict__ nblk, int32_t *__restrict__ live) {
   if (threadIdx.x || blockIdx.x) return;
   int off = 0, nb = 0, lv = 0;
@@ -103,6 +109,7 @@ __global__ void k_align(const int32_t *__restrict__ counts, int n_experts, int b
     off += blocks;
     lv += cnt;
   }
+  for (int i = nb; i < nblk_pad; i++) eids[i] = -1;
   *nblk = nb;
   *live = lv;
 }
@@ -155,14 +162,16 @@ void qmc_k_scatter(const int32_t *ids, int npick, int n_cold, const int32_t *rem
                                                 block_m, sorted_ids, n_rows);
 }
 
-void qmc_k_align(const int32_t *counts, int n_experts, int block_m, int32_t *blk_off,
-                 int32_t *eids, int32_t *nblk, int32_t *total, cudaStream_t s) {
+void qmc_k_align(const int32_t *counts, int n_experts, int block_m, int nblk_pad, int32_t *blk_off,
+                 int32_t *eids, int32_t *nblk, int32_t *live, cudaStream_t s) {
   if (n_experts <= 0) {
+    /* No group has an expert, so no block is live and the padded tail covers all of eids. */
+    qmc_k_fill_i32(eids, -1, nblk_pad, s);
     qmc_k_fill_i32(nblk, 0, 1, s);
-    qmc_k_fill_i32(total, 0, 1, s);
+    qmc_k_fill_i32(live, 0, 1, s);
     return;
   }
-  k_align<<<1, 1, 0, s>>>(counts, n_experts, block_m, blk_off, eids, nblk, total);
+  k_align<<<1, 1, 0, s>>>(counts, n_experts, block_m, nblk_pad, blk_off, eids, nblk, live);
 }
 
 void qmc_k_f32_to_half(const float *src, void *dst, int n, int mode, cudaStream_t s) {
