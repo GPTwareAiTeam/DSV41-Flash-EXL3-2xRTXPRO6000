@@ -281,8 +281,13 @@ class Sequence:
         restore_limit = None
         if recurrent_cache is not None:
             recurrent_pages = []
-            # A match shorter than `prefix_cache_min_match` cannot pay for a restore: the resume point only
-            # advances to a checkpoint, so the replay still covers the rest of those pages
+            # A restore resumes at the position of the last page whose checkpoint exists, so a match that
+            # ends before `prefix_cache_min_match` tokens cannot pay for one: the replay still covers those
+            # pages. Note this compares the *resume position* to the threshold, not the length of a run of
+            # matched pages, so with the model's own checkpoint spacing (2048 for generation, 32768 for
+            # prompt ingestion on DeepSeek-V4) every checkpoint already sits at or past any threshold <=2048
+            # and the gate is inert; it bites only when checkpoints are stashed every page (256) or when a
+            # caller asks for a longer minimum than the spacing.
             min_match = getattr(getattr(pagetable, "generator", None), "prefix_cache_min_match", None) or 0
             for pi, ph in enumerate(page_hashes):
                 if (pi + 1) * PAGE_SIZE >= min_match and recurrent_cache.has(ph):

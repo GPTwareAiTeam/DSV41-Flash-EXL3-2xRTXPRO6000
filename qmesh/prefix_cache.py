@@ -15,7 +15,12 @@ server's (`qmesh/tp2/run_tp2.py`) names, with the same defaults:
 
   EXL3_PREFIX_CACHE            1 enables the pool, 0 disables it (capacity 0, no checkpoints)
   EXL3_PREFIX_CACHE_CAPACITY   pool bytes (default 4 GiB); 0 disables
-  EXL3_PREFIX_CACHE_MIN_MATCH  shortest prefix, tokens, that may restore a checkpoint (default 256)
+  EXL3_PREFIX_CACHE_MIN_MATCH  resume position, tokens, below which a checkpoint may not be restored
+                               (default 256, one page = permissive). A restore resumes at the last page
+                               whose checkpoint exists, so with the model's own 2048/32768 spacing every
+                               checkpoint already sits past a 256 threshold: the gate is inert at this
+                               default and only bites with page-granular checkpoints or a threshold
+                               longer than the spacing.
   EXL3_PREFIX_CACHE_INTERVAL   checkpoint spacing, tokens; must be a positive multiple of the page size.
                                Unset = leave the model's schedule alone (DeepSeek-V4 declares 2048 for
                                generation and 32768 for prompt ingestion, which is what this pair has
