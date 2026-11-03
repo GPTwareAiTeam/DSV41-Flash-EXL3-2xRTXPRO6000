@@ -1093,6 +1093,14 @@ check("the worker is selected by comm, not by an argv prefix",
       and "pkill -f" not in _ens
       and 'kill ${1:+$1 }' in _ens, "")
 
+# The ids shim forwards attribute writes to the wrapped generator; with two arguments it raised
+# "setattr expected 3 arguments, got 2" right after ARM_START and every ids arm died (2026-11-03, both
+# census shapes). It lived only in scripts/ -- versioned here so the installer can carry it.
+_gap = open(os.path.join(HERE, "pair_arm_ids_gap.py")).read()
+check("the ids gap shim forwards (obj, name, value)",
+      'setattr(object.__getattribute__(self, "_g"), name, value)' in _gap
+      and 'getattr(object.__getattribute__(self, "_g"), name)' in _gap, "")
+
 check("the ensure gate has its own battery",
       os.path.exists(os.path.join(HERE, "tests", "gx_gate_ensure.sh")), "")
 print("\nRESULT %s fails=%d" % ("PASS" if not fails else "FAIL", len(fails)))
