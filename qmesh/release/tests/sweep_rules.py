@@ -368,7 +368,7 @@ _pe = src("pair_build_ext.sh"); _pl = src("pair_build_lib.sh")
 # surviving lock does not fail the build, it sleeps in file_baton.wait with no compiler running.
 check("the ext build clears the baton where it imports",
       _pe.count('for lck in $rel_c/ext/exllamav3_ext/lock $MOUNT/extcache/exllamav3_ext/lock; do') == 1
-      and _pe.index('EXT_LOCK cleared=$lck') < _pe.index('EXPECT_SRC=$rel_c/src/exllamav3 timeout'), "")
+      and _pe.index('EXT_LOCK cleared=\\$lck') < _pe.index('EXPECT_SRC=$rel_c/src/exllamav3 timeout'), "")
 
 check("the compiler guard counts only live compilers",
       _pe.count("ps -eo stat=,etimes=,comm=") == 1 and _pl.count("ps -eo stat=,etimes=,comm=") == 1
