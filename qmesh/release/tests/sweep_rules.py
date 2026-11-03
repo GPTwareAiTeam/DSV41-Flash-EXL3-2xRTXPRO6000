@@ -1193,6 +1193,12 @@ check("pair_lib joins the two halves on the pack's placement sha, not on a direc
       and 'pair_ckpt_resolve()' in _lib, "")
 check("pair_ckpt_resolve refuses rather than guessing when the halves do not pair",
       'matches=$n' in _lib and 'return 1' in _lib, "")
+check("the cold half's sha is read off the mount source, not out of a running container",
+      _lib.index('PACK_MANIFEST.json') < _lib.index('docker exec $gx'), "")
+check("the hot halves resolve before the pair's client container exists",
+      "pair_p7_pool()" in _lib and 'docker inspect -f' in _lib, "")
+check("the resolver starts nothing inside the pair's container unless the host path is gone",
+      _lib.index('pool=$(pair_p7_pool "$p7")') < _lib.index('docker exec "$p7"'), "")
 for _f in ("pair_arm.sh", "pair_server.sh", "pair_smoke.sh", "pair_pack_disk.py"):
     check("no code names the hot half by hand: " + _f,
           "exl3-p7hot-4460" not in "".join(code_lines(src(_f))), "")

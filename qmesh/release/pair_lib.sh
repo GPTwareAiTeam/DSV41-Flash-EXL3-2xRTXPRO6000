@@ -160,6 +160,7 @@ pair_ct_path() {  # <host path> -> path inside the pair containers
 # 4780p8 switch (2026-11-03) is a mount change, and no script in this tree should be edited for it.
 #   pair_cold_src       <gxct>        -> host path behind that container's /cold
 #   pair_cold_placement <gxct>        -> placement_sha256 that container's pack declares
+#   pair_p7_pool        <p7ct>        -> host path any P7 container mounts at /models/dsv41
 #   pair_p7_placements  <p7ct>        -> "<sha>\t<dir>" per hot pack on the P7 side
 #   pair_ckpt_auto      <p7ct> <gxct> -> the one P7 hot half with the pack's sha ("" when not exactly one)
 #   pair_ckpt_resolve   <want|auto>   -> what to load, or a refusal on stderr
@@ -167,15 +168,51 @@ pair_cold_src() {  # <gxct> -> host path behind /cold ("" when the container has
   pair_gxsh "docker inspect -f '{{range .Mounts}}{{if eq .Destination \"/cold\"}}{{.Source}}{{end}}{{end}}' ${1:-$GXCT}" 2>/dev/null | tail -1 | tr -d '\r'
 }
 pair_cold_placement() {  # <gxct> -> placement_sha256 the pack behind /cold declares
-  pair_gxsh "docker exec ${1:-$GXCT} python3 -c 'import json;print(json.load(open(\"/cold/PACK_MANIFEST.json\")).get(\"placement_sha256\",\"\"))'" 2>/dev/null | tail -1 | tr -d '\r'
+  local gx=${1:-$GXCT} src out
+  # The manifest is a plain file on the GX host behind the mount, and `docker inspect` answers for a
+  # stopped container, so the answer does not need the container to be up -- nor to be the one whose
+  # /cold still matches any later mount change. Read the host path first, the container's view second.
+  src=$(pair_cold_src "$gx")
+  if [ -n "$src" ]; then
+    out=$(pair_gxsh "python3 -c 'import json;print(json.load(open(\"$src/PACK_MANIFEST.json\")).get(\"placement_sha256\",\"\"))'" 2>/dev/null | tail -1 | tr -d '\r')
+    [ -n "$out" ] && { echo "$out"; return 0; }
+  fi
+  pair_gxsh "docker exec $gx python3 -c 'import json;print(json.load(open(\"/cold/PACK_MANIFEST.json\")).get(\"placement_sha256\",\"\"))'" 2>/dev/null | tail -1 | tr -d '\r'
 }
-pair_p7_placements() {  # <p7ct> -> "<placement_sha256>\t<dir>" for every hot pack that declares one
-  docker exec "${1:-$P7CT}" python3 -c 'import glob, json, os
+pair_p7_pool() {  # [p7ct] -> host path any P7 container mounts at /models/dsv41 ("" when none does)
+  local ct src
+  for ct in "${1:-$P7CT}" $(docker ps -a --format '{{.Names}}' 2>/dev/null); do
+    src=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/models/dsv41"}}{{.Source}}{{end}}{{end}}' "$ct" 2>/dev/null)
+    [ -n "$src" ] && { echo "$src"; return 0; }
+  done
+  return 1
+}
+pair_p7_placements() {  # <p7ct> -> "<placement_sha256>\t<container path>" for every hot pack that declares one
+  local p7=${1:-$P7CT} pool
+  # Host first: the pool is a bind mount, so /models/dsv41/exl3-p7hot-*/PACK_MANIFEST.json is readable from
+  # this workstation and reading it starts nothing inside the pair's container (a `docker exec` there is not
+  # free: the pair's own drift check compares extension state, and a resolver must not be a reason to rebuild).
+  # The container's view is the fallback for specs whose /models/dsv41 lives only inside the container.
+  pool=$(pair_p7_pool "$p7") || {
+    docker exec "$p7" python3 -c 'import glob, json, os
 for d in sorted(glob.glob("/models/dsv41/exl3-p7hot-*")):
     try: m = json.load(open(os.path.join(d, "PACK_MANIFEST.json")))
     except Exception: continue
     sha = m.get("placement_sha256") or ""
     if sha: print(sha, d, sep="\t")' 2>/dev/null | tr -d '\r'
+    return 0
+  }
+  python3 - "$pool" <<'PY2' 2>/dev/null
+import glob, json, os, sys
+for d in sorted(glob.glob(os.path.join(sys.argv[1], "exl3-p7hot-*"))):
+    try:
+        m = json.load(open(os.path.join(d, "PACK_MANIFEST.json")))
+    except Exception:
+        continue
+    sha = m.get("placement_sha256") or ""
+    if sha:
+        print(sha, "/models/dsv41/" + os.path.basename(d), sep="\t")
+PY2
 }
 pair_ckpt_auto() {  # <p7ct> <gxct> -> P7 hot half with the pack's placement_sha256; empty if 0 or >1 match
   local p7=${1:-$P7CT} gx=${2:-$GXCT} sha hits n
