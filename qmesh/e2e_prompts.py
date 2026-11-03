@@ -50,6 +50,7 @@ import torch
 
 from exllamav3 import Cache, CacheLayer_quant, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from qmesh.prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter, resolve_max_chunk
+from qmesh import prefix_cache
 from qmesh import placement as seam_placement
 
 CHECKPOINT = os.environ.get("CHECKPOINT", "/models/dsv41/exl3-2.8535-p7hot-hc1")
@@ -189,6 +190,10 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh, max_
         row = {
             "i": idx, "label": label, "arm": spec,
             "prompt_tokens": int(ids.shape[-1]), "new_tokens": new_tokens, "max_chunk": max_chunk,
+            # Tokens of this prompt that came out of the page/recurrent cache instead of being prefilled.
+            # The prefix-cache arm reads this: a repeat of a prefix must show it near prompt_tokens and
+            # drop ttft_ms by the prefill time it saved (generator.py reports it in complete pages).
+            "cached_tokens": st.get("cached_tokens"),
             "ttft_ms": round(1000.0 * prefill_s, 1),
             "decode_ms_per_tok": round(decode_ms, 2),
             "wall_s": round(wall, 3),
@@ -201,6 +206,14 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh, max_
             "prefill_shrunk": limiter.shrunk if limiter else None,
             "text": text[:400],
         }
+        # Recurrent checkpoints a later prompt in this run can resume from (RecurrentCache is an
+        # OrderedDict; current_size is its byte accounting). An arm that matches no pages shows the pool
+        # growing with nothing restored, which is what separates "cache on" from "cache paid off".
+        rc = getattr(generator, "recurrent_cache", None)
+        if rc is not None:
+            print(f"PREFIX_CACHE_STATE arm={spec} prompt={label} checkpoints={len(rc)} "
+                  f"mib={rc.current_size // 2**20} evictions={rc.metrics.get('stash_evictions', 0)}",
+                  flush=True)
         print(json.dumps(row, ensure_ascii=False), flush=True)
         if fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -248,6 +261,10 @@ def run_arm(spec, generator, draft_model, tokenizer, prompts, long_ids, fh, max_
                  and hasattr(draft_model, "gate_summary") else None),
         "gpu0_free_gib_min": min((r["gpu0_free_gib"] for r in rows), default=None),
         "tokens": sum(r["new_tokens"] for r in rows),
+        # Prompt tokens served from the prefix cache across the arm, and the prompts that used it: the
+        # pair of numbers an A/B of EXL3_PREFIX_CACHE=1 vs 0 is read from
+        "cached_tokens": sum(r.get("cached_tokens") or 0 for r in rows),
+        "prompts_with_cache_hits": sum(1 for r in rows if (r.get("cached_tokens") or 0) > 0),
         "wall_s": round(sum(r["wall_s"] for r in rows), 2),
     }
 
@@ -297,9 +314,15 @@ def main():
     # MAX_CHUNK comes back unchanged.
     max_chunk = resolve_max_chunk(torch.device("cuda:0"), MAX_CHUNK_RAW)
     print(f"MAX_CHUNK_EFFECTIVE rows={max_chunk} raw={MAX_CHUNK_RAW}", flush=True)
+    # The recurrent-state pool is sized from EXL3_PREFIX_CACHE* (default on, which is what this driver has
+    # always run); generator_kwargs() states no checkpoint interval unless asked, so an arm with the knob
+    # unset keeps the model's own 2048/32768 schedule and stays comparable with earlier numbers.
     generator = Generator(model, cache, tokenizer, max_batch_size=1, max_chunk_size=max_chunk,
                           draft_model=draft_model, draft_cache=draft_cache,
-                          num_draft_tokens=NUM_DRAFT if want_draft else None)
+                          num_draft_tokens=NUM_DRAFT if want_draft else None,
+                          **prefix_cache.generator_kwargs())
+    prefix_cache.apply(generator)
+    print(prefix_cache.summary(), flush=True)
     if MEM_BREAKDOWN:
         # Resident VRAM by owner after load (target + drafter + caches + generator statics),
         # before any job; then the peak since this reset is reported at the end

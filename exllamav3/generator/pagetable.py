@@ -281,8 +281,11 @@ class Sequence:
         restore_limit = None
         if recurrent_cache is not None:
             recurrent_pages = []
+            # A match shorter than `prefix_cache_min_match` cannot pay for a restore: the resume point only
+            # advances to a checkpoint, so the replay still covers the rest of those pages
+            min_match = getattr(getattr(pagetable, "generator", None), "prefix_cache_min_match", None) or 0
             for pi, ph in enumerate(page_hashes):
-                if recurrent_cache.has(ph):
+                if (pi + 1) * PAGE_SIZE >= min_match and recurrent_cache.has(ph):
                     recurrent_pages.append(pi)
             # CPU-tier restores past the last checkpoint can't advance the resume point; replay prefill
             # rewrites those pages anyway
