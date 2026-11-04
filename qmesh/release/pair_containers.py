@@ -2,9 +2,18 @@
 """pair_containers.py -- keep each pair's two containers on the release layout, by construction.
 
 The containers never mount a tree that can go stale: they mount the pair root at /pair and use a
-symlink inside the container, /src/exllamav3 -> /pair/current/src, plus TORCH_EXTENSIONS_DIR=/pair/
-extcache. Flipping the host symlinks therefore changes what the *next* job runs without recreating
-anything, and a running job keeps the release it started with.
+symlink inside the container, /src/exllamav3 -> /pair/current/src. Flipping the host symlinks
+therefore changes what the *next* job runs without recreating anything, and a running job keeps the
+release it started with.
+
+TORCH_EXTENSIONS_DIR is deliberately **not** /pair/extcache by default (2026-11-04): a bare `import
+exllamav3` inside one of these containers used to land in whichever release the extcache link named,
+and torch's rebuild decision is textual in build.ninja, so an import from a *different* release's src
+rewrote that release's compiled cache -- it voided two release A/B arms and a flip smoke. The spec
+default is /pair/scratch-ext, which costs a stray import a private JIT and nothing else. The paths
+that mean the release's cache state it explicitly: pair_arm.sh, pair_server.sh and pair_build_ext.sh
+pass `TORCH_EXTENSIONS_DIR=$EXT_DIR`, pair_smoke.sh's ext probe passes /pair/extcache, and
+/pair/extcache stays the release's cache for the GX worker and for anything the pair flips to.
 
     pair_containers.py plan <pair>              # live containers vs qmesh/release/containers/<pair>-<side>.json
     pair_containers.py apply <pair> <sha> [--ts T]   # recreate what plan says is stale; keep the old one as <name>.bak-<ts>

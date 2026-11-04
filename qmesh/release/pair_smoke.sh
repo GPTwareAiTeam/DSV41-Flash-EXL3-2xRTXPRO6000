@@ -273,12 +273,18 @@ fi
 # path while the arm and the server, both run as files, use the /src one.
 ext_probe() {  # <side> <container>
   local side=$1 ct=$2 cmd
+  # The cache is stated, not inherited. Until 2026-11-04 the container spec carried
+  # TORCH_EXTENSIONS_DIR=/pair/extcache as its default, so every ad-hoc `import exllamav3` inside
+  # seam-p7-dev/gx2-dev silently targeted whichever release the extcache link happened to name -- and
+  # because torch's rebuild decision is textual in build.ninja, a stray import from another release's
+  # src rewrote that release's cache and voided two A/B arms (20:12) plus a flip smoke. The spec now
+  # defaults to /pair/scratch-ext; anything that means the *release's* cache has to say so.
   cmd='cd /tmp && timeout -k 5 ${SMOKE_EXT_PROBE_S:-60} \
 python3 -c "import exllamav3.ext as e; print(\"SMOKE_EXT_HIT\", e.exllamav3_ext.__file__)"'
   if [ "$side" = p7 ]; then
-    docker exec "$ct" sh -c "$cmd" 2>&1
+    docker exec -e TORCH_EXTENSIONS_DIR=/pair/extcache "$ct" sh -c "$cmd" 2>&1
   else
-    pair_gxsh "docker exec $ct sh -c '$cmd'" 2>&1
+    pair_gxsh "docker exec -e TORCH_EXTENSIONS_DIR=/pair/extcache $ct sh -c '$cmd'" 2>&1
   fi
 }
 for _s in p7 gx; do

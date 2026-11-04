@@ -500,8 +500,19 @@ seam_server_ensure() {
   # and nothing else sets it. A script that launches the worker directly bypasses the gate check and
   # the preflight (2026-11-02: three such scripts started workers around a held gate), so the marker
   # makes that failure immediate and on the box instead of a pack loaded onto somebody else's claim.
-  local denv="-e SEAM_GATE_OK=1 "
-  for kv in $SEAM_ENV; do denv="$denv-e $kv "; done
+  # The worker's own extension cache must be *stated*, never inherited. The containers' default became
+  # /pair/scratch-ext on 2026-11-04 (containers/*.json), which is where an experiment tree's JIT
+  # belongs; the shipped tree must not fall into it. Measured the first time it did: the 02:03Z dev
+  # smoke started a release worker with no TORCH_EXTENSIONS_DIR here, it JIT'ed exllamav3 into
+  # /pair/scratch-ext, that nvcc run took MemAvailable from 120052 to 116596 MiB, and the load's own
+  # check then refused -- SEAM_NO_MEMORY need=116220+2048 avail=116596. Serving the release tree gets
+  # the release cache; any other tree keeps the container default on purpose (scratch is for that).
+  local wext=""
+  case "$(seam_gxsh "docker exec $CT readlink -f /src/exllamav3" 2>/dev/null | tr -d '\r')" in
+    /pair/releases/*/src|/pair/current/src) wext="-e TORCH_EXTENSIONS_DIR=/pair/extcache" ;;
+  esac
+  local denv="-e SEAM_GATE_OK=1 $wext"
+  for kv in $SEAM_ENV; do denv="$denv -e $kv"; done
   seam_gxsh "docker exec -d $denv$CT bash -lc 'cd /src/exllamav3 && stdbuf -oL -e0 python3 -u qmesh/worker_seam_server.py $args $SEAM_EXTRA > $SEAM_LOG 2>&1'" || return 2
   local i
   for i in $(seq 1 $((SEAM_SERVER_TIMEOUT / 2))); do

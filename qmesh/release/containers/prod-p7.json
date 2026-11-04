@@ -14,7 +14,7 @@
     "CUDA_HOME": "/opt/cuda",
     "TORCH_CUDA_ARCH_LIST": "12.0",
     "PYTHONPATH": "/src/exllamav3",
-    "TORCH_EXTENSIONS_DIR": "/pair/extcache",
+    "TORCH_EXTENSIONS_DIR": "/pair/scratch-ext",
     "LD_LIBRARY_PATH": "/opt/cuda/lib64:/usr/lib/x86_64-linux-gnu",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     "CUDA_VISIBLE_DEVICES": "0",

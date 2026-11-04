@@ -358,7 +358,17 @@ def check_side(manifest, side, ref, quiet, skip_ct=False, skip_srv=False):
         if csrc not in (f"/pair/releases/{sha}/src", "/pair/current/src"):
             problems.append(f"container_src={csrc or '-'} want=/pair/releases/{sha[:8]}/src")
         env = state.get("CT_ENV") or ""
-        for want_kv in ("TORCH_EXTENSIONS_DIR=/pair/extcache", "PYTHONPATH=/src/exllamav3",
+        # The spec's default is /pair/scratch-ext since 2026-11-04 (see pair_containers.py's
+        # docstring): the release's cache is stated by the arm, the server and the build, never
+        # inherited. What still has to hold is that the value is a path this pair owns -- an inherited
+        # /home/... spelling would put a JIT under the container's $HOME and lose it on recreate.
+        tex = ""
+        for kv in env.split():
+            if kv.startswith("TORCH_EXTENSIONS_DIR="):
+                tex = kv.split("=", 1)[1]
+        if tex not in ("/pair/scratch-ext", "/pair/extcache"):
+            problems.append(f"container_torch_extensions_dir={tex or '-'} want=/pair/scratch-ext")
+        for want_kv in ("PYTHONPATH=/src/exllamav3",
                         f"TORCH_CUDA_ARCH_LIST={manifest[side]['cuda_arch']}"):
             if want_kv not in env:
                 problems.append(f"container_env_missing={want_kv}")

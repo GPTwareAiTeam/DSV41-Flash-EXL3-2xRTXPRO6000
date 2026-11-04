@@ -85,6 +85,23 @@ build_side() {
     || { pair_step "EXT_SKIP $side $ct not_running"; return 1; }
   [ -z "$(side_docker "$side" exec "$ct" pgrep -f worker_seam_server.py 2>/dev/null)" ] \
     || { pair_step "EXT_REFUSE $side server_running_in=$ct"; return 1; }
+  # A warm cache is not proof that *this* release built it. build mode used to re-probe whatever .so
+  # was in $rel_c/ext and stamp it, so an .so that some other release's sources had produced could be
+  # published as this one's (2026-11-04 01:00Z, in the cache that then had to be deleted and rebuilt).
+  # The stamp inside the cache is the only self-description it has: if it exists and names another
+  # commit, the cache belongs to that commit -- refuse, say how to clear it, and stamp nothing.
+  local prev prev_sha
+  if [ "$side" = p7 ]; then prev=$(cat "$REL/ext/BUILD_STAMP.json" 2>/dev/null)
+  else prev=$(pair_gxsh "cat '$REL/ext/BUILD_STAMP.json'" 2>/dev/null); fi
+  if [ -n "$prev" ]; then
+    prev_sha=$(printf '%s' "$prev" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("source_sha",""))
+except Exception: print("")' 2>/dev/null)
+    if [ "$prev_sha" != "$SHA" ]; then
+      pair_step "EXT_REFUSE_STAMPED_OTHER $side cache=$rel_c/ext stamp_source_sha=${prev_sha:0:12} want=${SHA:0:12} (the cache in this release's ext dir was blessed for another commit; nothing stamped -- rm -rf the cache inside $ct and re-run the build)"
+      return 1
+    fi
+  fi
   # Count only compilers young enough to still be working: exl3-tp2-moe has kept 223 nvcc and 126
   # cc1plus alive for days, and waiting on those dead ones would block every build forever.
   local builds ignored stale=${PAIR_BUILD_STALE_SECS:-1800}
@@ -259,6 +276,31 @@ EXPECT_SRC=$rel_c/src/exllamav3 timeout $EXT_TIMEOUT python3 -u /tmp/pair_ext_pr
     ndry=$(ninja_plan)
   done
   [ -z "$ndry" ] || { pair_step "EXT_NINJA_UNSTABLE $side would_run=$ndry"; return 1; }
+  # A cache can converge and still hold the wrong build's plan. 2026-11-04 01:00Z: a contract test
+  # imported 3593531b's src with TORCH_EXTENSIONS_DIR pointing at 35bfaecb's cache; torch's rebuild
+  # decision is textual in build.ninja, so it wrote `-I/pair/releases/3593531b.../src` into that cache
+  # and started 132 nvcc units. The build "succeeded", and the client probe below still hit, because
+  # the spelling it asks for (/src/exllamav3) was at the front of the same include list. So before
+  # stamping, look for a *foreign* release include: clients never spell the cache this way.
+  # This release's own spelling is allowed: the `EXT_LINK missing` branch above builds from
+  # $rel_c/src on purpose, and such a cache carries `-I/pair/releases/$SHA/src/...` legitimately
+  # (checked on the a16465e4 caches: both sides carry `-I/src/exllamav3/...` and zero release paths).
+  # Only an include naming *another* commit is evidence that a client pointed this cache at foreign
+  # sources.
+  local inc foreign=""
+  inc=$(side_docker "$side" exec "$ct" \
+    sh -c "grep -o -- '-I/pair/releases/[0-9a-f]*/src' $rel_c/ext/exllamav3_ext/build.ninja 2>/dev/null | sort -u" 2>/dev/null)
+  for p in $inc; do
+    case "$p" in
+      "-I/pair/releases/$SHA/src"|"-I/pair/releases/${SHA:0:12}/src") ;;
+      *) foreign="$foreign $p" ;;
+    esac
+  done
+  if [ -n "${foreign// /}" ]; then
+    side_docker "$side" exec "$ct" sh -c "rm -rf $rel_c/ext/exllamav3_ext" >/dev/null 2>&1
+    pair_step "EXT_WIPE_HYBRID $side cache=$rel_c/ext/exllamav3_ext foreign_include=$foreign (a client imported another release's src into this cache; wiped, nothing stamped, re-run the build)"
+    return 1
+  fi
   # One stamp per release per side, and on GX it carries the kernel too: a release whose cuda-exl3 was
   # not built looks identical otherwise (the .so is gitignored), and the smoke would be the first place
   # that noticed -- as a slow server instead of a missing build.

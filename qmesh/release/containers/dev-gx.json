@@ -6,13 +6,13 @@
   "cmd": ["infinity"],
   "mounts": [
     ["__PAIR_ROOT__", "/pair"],
-    ["/home/treadall/exl3-cold-pack-4780p8", "/cold"]
+    ["/home/treadall/exl3-cold-pack-4460", "/cold"]
   ],
   "env": {
     "CUDA_HOME": "/usr/local/cuda",
     "TORCH_CUDA_ARCH_LIST": "12.1",
     "PYTHONPATH": "/src/exllamav3",
-    "TORCH_EXTENSIONS_DIR": "/pair/extcache",
+    "TORCH_EXTENSIONS_DIR": "/pair/scratch-ext",
     "LD_LIBRARY_PATH": "/usr/local/cuda/lib64",
     "LIBRARY_PATH": "/usr/local/cuda/lib64/stubs",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
