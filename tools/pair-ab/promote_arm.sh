@@ -78,6 +78,9 @@ trap on_exit EXIT
 SHA=$(git -C "$PAIR_REPO" rev-parse --verify "$SHA_ARG^{commit}" 2>/dev/null) \
   || { step "FAIL tag=$TAG no such commit: $SHA_ARG"; exit 2; }
 step "ARM_START tag=$TAG sha=${SHA:0:12} host_load=$(host_load) p7=$(p7_clocks) gx=$(gx_state)"
+# The stamp the archive fallback compares against: an archive written before this arm started belongs
+# to someone else's load and must never be quoted as this one's fused coverage.
+mkdir -p "$OUT"; touch "$OUT/arm_start_$TAG.stamp"
 
 # ---- 0. prepare (out of band, idempotent) --------------------------------------------------------
 if [ "${PROMOTE_PREPARE:-0}" = 1 ]; then
@@ -222,25 +225,31 @@ step "RATE_END tag=$TAG rc=$rate_rc host_load=$(host_load) p7=$(p7_clocks) gx=$(
 # separates "gate refused the shape" (knob=1 fused=0) from "the env never arrived" (knob=0). A build
 # with no counter at all prints nothing here -- the ref arm predates the knob, so its absence is
 # expected and is itself proof the two arms run different code.
-fused_seen=0
-for l in $(ls -t "$PAIR_STATE_DIR"/logs/server---*.log 2>/dev/null | head -2); do
-  n=$(grep -cE 'SEAM_MOE_CPP_FUSED_STATS' "$l" 2>/dev/null || true)
-  [ "${n:-0}" -gt 0 ] || continue
-  fused_seen=1
-  step "FUSED_SRC tag=$TAG src=$(basename "$l") lines=$n"
-  grep -hE 'SEAM_MOE_CPP_FUSED_STATS' "$l" | tail -2 | sed "s/^/FUSED_DETAIL tag=$TAG /" | cut -c1-300
-done
-if [ "$TAG" = cand ] && [ "$fused_seen" = 0 ]; then
-  # The counter is written by the worker, not by the ticket, so the release-side archive can be stale or
-  # absent while the worker is still the one that matters. Ask the worker directly before concluding the
-  # line is missing: the worker for *this* server is still up at this point (cleanup runs at the end), so
-  # /tmp/seam_server.log inside the GX container is this load's stderr and nothing else.
-  live=$(pair_gxsh "docker exec $GXCT sh -c 'grep -h SEAM_MOE_CPP_FUSED_STATS /tmp/seam_server.log 2>/dev/null | tail -3'" 2>/dev/null)
-  if [ -n "$live" ]; then
-    step "FUSED_SRC tag=$TAG src=gx:/tmp/seam_server.log lines=$(printf '%s\n' "$live" | grep -c SEAM_MOE_CPP_FUSED_STATS)"
-    printf '%s\n' "$live" | grep -hE 'SEAM_MOE_CPP_FUSED_STATS' | tail -2 \
-      | sed "s/^/FUSED_DETAIL tag=$TAG src=worker-stderr /" | cut -c1-300
-  fi
+# Ask the worker first, and believe nothing else. The counter is written by the worker's stderr, and
+# the worker for *this* server is still up here (cleanup runs at the end), so /tmp/seam_server.log
+# inside the GX container is this load's stderr: it is truncated on every worker start, which is what
+# makes it this arm's and no one else's. The release-side archives are only a fallback, and only when
+# they are newer than this arm's own start -- without that test the reader picked up a stale
+# server---*.log from an earlier lane and printed its fused_pct=100.0 as this arm's evidence (ticket
+# 3312781, both arms, while the ref build could not print the line at all).
+fused_src=worker-stderr
+live=$(pair_gxsh "docker exec $GXCT sh -c 'grep -h SEAM_MOE_CPP_FUSED_STATS /tmp/seam_server.log 2>/dev/null | tail -3'" 2>/dev/null)
+nlive=$(printf '%s\n' "$live" | grep -cE 'SEAM_MOE_CPP_FUSED_STATS' || true)
+if [ "${nlive:-0}" -gt 0 ]; then
+  step "FUSED_SRC tag=$TAG src=gx:/tmp/seam_server.log lines=$nlive"
+  printf '%s\n' "$live" | grep -hE 'SEAM_MOE_CPP_FUSED_STATS' | tail -2 \
+    | sed "s/^/FUSED_DETAIL tag=$TAG src=worker-stderr /" | cut -c1-300
+else
+  fused_seen=0
+  for l in $(ls -t "$PAIR_STATE_DIR"/logs/server---*.log 2>/dev/null | head -4); do
+    [ "$l" -nt "$OUT/arm_start_$TAG.stamp" ] || continue
+    n=$(grep -cE 'SEAM_MOE_CPP_FUSED_STATS' "$l" 2>/dev/null || true)
+    [ "${n:-0}" -gt 0 ] || continue
+    fused_seen=1
+    step "FUSED_SRC tag=$TAG src=$(basename "$l") lines=$n"
+    grep -hE 'SEAM_MOE_CPP_FUSED_STATS' "$l" | tail -2 | sed "s/^/FUSED_DETAIL tag=$TAG /" | cut -c1-300
+  done
+  [ "$fused_seen" = 1 ] || step "FUSED_SRC tag=$TAG none (worker stderr empty, no archive newer than this arm)"
 fi
 
 # ---- 4. quality: wiki2 quick8 against the ship reference ----------------------------------------
