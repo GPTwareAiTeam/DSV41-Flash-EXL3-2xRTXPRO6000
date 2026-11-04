@@ -140,12 +140,19 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   # third piece's first write after the first piece's copy, and ev_side_done joins the side stream
   # back onto the compute stream before the call's single sync -- so the slot is complete when the
   # call returns. Same bytes, same buffer, same slot; only the stream carrying the copy changes, and
-  # the profile arm reported gen_ids MATCH. Refused with SEAM_MOE_CPP_OUT=bf16|fp16 (one out16 slot a
-  # flying copy would be reading), which this pair does not set. Device evidence: write 3.527 ->
+  # the profile arm reported gen_ids MATCH. With SEAM_MOE_CPP_OUT=bf16|fp16 there is one out16 slot a
+  # flying copy would be reading, so the code prints `SEAM_MOE_CPP_SIDE ignored: ...` and runs
+  # single-stream -- it does not refuse the call (an earlier version of this comment said "refused").
+  # This pair does not set SEAM_MOE_CPP_OUT. Device evidence: write 3.527 ->
   # 0.010 ms/layer, dev 117.176 -> 113.359 ms/layer (-3.26 %) at 1024-row pieces; the rate jump in
-  # that ticket is not attributable (page-in on the first arm). MOE_SIDE=0 restores the single-stream
-  # copy for an A/B.
-  MOE_SIDE=${MOE_SIDE:-1}
+  # that ticket is not attributable (page-in on the first arm).
+  # DEFAULT 0 from 2026-11-04, not 1: the merged side path stalled a 32k prefill on 0df75a38 at
+  # `qes_issue layer=11 rows=8192 ... every slot is still unacknowledged after 30 s` (first prefill of
+  # the same build passed, so it is a race in the side code and not a size limit). SIDE is parked until
+  # that is understood, so every pair -- prod included -- runs the single-stream copy unless a ticket
+  # asks for MOE_SIDE=1 explicitly. This is also why the shipped candidate is f9d57851, whose tree has
+  # no SIDE code at all.
+  MOE_SIDE=${MOE_SIDE:-0}
   MOE_CPP=${MOE_CPP:-1}
   MOE_FUSED=${MOE_FUSED:-1}
   SRV_ENV_EXTRA=${PAIR_SRV_EXTRA_ENVS:-}
