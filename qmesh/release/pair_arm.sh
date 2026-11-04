@@ -114,6 +114,10 @@ envs=(
   # prefill (measured, see the constant in pair_lib.sh). The server half is aarch64 and runs no
   # Triton kernels, so this is the client's alone; it costs the worker nothing to carry it.
   -e "TRITON_CACHE_DIR=$PAIR_TRITON_CACHE"
+  # torch's NVRTC kernel cache, same carrier rule again (see PAIR_TORCH_HOME in pair_lib.sh): unset,
+  # the cubin is compiled into the container's own /root/.cache/torch and thrown away with it.
+  # The server half runs no torch, so this is the client's.
+  -e "TORCH_HOME=$PAIR_TORCH_HOME"
   # pairs.conf's `gpu` is a *host* index: the container spec spends it on --gpus device=<gpu>, so
   # inside the container that one card is device 0 again. Passing the host index here asked dev's
   # container (which had every GPU) for GPU 1 and asked a scoped one for a GPU it cannot see.

@@ -40,6 +40,28 @@ PAIR_SRC_LINK=${PAIR_SRC_LINK:-/src/exllamav3}  # container symlink -> /pair/cur
 # the one persisted vendor tuner (mla_decode.cu, CUDA_EXL3_TUNE_CACHE) is MLA attention, which this
 # pair never calls: the worker runs only the exl3_moe_* ops and P7's attention is Triton.
 PAIR_TUNE_CACHE=${PAIR_TUNE_CACHE:-$PAIR_MOUNT/tunecache/coop_autotune_v1.bin}
+# Triton's JIT cache is the *other* thing that dies with the client container, and on this pair it is
+# the expensive one: the first prefill arm after a `docker run` spends 10-13 s compiling the attention
+# kernels it is about to launch (measured 2026-11-03: four identical 32k arms in one container, arm 1
+# 41.00 s / 799 tok/s with no /root/.triton, arms 2-4 30.1-30.6 s / 1071-1088 tok/s with it, and
+# wiping the EXLLAMAV3_TUNE_CACHE file instead changed nothing at all). Triton 3.8 resolves its cache
+# from $TRITON_CACHE_DIR (knobs.cache.dir, /root/.triton/cache by default), so one exec-level variable
+# pins it; no container recreate is needed. The key is a content hash of the kernel source, the
+# specialisation constants, the backend and the arch -- every cache directory's name is that hash and
+# carries a json with it (verified on 81 directories of this pair's own cache) -- so a release whose
+# kernels changed misses and recompiles instead of reading a stale cubin, and sharing one directory
+# across releases is safe. Same shape as PAIR_TUNE_CACHE above: a container path, on the pair's root.
+PAIR_TRITON_CACHE=${PAIR_TRITON_CACHE:-$PAIR_MOUNT/tritoncache}
+# The third cache a fresh container loses, and the one that turned out to matter most: torch's NVRTC
+# kernel cache. `torch.cuda.jiterator` compiles one cubin per elementwise kernel on first call and
+# writes it to `$(dirname torch.hub.get_dir())/kernels` -- /root/.cache/torch/kernels by default --
+# and until it is there the first prefill arm of a container pays for it. Ablated 2026-11-03: same
+# ticket, same arms, Triton and the autotune file pinned in both; seeding only this cubin moved the
+# first arm from 42.56 s / 769.9 tok/s to 34.32 s / 954.8 tok/s against a second arm at 28.3-29.6 s.
+# TORCH_HOME moves the whole tree (verified in the pair's image: TORCH_HOME=/pair/torchhome gives
+# hub=/pair/torchhome/hub and kernels=/pair/torchhome/kernels), so one variable pins it. Exec-level,
+# like the two above; no container recreate.
+PAIR_TORCH_HOME=${PAIR_TORCH_HOME:-$PAIR_MOUNT/torchhome}
 PAIR_LIB=libqmesh_expert_seam                   # qmesh/native/bin/<this>.<arch>.so
 PAIR_CPP_LIB=libqmesh_moe_cpp                    # the C moe hook: same bin/, same stamp rule
 PAIR_SEAM_FILES=(qmesh/native/qmesh_expert_seam.cu qmesh/native/qmesh_expert_seam.h qmesh/native/qes.py)
