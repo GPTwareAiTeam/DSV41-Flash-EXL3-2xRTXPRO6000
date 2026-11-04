@@ -219,3 +219,18 @@ The canary enforces both observables: `SMOKE_WARM_PREFILL lines=4` from the work
 `warm_prefill_missing`; `SMOKE_WARM_OPTIONAL=1` for a release that ships the warm-up off) and a second
 identical 32k arm whose rate must be within `SMOKE_PREFILL_RATIO_MAX` (1.05) of the first (fail
 `prefill_first_arm_penalty`; `SMOKE_PREFILL_ARMS=1` skips it).
+
+**The slot header is data, not a staged line.** `qes_issue` used to build one pinned host header line
+per layer and `cudaMemcpyAsync` it into the seam slot. Under graph capture that copy becomes a memcpy
+node whose *source is host memory*, so a replay carries whatever the last capture of that layer left in
+the line — and a layer's decode rows all share it. A replay of a narrower graph then advertised the
+wider capture's `rows`: `client_check_ids` range-checked rows the request never wrote, refused a valid
+request, and the refusal fail-stopped the next block. GraphsPort saw it first on `gp-ab12 g0_a`
+(`rows=5 … 2 of 30 pick(s) outside [-1,251), first at 18`, row 3 of a 3-row request) and on
+`gp-ab10d graphs_a/b` the same way with a 4-row one; 600 requests had passed before it because the
+warm-up ramp walks widths in capture order and every replay matched its own width until the last
+capture of a layer. The header is now written from a device kernel (`ea8b70fb`, cherry-picked here),
+which is correct regardless of graphs: with `EXL3_WHOLE_GRAPH=1` the gate reports `IDENTITY_OK` on
+both the `ev` and fixed arms, 2048/2048 tokens, no `NOT SENT`, no `is dead`. Graphs stay **off** in the
+shipped defaults: with the drafter on, DET-on graphs were worth −0.6…−1.7 % per token, not the −17.6 %
+that motivated them, and the DET-off pair that would decide the default is a separate measurement.
