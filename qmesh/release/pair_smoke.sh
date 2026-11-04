@@ -77,8 +77,13 @@ SMOKE_SLAB_SLOTS=${SMOKE_SLAB_SLOTS:-1}
 # growth is expected (356 MiB at ws 256, 734 at ws 1024) and is printed and warned, never refused.
 # One absolute level survives -- a second tenant's pack -- at SMOKE_WSWAP_MAX, and a reading whose
 # avail_mib says it cannot be post-residency (> SMOKE_WSWAP_JUDGE_MIN) is printed but not judged.
+# GROW_MAX is 512, not 128 (supervisor 2026-11-04, authorised 11-03): a decode window on GX2 walks
+# 110-264 MiB out of the worker routinely with nothing wrong -- measured 165 MiB on the 0df75a38
+# candidate's own canary, on the same box that passed 128 earlier that morning -- so 128 refuses
+# honest arms and it was the only failure of the f9d57851 canary. 512 still separates that noise from
+# a real leak, and SMOKE_WSWAP_MAX=2048 still refuses another tenant's pack outright.
 SMOKE_WSWAP_MAX=${SMOKE_WSWAP_MAX:-2048}
-SMOKE_WSWAP_GROW_MAX=${SMOKE_WSWAP_GROW_MAX:-128}
+SMOKE_WSWAP_GROW_MAX=${SMOKE_WSWAP_GROW_MAX:-512}
 SMOKE_WSWAP_JUDGE_MIN=${SMOKE_WSWAP_JUDGE_MIN:-2000}
 # The grant the smoke server is given: the pair's own list (pairs.conf). Workspace for a bucket nobody
 # asks for still comes out of the box (242 MiB slab at 8192 rows), so the smoke grants exactly what
