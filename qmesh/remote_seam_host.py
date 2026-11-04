@@ -45,6 +45,10 @@ _PROF_MAX_ROWS = int(os.environ.get("EXL3_SEAM_PROF_ROWS", "6"))
 # Per-request stage trace: layer, bucket, cold count, stream and source pointers, printed host-side
 # only so it cannot change the ordering it is meant to observe.
 _ID_TRACE = os.environ.get("SEAM_ID_TRACE", "0") == "1"
+# EXL3_SEAM_PAD_TRACE=1 prints the first request per bucket whose pad rows are *not* rewritten, and
+# every request that does rewrite them (see _stage): the knob decides nothing, it is the proof that
+# the branch is taken where the note says it is.
+_PAD_TRACE = os.environ.get("EXL3_SEAM_PAD_TRACE", "0") == "1"
 # SEAM_OVERLAP=1 issues a layer's cold-expert request and returns immediately, so the caller's own
 # GPU experts (block_sparse_mlp.py:1194 submits, :1519 combines) run while the GX computes the cold
 # share; 0 waits for the reply inside submit_issue, which is what the transport did before, so the
@@ -222,6 +226,11 @@ class RemoteSeamHost:
         # only device buffers qes_issue reads, and they are never freed, so the copies it enqueues
         # can never race an allocation that reuses the same block.
         self._stage_bufs = {}
+        # Per-(device, bucket) row count of the last request staged into that bucket: the pad rows
+        # past `n` are already id -1 / weight 0 unless this request is narrower than the last one,
+        # and only then do they need rewriting (see _stage).
+        self._stage_rows = {}
+        self._pad_printed = set()     # EXL3_SEAM_PAD_TRACE only: buckets that have reported a skip
         # SEAM_ID_TRACE only: per-bucket (pre, caller, staged, event, layer, rows) of the last
         # request staged into that bucket, printed one request late (see _trace_ids).
         self._trace_prev = {}
@@ -312,8 +321,9 @@ class RemoteSeamHost:
 
         One staging set per bucket, reused across requests, is safe because the copies are
         stream-ordered: a later request's staging write runs after the earlier request's copy,
-        however the slots overlap. Pad rows are reset to id -1 / weight 0 so they contribute exactly
-        zero and no stale id can reach the client's range check."""
+        however the slots overlap. The buffers are born with pad rows at id -1 / weight 0, and the
+        only way a stale id can sit past `n` is a request narrower than the one before it in the same
+        bucket, so only that case rewrites them (see below)."""
         n = x.shape[0]
         dev = x.device
         bucket = next(b for b in self.buckets if b >= n)
@@ -330,9 +340,21 @@ class RemoteSeamHost:
         xp[:n] = x
         idp[:n] = ids
         wp[:n] = w
-        if n < bucket:
+        # The wire carries hdr->rows and the client's range check scans hdr->rows * TOPK ids, so the
+        # pad rows of a bucket never reach the peer. They only have to stay id -1 / weight 0 for a
+        # local reader, and rows past `n` are still cleared from the last time this bucket was
+        # wider, so rewriting them every request is two host calls that the decode steady state --
+        # one fixed row count per round, well under the bucket -- pays 40x per round for nothing.
+        last = self._stage_rows.get(key, 0)
+        self._stage_rows[key] = n
+        if n < bucket and n < last:
+            if _PAD_TRACE:
+                print(f"SEAM_STAGE_PAD bucket={bucket} n={n} last={last} action=clear", flush = True)
             idp[n:].fill_(-1)
             wp[n:].zero_()
+        elif n < bucket and last and _PAD_TRACE and key not in self._pad_printed:
+            self._pad_printed.add(key)
+            print(f"SEAM_STAGE_PAD bucket={bucket} n={n} last={last} action=skip", flush = True)
         if trace:
             self._trace_ids(layer_idx, dev, key, ids, idp, n, pre)
         return bucket, xp, idp, wp
