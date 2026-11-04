@@ -109,6 +109,11 @@ envs=(
   # EXLLAMAV3_TUNE_CACHE resolves under $HOME *inside* the container, so the picks die with it (see
   # the constant in pair_lib.sh). A container path, like the two above, not a host one.
   -e "EXLLAMAV3_TUNE_CACHE=$PAIR_TUNE_CACHE"
+  # The client's Triton JIT cache, pinned the same way and for the same reason: unset, it resolves
+  # under $HOME inside the container and every `docker run` pays 10-13 s of ptxas+nvcc in the first
+  # prefill (measured, see the constant in pair_lib.sh). The server half is aarch64 and runs no
+  # Triton kernels, so this is the client's alone; it costs the worker nothing to carry it.
+  -e "TRITON_CACHE_DIR=$PAIR_TRITON_CACHE"
   # pairs.conf's `gpu` is a *host* index: the container spec spends it on --gpus device=<gpu>, so
   # inside the container that one card is device 0 again. Passing the host index here asked dev's
   # container (which had every GPU) for GPU 1 and asked a scoped one for a GPU it cannot see.
@@ -168,5 +173,27 @@ if [ "$PAIR_DRY" = 1 ]; then
   echo "DRY docker exec ${envs[*]} $P7CT bash -lc 'cd $SRC && timeout $ARM_TIMEOUT python3 -u ${drv:-qmesh/e2e_prompts.py}'"
   exit 0
 fi
+CACHE_PROBE="e=$EXT_DIR/exllamav3_ext; stat -c '%Y %s' \"\$e/build.ninja\" \"\$e/exllamav3_ext.so\" 2>/dev/null | tr '\\n' '/'"
+ext_fp_before=$(docker exec "$P7CT" sh -c "$CACHE_PROBE" 2>/dev/null)
+
 timeout "$ARM_TIMEOUT" docker exec "${envs[@]}" "$P7CT" \
   bash -lc "cd $SRC && python3 -u ${drv:-qmesh/e2e_prompts.py}"
+
+# A client must never build into the cache it was pointed at, and the release cache least of all: on
+# 2026-11-03 18:50:56 some client inside seam-p7-dev regenerated build.ninja in the release cache
+# (/pair/extcache/exllamav3_ext) and recompiled 200 units for 5 minutes, which replaced the stamped
+# exllamav3_ext.so and left `pair_check dev` reading DRIFT ext_so=3ef6ed68 want=3e2d504a for 35 minutes
+# -- every serve on the pair refused, and nobody knew which client did it. torch decides to rebuild
+# quietly, so the arm has to look: fingerprint the cache before and after the client, and refuse the
+# numbers when it moved. A hit costs two stats; a miss is the one event this whole script exists to
+# name (and an arm that rebuilt 5 minutes of kernels cannot have measured the release's warm path
+# anyway). The tag printed here is the only handle back to the invocation.
+client_rc=$?
+ext_fp_after=$(docker exec "$P7CT" sh -c "$CACHE_PROBE" 2>/dev/null)
+if [ -n "$ext_fp_before" ] && [ "$ext_fp_before" != "$ext_fp_after" ]; then
+  echo "ARM_EXT_WRITE_REFUSED src=$SRC extcache=$EXT_DIR before=$ext_fp_before after=$ext_fp_after"
+  echo "ARM_EXT_WRITE_REFUSED numbers_void=1 why=the client rebuilt its own extension cache inside the arm"
+  [ "$EXT_DIR" = /pair/extcache ] && echo "ARM_EXT_WRITE_REFUSED release_cache=1 next=scripts/pair_check.sh $PAIR then scripts/pair_prepare.sh $PAIR <sha> --side p7"
+  exit 13
+fi
+exit "$client_rc"

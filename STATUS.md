@@ -178,3 +178,25 @@ Swap optimisation is deliberately deferred.
 
 Quality rule unchanged: a lossy change must land inside wiki2 quick-8 ppl 2.0391 ± 0.005, measured on the
 same pack and `KV_BITS=4`; lossless changes are gated on token identity instead.
+
+**A client may not build into the cache it was pointed at, and the release cache least of all.** On
+2026-11-03 18:50:56 local a client inside `seam-p7-dev` regenerated `build.ninja` in the *release* cache
+(`/pair/extcache/exllamav3_ext`) and recompiled 200 units for five minutes, replacing the stamped
+`exllamav3_ext.so` (18:56:16) and deleting its `BUILD_STAMP.json`. `pair_check.sh dev` then read
+`RESULT dev P7 DRIFT ext_so=3ef6ed68 want=3e2d504a`, and every serve on the pair refused — two graph
+tickets and one chunk ticket died on `PAIR_SERVE_DRIFT`/`PAIR_DRIFT` without a measurement, and the
+actor was not identifiable afterwards because nothing recorded it. Two consequences, both here:
+
+- `pair_arm.sh` now fingerprints `<extcache>/exllamav3_ext/{build.ninja,exllamav3_ext.so}` before and
+  after the client and refuses the arm with `ARM_EXT_WRITE_REFUSED … numbers_void=1` (exit 13) when it
+  moved, naming the cache and the `next=` repair step. An arm that spent minutes compiling kernels was
+  not measuring the release's warm path anyway; what it must not do is stay in the record as a speed
+  number. `pair_check.sh <pair>` is the pair-level backstop and belongs at the top of any ticket that
+  serves.
+- The repair is `pair_prepare.sh <pair> <sha> --side p7` (or `--side both`), **not** a bare
+  `pair_build_ext.sh`: the ext directory's `BUILD_STAMP.json` was gone, so torch rebuilt from the same
+  `/src/exllamav3` spelling with the same flags and produced a valid artifact, but only prepare
+  republishes the manifest that `pair_check` compares against. Rebuilding the extension alone leaves
+  `want` stale and the pair keeps refusing. Measured: 29 s from `PREPARE_PACK_P7` to `PREPARED`
+  (client hit, `ninja_runs=0`, lib stamp rebuilt), then `RESULT dev P7 IN_SYNC` and `RESULT dev GX
+  IN_SYNC`, twice.
