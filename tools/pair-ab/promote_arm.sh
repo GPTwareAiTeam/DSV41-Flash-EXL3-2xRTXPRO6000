@@ -98,12 +98,10 @@ step "FLIP_END tag=$TAG rc=$flip_rc host_load=$(host_load) gx=$(gx_state)"
 [ "$flip_rc" = 0 ] || { step "FAIL tag=$TAG flip rc=$flip_rc tail=$(tail -3 "$OUT/flip_$TAG.log" | tr '\n' '|' | cut -c1-400)"; exit 3; }
 
 # The flip's own smoke already ran the 32k prefill twice (SMOKE_PREFILL_ARMS, ratio-checked), so the
-# numbers a change to the GX half has to answer for are free -- but they are buried in two places:
-# PREFILL_ARM and SEAM_NEGOTIATED in the arm log the smoke names, and SEAM_MOE_CPP_FUSED_STATS (the bm
-# histogram) in the worker's log for that load. An 8192-row piece puts ~32 rows per expert, so
-# pick_block_m lands on tier 32 -- a prefill number is really a statement about *that* tier, and the
-# histogram is what says so. Both lines are printed with the file they came from, because "chunk_rows
-# is 8192" is a claim about the grant, not about the request.
+# prefill numbers are free -- but they are buried in the arm log the smoke names, which is why they are
+# read back here rather than re-measured: PREFILL_ARM says what the client asked for and got, and
+# SEAM_NEGOTIATED says what the worker *granted* (chunk_rows must be 8192, or the piece sizes -- and
+# therefore the tier the MoE kernels picked -- are not the ones the run claims).
 pf_arm=""
 while read -r p; do [ -n "$p" ] && pf_arm=$p; done <<EOF
 $(grep -h '^SMOKE_PREFILL_LOG ' "$OUT/flip_$TAG.log" 2>/dev/null | sed 's/.*SMOKE_PREFILL_LOG //')
@@ -113,10 +111,6 @@ if [ -n "$pf_arm" ] && [ -r "$pf_arm" ]; then
 else
   step "PREFILL_DETAIL tag=$TAG none (no readable SMOKE_PREFILL_LOG in the flip log)"
 fi
-for l in $(ls -t "$PAIR_STATE_DIR"/logs/server---*.log 2>/dev/null | head -2); do
-  grep -hE 'SEAM_MOE_CPP_FUSED_STATS' "$l" 2>/dev/null | tail -1 \
-    | sed "s/^/FUSED_DETAIL tag=$TAG src=$(basename "$l") /" | cut -c1-300
-done
 
 # The one line that makes the arm real: the release the pair's manifest names, the sha `current`
 # points at, and the build the worker was started with. A/B across two arms is meaningless if any of
@@ -218,6 +212,36 @@ else
   fi
 fi
 step "RATE_END tag=$TAG rc=$rate_rc host_load=$(host_load) p7=$(p7_clocks) gx=$(gx_state)"
+
+# The fused counter, read from the *decode* load and nothing else. It is not in this position by
+# accident: SERVER_START above is a --fresh worker with no prefill in front of it, so `fused_pct` here is
+# a statement about rows=256 decode. Reading it after the flip instead would mix 8192-row prefill pieces
+# into the same cumulative counters (the shipped gate is bm[g]==16, so those legitimately refuse the
+# fused branch) and turn a 100 % decode number into an unreadable blend. Several lines are printed per
+# load on a 4096-call throttle, so the last line of that log is the one to quote, and `knob=` is what
+# separates "gate refused the shape" (knob=1 fused=0) from "the env never arrived" (knob=0). A build
+# with no counter at all prints nothing here -- the ref arm predates the knob, so its absence is
+# expected and is itself proof the two arms run different code.
+fused_seen=0
+for l in $(ls -t "$PAIR_STATE_DIR"/logs/server---*.log 2>/dev/null | head -2); do
+  n=$(grep -cE 'SEAM_MOE_CPP_FUSED_STATS' "$l" 2>/dev/null || true)
+  [ "${n:-0}" -gt 0 ] || continue
+  fused_seen=1
+  step "FUSED_SRC tag=$TAG src=$(basename "$l") lines=$n"
+  grep -hE 'SEAM_MOE_CPP_FUSED_STATS' "$l" | tail -2 | sed "s/^/FUSED_DETAIL tag=$TAG /" | cut -c1-300
+done
+if [ "$TAG" = cand ] && [ "$fused_seen" = 0 ]; then
+  # The counter is written by the worker, not by the ticket, so the release-side archive can be stale or
+  # absent while the worker is still the one that matters. Ask the worker directly before concluding the
+  # line is missing: the worker for *this* server is still up at this point (cleanup runs at the end), so
+  # /tmp/seam_server.log inside the GX container is this load's stderr and nothing else.
+  live=$(pair_gxsh "docker exec $GXCT sh -c 'grep -h SEAM_MOE_CPP_FUSED_STATS /tmp/seam_server.log 2>/dev/null | tail -3'" 2>/dev/null)
+  if [ -n "$live" ]; then
+    step "FUSED_SRC tag=$TAG src=gx:/tmp/seam_server.log lines=$(printf '%s\n' "$live" | grep -c SEAM_MOE_CPP_FUSED_STATS)"
+    printf '%s\n' "$live" | grep -hE 'SEAM_MOE_CPP_FUSED_STATS' | tail -2 \
+      | sed "s/^/FUSED_DETAIL tag=$TAG src=worker-stderr /" | cut -c1-300
+  fi
+fi
 
 # ---- 4. quality: wiki2 quick8 against the ship reference ----------------------------------------
 ckpt=$(pair_ckpt_resolve auto) || { step "FAIL tag=$TAG cannot resolve the client half for $(pair_cold_src "$GXCT")"; exit 5; }
