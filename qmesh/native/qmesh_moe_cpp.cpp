@@ -64,6 +64,31 @@ constexpr int kBoundMaxRows = 64;
 constexpr int kRefuseMem = 4;
 constexpr int kRefuseCompute = 5;
 
+/* -- prof marks (SEAM_QMC_PROF) ------------------------------------------------------------------
+ * A piece is bracketed by four marks -- entry, after the request's H2D copies, after the two
+ * conversions, after the histogram/alignment (which ends at the plan readback's sync) -- and each
+ * group by five more: the end of its scratch prep, the Hadamard, the w13 GEMM, the glu, the down
+ * GEMM. A last mark after the response copy closes the piece. That splits the call into the spans
+ * the Python path had (copy, quant, align, had, gemms, write) instead of folding the Hadamard and
+ * the alignment into "the GEMMs", which is the question: how much of the seam window is device
+ * work and how much is the host leaving the stream empty. Events exist only when the flag is on,
+ * and only for the first kProfPieces pieces of a request (the SUM line says how many were timed).
+ * Indices: the four piece marks, then kProfPerGroup marks per group, then the write mark. */
+constexpr int kProfEntry = 0; /* run_piece entry */
+constexpr int kProfCopy = 1;  /* after the three H2D copies of the request slot */
+constexpr int kProfQuant = 2; /* after bf16->half and the routing weights */
+constexpr int kProfAlign = 3; /* after hist/align and, off bound mode, the plan readback sync */
+constexpr int kProfGBase = 4;
+/* Per group, in index order: end of prep (fill/scatter), after had, after w13, after glu, after
+ * down. The prep span runs from the previous boundary (the align mark for group 0), so it also
+ * holds whatever host work came between the two. */
+constexpr int kProfPerGroup = 5;
+constexpr int kProfPerPiece = kProfGBase + kProfPerGroup * QMC_MAX_GROUPS + 1;
+constexpr int kProfWrite = kProfPerPiece - 1; /* after the response D2H */
+constexpr int kProfPieces = 16;
+
+constexpr int prof_gi(int g, int k) { return kProfGBase + kProfPerGroup * g + k; }
+
 thread_local std::string g_err;
 
 void set_err(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -341,6 +366,25 @@ struct Ctx {
   void* fb_fn = nullptr;
   void* fb_ctx = nullptr;
   cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+  /* SEAM_QMC_PROF: per-piece cudaEvent marks (see run_piece and prof_report). prof_ev is empty
+   * unless the flag is on, so the shipped path pays one loaded bool per mark site. */
+  bool prof = false;
+  int prof_min_rows = 512; /* SEAM_QMC_PROF_ROWS: pieces narrower than this (decode) are not timed */
+  std::vector<cudaEvent_t> prof_ev; /* [kProfPieces * kProfPerPiece] */
+  /* SEAM_MOE_CPP_SIDE: the response D2H leaves the compute stream. Per piece the compute stream
+   * records side_join[p], the side stream waits for it and takes the copy, so the reply of piece p
+   * crosses the bus while piece p+1's copies and gemms run. The answer is the same bytes from the
+   * same buffer into the same slot; only the copy's stream changes, and ev_side_done joins the two
+   * at the end of the call so qmc_compute's existing sync still means "the reply slot is complete".
+   * side_join is sized per call to the call's own piece count, so no event is ever waited on after
+   * being re-recorded. */
+  bool side = false;
+  cudaStream_t side_stream = nullptr;
+  std::vector<cudaEvent_t> side_join;
+  /* side_done[slot]: the side stream has finished reading accumulator slot `slot`, so the piece two
+   * pieces later may write it (only two slots exist). */
+  std::vector<cudaEvent_t> side_done; /* [2] */
+  cudaEvent_t ev_side_done = nullptr;
 };
 
 bool cuda_alive() {
@@ -408,7 +452,10 @@ bool ensure_buffers(Ctx& c, int rows, int total_pad) {
     if (grow((void**)&b.ids, (size_t)rows * T * 4) != cudaSuccess) return false;
     if (grow((void**)&b.w_bf, (size_t)rows * T * 2) != cudaSuccess) return false;
     if (grow((void**)&b.w_f, (size_t)rows * T * 4) != cudaSuccess) return false;
-    if (grow((void**)&b.acc, (size_t)rows * H * 4) != cudaSuccess) return false;
+    /* SEAM_MOE_CPP_SIDE keeps two accumulator slots (see run_piece): the reply copy of piece p
+     * reads slot p&1 while piece p+1's down gemm writes the other. One extra piece-sized buffer
+     * (rows*H*4 = 20 MiB at 1024 rows), allocated only when the flag is on. */
+    if (grow((void**)&b.acc, (size_t)rows * H * 4 * (c.side ? 2 : 1)) != cudaSuccess) return false;
     if (grow(&b.out16, (size_t)rows * H * 2) != cudaSuccess) return false;
     b.cap_rows = rows;
   }
@@ -491,17 +538,38 @@ bool grow_trio(Ctx& c, int total_pad, int inter) {
  * first piece, after the buffers exist) and reads it once after qmc_compute's sync, so a bad id in
  * any piece of the request still refuses the whole request. */
 int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp,
-              const uint8_t* wp, float* outp, bool first_piece) {
+              const uint8_t* wp, float* outp, bool first_piece, int piece) {
   Layer& L = c.layers[layer];
   const int H = c.hidden, T = c.topk;
   const int m_valid = rows * T;
   cudaStream_t s = at::cuda::getCurrentCUDAStream(c.dev).stream();
+  /* Marks go on the compute stream, so a span is device time including any hole the host left in
+   * it -- which is the point: GEMM time and host latency need to be told apart. */
+  const bool prof = c.prof && rows >= c.prof_min_rows && piece >= 0 && piece < kProfPieces;
+  cudaEvent_t* pe = prof ? c.prof_ev.data() + (size_t)piece * kProfPerPiece : nullptr;
+  auto mark = [&](int k) {
+    if (pe) cudaEventRecord(pe[k], s);
+  };
+  mark(kProfEntry);
 
   if (!ensure_buffers(c, rows, m_valid)) {
     set_err("buffer alloc failed: %s", cudaGetErrorString(cudaGetLastError()));
     return kRefuseMem;
   }
   Buffers& b = c.b;
+  /* SEAM_MOE_CPP_SIDE: per-piece accumulator slot. The stride is cap_rows (the largest piece ever
+   * seen), not this piece's rows, or a short last piece would put the two slots on top of each
+   * other. */
+  float* accp = c.side ? b.acc + (size_t)(piece & 1) * (size_t)b.cap_rows * H : b.acc;
+  /* Two slots mean the third piece writes the slot the first piece's copy may still be reading, and
+   * nothing orders the side stream against this one. Piece p's copy marks side_done[p&1]; piece
+   * p+2 waits for it before its first write. By then the copy has had a whole piece of gemms to
+   * finish, so the wait is a formality that makes the two-stream schedule correct rather than
+   * likely. */
+  if (c.side && c.side_done.size() == 2 && piece >= 2) {
+    if (cudaStreamWaitEvent(s, c.side_done[(size_t)(piece & 1)], 0) != cudaSuccess)
+      cudaGetLastError(); /* a lost ordering marker is a stall, not a wrong answer */
+  }
 
   /* Request slot -> device. These are the copies worker_seam_server did with numpy .copy() and
    * .to(device); the bf16->half and the routing-weight conversions are the two kernels after. */
@@ -511,8 +579,10 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
     set_err("H2D from the pinned slab failed: %s", cudaGetErrorString(cudaGetLastError()));
     return kRefuseCompute;
   }
+  mark(kProfCopy);
   qmc_k_bf16_to_half(b.x_bf, b.x_h, rows * H, s);
   qmc_k_weights(b.ids, b.w_bf, b.w_f, rows * T, s);
+  mark(kProfQuant);
 
   /* Histogram and alignment, both on device. block_m is a function of the live picks per expert;
    * the live count of the previous call stands in for this one (a request moves it by a few
@@ -571,6 +641,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       return kRefuseCompute;
     }
   }
+  mark(kProfAlign);
 
   const at::Tensor x_h = dev_tensor(b.x_h, {rows, H}, at::kHalf, c.dev);
   const at::Tensor w_f = dev_tensor(b.w_f, {rows, T}, at::kFloat, c.dev);
@@ -589,14 +660,14 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
     }
     if (total[g] > total_max) total_max = total[g];
   }
-  if (bound_mode && cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+  if (bound_mode && cudaMemsetAsync(accp, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
     set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
     return kRefuseCompute;
   }
   int rc = 0;
   if (total_max <= 0) {
     /* No group has a live pick: the layer's answer for these rows is zero. */
-    if (cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+    if (cudaMemsetAsync(accp, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
       set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
       return kRefuseCompute;
     }
@@ -625,6 +696,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       qmc_k_fill_i32(b.sorted, m_valid, total[g], s);
       qmc_k_scatter(b.ids, m_valid, q.n_cold, q.remap, b.cursor + (size_t)g * QMC_MAX_EXPERTS,
                     blk_off_g, bm[g], b.sorted, b.n_rows + g, s);
+      mark(prof_gi(g, 0));
       if (c.dump) {
         L.dump_rows = rows;
         L.dump_bm[g] = bm[g];
@@ -648,7 +720,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       const at::Tensor inter =
           dev_tensor(b.inter, {total[g], 2 * (int64_t)q.inter}, at::kHalf, c.dev);
       const at::Tensor a2 = dev_tensor(b.a2, {1, total[g], (int64_t)q.inter}, at::kHalf, c.dev);
-      const at::Tensor acc = dev_tensor(b.acc, {rows, H}, at::kFloat, c.dev);
+      const at::Tensor acc = dev_tensor(accp, {rows, H}, at::kFloat, c.dev);
 
       /* Fused: the two Hadamard transforms run inside the GEMMs that read them, so neither a13 nor
        * a2 is ever written (qmesh_moe_fused.cu). Same tile (block_m=16) and same accumulators as
@@ -672,7 +744,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       }
       try {
         if (use_fused) {
-          if (!wrote && cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+          if (!wrote && cudaMemsetAsync(accp, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
             set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
             rc = kRefuseCompute;
             break;
@@ -683,7 +755,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
           if (qmc_fused_w13(b.x_h, b.sorted, q.suh13, b.inter, q.trellis13, q.svh13, eids_g,
                             b.n_rows + g, H, 2 * q.inter, q.inter, 2, q.words13 / 16, q.cb, bm[g],
                             bs13, m_valid, T, mblocks, s) != 0 ||
-              qmc_fused_down(b.inter, b.sorted, q.suh2, b.acc, q.trellis2, q.svh2, eids_g,
+              qmc_fused_down(b.inter, b.sorted, q.suh2, accp, q.trellis2, q.svh2, eids_g,
                              b.n_rows + g, b.w_f, q.inter, H, q.words2 / 16, q.cb, bm[g], bs2,
                              m_valid, T, mblocks, s) != 0) {
             /* Both stages report 2 for a refused launch and 1 for a shape with no instantiation;
@@ -693,12 +765,21 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
             rc = kRefuseCompute;
             break;
           }
+          /* One launch per projection: the Hadamard runs inside w13 and the glu inside down, so
+           * these four marks share a timestamp and the span lands in the had slot. */
+          mark(prof_gi(g, 1));
+          mark(prof_gi(g, 2));
+          mark(prof_gi(g, 3));
+          mark(prof_gi(g, 4));
         } else {
           moe_had_in(x_h, a13, L.grp[g].suh13, sorted_t, eids_t, nr_t, bm[g], T, m_valid);
+          mark(prof_gi(g, 1));
           moe_gemm(a13, L.grp[g].t13, L.grp[g].suh13, L.grp[g].svh13, eids_t, nr_t,
                    {(int64_t)q.inter, (int64_t)q.inter}, q.cb, bm[g], at::kHalf, sorted_t, true,
                    at::Tensor(), false, rows, T, inter, true, false);
+          mark(prof_gi(g, 2));
           moe_glu(inter, a2, L.grp[g].suh2, eids_t, nr_t, bm[g]);
+          mark(prof_gi(g, 3));
           if (c.det) {
             /* SEAM_MOE_CPP_DET: the Python path's deterministic branch (exl3_moe_cuda.py:482-491), the
              * only difference being the epilogue -- the down gemm unweighted into a half, the vendor's
@@ -717,12 +798,15 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
                          at::Tensor(), false, false);
             const at::Tensor combined = moe_combine(routed, sorted_t, w_f, rows, eids_t, bm[g]);
             /* total = out.float() on the first contributing group and total + out.float() after: the
-             * assign-vs-add distinction is -0.0's, and it is what the Python path does. */
-            qmc_k_h2f_add(combined.data_ptr(), b.acc, rows * H, wrote ? 1 : 0, s);
+             * assign-vs-add distinction is -0.0's, and it is what the Python path does. accp, not
+             * b.acc: with SEAM_MOE_CPP_SIDE the reply copy of the previous piece may still be reading
+             * the other slot. */
+            qmc_k_h2f_add(combined.data_ptr(), accp, rows * H, wrote ? 1 : 0, s);
           } else {
             moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H}, q.cb,
                      bm[g], at::kFloat, sorted_t, true, w_f, true, rows, T, acc, true, wrote);
           }
+          mark(prof_gi(g, 4));
         }
       } catch (const std::exception& e) {
         set_err("layer %d group %d raised: %s", layer, g, e.what());
@@ -742,7 +826,7 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
                 total[g], bound_mode ? -1 : live[g]);
     }
     if (rc == 0 && !wrote) {
-      if (cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+      if (cudaMemsetAsync(accp, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
         set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
         return kRefuseCompute;
       }
@@ -770,18 +854,98 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
    * (off_resp's stride in qmesh_expert_seam.cu and Seam.collect in remote_seam_host.py), not
    * this file's. */
   const size_t obytes = (size_t)rows * H * (c.out_mode ? 2 : 4);
-  const void* src = b.acc;
+  /* SEAM_MOE_CPP_SIDE: the copy (and, in a half wire format, the rounding that feeds it) is
+   * enqueued on the side stream behind a marker of everything the compute stream has done for this
+   * piece, so it overlaps the next piece instead of standing on the compute stream. */
+  cudaStream_t cs = s;
+  if (c.side && c.side_stream && piece >= 0 && piece < (int)c.side_join.size()) {
+    cudaError_t je = cudaEventRecord(c.side_join[(size_t)piece], s);
+    if (je == cudaSuccess) je = cudaStreamWaitEvent(c.side_stream, c.side_join[(size_t)piece], 0);
+    if (je == cudaSuccess)
+      cs = c.side_stream;
+    else
+      cudaGetLastError(); /* a failed hand-off is a slow piece, not a wrong answer: keep it on s */
+  }
+  const void* src = accp;
   if (c.out_mode) {
-    qmc_k_f32_to_half(b.acc, b.out16, rows * H, c.out_mode, s);
+    qmc_k_f32_to_half(accp, b.out16, rows * H, c.out_mode, cs);
     src = b.out16;
   }
-  if (cudaMemcpyAsync(outp, src, obytes, cudaMemcpyDeviceToHost, s) != cudaSuccess) {
+  if (cudaMemcpyAsync(outp, src, obytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
     set_err("D2H to the response slot failed: %s", cudaGetErrorString(cudaGetLastError()));
     return kRefuseCompute;
   }
+  if (cs == c.side_stream && c.side_done.size() == 2)
+    /* The side stream has now read accumulator slot (piece&1) to the end: the piece two later waits
+     * on this before writing it. */
+    cudaEventRecord(c.side_done[(size_t)(piece & 1)], c.side_stream);
+  mark(kProfWrite);
   return 0;
 }
 
+/* One elapsed time between two marks on the compute stream, or -1 when either was never recorded
+ * (an empty layer skips its groups). */
+float prof_span(cudaEvent_t a, cudaEvent_t b) {
+  float ms = 0.f;
+  if (cudaEventElapsedTime(&ms, a, b) != cudaSuccess) {
+    cudaGetLastError();
+    return -1.f;
+  }
+  return ms;
+}
+
+/* Printed after qmc_compute's own sync -- the first point in a call where every mark has a
+ * timestamp -- so the report adds no wait of its own to the served path. `dev` is qmc_last_call_ns'
+ * device span for the whole call (ev0 before the piece picker, ev1 after the last piece), so
+ * `rest = dev - sum` is the part of the call no piece mark covers: the picker, the buffer growth of
+ * the first call, and the report's own reading of the events. */
+void prof_report(Ctx& c, int layer, int rows, int pieces, int step) {
+  const int ng = c.layers[layer].n_groups;
+  const int timed = std::min(pieces, kProfPieces);
+  double s_copy = 0, s_quant = 0, s_align = 0, s_prep = 0, s_had = 0, s_w13 = 0, s_glu = 0,
+         s_down = 0, s_write = 0, tot = 0;
+  for (int p = 0; p < timed; p++) {
+    cudaEvent_t* pe = c.prof_ev.data() + (size_t)p * kProfPerPiece;
+    const float copy = std::max(prof_span(pe[kProfEntry], pe[kProfCopy]), 0.f);
+    const float quant = std::max(prof_span(pe[kProfCopy], pe[kProfQuant]), 0.f);
+    const float align = std::max(prof_span(pe[kProfQuant], pe[kProfAlign]), 0.f);
+    double prep = 0, had = 0, w13 = 0, glu = 0, down = 0;
+    cudaEvent_t prev = pe[kProfAlign];
+    for (int g = 0; g < ng; g++) {
+      prep += std::max(prof_span(prev, pe[prof_gi(g, 0)]), 0.f);
+      had += std::max(prof_span(pe[prof_gi(g, 0)], pe[prof_gi(g, 1)]), 0.f);
+      w13 += std::max(prof_span(pe[prof_gi(g, 1)], pe[prof_gi(g, 2)]), 0.f);
+      glu += std::max(prof_span(pe[prof_gi(g, 2)], pe[prof_gi(g, 3)]), 0.f);
+      down += std::max(prof_span(pe[prof_gi(g, 3)], pe[prof_gi(g, 4)]), 0.f);
+      prev = pe[prof_gi(g, 4)];
+    }
+    const float write = std::max(prof_span(prev, pe[kProfWrite]), 0.f);
+    const double total = (double)copy + quant + align + prep + had + w13 + glu + down + write;
+    fprintf(stderr,
+            "SEAM_QMC_PROF layer=%d piece=%d/%d rows=%d g=%d copy=%.3f quant=%.3f align=%.3f "
+            "prep=%.3f had=%.3f w13=%.3f glu=%.3f down=%.3f write=%.3f total=%.3f\n",
+            layer, p, pieces, rows, ng, copy, quant, align, prep, had, w13, glu, down, write,
+            total);
+    s_copy += copy;
+    s_quant += quant;
+    s_align += align;
+    s_prep += prep;
+    s_had += had;
+    s_w13 += w13;
+    s_glu += glu;
+    s_down += down;
+    s_write += write;
+    tot += total;
+  }
+  const double dev = (double)c.last_dev / 1e6;
+  fprintf(stderr,
+          "SEAM_QMC_PROF_SUM layer=%d rows=%d step=%d pieces=%d timed=%d dev=%.3f wall_us=%.1f "
+          "copy=%.3f quant=%.3f align=%.3f prep=%.3f had=%.3f w13=%.3f glu=%.3f down=%.3f "
+          "write=%.3f sum=%.3f rest=%.3f\n",
+          layer, rows, step, pieces, timed, dev, (double)c.last_wall / 1e3, s_copy, s_quant,
+          s_align, s_prep, s_had, s_w13, s_glu, s_down, s_write, tot, dev - tot);
+  fflush(stderr);
+}
 }  // namespace
 
 extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** out) {
@@ -800,6 +964,12 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
   c->block_m = env_int("SEAM_MOE_CPP_BLOCK_M", 0);
   c->dump = env_int("SEAM_MOE_CPP_DUMP", 0) != 0;
   c->trace = env_int("SEAM_MOE_CPP_TRACE", 0) != 0;
+  /* Per-piece marks: off by default, and nothing is allocated for them when off. SEAM_QMC_PROF_ROWS
+   * keeps decode and verify widths out of the log; a request at or above it is timed piece by
+   * piece and reported after its own sync (prof_report). */
+  c->prof = env_int("SEAM_QMC_PROF", 0) != 0;
+  c->prof_min_rows = (int)env_int("SEAM_QMC_PROF_ROWS", 512);
+  if (c->prof_min_rows < 1) c->prof_min_rows = 1;
   /* Alignment without the per-piece readback (see run_piece). Default off: on real routing it is
    * 3.3 % slower at 1 row and 5.1 % slower at 6 rows than the 8-byte readback, because padding every
    * group to min(n_experts, m_valid) costs more blocks than the sync saves at decode widths. On is a
@@ -847,6 +1017,51 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
     set_err("event create failed: %s", cudaGetErrorString(cudaGetLastError()));
     delete c;
     return -1;
+  }
+  if (c->prof) {
+    c->prof_ev.assign((size_t)kProfPieces * kProfPerPiece, nullptr);
+    for (auto& e : c->prof_ev) {
+      if (cudaEventCreateWithFlags(&e, cudaEventDefault) != cudaSuccess) {
+        set_err("prof event create failed: %s", cudaGetErrorString(cudaGetLastError()));
+        for (auto& x : c->prof_ev)
+          if (x) cudaEventDestroy(x);
+        delete c;
+        return -1;
+      }
+    }
+    fprintf(stderr, "SEAM_QMC_PROF_ON min_rows=%d pieces=%d per_piece=%d\n", c->prof_min_rows,
+            kProfPieces, kProfPerPiece);
+  }
+  /* SEAM_MOE_CPP_SIDE: take the response D2H off the compute stream and let it overlap the next
+   * piece. Off by default (the shipped path must not change without a token-identity arm); a half
+   * wire format is refused here because its rounding kernel writes the single out16 slot that a
+   * still-flying copy would be reading. */
+  c->side = env_int("SEAM_MOE_CPP_SIDE", 0) != 0;
+  if (c->side && c->out_mode) {
+    fprintf(stderr, "SEAM_MOE_CPP_SIDE ignored: SEAM_MOE_CPP_OUT=%s needs the single out16 slot\n",
+            c->out_mode == 1 ? "bf16" : "fp16");
+    c->side = false;
+  }
+  if (c->side) {
+    bool ok = cudaStreamCreateWithFlags(&c->side_stream, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaEventCreateWithFlags(&c->ev_side_done, cudaEventDisableTiming) == cudaSuccess;
+    c->side_done.assign(2, nullptr);
+    for (size_t i = 0; ok && i < c->side_done.size(); i++)
+      ok = cudaEventCreateWithFlags(&c->side_done[i], cudaEventDisableTiming) == cudaSuccess;
+    if (!ok) {
+      set_err("side stream create failed: %s", cudaGetErrorString(cudaGetLastError()));
+      for (auto& e : c->side_done)
+        if (e) cudaEventDestroy(e);
+      c->side_done.clear();
+      if (c->side_stream) cudaStreamDestroy(c->side_stream);
+      c->side_stream = nullptr;
+      if (c->ev_side_done) cudaEventDestroy(c->ev_side_done);
+      c->ev_side_done = nullptr;
+      c->side = false;
+    } else {
+      fprintf(stderr, "SEAM_MOE_CPP_SIDE_ON reply_copy_overlaps_next_piece=1 acc_slots=2\n");
+    }
+    fflush(stderr);
   }
   *out = c;
   return 0;
@@ -948,21 +1163,44 @@ extern "C" int qmc_compute(void* ctx, int layer, int rows, const void* x_bf16, c
   cudaEventRecord(c->ev0, s);
   int rc = 0;
   const int step = pick_step(*c, rows);
+  /* SEAM_MOE_CPP_SIDE: one join event per piece of this call, so run_piece can hand the compute
+   * stream's completion to the side stream without an event ever being re-recorded under a pending
+   * wait. Grown once per shape and kept for the next call. */
+  if (c->side && step > 0) {
+    const size_t npieces = (size_t)((rows + step - 1) / step);
+    while (c->side_join.size() < npieces) {
+      cudaEvent_t e = nullptr;
+      if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+        cudaGetLastError();
+        break;
+      }
+      c->side_join.push_back(e);
+    }
+  }
   /* Bound mode leaves every bad-id flag on device until here: run_piece clears the flag on the
    * first piece (once the buffers exist) and this request's single sync, which the timing already
    * needed, carries the verdict back. */
   const bool req_bound = c->bound && !c->dump && std::min(step, rows) <= kBoundMaxRows;
+  int piece = 0;
   for (int r0 = 0; r0 < rows && rc == 0; r0 += step) {
     const int n = std::min(step, rows - r0);
     rc = run_piece(*c, layer, n, (const uint8_t*)x_bf16 + (size_t)r0 * c->hidden * 2,
                    ids + (size_t)r0 * c->topk,
                    (const uint8_t*)w_bf16 + (size_t)r0 * c->topk * 2,
-                   out_f32 + (size_t)r0 * c->hidden, r0 == 0);
+                   out_f32 + (size_t)r0 * c->hidden, r0 == 0, piece);
+    ++piece;
   }
   if (rc == 0 && req_bound &&
       cudaMemcpyAsync(c->b.h_bad, c->b.bad, 4, cudaMemcpyDeviceToHost, s) != cudaSuccess) {
     set_err("id flag readback failed: %s", cudaGetErrorString(cudaGetLastError()));
     rc = kRefuseCompute;
+  }
+  /* The reply of the last piece must be in the slot before this call returns: mark the side
+   * stream's completion and make the compute stream (whose sync below is the one this call does)
+   * wait for it. Empty side stream = a no-op. */
+  if (c->side && c->side_stream) {
+    if (cudaEventRecord(c->ev_side_done, c->side_stream) == cudaSuccess)
+      cudaStreamWaitEvent(s, c->ev_side_done, 0);
   }
   cudaEventRecord(c->ev1, s);
   const cudaError_t se = cudaStreamSynchronize(s);
@@ -979,6 +1217,8 @@ extern "C" int qmc_compute(void* ctx, int layer, int rows, const void* x_bf16, c
   clock_gettime(CLOCK_MONOTONIC, &ts1);
   c->last_wall = (int64_t)(ts1.tv_sec - ts0.tv_sec) * 1000000000LL + (ts1.tv_nsec - ts0.tv_nsec);
   c->last_dev = (int64_t)(dev_ms * 1e6);
+  if (c->prof && rc == 0 && rows >= c->prof_min_rows)
+    prof_report(*c, layer, rows, piece, step);
   if (rc != 0) {
     c->refused++;
     const bool usable = cuda_alive();
@@ -1113,6 +1353,19 @@ extern "C" void qmc_close(void* ctx) {
     if (c->ev0) cudaEventDestroy(c->ev0);
     if (c->ev1) cudaEventDestroy(c->ev1);
     c->ev0 = c->ev1 = nullptr;
+    for (auto& e : c->prof_ev)
+      if (e) cudaEventDestroy(e);
+    c->prof_ev.clear();
+    for (auto& e : c->side_join)
+      if (e) cudaEventDestroy(e);
+    c->side_join.clear();
+    for (auto& e : c->side_done)
+      if (e) cudaEventDestroy(e);
+    c->side_done.clear();
+    if (c->ev_side_done) cudaEventDestroy(c->ev_side_done);
+    c->ev_side_done = nullptr;
+    if (c->side_stream) cudaStreamDestroy(c->side_stream);
+    c->side_stream = nullptr;
   }
   delete c; /* Buffers' destructor frees the rest */
 }

@@ -133,12 +133,25 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   # *timing*, not arithmetic: the fallback is byte-identical and `=2` refuses a fallback instead of
   # taking it. MOE_FUSED=0 restores the per-group path for an A/B. The box drifts +-5 % load to load
   # (55.48/58.38/58.48 on one identical base read), so quote the means, never a single pair.
+  # MOE_SIDE: SEAM_MOE_CPP_SIDE=1 ships ON from 2026-11-04 (GXProfile 5a786daf). The response D2H of
+  # piece p is enqueued on a second stream behind a completion marker of the compute stream, so it
+  # crosses the bus while piece p+1's copies and gemms run; the accumulator is double buffered
+  # (slot piece&1, stride cap_rows so a short last piece cannot alias), side_done per slot orders the
+  # third piece's first write after the first piece's copy, and ev_side_done joins the side stream
+  # back onto the compute stream before the call's single sync -- so the slot is complete when the
+  # call returns. Same bytes, same buffer, same slot; only the stream carrying the copy changes, and
+  # the profile arm reported gen_ids MATCH. Refused with SEAM_MOE_CPP_OUT=bf16|fp16 (one out16 slot a
+  # flying copy would be reading), which this pair does not set. Device evidence: write 3.527 ->
+  # 0.010 ms/layer, dev 117.176 -> 113.359 ms/layer (-3.26 %) at 1024-row pieces; the rate jump in
+  # that ticket is not attributable (page-in on the first arm). MOE_SIDE=0 restores the single-stream
+  # copy for an A/B.
+  MOE_SIDE=${MOE_SIDE:-1}
   MOE_CPP=${MOE_CPP:-1}
   MOE_FUSED=${MOE_FUSED:-1}
   SRV_ENV_EXTRA=${PAIR_SRV_EXTRA_ENVS:-}
   CX_MARGIN_MIB=${CX_MARGIN_MIB:-1536}
-  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB SEAM_MOE_CPP=$MOE_CPP SEAM_MOE_CPP_FUSED=$MOE_FUSED $SRV_ENV_EXTRA"
-  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV MOE_CPP MOE_FUSED SRV_ENV_EXTRA PAIR_TUNE_CACHE
+  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB SEAM_MOE_CPP=$MOE_CPP SEAM_MOE_CPP_FUSED=$MOE_FUSED SEAM_MOE_CPP_SIDE=$MOE_SIDE $SRV_ENV_EXTRA"
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV MOE_CPP MOE_FUSED MOE_SIDE SRV_ENV_EXTRA PAIR_TUNE_CACHE
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
   PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}
