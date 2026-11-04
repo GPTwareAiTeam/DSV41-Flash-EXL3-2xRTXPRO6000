@@ -124,11 +124,21 @@ pair_load() {  # <prod|dev> -> PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER 
   # identical text (58051d96) on both arms. It is fail-open: a missing .so or a failed registration
   # prints SEAM_MOE_CPP_OFF and the worker serves the Python path. MOE_CPP=0 puts the Python path back
   # for an A/B; PAIR_SRV_EXTRA_ENVS still appends afterwards, so it can override either way.
+  # MOE_FUSED: SEAM_MOE_CPP_FUSED=1 ships ON from 2026-11-04. Three same-ticket base->fused pairs on
+  # 3cd80749 (warm-up discarded, order reversed, k35, shipped table untouched) read 61.74 -> 64.74
+  # tok/s (+4.9 % mean; +5.3 %, +7.4 %, +1.8 %), one w6 verify step 52.99 -> 50.25 ms (-5.1 %,
+  # accepts 3.043 -> 3.110 draft tokens per step), and paired wiki2 quick8 2.0436 -> 2.0406 (-0.0030,
+  # inside the +/-0.005 gate); every fused arm reported SEAM_MOE_CPP_FUSED_STATS fused=100.0 with an
+  # empty fallback list. It is a single launch per projection instead of one per group, so it changes
+  # *timing*, not arithmetic: the fallback is byte-identical and `=2` refuses a fallback instead of
+  # taking it. MOE_FUSED=0 restores the per-group path for an A/B. The box drifts +-5 % load to load
+  # (55.48/58.38/58.48 on one identical base read), so quote the means, never a single pair.
   MOE_CPP=${MOE_CPP:-1}
+  MOE_FUSED=${MOE_FUSED:-1}
   SRV_ENV_EXTRA=${PAIR_SRV_EXTRA_ENVS:-}
   CX_MARGIN_MIB=${CX_MARGIN_MIB:-1536}
-  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB SEAM_MOE_CPP=$MOE_CPP $SRV_ENV_EXTRA"
-  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV MOE_CPP SRV_ENV_EXTRA PAIR_TUNE_CACHE
+  MOE_ENV="SEAM_MOE_KERNEL=cudaexl3 SEAM_MOE_PRELOAD=1 SEAM_CX_MARGIN_MIB=$CX_MARGIN_MIB SEAM_MOE_CPP=$MOE_CPP SEAM_MOE_CPP_FUSED=$MOE_FUSED $SRV_ENV_EXTRA"
+  export PAIR P7CT GPU SEAM_DEV SEAM_GID GX_GID SEAM_PEER GX GXCT PAIR_ROOT PORT BUCKETS P7_ARCH GX_ARCH LOAD_MARGIN WS_ROWS WS_ENV CX_MARGIN_MIB MOE_ENV MOE_CPP MOE_FUSED SRV_ENV_EXTRA PAIR_TUNE_CACHE
   # PAIR_STATE_OVERRIDE lets the stub harnesses (@see tests/dry_run.sh) keep every log, ref and
   # restore note out of the real pairs/ tree: a dry run must never touch what a real one wrote.
   PAIR_STATE=${PAIR_STATE_OVERRIDE:-$PAIR_STATE}

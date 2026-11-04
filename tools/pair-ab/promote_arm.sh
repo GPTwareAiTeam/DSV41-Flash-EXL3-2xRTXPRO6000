@@ -97,6 +97,27 @@ grep -E 'UPDATE_(RELEASE|CONTAINERS|FLIP|SHA)|SMOKE_|FLIP_|UPDATE_SMOKE|PLACEMEN
 step "FLIP_END tag=$TAG rc=$flip_rc host_load=$(host_load) gx=$(gx_state)"
 [ "$flip_rc" = 0 ] || { step "FAIL tag=$TAG flip rc=$flip_rc tail=$(tail -3 "$OUT/flip_$TAG.log" | tr '\n' '|' | cut -c1-400)"; exit 3; }
 
+# The flip's own smoke already ran the 32k prefill twice (SMOKE_PREFILL_ARMS, ratio-checked), so the
+# numbers a change to the GX half has to answer for are free -- but they are buried in two places:
+# PREFILL_ARM and SEAM_NEGOTIATED in the arm log the smoke names, and SEAM_MOE_CPP_FUSED_STATS (the bm
+# histogram) in the worker's log for that load. An 8192-row piece puts ~32 rows per expert, so
+# pick_block_m lands on tier 32 -- a prefill number is really a statement about *that* tier, and the
+# histogram is what says so. Both lines are printed with the file they came from, because "chunk_rows
+# is 8192" is a claim about the grant, not about the request.
+pf_arm=""
+while read -r p; do [ -n "$p" ] && pf_arm=$p; done <<EOF
+$(grep -h '^SMOKE_PREFILL_LOG ' "$OUT/flip_$TAG.log" 2>/dev/null | sed 's/.*SMOKE_PREFILL_LOG //')
+EOF
+if [ -n "$pf_arm" ] && [ -r "$pf_arm" ]; then
+  grep -hE '^PREFILL_ARM |^SEAM_NEGOTIATED ' "$pf_arm" | sed "s/^/PREFILL_DETAIL tag=$TAG src=$(basename "$pf_arm") /" | cut -c1-430
+else
+  step "PREFILL_DETAIL tag=$TAG none (no readable SMOKE_PREFILL_LOG in the flip log)"
+fi
+for l in $(ls -t "$PAIR_STATE_DIR"/logs/server---*.log 2>/dev/null | head -2); do
+  grep -hE 'SEAM_MOE_CPP_FUSED_STATS' "$l" 2>/dev/null | tail -1 \
+    | sed "s/^/FUSED_DETAIL tag=$TAG src=$(basename "$l") /" | cut -c1-300
+done
+
 # The one line that makes the arm real: the release the pair's manifest names, the sha `current`
 # points at, and the build the worker was started with. A/B across two arms is meaningless if any of
 # the three silently names the other arm's release.
@@ -244,16 +265,3 @@ rc=0
 [ "$ppl_rc" = 0 ] || rc=7
 step "ARM_DONE tag=$TAG sha=${SHA:0:12} rc=$rc"
 exit "$rc"
-
-# ---------------------------------------------------------------------------------------------
-# Measured with this file on 2026-11-04 (dev pair, 3cd80749 vs 35bfaecb): ref 61.87 tok/s, cand
-# 61.60 tok/s at rows=256 max_new=256 (n=40), ppl cand 2.0424 +/- 0.0414. Four bugs had to be fixed
-# before an arm was quotable at all, and they are the reason every step here prints a line:
-#   1. pair_arm writes its summary as `SUMMARY {…}` in the jsonl, not to stdout (DECODE_SUMMARY step).
-#   2. inside a container the pair's card is device 0; `-e CUDA_VISIBLE_DEVICES=$GPU` from pairs.conf
-#      gives "No CUDA GPUs are available" (PPL_END rc=1 in five seconds).
-#   3. the ensure writes no pidfile, so pair_server_stop left the worker resident and the *next* flip
-#      refused with SMOKE_FAIL memory box_busy (SERVER_RECORDED + kill_worker).
-#   4. a comment inside a `docker exec \` argument list eats the continuation (PPL_END rc=127).
-# Exit codes: 4 no build_id, 5 ckpt, 6 rate, 7 ppl, 8 gate/nvml/ensure, 9 ext probe, 10 server/serving,
-# 11 worker/ext check.
