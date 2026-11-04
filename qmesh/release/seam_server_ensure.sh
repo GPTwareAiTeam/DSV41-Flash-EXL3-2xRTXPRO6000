@@ -511,9 +511,13 @@ seam_server_ensure() {
   case "$(seam_gxsh "docker exec $CT readlink -f /src/exllamav3" 2>/dev/null | tr -d '\r')" in
     /pair/releases/*/src|/pair/current/src) wext="-e TORCH_EXTENSIONS_DIR=/pair/extcache" ;;
   esac
+  # The container name is joined to $denv with a space, never by concatenation: with an empty $wext the
+  # old `$denv$CT` worked by accident (the value ended in a space), and the moment the pin above made
+  # $wext non-empty docker read the glued token as the -e value and the *next* word as the container
+  # name -- "Error response from daemon: No such container: bash", rc 2 in 7 s, twice at 02:43Z.
   local denv="-e SEAM_GATE_OK=1 $wext"
   for kv in $SEAM_ENV; do denv="$denv -e $kv"; done
-  seam_gxsh "docker exec -d $denv$CT bash -lc 'cd /src/exllamav3 && stdbuf -oL -e0 python3 -u qmesh/worker_seam_server.py $args $SEAM_EXTRA > $SEAM_LOG 2>&1'" || return 2
+  seam_gxsh "docker exec -d $denv $CT bash -lc 'cd /src/exllamav3 && stdbuf -oL -e0 python3 -u qmesh/worker_seam_server.py $args $SEAM_EXTRA > $SEAM_LOG 2>&1'" || return 2
   local i
   for i in $(seq 1 $((SEAM_SERVER_TIMEOUT / 2))); do
     if seam_ready; then
