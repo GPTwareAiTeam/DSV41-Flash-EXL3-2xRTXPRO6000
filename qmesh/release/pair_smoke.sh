@@ -356,20 +356,6 @@ case "$loaded" in
   *"build=$BUILD_ID"*) ;;
   *) fail "server_build_mismatch loaded=${loaded:-none} want=$BUILD_ID" ;;
 esac
-# The release warms one prefill call per seam bucket before SERVER_READY (`serve_pair.py`,
-# `WARM_PREFILL=1`). That is startup behaviour, so the only place it can be proven is the server this
-# smoke just started: the lines have to be there, four of them, and the bucket grant has to be the
-# pair's own list -- a warm-up that widened or narrowed `accepted=` would change what every later arm
-# measures (and 2026-11-03's chunk_rows=64 surprise came exactly from a client-side SEAM_BUCKETS
-# fallback, so the grant is printed on every smoke). SMOKE_WARM_OPTIONAL=1 is for a release that
-# deliberately ships the warm-up off.
-warm_log=$(pair_gxsh "docker exec $GXCT sh -c \"grep -E '^(WARM_PREFILL_OK|SEAM_NEGOTIATED)' /tmp/seam_server.log\"" 2>/dev/null)
-warm_lines=$(printf '%s\n' "$warm_log" | grep -c '^WARM_PREFILL_OK ')
-warm_neg=$(printf '%s\n' "$warm_log" | grep -m1 '^SEAM_NEGOTIATED ')
-echo "SMOKE_WARM_PREFILL lines=$warm_lines want=${SMOKE_WARM_ROWS:-4} ${warm_neg:-negotiated=none}"
-if [ "${SMOKE_WARM_OPTIONAL:-0}" != 1 ] && [ "$warm_lines" -lt "${SMOKE_WARM_ROWS:-4}" ]; then
-  fail "warm_prefill_missing lines=$warm_lines want=${SMOKE_WARM_ROWS:-4} last=$(printf '%s\n' "$warm_log" | tail -1 | cut -c1-200)"
-fi
 # Which cold-expert path the worker installed, and what the pair asked of it. SEAM_MOE_CPP is read by
 # worker_seam_server.py, not by the client, so an arm that sets it in the client's environment is the
 # same arm as its control -- 2026-11-03 04:16/04:31 ran exactly that and produced two identical rows
@@ -658,13 +644,15 @@ if [ "${SMOKE_PREFILL_ARMS:-2}" -ge 2 ]; then
   if [ "$pf2_rc" != 0 ] || [ -z "$pf2_line" ] || [ "${pf2_ab:-1}" != 0 ]; then
     fail "prefill_arm2 rc=$pf2_rc aborted=${pf2_ab:-unknown} $(printf '%s\n' "$pf2_out" | grep -m1 -E 'Traceback|Error|MEM_ABORT' | cut -c1-240)"
   fi
-  if [ "${warm_lines:-0}" -gt 0 ] && [ -n "${pf_tps:-}" ] && [ -n "${pf2_tps:-}" ]; then
-    ratio=$(awk -v a="$pf_tps" -v b="$pf2_tps" 'BEGIN { if (b + 0 <= 0) print "nan"; else printf "%.3f", a / b }')
-    echo "SMOKE_PREFILL_ARMS arm1_tok_per_s=$pf_tps arm2_tok_per_s=$pf2_tps ratio=$ratio max=${SMOKE_PREFILL_RATIO_MAX:-1.05} warm_lines=$warm_lines"
-    awk -v r="$ratio" -v m="${SMOKE_PREFILL_RATIO_MAX:-1.05}" 'BEGIN { exit !(r + 0 > m + 0) }' \
-      && fail "prefill_first_arm_penalty arm1=$pf_tps arm2=$pf2_tps ratio=$ratio max=${SMOKE_PREFILL_RATIO_MAX:-1.05} warm_lines=$warm_lines"
+  if [ -n "${pf_tps:-}" ] && [ -n "${pf2_tps:-}" ]; then
+    # Measured here (both arms on this smoke's worker, back to back); judged after the server block,
+    # because the warm-up that is supposed to remove this penalty runs in the server process and only
+    # that run can show the lines that justify the gate.
+    pf_ratio=$(awk -v a="$pf_tps" -v b="$pf2_tps" 'BEGIN { if (b + 0 <= 0) print "nan"; else printf "%.3f", a / b }')
+    echo "SMOKE_PREFILL_ARMS arm1_tok_per_s=$pf_tps arm2_tok_per_s=$pf2_tps ratio=$pf_ratio max=${SMOKE_PREFILL_RATIO_MAX:-1.05}"
   else
-    echo "SMOKE_PREFILL_ARMS unjudged arm1_tok_per_s=${pf_tps:-none} arm2_tok_per_s=${pf2_tps:-none} warm_lines=${warm_lines:-0} why=no_warm_up"
+    pf_ratio=
+    echo "SMOKE_PREFILL_ARMS unmeasured arm1_tok_per_s=${pf_tps:-none} arm2_tok_per_s=${pf2_tps:-none} why=no_rate"
   fi
 fi
 # The OpenAI-compatible server is on no critical path -- nothing in the release calls it unless an
@@ -674,6 +662,11 @@ fi
 # stops only the process it started. Opt-in because the prefill arm above has just paid for the load
 # this needs, and because a pair that fails here should fail the smoke rather than a user's client.
 if [ "${PAIR_SMOKE_SERVER:-0}" = 1 ]; then
+  # The seam worker this smoke loaded holds the pack and the GX card, and the HTTP server brings its own
+  # (pair_server.sh start): two workers on one pack is `gx_busy`, not a second measurement. Every arm
+  # above has already been taken from this smoke's worker, so it goes now; the EXIT trap's stop then
+  # finds no pidfile and is a no-op. The GX claim stays held, so nothing else can take the box mid-run.
+  pair_server_stop >/dev/null 2>&1 || true
   pair_step "SMOKE_HTTP_SERVER pair=$PAIR ct=$P7CT port=${PAIR_SRV_PORT:-${SRV_PORT:-8000}}"
   # No port argument: pair_server_smoke.sh resolves PAIR_SRV_PORT/SRV_PORT/8000 itself, the same way
   # pair_server.sh picked the port this pair serves on.
@@ -686,6 +679,34 @@ if [ "${PAIR_SMOKE_SERVER:-0}" = 1 ]; then
     fail "http_server rc=$srv_rc $(printf '%s\n' "$srv_out" | grep -m1 -E '^SMOKE_FAIL|^PAIR_SRV' | cut -c1-300)"
   fi
   echo "SMOKE_HTTP_OK $(printf '%s\n' "$srv_out" | grep -m1 '^SMOKE_OK ')"
+  # The release warms one prefill call per seam bucket before SERVER_READY (`serve_pair.py`,
+  # `WARM_PREFILL=1`). That is a property of the *server* process, so the only run that can prove it is
+  # this one -- and the lines land in the server's own log on P7 (`serve_pair.py` prints
+  # `WARM_PREFILL_OK`, the client-side seam host in the same process prints `SEAM_NEGOTIATED`), never in
+  # the GX worker's `/tmp/seam_server.log`. `tail -1` on the grant because the file is truncated per
+  # start but a restart mid-run leaves an older line above the current one. SMOKE_WARM_OPTIONAL=1 is for
+  # a release that deliberately ships the warm-up off; SMOKE_WARM_ROWS=0 disables the count check.
+  srv_log=$(pair_ct_path "$PAIR_STATE_DIR/server/pair-server.log")
+  warm_log=$(docker exec "$P7CT" grep -E '^(WARM_PREFILL_OK|SEAM_NEGOTIATED)' "$srv_log" 2>/dev/null)
+  warm_lines=$(printf '%s\n' "$warm_log" | grep -c '^WARM_PREFILL_OK ')
+  warm_neg=$(printf '%s\n' "$warm_log" | grep '^SEAM_NEGOTIATED ' | tail -1)
+  echo "SMOKE_WARM_PREFILL lines=$warm_lines want=$SMOKE_WARM_ROWS ${warm_neg:-negotiated=none} log=$srv_log"
+  if [ "$warm_lines" -lt "$SMOKE_WARM_ROWS" ] && [ "${SMOKE_WARM_OPTIONAL:-0}" != 1 ]; then
+    fail "warm_prefill_missing lines=$warm_lines want=$SMOKE_WARM_ROWS log=$srv_log last=$(printf '%s\n' "$warm_log" | tail -1 | cut -c1-200)"
+  fi
+fi
+# The first-arm ratio is judged here, where `warm_lines` is known. Only a run that actually started the
+# release's own server can say whether the warm-up fired, so a smoke without one prints the ratio and
+# says why it is not judging it -- a red gate for a scenario that was never run is how a canary stops
+# being read.
+if [ "${SMOKE_PREFILL_ARMS:-2}" -ge 2 ] && [ -n "${pf_ratio:-}" ]; then
+  if [ "${warm_lines:-0}" -gt 0 ]; then
+    awk -v r="$pf_ratio" -v m="${SMOKE_PREFILL_RATIO_MAX:-1.05}" 'BEGIN { exit !(r + 0 > m + 0) }' \
+      && fail "prefill_first_arm_penalty arm1=$pf_tps arm2=$pf2_tps ratio=$pf_ratio max=${SMOKE_PREFILL_RATIO_MAX:-1.05} warm_lines=$warm_lines"
+    echo "SMOKE_PREFILL_RATIO_OK ratio=$pf_ratio max=${SMOKE_PREFILL_RATIO_MAX:-1.05} warm_lines=$warm_lines"
+  else
+    echo "SMOKE_PREFILL_RATIO_UNJUDGED ratio=$pf_ratio why=no_warm_up (PAIR_SMOKE_SERVER=1 is the run that exercises it)"
+  fi
 fi
 echo "SMOKE_OK $PAIR $SHA $BUILD_ID"
 # The pidfile stays: the EXIT trap uses it to stop the server it started. Deleting it on the passing
