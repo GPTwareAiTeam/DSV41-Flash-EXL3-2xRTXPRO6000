@@ -200,3 +200,22 @@ actor was not identifiable afterwards because nothing recorded it. Two consequen
   `want` stale and the pair keeps refusing. Measured: 29 s from `PREPARE_PACK_P7` to `PREPARED`
   (client hit, `ninja_runs=0`, lib stamp rebuilt), then `RESULT dev P7 IN_SYNC` and `RESULT dev GX
   IN_SYNC`, twice.
+
+**The first request used to pay 31 %.** Four identical `c0` prefill arms per ticket, one variable per
+ticket, showed the first arm 1.34× slower than the second with nothing pinned, 1.44× with the Triton and
+autotune caches seeded, and 1.21× (954.8 → 1156.4 rows/s) once torch's one NVRTC cubin at
+`$TORCH_HOME/kernels` was reachable — that cubin is what the exl3 dequant at
+`exllamav3/modules/linear.py` compiles on first launch, and a container that starts empty pays it again.
+So the pin is a shipping default: `PAIR_TRITON_CACHE` and `PAIR_TORCH_HOME` in `pair_lib.sh`, carried as
+`TRITON_CACHE_DIR`/`TORCH_HOME` by `pair_arm.sh` *and* `pair_server.sh` (the server is the process that
+fills both, so a server without them recompiles into `/root` on every restart). The residual ~6 s of
+in-process cost is handled in the server, not the arm: `serve_pair.py` runs one prefill call per seam
+bucket (1, 6, 64 and the load-time row count) after the decode warm-up and before `SERVER_READY`, logging
+`WARM_PREFILL_OK rows=<n> s=<t>`; `WARM_PREFILL=0` turns it off and `WARM_PREFILL_ROWS=<n>` overrides the
+big chunk. The arm is deliberately **not** warmed — it is the benchmark, and warming it would hide the
+number being tracked. The bucket grant is fixed before any warm call (`SEAM_BUCKETS` is read at host
+construction), so `SEAM_NEGOTIATED requested=… accepted=…` must read the same list with the warm-up on.
+The canary enforces both observables: `SMOKE_WARM_PREFILL lines=4` from the worker's log (fail
+`warm_prefill_missing`; `SMOKE_WARM_OPTIONAL=1` for a release that ships the warm-up off) and a second
+identical 32k arm whose rate must be within `SMOKE_PREFILL_RATIO_MAX` (1.05) of the first (fail
+`prefill_first_arm_penalty`; `SMOKE_PREFILL_ARMS=1` skips it).

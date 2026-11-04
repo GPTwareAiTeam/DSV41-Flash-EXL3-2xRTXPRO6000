@@ -102,6 +102,15 @@ fi
 # the rate is printed, warned and NOT judged -- the same way the swap gate prints a prefill growth
 # instead of refusing it. It never skips the abort/compute checks below, which do not depend on speed.
 SMOKE_PREFILL_MIN_AVAIL_MIB=${SMOKE_PREFILL_MIN_AVAIL_MIB:-4000}
+# The release warms one prefill call per seam bucket before SERVER_READY (serve_pair.py, WARM_PREFILL=1),
+# which is aimed at the 31 % first-arm penalty (955 -> 1156 rows/s once the caches were seeded). Its two
+# observables are here: SMOKE_WARM_ROWS `WARM_PREFILL_OK` lines in the worker's log before the first
+# request (four shipped: 1, 6, 64 and the load-time row count), and a second identical 32k arm whose
+# rate must land within SMOKE_PREFILL_RATIO_MAX of the first. SMOKE_WARM_OPTIONAL=1 / SMOKE_PREFILL_ARMS=1
+# relax them for a release that deliberately ships the warm-up off.
+SMOKE_WARM_ROWS=${SMOKE_WARM_ROWS:-4}
+SMOKE_PREFILL_ARMS=${SMOKE_PREFILL_ARMS:-2}
+SMOKE_PREFILL_RATIO_MAX=${SMOKE_PREFILL_RATIO_MAX:-1.05}
 ENSURE=${SEAM_ENSURE:-}
 if [ -z "$ENSURE" ]; then
   for c in "$PAIR_SCRIPTS/seam_server_ensure.sh" "$HERE/seam_server_ensure.sh"; do
@@ -347,6 +356,20 @@ case "$loaded" in
   *"build=$BUILD_ID"*) ;;
   *) fail "server_build_mismatch loaded=${loaded:-none} want=$BUILD_ID" ;;
 esac
+# The release warms one prefill call per seam bucket before SERVER_READY (`serve_pair.py`,
+# `WARM_PREFILL=1`). That is startup behaviour, so the only place it can be proven is the server this
+# smoke just started: the lines have to be there, four of them, and the bucket grant has to be the
+# pair's own list -- a warm-up that widened or narrowed `accepted=` would change what every later arm
+# measures (and 2026-11-03's chunk_rows=64 surprise came exactly from a client-side SEAM_BUCKETS
+# fallback, so the grant is printed on every smoke). SMOKE_WARM_OPTIONAL=1 is for a release that
+# deliberately ships the warm-up off.
+warm_log=$(pair_gxsh "docker exec $GXCT sh -c \"grep -E '^(WARM_PREFILL_OK|SEAM_NEGOTIATED)' /tmp/seam_server.log\"" 2>/dev/null)
+warm_lines=$(printf '%s\n' "$warm_log" | grep -c '^WARM_PREFILL_OK ')
+warm_neg=$(printf '%s\n' "$warm_log" | grep -m1 '^SEAM_NEGOTIATED ')
+echo "SMOKE_WARM_PREFILL lines=$warm_lines want=${SMOKE_WARM_ROWS:-4} ${warm_neg:-negotiated=none}"
+if [ "${SMOKE_WARM_OPTIONAL:-0}" != 1 ] && [ "$warm_lines" -lt "${SMOKE_WARM_ROWS:-4}" ]; then
+  fail "warm_prefill_missing lines=$warm_lines want=${SMOKE_WARM_ROWS:-4} last=$(printf '%s\n' "$warm_log" | tail -1 | cut -c1-200)"
+fi
 # Which cold-expert path the worker installed, and what the pair asked of it. SEAM_MOE_CPP is read by
 # worker_seam_server.py, not by the client, so an arm that sets it in the client's environment is the
 # same arm as its control -- 2026-11-03 04:16/04:31 ran exactly that and produced two identical rows
@@ -613,6 +636,36 @@ else
   awk -v got="$pf_tps" -v want="$SMOKE_PREFILL_MIN_TPS" 'BEGIN { exit !(got + 0 >= want + 0) }' \
     || fail "prefill_slow depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS avail_mib_min=${pf_avail_min:-unknown}"
   echo "SMOKE_PREFILL_OK depth=$SMOKE_PREFILL_DEPTH tok_per_s=$pf_tps min=$SMOKE_PREFILL_MIN_TPS aborts=0"
+fi
+# The 31 % first-arm penalty was a cache-in-a-fresh-container effect (Triton, NVRTC cubin, autotune file)
+# plus in-process warm-up, and the release's answer to the in-process half is the prefill warm-up above.
+# The gate for it is a second identical arm right here, on the same loaded worker: arm 1 is the shape a
+# first request meets, arm 2 is what a warmed process gives, and the ratio is the whole claim. It runs
+# after the rate gate so a slow release still fails on the number the owner's bar is stated in; a ratio
+# above SMOKE_PREFILL_RATIO_MAX means the warm-up is not reaching the same shape (the log names the row
+# counts it used). Judged only when the warm-up lines were actually present, because a release that
+# ships WARM_PREFILL=0 must not be failed for the thing it turned off.
+if [ "${SMOKE_PREFILL_ARMS:-2}" -ge 2 ]; then
+  pair_step "SMOKE_PREFILL_ARM2 pair=$PAIR depth=$SMOKE_PREFILL_DEPTH timeout=${SMOKE_PREFILL_TIMEOUT}s"
+  pf2_out=$(ARM_IDS_OUT="" "$HERE/pair_arm.sh" "$PAIR" --prefill "$SMOKE_PREFILL_DEPTH" \
+            --timeout "$SMOKE_PREFILL_TIMEOUT" 2>&1)
+  pf2_rc=$?
+  printf '%s\n' "$pf2_out" > "${pf_log%.log}-arm2.log" 2>/dev/null || true
+  [ -n "${PAIR_LOG:-}" ] && printf '%s\n' "$pf2_out" >> "$PAIR_LOG"
+  pf2_line=$(printf '%s\n' "$pf2_out" | sed -n "s/^PREFILL_ARM depth=$SMOKE_PREFILL_DEPTH .*/&/p" | tail -1)
+  pf2_tps=$(printf '%s\n' "$pf2_line" | sed -n 's/.*tok_per_s=\([0-9.]*\).*/\1/p')
+  pf2_ab=$(printf '%s\n' "$pf2_line" | sed -n 's/.*aborted=\([0-9]*\).*/\1/p')
+  if [ "$pf2_rc" != 0 ] || [ -z "$pf2_line" ] || [ "${pf2_ab:-1}" != 0 ]; then
+    fail "prefill_arm2 rc=$pf2_rc aborted=${pf2_ab:-unknown} $(printf '%s\n' "$pf2_out" | grep -m1 -E 'Traceback|Error|MEM_ABORT' | cut -c1-240)"
+  fi
+  if [ "${warm_lines:-0}" -gt 0 ] && [ -n "${pf_tps:-}" ] && [ -n "${pf2_tps:-}" ]; then
+    ratio=$(awk -v a="$pf_tps" -v b="$pf2_tps" 'BEGIN { if (b + 0 <= 0) print "nan"; else printf "%.3f", a / b }')
+    echo "SMOKE_PREFILL_ARMS arm1_tok_per_s=$pf_tps arm2_tok_per_s=$pf2_tps ratio=$ratio max=${SMOKE_PREFILL_RATIO_MAX:-1.05} warm_lines=$warm_lines"
+    awk -v r="$ratio" -v m="${SMOKE_PREFILL_RATIO_MAX:-1.05}" 'BEGIN { exit !(r + 0 > m + 0) }' \
+      && fail "prefill_first_arm_penalty arm1=$pf_tps arm2=$pf2_tps ratio=$ratio max=${SMOKE_PREFILL_RATIO_MAX:-1.05} warm_lines=$warm_lines"
+  else
+    echo "SMOKE_PREFILL_ARMS unjudged arm1_tok_per_s=${pf_tps:-none} arm2_tok_per_s=${pf2_tps:-none} warm_lines=${warm_lines:-0} why=no_warm_up"
+  fi
 fi
 # The OpenAI-compatible server is on no critical path -- nothing in the release calls it unless an
 # operator does -- so the default smoke does not pay for a second load. PAIR_SMOKE_SERVER=1 adds it:
