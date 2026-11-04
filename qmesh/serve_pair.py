@@ -60,6 +60,16 @@ NUM_DRAFT = int(os.environ.get("NUM_DRAFT", "5"))
 CACHE_TOKENS = int(os.environ.get("CACHE_TOKENS", "65536"))
 BATCH = int(os.environ.get("BATCH", "1"))
 WARM_TOKENS = int(os.environ.get("WARM_TOKENS", "8"))
+# The first prefill of a fresh container is ~31 % slower than the second whatever the config, and an
+# ablation over every on-disk cache the container owns (Triton kernels, exllamav3's autotune file,
+# torch's NVRTC cubins) cut it from 12.9 s to ~6 s and no further: the first chunk of a *process*
+# pays one-time buffer growth plus a gap between enqueue and the first chunk timer, and both are
+# absent from every later request (notes/HalfWire.md, "Which cache the first arm is paying for").
+# So startup does one chunk at the load-time row count and one short call per seam bucket, which
+# moves that cost behind SERVER_READY. WARM_PREFILL=0 turns it off; WARM_PREFILL_ROWS=0 skips only
+# the big chunk (the cheap buckets still run, since they cover the decode path).
+WARM_PREFILL = os.environ.get("WARM_PREFILL", "1") != "0"
+WARM_PREFILL_ROWS = int(os.environ.get("WARM_PREFILL_ROWS", "0"))  # 0: the load-time row count
 # KV_BITS=4 (default) is DeepSeek's trained FP4 layout: whole 512-wide latent rows plus indexer
 # keys, as the model was trained. 8 packs the nope part with CacheLayer_quant, 16 is the fp16 pool.
 # Same three-way pick as the shipping client (qmesh/e2e_prompts.py:85-92); the pair ships 4.
@@ -130,9 +140,9 @@ def setup():
     log(prefix_cache.summary())
     if PREFILL_ADAPTIVE:
         generator.prefill_chunk_limit = PrefillChunkLimiter(device)
+    warm_text = encode_messages([{"role": "user", "content": "Hello"}], thinking_mode="chat")
+    warm_ids = tokenizer.encode(warm_text, add_bos=False, encode_special_tokens=True)
     if WARM_TOKENS:
-        warm_text = encode_messages([{"role": "user", "content": "Hello"}], thinking_mode="chat")
-        warm_ids = tokenizer.encode(warm_text, add_bos=False, encode_special_tokens=True)
         for _ in range(BATCH):
             generator.enqueue(Job(input_ids=warm_ids, max_new_tokens=WARM_TOKENS,
                                   min_new_tokens=WARM_TOKENS, sampler=ComboSampler(temperature=0),
@@ -140,6 +150,22 @@ def setup():
         while generator.num_remaining_jobs():
             for _ in generator.iterate():
                 pass
+    if WARM_PREFILL:
+        # One call per seam bucket, so every expert-row width the wire will see is compiled and its
+        # buffers grown here rather than inside the first request. The buckets are the placement's
+        # (1, 6, 64, 8192 by default); WARM_PREFILL_ROWS names the big one, capped by what the
+        # request cache could hold and by the chunk the generator was built with.
+        big = min(WARM_PREFILL_ROWS or rows, rows, max(CACHE_TOKENS - MAX_NEW, 0))
+        filler = warm_ids * (max(rows, 64) // max(len(warm_ids), 1) + 2)
+        for n_rows in [n for n in (1, 6, 64, big) if n and n <= len(filler)]:
+            t_warm = time.time()
+            generator.enqueue(Job(input_ids=filler[:n_rows], max_new_tokens=1,
+                                  min_new_tokens=1, sampler=ComboSampler(temperature=0),
+                                  stop_conditions=[]))
+            while generator.num_remaining_jobs():
+                for _ in generator.iterate():
+                    pass
+            log(f"WARM_PREFILL_OK rows={n_rows} s={time.time() - t_warm:.2f}")
     log("SERVER_READY")
     return generator, tokenizer
 

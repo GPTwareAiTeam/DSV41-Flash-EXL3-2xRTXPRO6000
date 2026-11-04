@@ -160,6 +160,17 @@ except Exception: print("")' "$REL/RELEASE.json")
     # Same pin the client and the worker get, for the server's half of the autotuner: unset,
     # EXLLAMAV3_TUNE_CACHE resolves under $HOME *inside* the container and the picks die with it.
     -e "EXLLAMAV3_TUNE_CACHE=$PAIR_TUNE_CACHE"
+    # The two caches the server's own prefill fills, same pins as the client and the worker
+    # (pair_lib.sh:54-64, pair_arm.sh:116-120): unset, Triton's kernels and torch's NVRTC cubin are
+    # compiled into the container's own /root and die with it, so the first request after a restart
+    # pays for them again (measured 2026-11-03: 12.9 s on the first prefill arm, ~6 s of it still open).
+    -e "TRITON_CACHE_DIR=$PAIR_TRITON_CACHE"
+    -e "TORCH_HOME=$PAIR_TORCH_HOME"
+    # The startup warm-up itself (serve_pair.py:62-72,143-168). On by default because the cost it
+    # hides is real and is paid again on every restart; `pair_server.sh dev start -e WARM_PREFILL=0`
+    # turns it off, and WARM_PREFILL_ROWS overrides the big chunk (default: the load-time row count).
+    -e "WARM_PREFILL=${WARM_PREFILL:-1}"
+    -e "WARM_PREFILL_ROWS=${WARM_PREFILL_ROWS:-0}"
     # pairs.conf's `gpu` is a host index (spent on --gpus device=N at container creation), so inside
     # the container that one card is device 0 again -- the index serve_pair.py loads on.
     -e "CUDA_VISIBLE_DEVICES=0"
