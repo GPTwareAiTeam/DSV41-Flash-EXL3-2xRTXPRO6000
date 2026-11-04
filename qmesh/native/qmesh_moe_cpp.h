@@ -128,6 +128,23 @@ void qmc_k_f32_to_half(const float *src, void *dst, int n, int mode, cudaStream_
  * src_half[i] when accumulate is 0. Same element order every call and every block_m. */
 void qmc_k_h2f_add(const void *src_half, float *dst, int n, int accumulate, cudaStream_t s);
 
+/* -- fused stages (qmesh_moe_fused.cu) ---------------------------------------------------------- *
+ * One launch per projection instead of the vendor's two per projection: the input Hadamard (and, for
+ * the down projection, the SwiGLU) is folded into the GEMM's A tile, and the output Hadamard and the
+ * routing-weighted combine into its epilogue. Pointers are device pointers, the layout is exactly
+ * what exl3_moe_had_in / exl3_moe_glu_had_in / exl3_moe_gemm take, and the k order is unchanged, so
+ * the answer is the same bits. `block_m` must be 16, `bits` 2 or 4 and `cb` 0..2; any other
+ * combination returns 1 and the caller must use the vendor ops. Returns 0 when the launches were
+ * issued. */
+int qmc_fused_w13(const void *x_h, const void *sorted_ids, const void *suh13, void *inter,
+                  const void *trellis13, const void *svh13, const void *eids, const void *n_rows,
+                  int k, int n_total, int shard_w, int n_shards, int bits, int cb, int block_m,
+                  int64_t b_expert_stride, int m_valid, int top_k, int m_blocks, cudaStream_t s);
+int qmc_fused_down(const void *inter, const void *sorted_ids, const void *suh2, void *acc,
+                   const void *trellis2, const void *svh2, const void *eids, const void *n_rows,
+                   const void *w_f32, int k, int n_total, int bits, int cb, int block_m,
+                   int64_t b_expert_stride, int m_valid, int top_k, int m_blocks, cudaStream_t s);
+
 #ifdef __cplusplus
 }
 #endif

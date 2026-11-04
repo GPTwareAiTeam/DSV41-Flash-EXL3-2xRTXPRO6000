@@ -312,6 +312,9 @@ struct Ctx {
   bool dump = false; /* SEAM_MOE_CPP_DUMP: mirror each group's alignment into host buffers */
   bool trace = false;
   bool bound = false; /* SEAM_MOE_CPP_BOUND: align from the picks' bound, no per-piece readback */
+  int fused = 0; /* SEAM_MOE_CPP_FUSED: 1 = one launch per projection, 2 = require it (refuse the
+                  * vendor fallback, so a green run is evidence the fused kernels actually ran) */
+  bool h_acc = false; /* CUDA_EXL3_FP16_ACC: the vendor's fp16 accumulator, which fused refuses */
   bool det = false; /* SEAM_MOE_CPP_DET: the Python path's deterministic epilogue branch, op for op
                      * (see run_piece). Refuses the bounded alignment, whose epilogue is the other,
                      * order-dependent sum. */
@@ -322,6 +325,13 @@ struct Ctx {
   Buffers b;
   int64_t calls = 0;
   int64_t refused = 0;
+  /* With SEAM_MOE_CPP_FUSED=1 the fused path is opportunistic, so a run says nothing about the fused
+   * kernels unless it also says how much of the work they did: these two counters are what makes an
+   * =1 measurement interpretable (a prefill-only run can fuse nothing at all if every group's
+   * pick_block_m comes back 32). Printed every 4096 calls and on every refusal. */
+  int64_t fused_groups = 0;
+  int64_t vendor_groups = 0;
+  int64_t stat_calls = 0;
   int64_t last_wall = 0;
   int64_t last_dev = 0;
   bool reported = false;
@@ -640,40 +650,89 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
       const at::Tensor a2 = dev_tensor(b.a2, {1, total[g], (int64_t)q.inter}, at::kHalf, c.dev);
       const at::Tensor acc = dev_tensor(b.acc, {rows, H}, at::kFloat, c.dev);
 
+      /* Fused: the two Hadamard transforms run inside the GEMMs that read them, so neither a13 nor
+       * a2 is ever written (qmesh_moe_fused.cu). Same tile (block_m=16) and same accumulators as
+       * the vendor path; anything the fused kernels are not instantiated for -- another block_m, a
+       * fractional bitrate, fp16 accumulation -- falls through to the four vendor ops below.
+       * SEAM_MOE_CPP_DET outranks it: the fused stages write the folded fp32 atomic epilogue, so a
+       * layer served by them would be neither reproducible nor comparable with the Python path,
+       * which is the whole promise of the DET arm. DET therefore takes the vendor branch (whose
+       * epilogue it replaces), and FUSED=2 under DET is a refusal rather than a silent vendor run. */
+      const bool use_fused =
+          c.fused != 0 && !c.det && !c.h_acc && bm[g] == 16 && total[g] % 16 == 0 &&
+          q.words13 % 16 == 0 && q.words2 % 16 == 0 && H % 128 == 0 && q.inter % 128 == 0;
+      /* SEAM_MOE_CPP_FUSED=2: the caller is measuring the fused kernels and a fallback would measure
+       * something else, so what cannot be fused is refused with the reason it could not be. */
+      if (c.fused == 2 && !use_fused) {
+        set_err("layer %d group %d: fused required but not applicable (bm=%d total=%d words13=%d "
+                "words2=%d h_acc=%d det=%d)", layer, g, bm[g], total[g], (int)q.words13,
+                (int)q.words2, (int)c.h_acc, (int)c.det);
+        rc = kRefuseCompute;
+        break;
+      }
       try {
-        moe_had_in(x_h, a13, L.grp[g].suh13, sorted_t, eids_t, nr_t, bm[g], T, m_valid);
-        moe_gemm(a13, L.grp[g].t13, L.grp[g].suh13, L.grp[g].svh13, eids_t, nr_t,
-                 {(int64_t)q.inter, (int64_t)q.inter}, q.cb, bm[g], at::kHalf, sorted_t, true,
-                 at::Tensor(), false, rows, T, inter, true, false);
-        moe_glu(inter, a2, L.grp[g].suh2, eids_t, nr_t, bm[g]);
-        if (c.det) {
-          /* SEAM_MOE_CPP_DET: the Python path's deterministic branch (exl3_moe_cuda.py:482-491), the
-           * only difference being the epilogue -- the down gemm unweighted into a half, the vendor's
-           * pick-order combine into a second half, one fp32 add per group. The default epilogue folds
-           * the routing weight into the down gemm's fp32 atomics instead, so its answer depends on
-           * the order blocks retire in (and on block_m); this one depends on nothing but the group
-           * order. That is what makes a per-layer byte comparison between the two paths mean
-           * anything: measured on 2026-11-03 over 40 layers at rows 1/6/64/8192, the default arm
-           * agrees with the Python path on 0/40 layers and this branch on 40/40 (max_abs exactly 0).
-           * The "13/40 identical" figure often quoted next to this code is fused-vs-native, a
-           * different comparison: both of those sum by fp32 atomicAdd in block-retirement order. */
-          const at::Tensor routed =
-              moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H},
-                       q.cb, bm[g], at::kHalf, sorted_t, true, at::Tensor(), false, rows, T,
-                       at::Tensor(), false, false);
-          const at::Tensor combined = moe_combine(routed, sorted_t, w_f, rows, eids_t, bm[g]);
-          /* total = out.float() on the first contributing group and total + out.float() after: the
-           * assign-vs-add distinction is -0.0's, and it is what the Python path does. */
-          qmc_k_h2f_add(combined.data_ptr(), b.acc, rows * H, wrote ? 1 : 0, s);
+        if (use_fused) {
+          if (!wrote && cudaMemsetAsync(b.acc, 0, (size_t)rows * H * 4, s) != cudaSuccess) {
+            set_err("zero fill failed: %s", cudaGetErrorString(cudaGetLastError()));
+            rc = kRefuseCompute;
+            break;
+          }
+          const int64_t bs13 = (int64_t)(H / 16) * (2 * q.inter / 16) * q.words13;
+          const int64_t bs2 = (int64_t)(q.inter / 16) * (H / 16) * q.words2;
+          const int mblocks = total[g] / bm[g];
+          if (qmc_fused_w13(b.x_h, b.sorted, q.suh13, b.inter, q.trellis13, q.svh13, eids_g,
+                            b.n_rows + g, H, 2 * q.inter, q.inter, 2, q.words13 / 16, q.cb, bm[g],
+                            bs13, m_valid, T, mblocks, s) != 0 ||
+              qmc_fused_down(b.inter, b.sorted, q.suh2, b.acc, q.trellis2, q.svh2, eids_g,
+                             b.n_rows + g, b.w_f, q.inter, H, q.words2 / 16, q.cb, bm[g], bs2,
+                             m_valid, T, mblocks, s) != 0) {
+            /* Both stages report 2 for a refused launch and 1 for a shape with no instantiation;
+             * either way the layer's numbers are not usable, so it is a refusal, not a result. */
+            set_err("layer %d group %d: fused stage failed (bits=%d cb=%d bm=%d): no instantiation "
+                    "or launch refused", layer, g, (int)(q.words13 / 16), (int)q.cb, bm[g]);
+            rc = kRefuseCompute;
+            break;
+          }
         } else {
-          moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H}, q.cb,
-                   bm[g], at::kFloat, sorted_t, true, w_f, true, rows, T, acc, true, wrote);
+          moe_had_in(x_h, a13, L.grp[g].suh13, sorted_t, eids_t, nr_t, bm[g], T, m_valid);
+          moe_gemm(a13, L.grp[g].t13, L.grp[g].suh13, L.grp[g].svh13, eids_t, nr_t,
+                   {(int64_t)q.inter, (int64_t)q.inter}, q.cb, bm[g], at::kHalf, sorted_t, true,
+                   at::Tensor(), false, rows, T, inter, true, false);
+          moe_glu(inter, a2, L.grp[g].suh2, eids_t, nr_t, bm[g]);
+          if (c.det) {
+            /* SEAM_MOE_CPP_DET: the Python path's deterministic branch (exl3_moe_cuda.py:482-491), the
+             * only difference being the epilogue -- the down gemm unweighted into a half, the vendor's
+             * pick-order combine into a second half, one fp32 add per group. The default epilogue folds
+             * the routing weight into the down gemm's fp32 atomics instead, so its answer depends on
+             * the order blocks retire in (and on block_m); this one depends on nothing but the group
+             * order. That is what makes a per-layer byte comparison between the two paths mean
+             * anything: measured on 2026-11-03 over 40 layers at rows 1/6/64/8192, the default arm
+             * agrees with the Python path on 0/40 layers and this branch on 40/40 (max_abs exactly 0).
+             * The "13/40 identical" figure often quoted next to this code is fused-vs-native, a
+             * different comparison: both of those sum by fp32 atomicAdd in block-retirement order.
+             * DET never takes the fused stages, whose epilogue is the folded one (see use_fused). */
+            const at::Tensor routed =
+                moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H},
+                         q.cb, bm[g], at::kHalf, sorted_t, true, at::Tensor(), false, rows, T,
+                         at::Tensor(), false, false);
+            const at::Tensor combined = moe_combine(routed, sorted_t, w_f, rows, eids_t, bm[g]);
+            /* total = out.float() on the first contributing group and total + out.float() after: the
+             * assign-vs-add distinction is -0.0's, and it is what the Python path does. */
+            qmc_k_h2f_add(combined.data_ptr(), b.acc, rows * H, wrote ? 1 : 0, s);
+          } else {
+            moe_gemm(a2, L.grp[g].t2, L.grp[g].suh2, L.grp[g].svh2, eids_t, nr_t, {(int64_t)H}, q.cb,
+                     bm[g], at::kFloat, sorted_t, true, w_f, true, rows, T, acc, true, wrote);
+          }
         }
       } catch (const std::exception& e) {
         set_err("layer %d group %d raised: %s", layer, g, e.what());
         rc = kRefuseCompute;
         break;
       }
+      if (use_fused)
+        c.fused_groups++;
+      else
+        c.vendor_groups++;
       wrote = true;
       if (c.trace)
         /* blk is what the gemm grid ran over. In bound mode that is the padded count, not the
@@ -688,6 +747,19 @@ int run_piece(Ctx& c, int layer, int rows, const uint8_t* xp, const int32_t* idp
         return kRefuseCompute;
       }
     }
+  }
+  /* run_piece sees the context by reference (Ctx& c), so the counters are c. not c->. */
+  const bool want_stat = c.fused != 0 && (rc != 0 || c.calls - c.stat_calls >= 4096);
+  if (want_stat) {
+    const int64_t tot = c.fused_groups + c.vendor_groups;
+    fprintf(stderr,
+            "SEAM_MOE_CPP_FUSED_STATS calls=%lld groups=%lld fused=%lld vendor=%lld fused_pct=%.1f "
+            "knob=%d\n",
+            (long long)c.calls, (long long)tot, (long long)c.fused_groups,
+            (long long)c.vendor_groups, tot ? 100.0 * (double)c.fused_groups / (double)tot : 0.0,
+            (int)c.fused);
+    fflush(stderr);
+    c.stat_calls = c.calls;
   }
   if (rc != 0) return rc;
   /* Answer -> pinned response slot. The Python path built this with .float().cpu().numpy(); it is
@@ -733,6 +805,19 @@ extern "C" int qmc_open(int device, int hidden, int topk, int ws_rows, void** ou
    * group to min(n_experts, m_valid) costs more blocks than the sync saves at decode widths. On is a
    * measurement arm. */
   c->bound = env_int("SEAM_MOE_CPP_BOUND", 0) != 0;
+  /* One launch per projection instead of four (see qmesh_moe_fused.cu). Only the block_m=16 tile is
+   * instantiated, and only fp32 accumulation: a fused kernel has no second pass to fall back on, so
+   * CUDA_EXL3_FP16_ACC is refused here and the vendor path keeps it. Off by default until the
+   * 40-layer dump comparison says the answer is identical. 2 = require: any layer the fused kernels
+   * cannot take is a refusal rather than a silent run of the vendor path, which is what makes an
+   * identity comparison between the two arms mean something. */
+  c->fused = (int)env_int("SEAM_MOE_CPP_FUSED", 0);
+  {
+    /* The vendor reads this through exl3_env, which also honours the VLLM_EXL3_ alias; the seam
+     * process only ever sets the CUDA_ name, and a set-but-empty or "0" value means off there too. */
+    const char* ha = getenv("CUDA_EXL3_FP16_ACC");
+    c->h_acc = ha && *ha && *ha != '0';
+  }
   /* The Python path's deterministic epilogue (see run_piece): an unweighted half out of the down gemm,
    * the vendor's pick-order combine, one fp32 add per group. It is the only mode whose answer is the
    * same on every run and at every block_m, which is what makes a per-layer byte comparison between
