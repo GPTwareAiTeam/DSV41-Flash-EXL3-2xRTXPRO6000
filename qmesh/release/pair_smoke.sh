@@ -665,8 +665,13 @@ if [ "${PAIR_SMOKE_SERVER:-0}" = 1 ]; then
   # The seam worker this smoke loaded holds the pack and the GX card, and the HTTP server brings its own
   # (pair_server.sh start): two workers on one pack is `gx_busy`, not a second measurement. Every arm
   # above has already been taken from this smoke's worker, so it goes now; the EXIT trap's stop then
-  # finds no pidfile and is a no-op. The GX claim stays held, so nothing else can take the box mid-run.
+  # finds no pidfile and is a no-op.
+  # The claim goes with it: pair_serve.sh takes the gate as `serve-$PAIR` and dies `PAIR_SERVE_GX_BUSY`
+  # if anyone holds it, so a smoke that kept `smoke-$PAIR` would fail the server stage for its own
+  # claim. The server re-claims immediately (it is the only process that loads the pack from here on)
+  # and drops the gate when its worker is up.
   pair_server_stop >/dev/null 2>&1 || true
+  pair_gx_gate_down >/dev/null 2>&1 || true
   pair_step "SMOKE_HTTP_SERVER pair=$PAIR ct=$P7CT port=${PAIR_SRV_PORT:-${SRV_PORT:-8000}}"
   # No port argument: pair_server_smoke.sh resolves PAIR_SRV_PORT/SRV_PORT/8000 itself, the same way
   # pair_server.sh picked the port this pair serves on.
